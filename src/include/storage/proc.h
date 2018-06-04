@@ -260,6 +260,8 @@ typedef struct PROC_HDR
 	Latch	   *walwriterLatch;
 	/* Checkpointer process's latch */
 	Latch	   *checkpointerLatch;
+	/* */
+	Latch		*relcleanerLatch;
 	/* Current shared estimate of appropriate spins_per_delay value */
 	int			spins_per_delay;
 	/* The proc of the Startup process, since not in ProcArray */

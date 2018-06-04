@@ -233,6 +233,13 @@ typedef struct xl_parameter_change
 	bool		track_commit_timestamp;
 } xl_parameter_change;
 
+/* logs backup-end operation */
+typedef struct xl_backup_end
+{
+	TimestampTz timestamp;
+	XLogRecPtr	startpoint;
+} xl_backup_end;
+
 /* logs restore point */
 typedef struct xl_restore_point
 {

@@ -730,6 +730,32 @@ index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap)
 	return ntids;
 }
 
+IndexBulkDeleteResult *
+index_target_delete(IndexVacuumInfo *info,
+					IndexBulkDeleteResult *stats,
+					Relation HeapRel, ItemPointer htups, int nhtups)
+{
+	Relation	indexRelation = info->index;
+
+	RELATION_CHECKS;
+
+	Assert(HeapRel != InvalidRelation);
+	Assert(indexRelation->rd_amroutine->ambulkdelete != NULL);
+	if (indexRelation->rd_amroutine->amtargetdelete == NULL)
+	{
+		/*
+		 * Now not all index access methods uses amtargetdelete()
+		 */
+		 elog(LOG, "-> Now not all index access methods uses amtargetdelete() function.\n");
+		return NULL;
+	}
+	/* TODO:
+	 * Learn a vacuum statistics collection procedure and insert code for it.
+	 */
+	return indexRelation->rd_amroutine->amtargetdelete(info, stats, HeapRel,
+												indexRelation, htups, nhtups);
+}
+
 /* ----------------
  *		index_bulk_delete - do mass deletion of index entries
  *
@@ -769,6 +795,7 @@ index_vacuum_cleanup(IndexVacuumInfo *info,
 	RELATION_CHECKS;
 	CHECK_REL_PROCEDURE(amvacuumcleanup);
 
+	info->del_blcks = NULL;
 	return indexRelation->rd_amroutine->amvacuumcleanup(info, stats);
 }
 

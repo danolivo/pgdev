@@ -137,8 +137,8 @@ typedef struct LVRelStats
 	int			num_index_scans;
 	TransactionId latestRemovedXid;
 	bool		lock_waiter_detected;
+	Relation	rel;
 } LVRelStats;
-
 
 /* A few variables that don't seem worth passing around as parameters */
 static int	elevel = -1;
@@ -519,6 +519,7 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 	vacrelstats->tupcount_pages = 0;
 	vacrelstats->nonempty_pages = 0;
 	vacrelstats->latestRemovedXid = InvalidTransactionId;
+	vacrelstats->rel = onerel;
 
 	lazy_space_alloc(vacrelstats, nblocks);
 	frozen = palloc(sizeof(xl_heap_freeze_tuple) * MaxHeapTuplesPerPage);
@@ -1684,6 +1685,7 @@ lazy_vacuum_index(Relation indrel,
 				  LVRelStats *vacrelstats)
 {
 	IndexVacuumInfo ivinfo;
+	bool use_target_strategy = (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
 	PGRUsage	ru0;
 
 	pg_rusage_init(&ru0);
@@ -1695,10 +1697,18 @@ lazy_vacuum_index(Relation indrel,
 	/* We can only provide an approximate value of num_heap_tuples here */
 	ivinfo.num_heap_tuples = vacrelstats->old_live_tuples;
 	ivinfo.strategy = vac_strategy;
+	ivinfo.del_blcks = NULL;
 
-	/* Do bulk deletion */
-	*stats = index_bulk_delete(&ivinfo, *stats,
-							   lazy_tid_reaped, (void *) vacrelstats);
+	if (use_target_strategy)
+		*stats = index_target_delete(&ivinfo, *stats,
+									 vacrelstats->rel,
+									 vacrelstats->dead_tuples,
+									 vacrelstats->num_dead_tuples);
+
+	if ((!use_target_strategy) || (*stats == NULL))
+		/* Do bulk deletion */
+		*stats = index_bulk_delete(&ivinfo, *stats,
+									lazy_tid_reaped, (void *) vacrelstats);
 
 	ereport(elevel,
 			(errmsg("scanned index \"%s\" to remove %d row versions",

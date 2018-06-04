@@ -113,6 +113,7 @@
 #include "postmaster/fork_process.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/relcleaner.h"
 #include "postmaster/syslogger.h"
 #include "replication/logicallauncher.h"
 #include "replication/walsender.h"
@@ -254,6 +255,7 @@ static pid_t StartupPID = 0,
 			AutoVacPID = 0,
 			PgArchPID = 0,
 			PgStatPID = 0,
+			RelCleanerPID = 0,
 			SysLoggerPID = 0;
 
 /* Startup process's status */
@@ -549,6 +551,7 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #define StartupDataBase()		StartChildProcess(StartupProcess)
 #define StartBackgroundWriter() StartChildProcess(BgWriterProcess)
 #define StartCheckpointer()		StartChildProcess(CheckpointerProcess)
+#define StartRelCleaner()		StartChildProcess(RelCleanerProcess)
 #define StartWalWriter()		StartChildProcess(WalWriterProcess)
 #define StartWalReceiver()		StartChildProcess(WalReceiverProcess)
 
@@ -1765,6 +1768,9 @@ ServerLoop(void)
 		/* If we have lost the archiver, try to start a new one. */
 		if (PgArchPID == 0 && PgArchStartupAllowed())
 			PgArchPID = pgarch_start();
+
+		if (RelCleanerPID == 0)
+			RelCleanerPID = StartRelCleaner();
 
 		/* If we need to signal the autovacuum launcher, do so now */
 		if (avlauncher_needs_signal)

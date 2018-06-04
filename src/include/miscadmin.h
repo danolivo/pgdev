@@ -398,6 +398,7 @@ typedef enum
 	StartupProcess,
 	BgWriterProcess,
 	CheckpointerProcess,
+	RelCleanerProcess,
 	WalWriterProcess,
 	WalReceiverProcess,
 
@@ -410,6 +411,7 @@ extern AuxProcType MyAuxProcType;
 #define AmStartupProcess()			(MyAuxProcType == StartupProcess)
 #define AmBackgroundWriterProcess() (MyAuxProcType == BgWriterProcess)
 #define AmCheckpointerProcess()		(MyAuxProcType == CheckpointerProcess)
+#define AmRelCleanerProcess()		(MyAuxProcType == RelCleanerProcess)
 #define AmWalWriterProcess()		(MyAuxProcType == WalWriterProcess)
 #define AmWalReceiverProcess()		(MyAuxProcType == WalReceiverProcess)
 

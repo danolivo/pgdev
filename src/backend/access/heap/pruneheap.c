@@ -43,6 +43,9 @@ typedef struct
 	bool		marked[MaxHeapTuplesPerPage + 1];
 } PruneState;
 
+/* Parameter for target deletion strategy in lazy vacuum */
+double target_index_deletion_factor = 0.01;
+
 /* Local functions */
 static int heap_prune_chain(Relation relation, Buffer buffer,
 				 OffsetNumber rootoffnum,
@@ -271,6 +274,19 @@ heap_page_prune(Relation relation, Buffer buffer, TransactionId OldestXmin,
 
 			PageSetLSN(BufferGetPage(buffer), recptr);
 		}
+		if (ProcGlobal->relcleanerLatch)
+		{
+			FILE* f = fopen("/home/andrey/test.log", "a+");
+			fprintf(f, "NOP-3\n");
+			fclose(f);
+			SetLatch(ProcGlobal->relcleanerLatch);
+		}
+		else {
+			FILE* f = fopen("/home/andrey/test.log", "a+");
+			fprintf(f, "NOP-NULL\n");
+			printf("NOP1\n");
+			fclose(f);
+			}
 	}
 	else
 	{
@@ -580,8 +596,10 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 		 */
 		for (i = 1; (i < nchain) && (chainitems[i - 1] != latestdead); i++)
 		{
-			heap_prune_record_unused(prstate, chainitems[i]);
 			ndeleted++;
+			if (chainitems[i] == latestdead)
+				continue;
+			heap_prune_record_unused(prstate, chainitems[i]);
 		}
 
 		/*
@@ -598,9 +616,24 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 		 * redirect the root to the correct chain member.
 		 */
 		if (i >= nchain)
+		{
+			if (rootoffnum != latestdead)
+			{
+				if (ItemIdIsNormal(rootlp))
+					heap_prune_record_unused(prstate, latestdead);
+				else
+				{
+					ItemIdSetDeadRedirect(rootlp, latestdead);
+					heap_prune_record_dead(prstate, latestdead);
+				}
+			}
 			heap_prune_record_dead(prstate, rootoffnum);
-		else
+		}
+		else {
+			if (rootoffnum != latestdead)
+				heap_prune_record_unused(prstate, latestdead);
 			heap_prune_record_redirect(prstate, rootoffnum, chainitems[i]);
+		}
 	}
 	else if (nchain < 2 && ItemIdIsRedirected(rootlp))
 	{
@@ -706,7 +739,10 @@ heap_page_prune_execute(Buffer buffer,
 		OffsetNumber off = *offnum++;
 		ItemId		lp = PageGetItemId(page, off);
 
-		ItemIdSetDead(lp);
+		if (target_index_deletion_factor > 0)
+			ItemIdMarkDead(lp);
+		else
+			ItemIdSetDead(lp);
 	}
 
 	/* Update all now-unused line pointers */

@@ -3492,6 +3492,9 @@ pgstat_get_wait_activity(WaitEventActivity w)
 		case WAIT_EVENT_CHECKPOINTER_MAIN:
 			event_name = "CheckpointerMain";
 			break;
+		case WAIT_EVENT_RELCLEANER_MAIN:
+			event_name = "RelCleanerMain";
+			break;
 		case WAIT_EVENT_LOGICAL_LAUNCHER_MAIN:
 			event_name = "LogicalLauncherMain";
 			break;
@@ -4119,6 +4122,9 @@ pgstat_get_backend_desc(BackendType backendType)
 			break;
 		case B_CHECKPOINTER:
 			backendDesc = "checkpointer";
+			break;
+		case B_RELCLEANER:
+			backendDesc = "relcleaner";
 			break;
 		case B_STARTUP:
 			backendDesc = "startup";

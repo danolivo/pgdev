@@ -30,6 +30,7 @@
 #include "pg_getopt.h"
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
+#include "postmaster/relcleaner.h"
 #include "postmaster/startup.h"
 #include "postmaster/walwriter.h"
 #include "replication/walreceiver.h"
@@ -329,6 +330,9 @@ AuxiliaryProcessMain(int argc, char *argv[])
 			case CheckpointerProcess:
 				statmsg = pgstat_get_backend_desc(B_CHECKPOINTER);
 				break;
+			case RelCleanerProcess:
+				statmsg = pgstat_get_backend_desc(B_RELCLEANER);
+				break;
 			case WalWriterProcess:
 				statmsg = pgstat_get_backend_desc(B_WAL_WRITER);
 				break;
@@ -449,6 +453,10 @@ AuxiliaryProcessMain(int argc, char *argv[])
 		case CheckpointerProcess:
 			/* don't set signals, checkpointer has its own agenda */
 			CheckpointerMain();
+			proc_exit(1);		/* should never return */
+		case RelCleanerProcess:
+			/* don't set signals, checkpointer has its own agenda */
+			RelCleanerMain();
 			proc_exit(1);		/* should never return */
 
 		case WalWriterProcess:
