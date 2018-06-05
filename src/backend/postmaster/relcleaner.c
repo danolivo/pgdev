@@ -15,40 +15,27 @@
 #include "utils/ps_status.h"
 
 #ifdef EXEC_BACKEND
-static pid_t rclauncher_forkexec(void);
-#endif
-static void RelCleaner_MainLoop(void);
-
-#ifdef EXEC_BACKEND
-static pid_t
-rclauncher_forkexec(void)
-{
-	char	   *av[10];
-	int			ac = 0;
-
-	av[ac++] = "postgres";
-	av[ac++] = "--forkrclauncher";
-	av[ac++] = NULL;			/* filled in by postmaster_forkexec */
-	av[ac] = NULL;
-
-	return postmaster_forkexec(ac, av);
-}
-
+static pid_t rcleaner_forkexec(void);
 #endif
 
-int relcleaner_start(void)
+NON_EXEC_STATIC void RelCleanerMain(int argc, char *argv[]) pg_attribute_noreturn();
+
+static void main_loop(void);
+
+int
+rcleaner_start(void)
 {
-	pid_t		RelCleanerPid;
+	pid_t		RCleanerPid;
 
 #ifdef EXEC_BACKEND
-	switch ((RelCleanerPid = rclauncher_forkexec()))
+	switch ((RCleanerPid = rcleaner_forkexec()))
 #else
-	switch ((RelCleanerPid = fork_process()))
+	switch ((RCleanerPid = fork_process()))
 #endif
 	{
 		case -1:
 			ereport(LOG,
-					(errmsg("could not fork relcleaner: %m")));
+					(errmsg("could not fork relation cleaner: %m")));
 			return 0;
 
 #ifndef EXEC_BACKEND
@@ -59,25 +46,52 @@ int relcleaner_start(void)
 			/* Close the postmaster's sockets */
 			ClosePostmasterPorts(false);
 
-			RelCleanerMain();
+			RelCleanerMain(0, NULL);
 			break;
 #endif
 
 		default:
-			return (int) RelCleanerPid;
+			return (int) RCleanerPid;
 	}
 
-	/*
-	 * Advertise our latch that backends can use to wake us up while we're
-	 * sleeping.
-	 */
-	ProcGlobal->relcleanerLatch = &MyProc->procLatch;
 	/* shouldn't get here */
 	return 0;
 }
 
-void RelCleanerMain(void)
+#ifdef EXEC_BACKEND
+
+/*
+ * pgarch_forkexec() -
+ *
+ * Format up the arglist for, then fork and exec, archive process
+ */
+static pid_t
+rcleaner_forkexec(void)
 {
+	char	   *av[10];
+	int			ac = 0;
+
+	av[ac++] = "postgres";
+
+	av[ac++] = "--forkrcleaner";
+
+	av[ac++] = NULL;			/* filled in by postmaster_forkexec */
+
+	av[ac] = NULL;
+	Assert(ac < lengthof(av));
+
+	return postmaster_forkexec(ac, av);
+}
+#endif							/* EXEC_BACKEND */
+
+NON_EXEC_STATIC void
+RelCleanerMain(int argc, char *argv[])
+{
+		{
+			FILE* f = fopen("/home/andrey/test.log", "a+");
+			fprintf(f, "Start\n");
+			fclose(f);
+		}
 	pqsignal(SIGHUP, SIG_IGN);
 	pqsignal(SIGINT, SIG_IGN);
 	pqsignal(SIGTERM, SIG_IGN);
@@ -92,19 +106,19 @@ void RelCleanerMain(void)
 	pqsignal(SIGCONT, SIG_DFL);
 	pqsignal(SIGWINCH, SIG_DFL);
 	PG_SETMASK(&UnBlockSig);
-
 	/*
 	 * Identify myself via ps
 	 */
 	init_ps_display("archiver", "", "", "");
 
-	RelCleaner_MainLoop();
+//	ProcGlobal->relcleanerLatch = &MyProc->procLatch;
+
+	main_loop();
 
 	exit(0);
 }
 
-static void
-RelCleaner_MainLoop(void)
+static void main_loop(void)
 {
 	int rc;
 
@@ -121,13 +135,15 @@ RelCleaner_MainLoop(void)
 		 */
 		if (rc & WL_POSTMASTER_DEATH)
 			exit(1);
-		{
-		FILE* f = fopen("/home/andrey/test.log", "a+");
-		fprintf(f, "NOP-2\n");
-		printf("NOP1\n");
-		fclose(f);
-		sleep(1);
-		}
+		
+		/* WAL has a records with DEAD tuples. We need:
+		 * 1. Scan WAL from lastScannedPosition to the end.
+		 * 2. Got Messages with deleted tuples.
+		 * 3. Generate scankeys, itids
+		 * 4. Remove itids
+		 * 5. Set UNUSED heap tuples
+		 * 6. Write to WAL an info
+		 */
 	}
 	proc_exit(0);
 }

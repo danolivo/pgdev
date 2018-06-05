@@ -551,7 +551,6 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #define StartupDataBase()		StartChildProcess(StartupProcess)
 #define StartBackgroundWriter() StartChildProcess(BgWriterProcess)
 #define StartCheckpointer()		StartChildProcess(CheckpointerProcess)
-#define StartRelCleaner()		StartChildProcess(RelCleanerProcess)
 #define StartWalWriter()		StartChildProcess(WalWriterProcess)
 #define StartWalReceiver()		StartChildProcess(WalReceiverProcess)
 
@@ -1770,7 +1769,7 @@ ServerLoop(void)
 			PgArchPID = pgarch_start();
 
 		if (RelCleanerPID == 0)
-			RelCleanerPID = StartRelCleaner();
+			RelCleanerPID = rcleaner_start();
 
 		/* If we need to signal the autovacuum launcher, do so now */
 		if (avlauncher_needs_signal)
@@ -4954,6 +4953,12 @@ SubPostmasterMain(int argc, char *argv[])
 		/* Do not want to attach to shared memory */
 
 		PgArchiverMain(argc, argv); /* does not return */
+	}
+	if (strcmp(argv[1], "--forkrcleaner") == 0)
+	{
+		/* Do not want to attach to shared memory */
+
+		RelCleanerMain(argc, argv); /* does not return */
 	}
 	if (strcmp(argv[1], "--forkcol") == 0)
 	{

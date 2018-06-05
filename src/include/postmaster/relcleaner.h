@@ -4,8 +4,10 @@
 #ifndef RELCLEANER_H
 #define RELCLEANER_H
 
-extern int relcleaner_start(void);
+extern int rcleaner_start(void);
 
-extern void RelCleanerMain(void) pg_attribute_noreturn();
+#ifdef EXEC_BACKEND
+extern void RelCleanerMain(int argc, char *argv[]) pg_attribute_noreturn();
+#endif
 
 #endif							/* RELCLEANER_H */

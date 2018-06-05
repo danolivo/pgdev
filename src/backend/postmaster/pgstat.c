@@ -50,6 +50,7 @@
 #include "postmaster/autovacuum.h"
 #include "postmaster/fork_process.h"
 #include "postmaster/postmaster.h"
+#include "postmaster/relcleaner.h"
 #include "replication/walsender.h"
 #include "storage/backendid.h"
 #include "storage/dsm.h"

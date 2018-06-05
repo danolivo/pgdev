@@ -276,16 +276,16 @@ heap_page_prune(Relation relation, Buffer buffer, TransactionId OldestXmin,
 		}
 		if (ProcGlobal->relcleanerLatch)
 		{
-			FILE* f = fopen("/home/andrey/test.log", "a+");
-			fprintf(f, "NOP-3\n");
-			fclose(f);
+//			FILE* f = fopen("/home/andrey/test.log", "a+");
+//			fprintf(f, "NOP-3\n");
+//			fclose(f);
 			SetLatch(ProcGlobal->relcleanerLatch);
 		}
 		else {
-			FILE* f = fopen("/home/andrey/test.log", "a+");
-			fprintf(f, "NOP-NULL\n");
-			printf("NOP1\n");
-			fclose(f);
+//			FILE* f = fopen("/home/andrey/test.log", "a+");
+//			fprintf(f, "NOP-NULL\n");
+//			printf("NOP1\n");
+//			fclose(f);
 			}
 	}
 	else
