@@ -510,7 +510,7 @@ extern void btmarkpos(IndexScanDesc scan);
 extern void btrestrpos(IndexScanDesc scan);
 extern IndexBulkDeleteResult *bttargetdelete(IndexVacuumInfo *info,
 			IndexBulkDeleteResult *stats,
-			Relation rel, Relation irel, ItemPointer htups, int nhtups);
+			IndexEntry* tid, int ntid);
 extern IndexBulkDeleteResult *btbulkdelete(IndexVacuumInfo *info,
 			 IndexBulkDeleteResult *stats,
 			 IndexBulkDeleteCallback callback,

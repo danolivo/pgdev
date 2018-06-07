@@ -114,6 +114,7 @@ typedef struct IndexScanDescData
 	 */
 	IndexTuple	xs_itup;		/* index tuple returned by AM */
 	TupleDesc	xs_itupdesc;	/* rowtype descriptor of xs_itup */
+	ItemPointerData	xs_itid;	/* tid of an index tuple, returned by AM */
 	HeapTuple	xs_hitup;		/* index data returned by AM, as HeapTuple */
 	TupleDesc	xs_hitupdesc;	/* rowtype descriptor of xs_hitup */
 

@@ -79,8 +79,8 @@ typedef bool (*aminsert_function) (Relation indexRelation,
 /* target delete */
 typedef  IndexBulkDeleteResult *(*amtargetdelete_function) (IndexVacuumInfo *info,
 														   IndexBulkDeleteResult *stats,
-														   Relation rel, Relation irel,
-														   ItemPointer htups, int nhtups);
+														   IndexEntry* tid,
+														   int ntid);
 /* bulk delete */
 typedef IndexBulkDeleteResult *(*ambulkdelete_function) (IndexVacuumInfo *info,
 														 IndexBulkDeleteResult *stats,

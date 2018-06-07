@@ -35,8 +35,6 @@
 #include "utils/builtins.h"
 #include "utils/index_selfuncs.h"
 #include "utils/memutils.h"
-#include "utils/syscache.h"
-#include "utils/lsyscache.h"
 
 
 /* Working state needed by btvacuumpage */
@@ -97,8 +95,7 @@ static void btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			 IndexBulkDeleteCallback callback, void *callback_state,
 			 BTCycleId cycleid, TransactionId *oldestBtpoXact);
 static void btvacuumpage(BTVacState *vstate, BlockNumber blkno,
-						 BlockNumber orig_blkno, IndexTid* tids,
-						 int ntids_max, int* counter);
+						 BlockNumber orig_blkno);
 
 
 /*
@@ -888,276 +885,70 @@ btbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	return stats;
 }
 
-/*
- * Get tuple from heap for a scan key building. If tuples in HOT chain
- * have not a storage, return NULL.
- */
-static HeapTuple get_tuple_by_tid(Relation rel, ItemPointer tid)
-{
-	Buffer			buffer;
-	Page			page;
-	OffsetNumber	offnum;
-	ItemId			lp;
-	HeapTuple 		tuple;
-
-	buffer = ReadBufferExtended(rel, MAIN_FORKNUM, ItemPointerGetBlockNumber(tid), RBM_NORMAL, NULL);
-	LockBuffer(buffer, BT_READ);
-
-	page = (Page) BufferGetPage(buffer);
-	offnum = ItemPointerGetOffsetNumber(tid);
-	lp = PageGetItemId(page, offnum);
-
-	while (!ItemIdHasStorage(lp))
-	{
-		offnum = ItemIdGetRedirect(lp);
-		lp = PageGetItemId(page, offnum);
-
-		if (!ItemIdIsUsed(lp))
-		{
-			_bt_relbuf(rel, buffer);
-			return NULL;
-		}
-	}
-
-	tuple = palloc(sizeof(HeapTupleData));
-	ItemPointerSet(&(tuple->t_self), BufferGetBlockNumber(buffer), offnum);
-	tuple->t_tableOid = RelationGetRelid(rel);
-	tuple->t_data = (HeapTupleHeader) PageGetItem(page, lp);
-	tuple->t_len = ItemIdGetLength(lp);
-	_bt_relbuf(rel, buffer);
-	return tuple;
-}
-
-/*
- * Build scan key for an index relation by a heap tuple TID
- */
-static int build_scan_key(ScanKey skey, Relation rel, Relation irel, ItemPointer tid)
-{
-	TupleDesc	desc = RelationGetDescr(rel);
-	HeapTuple	tuple;
-	int			attoff;
-	Datum		indclassDatum;
-	oidvector*	opclass;
-	int2vector*	indkey = &irel->rd_index->indkey;
-	bool 		isnull;
-
-	tuple = get_tuple_by_tid(rel, tid);
-	if (tuple == NULL)
-		return 0;
-
-	indclassDatum = SysCacheGetAttr(INDEXRELID, irel->rd_indextuple,
-										Anum_pg_index_indclass, &isnull);
-
-	opclass = (oidvector *) DatumGetPointer(indclassDatum);
-	for (attoff = 0; attoff < IndexRelationGetNumberOfKeyAttributes(irel); attoff++)
-	{
-		Oid				operator;
-		Oid				opfamily;
-		RegProcedure	regop;
-		int				pkattno = attoff + 1;
-		int				mainattno = indkey->values[attoff];
-		Oid				optype = get_opclass_input_type(opclass->values[attoff]);
-		Datum			scanvalue;
-		StrategyNumber	strategy;
-		Oid				*operators = NULL;
-		Oid				*procs = NULL;
-		uint16			*strategies = NULL;
-
-		if (irel->rd_index->indisexclusion)
-			RelationGetExclusionInfo(irel, &operators, &procs, &strategies);
-
-		if (mainattno > 0)
-			scanvalue = heap_getattr(tuple, mainattno, desc, &isnull);
-		else if (mainattno < 0)
-			scanvalue = heap_getsysattr(tuple, mainattno, desc, &isnull);
-		else
-			return -1;
-
-		/*
-		 * Load the operator info.  We need this to get the equality operator
-		 * function for the scan key.
-		 */
-		opfamily = get_opclass_family(opclass->values[attoff]);
-
-		if (irel->rd_exclstrats != NULL)
-			strategy = irel->rd_exclstrats[attoff];
-		else
-			strategy = BTEqualStrategyNumber;
-
-		operator = get_opfamily_member(opfamily, optype, optype, strategy);
-		if (!OidIsValid(operator))
-			elog(ERROR, "missing operator %d(%u,%u) in opfamily %u", strategy, optype, optype, opfamily);
-
-		regop = get_opcode(operator);
-
-		/* Initialize the scan key. */
-		ScanKeyInit(&skey[attoff],
-				pkattno,
-				strategy,
-				regop,
-				scanvalue);
-		/* Check for null value. */
-		if (isnull)
-			skey[attoff].sk_flags |= SK_ISNULL;
-
-		/* Use index collation */
-		if (irel->rd_indcollation != NULL)
-			skey[attoff].sk_collation = irel->rd_indcollation[attoff];
-
-		/* Use index procedure */
-		if (irel->rd_exclprocs != NULL)
-			fmgr_info(irel->rd_exclprocs[attoff], &(skey[attoff].sk_func));
-	}
-
-	return 1;
-}
-
-static int
-compareIndexTid(const void *a, const void *b)
-{
-	IndexTid	x = *(IndexTid *) a;
-	IndexTid	y = *(IndexTid *) b;
-
-	if (x.blkno > y.blkno)
-		return 1;
-	else if (x.blkno < y.blkno)
-		return -1;
-	else if (x.off > y.off)
-		return 1;
-	else if (x.off < y.off)
-		return -1;
-
-	return 0;
-}
-
-/*
- * Get array of dead index entries ordered by block number (1) and offset (2) fields
- */
-static OrderedIndexTuples*
-btgetindextuples(Relation rel, Relation irel, ItemPointer dead_tuples, int num_dead_tuples)
-{
-	int dt;
-	ScanKeyData	skey[INDEX_MAX_KEYS];
-	IndexScanDesc scan;
-	SnapshotData snap;
-	OrderedIndexTuples* data;
-
-	data = (OrderedIndexTuples *)palloc(sizeof(OrderedIndexTuples));
-	data->ntid = 0;
-	data->tid = (IndexTid *)palloc(sizeof(IndexTid)*num_dead_tuples);
-	if (data->tid == NULL)
-		return NULL;
-
-	/* Search for each dead tuple tid entry in the index relation */
-	InitDirtySnapshot(snap);
-	for (dt = 0; dt < num_dead_tuples; dt++)
-	{
-		bool		found = false;
-		ItemPointer	tid;
-
-		int res = build_scan_key(skey, rel, irel, &(dead_tuples[dt]));
-
-		if (res == 0)
-			continue;
-		if (res == -1)
-		{
-			if (data->tid != NULL)
-				pfree(data->tid);
-
-			return NULL;
-		}
-		scan = index_beginscan(rel, irel, &snap, IndexRelationGetNumberOfKeyAttributes(irel), 0);
-		index_rescan(scan, skey, IndexRelationGetNumberOfKeyAttributes(irel), NULL, 0);
-
-		/* Pass along index entries array with equal scan key value */
-		while ((tid = index_getnext_tid(scan, ForwardScanDirection)) != NULL)
-		{
-			ItemPointerData	ctid = *tid;
-			OffsetNumber	offnum;
-			Buffer			buffer;
-			Page			page;
-
-			buffer = ReadBufferExtended(rel, MAIN_FORKNUM, ItemPointerGetBlockNumber(&ctid), RBM_NORMAL, NULL);
-			LockBuffer(buffer, BT_READ);
-			page = BufferGetPage(buffer);
-
-			/*
-			 * Scan HOT chain. Compare each tuple at a chain with TID
-			 * of dead tuple, until tid can't be found or the chain can't be ended.
-			 */
-			for (;;)
-			{
-				ItemId			lp;
-				HeapTupleHeader	htup;
-
-				if (ItemPointerEquals(&ctid, &(dead_tuples[dt])))
-				{
-					found = true;
-					break;
-				}
-				/*
-				 * If ctid is not equal to the dead tuple, go to next tuple at a chain
-				 */
-				offnum = ItemPointerGetOffsetNumber(&ctid);
-				lp = PageGetItemId(page, offnum);
-
-				if (ItemIdIsDeadRedirection(lp) || (ItemIdIsRedirected(lp)))
-				{
-					/* Follow the redirection */
-					ItemPointerSet(&(ctid), ItemPointerGetBlockNumber(&ctid),
-											ItemIdGetRedirect(lp));
-					continue;
-				}
-
-				if(!ItemIdIsUsed(lp))
-					break;
-
-				/* Move to next tuple in HOT chain, if any*/
-				htup = (HeapTupleHeader) PageGetItem(page, lp);
-				if (!HeapTupleHeaderIsHotUpdated(htup))
-					break;
-				Assert(ItemPointerGetBlockNumber(&htup->t_ctid) ==
-							   BufferGetBlockNumber(buffer));
-				ctid = htup->t_ctid;
-			}
-			_bt_relbuf(rel, buffer);
-
-			if (found)
-			{
-				BTScanPos	idx_pos = (BTScanPos) &(((BTScanOpaque) scan->opaque)->currPos);
-
-				data->tid[data->ntid].blkno = idx_pos->currPage;
-				data->tid[data->ntid].off = idx_pos->items[idx_pos->itemIndex].indexOffset;
-
-				/*
-				 * Save dead tid for a index relation vacuuming check.
-				 * It needed to prevent race conditions between vacuum processes.
-				 */
-				data->tid[data->ntid].htid = dead_tuples[dt];
-				data->ntid++;
-				break;
-			}
-		}
-		index_endscan(scan);
-		/*
-		 * We ignore case then a dead tuple tid entry could not found in an index relation.
-		 */
-	}
-	qsort(data->tid, data->ntid, sizeof(IndexTid), compareIndexTid);
-	return data;
-}
-
 IndexBulkDeleteResult *
 bttargetdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
-			   Relation rel, Relation irel, ItemPointer htups,
-			   int nhtups)
+				IndexEntry* tid, int ntid)
 {
-	info->del_blcks = btgetindextuples(rel, irel, htups, nhtups);
+	Relation	rel = info->index;
+	bool		needLock;
+	int			num_pages;
+	int			tid_num = 0;
 
-	if ((info->del_blcks == NULL))
+	if (ntid == 0)
 		return NULL;
 
-	stats = index_bulk_delete(info, stats, NULL, NULL);
+	if (stats == NULL)
+		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+
+	stats->estimated_count = false;
+	stats->num_index_tuples = 0;
+	stats->pages_deleted = 0;
+	
+	needLock = !RELATION_IS_LOCAL(rel);
+	if (needLock)
+		LockRelationForExtension(rel, ExclusiveLock);
+	num_pages = RelationGetNumberOfBlocks(rel);
+	if (needLock)
+		UnlockRelationForExtension(rel, ExclusiveLock);
+	Assert(stats->tuples_removed == 0);	
+
+	/* Pass across all blocks in tid array */
+	for ( ; tid_num<ntid; )
+	{
+		Buffer			buf;
+		OffsetNumber	deletable[MaxOffsetNumber];
+		int				ndeletable;
+		BlockNumber		curblk;
+		Page			page;
+
+		ndeletable = 0;
+		curblk = tid[tid_num].blkno;
+
+		buf = ReadBufferExtended(rel, MAIN_FORKNUM, curblk, RBM_NORMAL, info->strategy);
+		page = BufferGetPage(buf);
+		LockBufferForCleanup(buf);
+		while ((tid[tid_num].blkno == curblk) && (tid_num<ntid))
+		{
+			OffsetNumber offnum = tid[tid_num].off;
+			IndexTuple itup;
+
+			Assert(OffsetNumberIsValid(offnum));
+			itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, offnum));
+			
+			if (ItemPointerEquals(&(tid[tid_num].htid), &(itup->t_tid)))
+				deletable[ndeletable++] = offnum;
+			tid_num++;
+		}
+		if (ndeletable > 0)
+		{
+			_bt_delitems_vacuum(rel, buf, deletable, ndeletable, curblk);
+			stats->tuples_removed += ndeletable;
+		}
+		_bt_relbuf(rel, buf);
+	}
+	stats->num_pages = num_pages;
+	stats->pages_free = 0;
+//	btvacuumcleanup(info, stats);
 	return stats;
 }
 
@@ -1286,47 +1077,23 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	 */
 	needLock = !RELATION_IS_LOCAL(rel);
 
-	if (info->del_blcks != NULL)
+	blkno = BTREE_METAPAGE + 1;
+	for (;;)
 	{
-			int counter = 0;
+		/* Get the current relation length */
+		if (needLock)
+			LockRelationForExtension(rel, ExclusiveLock);
+		num_pages = RelationGetNumberOfBlocks(rel);
+		if (needLock)
+			UnlockRelationForExtension(rel, ExclusiveLock);
 
-			if (needLock)
-				LockRelationForExtension(rel, ExclusiveLock);
-			num_pages = RelationGetNumberOfBlocks(rel);
-			if (needLock)
-				UnlockRelationForExtension(rel, ExclusiveLock);
-			Assert(stats->tuples_removed == 0);
-
-			/* Use target delete strategy */
-			while (counter<info->del_blcks->ntid)
-			{
-				blkno = info->del_blcks->tid[counter].blkno;
-
-				if ((blkno >= num_pages) || (blkno < 0)) {
-					counter++;
-					continue;
-				}
-				btvacuumpage(&vstate, blkno, blkno, info->del_blcks->tid, info->del_blcks->ntid, &counter);
-			}
-	} else {
-		blkno = BTREE_METAPAGE + 1;
-		for (;;)
+		/* Quit if we've scanned the whole relation */
+		if (blkno >= num_pages)
+			break;
+		/* Iterate over pages, then loop back to recheck length */
+		for (; blkno < num_pages; blkno++)
 		{
-			/* Get the current relation length */
-			if (needLock)
-				LockRelationForExtension(rel, ExclusiveLock);
-			num_pages = RelationGetNumberOfBlocks(rel);
-			if (needLock)
-				UnlockRelationForExtension(rel, ExclusiveLock);
-
-			/* Quit if we've scanned the whole relation */
-			if (blkno >= num_pages)
-				break;
-			/* Iterate over pages, then loop back to recheck length */
-			for (; blkno < num_pages; blkno++)
-			{
-				btvacuumpage(&vstate, blkno, blkno, NULL, 0, NULL);
-			}
+			btvacuumpage(&vstate, blkno, blkno);
 		}
 	}
 
@@ -1400,7 +1167,7 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
  * are recursing to re-examine a previous page).
  */
 static void
-btvacuumpage(BTVacState *vstate, BlockNumber blkno, BlockNumber orig_blkno, IndexTid* tids, int ntids_max, int* counter)
+btvacuumpage(BTVacState *vstate, BlockNumber blkno, BlockNumber orig_blkno)
 {
 	IndexVacuumInfo *info = vstate->info;
 	IndexBulkDeleteResult *stats = vstate->stats;
@@ -1557,23 +1324,6 @@ restart:
 				 */
 				if (callback(htup, callback_state))
 					deletable[ndeletable++] = offnum;
-			}
-		} else if (tids != NULL)
-		{
-			while ((*counter<ntids_max) && (tids[*counter].blkno == blkno))
-			{
-/*				if ((ndeletable == 0) || (deletable[ndeletable-1] != tids[*counter].off))*/
-				{
-					OffsetNumber offnum = tids[*counter].off;
-					if ((offnum >= FirstOffsetNumber) && (offnum <= PageGetMaxOffsetNumber(page)))
-					{
-						IndexTuple itup = (IndexTuple) PageGetItem(page,
-												PageGetItemId(page, offnum));
-						if (ItemPointerEquals(&(tids[*counter].htid), &(itup->t_tid)))
-							deletable[ndeletable++] = tids[*counter].off;
-					}
-				}
-				(*counter)++;
 			}
 		}
 

@@ -33,17 +33,16 @@ typedef struct IndexBuildResult
 	double		index_tuples;	/* # of tuples inserted into index */
 } IndexBuildResult;
 
-typedef struct IndexTid
+typedef struct IndexEntry
 {
 	BlockNumber		blkno;
 	OffsetNumber	off;
 	ItemPointerData htid;
-} IndexTid;
-
+} IndexEntry;
 typedef struct OrderedIndexTuples
 {
-	int			ntid;		/* number of blocks with deleted items */
-	IndexTid*	tid;		/* array of block numbers */
+	IndexEntry*	tid;
+	int			ntid;
 } OrderedIndexTuples;
 /*
  * Struct for input arguments passed to ambulkdelete and amvacuumcleanup
@@ -178,7 +177,7 @@ extern int64 index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap);
 
 extern IndexBulkDeleteResult *index_target_delete(IndexVacuumInfo *info,
 				  IndexBulkDeleteResult *stats,
-				  Relation HeapRel, ItemPointer dead_htup, int nhtups);
+				  IndexEntry* tid, int ntid);
 extern IndexBulkDeleteResult *index_bulk_delete(IndexVacuumInfo *info,
 				  IndexBulkDeleteResult *stats,
 				  IndexBulkDeleteCallback callback,

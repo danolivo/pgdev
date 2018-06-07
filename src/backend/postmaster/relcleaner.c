@@ -109,7 +109,7 @@ RelCleanerMain(int argc, char *argv[])
 	/*
 	 * Identify myself via ps
 	 */
-	init_ps_display("archiver", "", "", "");
+	init_ps_display("relcleaner", "", "", "");
 
 //	ProcGlobal->relcleanerLatch = &MyProc->procLatch;
 
