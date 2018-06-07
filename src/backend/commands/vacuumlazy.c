@@ -41,6 +41,7 @@
 #include "access/heapam_xlog.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/relscan.h"
 #include "access/transam.h"
 #include "access/visibilitymap.h"
 #include "access/xlog.h"
@@ -58,6 +59,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/tqual.h"
 
@@ -1671,6 +1673,265 @@ lazy_check_needs_freeze(Buffer buf, bool *hastup)
 	return false;
 }
 
+<<<<<<< HEAD
+=======
+/*
+ * Get tuple from heap for a scan key building. If tuples in HOT chain
+ * have not a storage, return NULL.
+ */
+static HeapTuple get_tuple_by_tid(Relation rel, ItemPointer tid)
+{
+	Buffer			buffer;
+	Page			page;
+	OffsetNumber	offnum;
+	ItemId			lp;
+	HeapTuple		tuple;
+
+	buffer = ReadBufferExtended(rel, MAIN_FORKNUM, ItemPointerGetBlockNumber(tid), RBM_NORMAL, NULL);
+	LockBuffer(buffer, BUFFER_LOCK_SHARE);
+
+	page = (Page) BufferGetPage(buffer);
+	offnum = ItemPointerGetOffsetNumber(tid);
+	lp = PageGetItemId(page, offnum);
+
+	while (!ItemIdHasStorage(lp))
+	{
+		offnum = ItemIdGetRedirect(lp);
+		lp = PageGetItemId(page, offnum);
+
+		if (!ItemIdIsUsed(lp))
+		{
+			UnlockReleaseBuffer(buffer);
+			return NULL;
+		}
+	}
+
+	tuple = palloc(sizeof(HeapTupleData));
+	ItemPointerSet(&(tuple->t_self), BufferGetBlockNumber(buffer), offnum);
+	tuple->t_tableOid = RelationGetRelid(rel);
+	tuple->t_data = (HeapTupleHeader) PageGetItem(page, lp);
+	tuple->t_len = ItemIdGetLength(lp);
+	UnlockReleaseBuffer(buffer);
+	return tuple;
+}
+
+/*
+ * Build scan key for an index relation by a heap tuple TID
+ */
+static int build_scan_key(ScanKey skey, Relation rel, Relation irel, ItemPointer tid)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	HeapTuple	tuple;
+	int			attoff;
+	Datum		indclassDatum;
+	oidvector*	opclass;
+	int2vector*	indkey = &irel->rd_index->indkey;
+	bool 		isnull;
+
+	tuple = get_tuple_by_tid(rel, tid);
+	if (tuple == NULL)
+		return 0;
+
+	indclassDatum = SysCacheGetAttr(INDEXRELID, irel->rd_indextuple,
+										Anum_pg_index_indclass, &isnull);
+
+	opclass = (oidvector *) DatumGetPointer(indclassDatum);
+	for (attoff = 0; attoff < IndexRelationGetNumberOfKeyAttributes(irel); attoff++)
+	{
+		Oid				operator;
+		Oid				opfamily;
+		RegProcedure	regop;
+		int				pkattno = attoff + 1;
+		int				mainattno = indkey->values[attoff];
+		Oid				optype = get_opclass_input_type(opclass->values[attoff]);
+		Datum			scanvalue;
+		StrategyNumber	strategy;
+		Oid				*operators = NULL;
+		Oid				*procs = NULL;
+		uint16			*strategies = NULL;
+
+		if (irel->rd_index->indisexclusion)
+			RelationGetExclusionInfo(irel, &operators, &procs, &strategies);
+
+		if (mainattno > 0)
+			scanvalue = heap_getattr(tuple, mainattno, desc, &isnull);
+		else if (mainattno < 0)
+			scanvalue = heap_getsysattr(tuple, mainattno, desc, &isnull);
+		else
+			return -1;
+
+		/*
+		 * Load the operator info.  We need this to get the equality operator
+		 * function for the scan key.
+		 */
+		opfamily = get_opclass_family(opclass->values[attoff]);
+
+		if (irel->rd_exclstrats != NULL)
+			strategy = irel->rd_exclstrats[attoff];
+		else
+			strategy = BTEqualStrategyNumber;
+
+		operator = get_opfamily_member(opfamily, optype, optype, strategy);
+		if (!OidIsValid(operator))
+			elog(ERROR, "missing operator %d(%u,%u) in opfamily %u", strategy, optype, optype, opfamily);
+
+		regop = get_opcode(operator);
+
+		/* Initialize the scan key. */
+		ScanKeyInit(&skey[attoff],
+				pkattno,
+				strategy,
+				regop,
+				scanvalue);
+		/* Check for null value. */
+		if (isnull)
+			skey[attoff].sk_flags |= SK_ISNULL;
+
+		/* Use index collation */
+		if (irel->rd_indcollation != NULL)
+			skey[attoff].sk_collation = irel->rd_indcollation[attoff];
+
+		/* Use index procedure */
+		if (irel->rd_exclprocs != NULL)
+			fmgr_info(irel->rd_exclprocs[attoff], &(skey[attoff].sk_func));
+	}
+
+	return 1;
+}
+
+static int
+compareIndexEntry(const void *a, const void *b)
+{
+	IndexEntry	x = *(IndexEntry *) a;
+	IndexEntry	y = *(IndexEntry *) b;
+
+	if (x.blkno > y.blkno)
+		return 1;
+	else if (x.blkno < y.blkno)
+		return -1;
+	else if (x.off > y.off)
+		return 1;
+	else if (x.off < y.off)
+		return -1;
+
+	return 0;
+}
+
+/*
+ * Get array of dead index entries ordered by block number (1) and offset (2) fields
+ */
+static IndexEntry*
+get_index_tids(Relation rel, Relation irel, ItemPointer dead_tuples, int num_dead_tuples, int* tnum)
+{
+	int				dt;
+	ScanKeyData		skey[INDEX_MAX_KEYS];
+	IndexScanDesc	scan;
+	SnapshotData	snap;
+	IndexEntry*		itid = (IndexEntry *)palloc(sizeof(IndexEntry)*num_dead_tuples);
+	int				ntid = 0;
+
+	Assert(tnum > 0);
+
+	if (itid == NULL)
+		return NULL;
+
+	/* Search for each dead tuple tid entry in the index relation */
+	InitDirtySnapshot(snap);
+	for (dt = 0; dt < num_dead_tuples; dt++)
+	{
+		bool		found = false;
+		ItemPointer	tid;
+
+		int res = build_scan_key(skey, rel, irel, &(dead_tuples[dt]));
+
+		if (res == 0)
+			continue;
+		if (res == -1)
+		{
+			if (itid != NULL)
+				pfree(itid);
+
+			return NULL;
+		}
+		scan = index_beginscan(rel, irel, &snap, IndexRelationGetNumberOfKeyAttributes(irel), 0);
+		index_rescan(scan, skey, IndexRelationGetNumberOfKeyAttributes(irel), NULL, 0);
+
+		/* Pass along index entries array with equal scan key value */
+		while ((tid = index_getnext_tid(scan, ForwardScanDirection)) != NULL)
+		{
+			ItemPointerData	ctid = *tid;
+			OffsetNumber	offnum;
+			Buffer			buffer;
+			Page			page;
+
+			buffer = ReadBufferExtended(rel, MAIN_FORKNUM, ItemPointerGetBlockNumber(&ctid), RBM_NORMAL, NULL);
+			LockBuffer(buffer, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buffer);
+
+			/*
+			 * Scan HOT chain. Compare each tuple at a chain with TID
+			 * of dead tuple, until tid can't be found or the chain can't be ended.
+			 */
+			for (;;)
+			{
+				ItemId			lp;
+				HeapTupleHeader	htup;
+
+				if (ItemPointerEquals(&ctid, &(dead_tuples[dt])))
+				{
+					found = true;
+					break;
+				}
+				/*
+				 * If ctid is not equal to the dead tuple, go to next tuple at a chain
+				 */
+				offnum = ItemPointerGetOffsetNumber(&ctid);
+				lp = PageGetItemId(page, offnum);
+
+				if (ItemIdIsDeadRedirection(lp) || (ItemIdIsRedirected(lp)))
+				{
+					/* Follow the redirection */
+					ItemPointerSet(&(ctid), ItemPointerGetBlockNumber(&ctid),
+											ItemIdGetRedirect(lp));
+					continue;
+				}
+
+				if(!ItemIdIsUsed(lp))
+					break;
+
+				/* Move to next tuple in HOT chain, if any*/
+				htup = (HeapTupleHeader) PageGetItem(page, lp);
+				if (!HeapTupleHeaderIsHotUpdated(htup))
+					break;
+				Assert(ItemPointerGetBlockNumber(&htup->t_ctid) ==
+							   BufferGetBlockNumber(buffer));
+				ctid = htup->t_ctid;
+			}
+			UnlockReleaseBuffer(buffer);
+
+			if (found)
+			{
+				itid[ntid].blkno = ItemPointerGetBlockNumber(&(scan->xs_itid));
+				itid[ntid].off = ItemPointerGetOffsetNumber(&(scan->xs_itid));
+
+				/*
+				 * Save dead tid for a index relation vacuuming check.
+				 * It needed to prevent race conditions between vacuum processes.
+				 */
+				itid[ntid].htid = dead_tuples[dt];
+				ntid++;
+				break;
+			}
+		}
+		index_endscan(scan);
+		/*
+		 * We ignore case then a dead tuple tid entry could not found in an index relation.
+		 */
+	}
+	qsort(itid, ntid, sizeof(IndexEntry), compareIndexEntry);
+	*tnum = ntid;
+	return itid;
+}
 
 /*
  *	lazy_vacuum_index() -- vacuum one index relation.

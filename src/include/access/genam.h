@@ -33,6 +33,18 @@ typedef struct IndexBuildResult
 	double		index_tuples;	/* # of tuples inserted into index */
 } IndexBuildResult;
 
+typedef struct IndexEntry
+{
+	BlockNumber		blkno;
+	OffsetNumber	off;
+	ItemPointerData	htid;
+} IndexEntry;
+typedef struct OrderedIndexTuples
+{
+	IndexEntry*	tid;
+	int			ntid;
+} OrderedIndexTuples;
+
 /*
  * Struct for input arguments passed to ambulkdelete and amvacuumcleanup
  *

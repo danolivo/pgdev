@@ -884,6 +884,74 @@ btbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	return stats;
 }
 
+<<<<<<< HEAD
+=======
+IndexBulkDeleteResult *
+bttargetdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+				IndexEntry* tid, int ntid)
+{
+	Relation	rel = info->index;
+	bool		needLock;
+	int			num_pages;
+	int			tnum = 0;
+
+	if (ntid == 0)
+		return NULL;
+
+	if (stats == NULL)
+		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+
+	stats->estimated_count = false;
+	stats->num_index_tuples = 0;
+	stats->pages_deleted = 0;
+
+	needLock = !RELATION_IS_LOCAL(rel);
+	if (needLock)
+		LockRelationForExtension(rel, ExclusiveLock);
+	num_pages = RelationGetNumberOfBlocks(rel);
+	if (needLock)
+		UnlockRelationForExtension(rel, ExclusiveLock);
+	Assert(stats->tuples_removed == 0);
+
+	/* Pass across all blocks in tid array */
+	for ( ; tnum<ntid; )
+	{
+		Buffer			buf;
+		OffsetNumber	deletable[MaxOffsetNumber];
+		int				ndeletable;
+		BlockNumber		blkno;
+		Page			page;
+
+		ndeletable = 0;
+		blkno = tid[tnum].blkno;
+
+		buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, info->strategy);
+		page = BufferGetPage(buf);
+		LockBufferForCleanup(buf);
+		while ((tid[tnum].blkno == blkno) && (tnum<ntid))
+		{
+			OffsetNumber offnum = tid[tnum].off;
+			IndexTuple itup;
+
+			Assert(OffsetNumberIsValid(offnum));
+			itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, offnum));
+
+			if (ItemPointerEquals(&(tid[tnum].htid), &(itup->t_tid)))
+				deletable[ndeletable++] = offnum;
+			tnum++;
+		}
+		if (ndeletable > 0)
+			_bt_delitems_vacuum(rel, buf, deletable, ndeletable, blkno);
+
+		stats->tuples_removed += ndeletable;
+		_bt_relbuf(rel, buf);
+	}
+	stats->num_pages = num_pages;
+	stats->pages_free = 0;
+
+	return stats;
+}
+
 /*
  * Post-VACUUM cleanup.
  *
