@@ -1109,7 +1109,6 @@ readcomplete:
 	scan->xs_ctup.t_self = currItem->heapTid;
 	if (scan->xs_want_itup)
 		scan->xs_itup = (IndexTuple) (so->currTuples + currItem->tupleOffset);
-	ItemPointerSet(&(scan->xs_itid), so->currPos.currPage, currItem->indexOffset);
 
 	return true;
 }
@@ -1160,7 +1159,6 @@ _bt_next(IndexScanDesc scan, ScanDirection dir)
 	scan->xs_ctup.t_self = currItem->heapTid;
 	if (scan->xs_want_itup)
 		scan->xs_itup = (IndexTuple) (so->currTuples + currItem->tupleOffset);
-	ItemPointerSet(&(scan->xs_itid), so->currPos.currPage, currItem->indexOffset);
 
 	return true;
 }
@@ -1938,7 +1936,6 @@ _bt_endpoint(IndexScanDesc scan, ScanDirection dir)
 	scan->xs_ctup.t_self = currItem->heapTid;
 	if (scan->xs_want_itup)
 		scan->xs_itup = (IndexTuple) (so->currTuples + currItem->tupleOffset);
-	ItemPointerSet(&(scan->xs_itid), so->currPos.currPage, currItem->indexOffset);
 
 	return true;
 }

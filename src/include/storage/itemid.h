@@ -112,11 +112,6 @@ typedef uint16 ItemLength;
 #define ItemIdIsDead(itemId) \
 	((itemId)->lp_flags == LP_DEAD)
 
-#define ItemIdIsDeadRedirection(itemId) \
-	( ((itemId)->lp_flags == 3) && \
-	  ((itemId)->lp_len == 0) && \
-	  ((itemId)->lp_off != 0) )
-
 /*
  * ItemIdHasStorage
  *		True iff item identifier has associated storage.
@@ -156,12 +151,6 @@ typedef uint16 ItemLength;
 #define ItemIdSetRedirect(itemId, link) \
 ( \
 	(itemId)->lp_flags = LP_REDIRECT, \
-	(itemId)->lp_off = (link), \
-	(itemId)->lp_len = 0 \
-)
-
-#define ItemIdSetDeadRedirect(itemId, link) \
-( \
 	(itemId)->lp_off = (link), \
 	(itemId)->lp_len = 0 \
 )

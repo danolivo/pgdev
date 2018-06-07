@@ -95,7 +95,7 @@ static void btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			 IndexBulkDeleteCallback callback, void *callback_state,
 			 BTCycleId cycleid, TransactionId *oldestBtpoXact);
 static void btvacuumpage(BTVacState *vstate, BlockNumber blkno,
-						 BlockNumber orig_blkno);
+			 BlockNumber orig_blkno);
 
 
 /*
@@ -127,7 +127,6 @@ bthandler(PG_FUNCTION_ARGS)
 	amroutine->ambuild = btbuild;
 	amroutine->ambuildempty = btbuildempty;
 	amroutine->aminsert = btinsert;
-	amroutine->amtargetdelete = bttargetdelete;
 	amroutine->ambulkdelete = btbulkdelete;
 	amroutine->amvacuumcleanup = btvacuumcleanup;
 	amroutine->amcanreturn = btcanreturn;
@@ -882,73 +881,6 @@ btbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	PG_END_ENSURE_ERROR_CLEANUP(_bt_end_vacuum_callback, PointerGetDatum(rel));
 	_bt_end_vacuum(rel);
 
-	return stats;
-}
-
-IndexBulkDeleteResult *
-bttargetdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
-				IndexEntry* tid, int ntid)
-{
-	Relation	rel = info->index;
-	bool		needLock;
-	int			num_pages;
-	int			tid_num = 0;
-
-	if (ntid == 0)
-		return NULL;
-
-	if (stats == NULL)
-		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
-
-	stats->estimated_count = false;
-	stats->num_index_tuples = 0;
-	stats->pages_deleted = 0;
-	
-	needLock = !RELATION_IS_LOCAL(rel);
-	if (needLock)
-		LockRelationForExtension(rel, ExclusiveLock);
-	num_pages = RelationGetNumberOfBlocks(rel);
-	if (needLock)
-		UnlockRelationForExtension(rel, ExclusiveLock);
-	Assert(stats->tuples_removed == 0);	
-
-	/* Pass across all blocks in tid array */
-	for ( ; tid_num<ntid; )
-	{
-		Buffer			buf;
-		OffsetNumber	deletable[MaxOffsetNumber];
-		int				ndeletable;
-		BlockNumber		curblk;
-		Page			page;
-
-		ndeletable = 0;
-		curblk = tid[tid_num].blkno;
-
-		buf = ReadBufferExtended(rel, MAIN_FORKNUM, curblk, RBM_NORMAL, info->strategy);
-		page = BufferGetPage(buf);
-		LockBufferForCleanup(buf);
-		while ((tid[tid_num].blkno == curblk) && (tid_num<ntid))
-		{
-			OffsetNumber offnum = tid[tid_num].off;
-			IndexTuple itup;
-
-			Assert(OffsetNumberIsValid(offnum));
-			itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, offnum));
-			
-			if (ItemPointerEquals(&(tid[tid_num].htid), &(itup->t_tid)))
-				deletable[ndeletable++] = offnum;
-			tid_num++;
-		}
-		if (ndeletable > 0)
-		{
-			_bt_delitems_vacuum(rel, buf, deletable, ndeletable, curblk);
-			stats->tuples_removed += ndeletable;
-		}
-		_bt_relbuf(rel, buf);
-	}
-	stats->num_pages = num_pages;
-	stats->pages_free = 0;
-//	btvacuumcleanup(info, stats);
 	return stats;
 }
 

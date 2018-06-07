@@ -113,7 +113,6 @@
 #include "postmaster/fork_process.h"
 #include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
-#include "postmaster/relcleaner.h"
 #include "postmaster/syslogger.h"
 #include "replication/logicallauncher.h"
 #include "replication/walsender.h"
@@ -255,7 +254,6 @@ static pid_t StartupPID = 0,
 			AutoVacPID = 0,
 			PgArchPID = 0,
 			PgStatPID = 0,
-			RelCleanerPID = 0,
 			SysLoggerPID = 0;
 
 /* Startup process's status */
@@ -1767,9 +1765,6 @@ ServerLoop(void)
 		/* If we have lost the archiver, try to start a new one. */
 		if (PgArchPID == 0 && PgArchStartupAllowed())
 			PgArchPID = pgarch_start();
-
-		if (RelCleanerPID == 0)
-			RelCleanerPID = rcleaner_start();
 
 		/* If we need to signal the autovacuum launcher, do so now */
 		if (avlauncher_needs_signal)
@@ -4953,12 +4948,6 @@ SubPostmasterMain(int argc, char *argv[])
 		/* Do not want to attach to shared memory */
 
 		PgArchiverMain(argc, argv); /* does not return */
-	}
-	if (strcmp(argv[1], "--forkrcleaner") == 0)
-	{
-		/* Do not want to attach to shared memory */
-
-		RelCleanerMain(argc, argv); /* does not return */
 	}
 	if (strcmp(argv[1], "--forkcol") == 0)
 	{
