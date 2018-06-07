@@ -37,7 +37,7 @@ typedef struct IndexEntry
 {
 	BlockNumber		blkno;
 	OffsetNumber	off;
-	ItemPointerData htid;
+	ItemPointerData	htid;
 } IndexEntry;
 typedef struct OrderedIndexTuples
 {
@@ -60,7 +60,6 @@ typedef struct IndexVacuumInfo
 	int			message_level;	/* ereport level for progress messages */
 	double		num_heap_tuples;	/* tuples remaining in heap */
 	BufferAccessStrategy strategy;	/* access strategy for reads */
-	OrderedIndexTuples *del_blcks;
 } IndexVacuumInfo;
 
 /*

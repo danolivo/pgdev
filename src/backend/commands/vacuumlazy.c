@@ -41,6 +41,7 @@
 #include "access/heapam_xlog.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/relscan.h"
 #include "access/transam.h"
 #include "access/visibilitymap.h"
 #include "access/xlog.h"
@@ -58,6 +59,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/tqual.h"
 
@@ -1672,8 +1674,6 @@ lazy_check_needs_freeze(Buffer buf, bool *hastup)
 	return false;
 }
 
-#include "utils/syscache.h"
-#include "utils/lsyscache.h"
 /*
  * Get tuple from heap for a scan key building. If tuples in HOT chain
  * have not a storage, return NULL.
@@ -1684,7 +1684,7 @@ static HeapTuple get_tuple_by_tid(Relation rel, ItemPointer tid)
 	Page			page;
 	OffsetNumber	offnum;
 	ItemId			lp;
-	HeapTuple 		tuple;
+	HeapTuple		tuple;
 
 	buffer = ReadBufferExtended(rel, MAIN_FORKNUM, ItemPointerGetBlockNumber(tid), RBM_NORMAL, NULL);
 	LockBuffer(buffer, BUFFER_LOCK_SHARE);
@@ -1713,7 +1713,7 @@ static HeapTuple get_tuple_by_tid(Relation rel, ItemPointer tid)
 	UnlockReleaseBuffer(buffer);
 	return tuple;
 }
-#include "access/relscan.h"
+
 /*
  * Build scan key for an index relation by a heap tuple TID
  */
@@ -1820,16 +1820,16 @@ compareIndexEntry(const void *a, const void *b)
  * Get array of dead index entries ordered by block number (1) and offset (2) fields
  */
 static IndexEntry*
-get_index_tids(Relation rel, Relation irel, ItemPointer dead_tuples, int num_dead_tuples, int* tid_num)
+get_index_tids(Relation rel, Relation irel, ItemPointer dead_tuples, int num_dead_tuples, int* tnum)
 {
-	int					dt;
-	ScanKeyData			skey[INDEX_MAX_KEYS];
-	IndexScanDesc		scan;
-	SnapshotData		snap;
-	IndexEntry*			itid = (IndexEntry *)palloc(sizeof(IndexEntry)*num_dead_tuples);
-	int					ntid = 0;
+	int				dt;
+	ScanKeyData		skey[INDEX_MAX_KEYS];
+	IndexScanDesc	scan;
+	SnapshotData	snap;
+	IndexEntry*		itid = (IndexEntry *)palloc(sizeof(IndexEntry)*num_dead_tuples);
+	int				ntid = 0;
 
-	Assert(tid_num > 0);
+	Assert(tnum > 0);
 
 	if (itid == NULL)
 		return NULL;
@@ -1928,7 +1928,7 @@ get_index_tids(Relation rel, Relation irel, ItemPointer dead_tuples, int num_dea
 		 */
 	}
 	qsort(itid, ntid, sizeof(IndexEntry), compareIndexEntry);
-	*tid_num = ntid;
+	*tnum = ntid;
 	return itid;
 }
 
@@ -1956,7 +1956,6 @@ lazy_vacuum_index(Relation indrel,
 	/* We can only provide an approximate value of num_heap_tuples here */
 	ivinfo.num_heap_tuples = vacrelstats->old_live_tuples;
 	ivinfo.strategy = vac_strategy;
-	ivinfo.del_blcks = NULL;
 
 	if (use_target_strategy)
 	{

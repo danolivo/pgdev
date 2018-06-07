@@ -95,7 +95,7 @@ static void btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			 IndexBulkDeleteCallback callback, void *callback_state,
 			 BTCycleId cycleid, TransactionId *oldestBtpoXact);
 static void btvacuumpage(BTVacState *vstate, BlockNumber blkno,
-						 BlockNumber orig_blkno);
+			 BlockNumber orig_blkno);
 
 
 /*
@@ -892,7 +892,7 @@ bttargetdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	Relation	rel = info->index;
 	bool		needLock;
 	int			num_pages;
-	int			tid_num = 0;
+	int			tnum = 0;
 
 	if (ntid == 0)
 		return NULL;
@@ -903,52 +903,51 @@ bttargetdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	stats->estimated_count = false;
 	stats->num_index_tuples = 0;
 	stats->pages_deleted = 0;
-	
+
 	needLock = !RELATION_IS_LOCAL(rel);
 	if (needLock)
 		LockRelationForExtension(rel, ExclusiveLock);
 	num_pages = RelationGetNumberOfBlocks(rel);
 	if (needLock)
 		UnlockRelationForExtension(rel, ExclusiveLock);
-	Assert(stats->tuples_removed == 0);	
+	Assert(stats->tuples_removed == 0);
 
 	/* Pass across all blocks in tid array */
-	for ( ; tid_num<ntid; )
+	for ( ; tnum<ntid; )
 	{
 		Buffer			buf;
 		OffsetNumber	deletable[MaxOffsetNumber];
 		int				ndeletable;
-		BlockNumber		curblk;
+		BlockNumber		blkno;
 		Page			page;
 
 		ndeletable = 0;
-		curblk = tid[tid_num].blkno;
+		blkno = tid[tnum].blkno;
 
-		buf = ReadBufferExtended(rel, MAIN_FORKNUM, curblk, RBM_NORMAL, info->strategy);
+		buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, info->strategy);
 		page = BufferGetPage(buf);
 		LockBufferForCleanup(buf);
-		while ((tid[tid_num].blkno == curblk) && (tid_num<ntid))
+		while ((tid[tnum].blkno == blkno) && (tnum<ntid))
 		{
-			OffsetNumber offnum = tid[tid_num].off;
+			OffsetNumber offnum = tid[tnum].off;
 			IndexTuple itup;
 
 			Assert(OffsetNumberIsValid(offnum));
 			itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, offnum));
-			
-			if (ItemPointerEquals(&(tid[tid_num].htid), &(itup->t_tid)))
+
+			if (ItemPointerEquals(&(tid[tnum].htid), &(itup->t_tid)))
 				deletable[ndeletable++] = offnum;
-			tid_num++;
+			tnum++;
 		}
 		if (ndeletable > 0)
-		{
-			_bt_delitems_vacuum(rel, buf, deletable, ndeletable, curblk);
-			stats->tuples_removed += ndeletable;
-		}
+			_bt_delitems_vacuum(rel, buf, deletable, ndeletable, blkno);
+
+		stats->tuples_removed += ndeletable;
 		_bt_relbuf(rel, buf);
 	}
 	stats->num_pages = num_pages;
 	stats->pages_free = 0;
-//	btvacuumcleanup(info, stats);
+
 	return stats;
 }
 
