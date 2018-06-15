@@ -163,12 +163,6 @@ extern HeapTuple index_fetch_heap(IndexScanDesc scan);
 extern HeapTuple index_getnext(IndexScanDesc scan, ScanDirection direction);
 extern int64 index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap);
 
-extern IndexBulkDeleteResult *index_target_delete(IndexVacuumInfo *info,
-												IndexBulkDeleteResult *stats,
-												Relation hrel,
-												Datum *values,
-												bool *isnull,
-												ItemPointer htid);
 extern IndexBulkDeleteResult *index_bulk_delete(IndexVacuumInfo *info,
 				  IndexBulkDeleteResult *stats,
 				  IndexBulkDeleteCallback callback,

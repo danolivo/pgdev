@@ -34,9 +34,7 @@
 #include "storage/smgr.h"
 #include "utils/builtins.h"
 #include "utils/index_selfuncs.h"
-#include "utils/lsyscache.h"
 #include "utils/memutils.h"
-#include "utils/syscache.h"
 
 
 /* Working state needed by btvacuumpage */
@@ -129,7 +127,6 @@ bthandler(PG_FUNCTION_ARGS)
 	amroutine->ambuild = btbuild;
 	amroutine->ambuildempty = btbuildempty;
 	amroutine->aminsert = btinsert;
-	amroutine->amtargetdelete = bttargetdelete;
 	amroutine->ambulkdelete = btbulkdelete;
 	amroutine->amvacuumcleanup = btvacuumcleanup;
 	amroutine->amcanreturn = btcanreturn;
@@ -884,195 +881,6 @@ btbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	PG_END_ENSURE_ERROR_CLEANUP(_bt_end_vacuum_callback, PointerGetDatum(rel));
 	_bt_end_vacuum(rel);
 
-	return stats;
-}
-
-static void
-cleanup_block(IndexVacuumInfo *info,
-		   IndexBulkDeleteResult *stats, BlockNumber blkno)
-{
-	BTVacState	vstate;
-
-	vstate.info = info;
-	vstate.stats = stats;
-	vstate.callback = NULL;
-	vstate.callback_state = NULL;
-	vstate.cycleid = 0;
-	vstate.lastBlockVacuumed = BTREE_METAPAGE;	/* Initialise at first block */
-	vstate.lastBlockLocked = BTREE_METAPAGE;
-	vstate.totFreePages = 0;
-	vstate.oldestBtpoXact = InvalidTransactionId;
-
-	/* Create a temporary memory context to run _bt_pagedel in */
-	vstate.pagedelcontext = AllocSetContextCreate(CurrentMemoryContext,
-												  "_bt_pagedel",
-												  ALLOCSET_DEFAULT_SIZES);
-	btvacuumpage(&vstate, blkno, blkno);
-
-	if (vstate.totFreePages > 0)
-		IndexFreeSpaceMapVacuum(info->index);
-
-	stats->pages_free += vstate.totFreePages;
-
-	MemoryContextDelete(vstate.pagedelcontext);
-}
-
-/*
- * Build scan key for an index relation by a heap tuple TID
- */
-static int
-build_scan_key(ScanKey skey, Relation rel, Relation irel, Datum *values, bool *nulls)
-{
-	TupleDesc	desc = RelationGetDescr(rel);
-	HeapTuple	tuple;
-	Datum		indclassDatum;
-	int			attoff;
-	oidvector*	opclass;
-	int2vector*	indkey = &irel->rd_index->indkey;
-	bool 		isnull;
-
-	tuple = heap_form_tuple(desc, values, nulls);
-	indclassDatum = SysCacheGetAttr(INDEXRELID, irel->rd_indextuple,
-										Anum_pg_index_indclass, &isnull);
-
-	opclass = (oidvector *) DatumGetPointer(indclassDatum);
-	for (attoff = 0; attoff < IndexRelationGetNumberOfKeyAttributes(irel); attoff++)
-	{
-		Oid				operator;
-		Oid				opfamily;
-		RegProcedure	regop;
-		int				pkattno = attoff + 1;
-		int				mainattno = indkey->values[attoff];
-		Oid				optype = get_opclass_input_type(opclass->values[attoff]);
-		Datum			scanvalue;
-		StrategyNumber	strategy;
-
-		if (mainattno > 0)
-			scanvalue = heap_getattr(tuple, mainattno, desc, &isnull);
-		else
-			return -1;
-
-		/*
-		 * Load the operator info.  We need this to get the equality operator
-		 * function for the scan key.
-		 */
-		opfamily = get_opclass_family(opclass->values[attoff]);
-
-		if (irel->rd_exclstrats != NULL)
-			strategy = irel->rd_exclstrats[attoff];
-		else
-			strategy = BTEqualStrategyNumber;
-
-		operator = get_opfamily_member(opfamily, optype, optype, strategy);
-		if (!OidIsValid(operator))
-			return -1;
-
-		regop = get_opcode(operator);
-
-		/* Initialize the scan key. */
-		ScanKeyInit(&skey[attoff],
-				pkattno,
-				strategy,
-				regop,
-				scanvalue);
-
-		/* Check for null value. */
-		if (isnull)
-			skey[attoff].sk_flags |= SK_ISNULL;
-
-		/* Use index collation */
-		if (irel->rd_indcollation != NULL)
-			skey[attoff].sk_collation = irel->rd_indcollation[attoff];
-
-		/* Use index procedure */
-		if (irel->rd_exclprocs != NULL)
-			fmgr_info(irel->rd_exclprocs[attoff], &(skey[attoff].sk_func));
-	}
-
-	return 0;
-}
-
-IndexBulkDeleteResult*
-bttargetdelete(IndexVacuumInfo *info,
-			   IndexBulkDeleteResult *stats,
-			   Relation hrel,
-			   Datum *values,
-			   bool *isnull,
-			   ItemPointer htid)
-{
-	Relation		irel = info->index;
-	ScanKeyData		skey[INDEX_MAX_KEYS];
-	SnapshotData	snap;
-	IndexScanDesc	scan;
-	ItemPointer		tid;
-	bool			found = false;
-	OffsetNumber	offnum;
-	BlockNumber		blkno;
-
-	if (stats == NULL)
-	{
-		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
-		stats->estimated_count = false;
-		stats->num_index_tuples = 0;
-		stats->pages_deleted = 0;
-	}
-
-	if (build_scan_key(skey, hrel, irel, values, isnull) != 0)
-	{
-		pfree(stats);
-		return NULL;
-	}
-
-	InitDirtySnapshot(snap);
-	scan = index_beginscan(hrel, irel, &snap, IndexRelationGetNumberOfKeyAttributes(irel), 0);
-	index_rescan(scan, skey, IndexRelationGetNumberOfKeyAttributes(irel), NULL, 0);
-
-	/* Pass along index entries array with equal scan key value */
-	while ((!found) && ((tid = index_getnext_tid(scan, ForwardScanDirection)) != NULL))
-	{
-		if (ItemPointerEquals(tid, htid))
-		{
-			BTScanPos	idx_pos = (BTScanPos) &(((BTScanOpaque) scan->opaque)->currPos);
-			blkno = idx_pos->currPage;
-			offnum = idx_pos->items[idx_pos->itemIndex].indexOffset;
-			found = true;
-		}
-	}
-	index_endscan(scan);
-
-	/* Delete index tuple */
-	if (found)
-	{
-		Buffer		buf;
-		Page		page;
-		bool		needLock;
-		int			npages;
-		IndexTuple	itup;
-
-		needLock = !RELATION_IS_LOCAL(irel);
-		if (needLock)
-			LockRelationForExtension(irel, ExclusiveLock);
-			npages = RelationGetNumberOfBlocks(irel);
-		if (needLock)
-			UnlockRelationForExtension(irel, ExclusiveLock);
-		if (blkno >= npages)
-			return stats;
-
-		buf = ReadBuffer(irel, blkno);
-		page = BufferGetPage(buf);
-		LockBufferForCleanup(buf);
-
-		itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, offnum));
-
-		if (ItemPointerEquals(htid, &(itup->t_tid)))
-		{
-			_bt_delitems_vacuum(irel, buf, &offnum, 1, blkno);
-			stats->tuples_removed++;
-			stats->num_pages = npages;
-		}
-		_bt_relbuf(irel, buf);
-		cleanup_block(info, stats, blkno);
-	}
 	return stats;
 }
 
