@@ -730,6 +730,23 @@ index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap)
 	return ntids;
 }
 
+IndexBulkDeleteResult *
+index_target_delete(IndexVacuumInfo *info,
+		   	   	    IndexBulkDeleteResult *stats,
+					Relation hrel,
+					Datum *values,
+					bool *isnull,
+					ItemPointer htid)
+{
+	Relation indexRelation = info->index;
+
+	RELATION_CHECKS;
+
+	CHECK_REL_PROCEDURE(amtargetdelete);
+
+	return indexRelation->rd_amroutine->amtargetdelete(info, stats, hrel, values, isnull, htid);
+}
+
 /* ----------------
  *		index_bulk_delete - do mass deletion of index entries
  *
