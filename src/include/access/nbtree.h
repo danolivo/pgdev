@@ -508,6 +508,12 @@ extern void btparallelrescan(IndexScanDesc scan);
 extern void btendscan(IndexScanDesc scan);
 extern void btmarkpos(IndexScanDesc scan);
 extern void btrestrpos(IndexScanDesc scan);
+extern IndexBulkDeleteResult *bttargetdelete(IndexVacuumInfo *info,
+		   IndexBulkDeleteResult *stats,
+		   Relation hrel,
+		   Datum *values,
+		   bool *isnull,
+		   ItemPointer htid);
 extern IndexBulkDeleteResult *btbulkdelete(IndexVacuumInfo *info,
 			 IndexBulkDeleteResult *stats,
 			 IndexBulkDeleteCallback callback,
