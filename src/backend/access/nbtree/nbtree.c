@@ -1052,7 +1052,7 @@ bttargetdelete(IndexVacuumInfo *info,
 		needLock = !RELATION_IS_LOCAL(irel);
 		if (needLock)
 			LockRelationForExtension(irel, ExclusiveLock);
-			npages = RelationGetNumberOfBlocks(irel);
+		npages = RelationGetNumberOfBlocks(irel);
 		if (needLock)
 			UnlockRelationForExtension(irel, ExclusiveLock);
 		if (blkno >= npages)

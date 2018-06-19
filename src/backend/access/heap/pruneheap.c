@@ -616,7 +616,8 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 			}
 			heap_prune_record_dead(prstate, rootoffnum);
 		}
-		else {
+		else
+		{
 			if (rootoffnum != latestdead)
 				heap_prune_record_unused(prstate, latestdead);
 			heap_prune_record_redirect(prstate, rootoffnum, chainitems[i]);
