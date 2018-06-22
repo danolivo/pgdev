@@ -1778,6 +1778,7 @@ quick_vacuum_index(Relation irel, Relation hrel,
 			if (found[tnum])
 				continue;
 
+			/* Get a tuple from heap */
 			if ((tuple = get_tuple_by_tid(hrel, &(vacrelstats->dead_tuples[tnum]))) == NULL)
 			{
 				/*
@@ -1796,13 +1797,15 @@ quick_vacuum_index(Relation irel, Relation hrel,
 
 			ExecStoreTuple(tuple, slot, InvalidBuffer, false);
 
-			/* Ignore situation with partial index.
-			 * It will be resolved later.
+			/*
+			 * In a partial index, ignore tuples that don't satisfy the
+			 * predicate.
 			 */
-			if (predicate != NULL)
-				ExecQual(predicate, econtext);
-//				if (!ExecQual(predicate, econtext))
-//					Assert(0);
+			if ((predicate != NULL) && (!ExecQual(predicate, econtext)))
+			{
+				found[tnum] = true;
+				continue;
+			}
 
 			FormIndexDatum(indexInfo, slot, estate, values, isnull);
 
