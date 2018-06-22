@@ -730,21 +730,19 @@ index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap)
 	return ntids;
 }
 
-IndexBulkDeleteResult *
-index_target_delete(IndexVacuumInfo *info,
-					IndexBulkDeleteResult *stats,
-					Relation hrel,
+IndexTargetDeleteResult *
+index_target_delete(IndexTargetDeleteInfo *info,
+					IndexTargetDeleteResult *stats,
 					Datum *values,
-					bool *isnull,
-					ItemPointer htid)
+					bool *isnull)
 {
-	Relation indexRelation = info->index;
+	Relation indexRelation = info->indexRelation;
 
 	RELATION_CHECKS;
 
 	CHECK_REL_PROCEDURE(amtargetdelete);
 
-	return indexRelation->rd_amroutine->amtargetdelete(info, stats, hrel, values, isnull, htid);
+	return indexRelation->rd_amroutine->amtargetdelete(info, stats, values, isnull);
 }
 
 /* ----------------
