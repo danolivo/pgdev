@@ -736,7 +736,7 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 			/* Remove index entries */
 			for (i = 0; i < nindexes; i++)
 			{
-				bool use_quick_strategy = (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
+				bool use_quick_strategy = true; // (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
 
 				if (use_quick_strategy)
 					quick_vacuum_index(Irel[i], onerel, vacrelstats);
@@ -1388,7 +1388,7 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 		/* Remove index entries */
 		for (i = 0; i < nindexes; i++)
 		{
-			bool use_quick_strategy = (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
+			bool use_quick_strategy = true; // (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
 
 			if (use_quick_strategy)
 				quick_vacuum_index(Irel[i], onerel, vacrelstats);
@@ -1749,9 +1749,6 @@ static void
 quick_vacuum_index(Relation irel, Relation hrel,
 				   LVRelStats *vacrelstats)
 {
-	IndexTargetDeleteResult	stats;
-	IndexTargetDeleteInfo	ivinfo;
-
 	if (irel->rd_amroutine->amtargetdelete != NULL)
 	{
 		int				tnum;
@@ -1760,6 +1757,8 @@ quick_vacuum_index(Relation irel, Relation hrel,
 		EState*			estate = CreateExecutorState();
 		ExprContext*	econtext = GetPerTupleExprContext(estate);
 		ExprState*		predicate = ExecPrepareQual(indexInfo->ii_Predicate, estate);
+		IndexTargetDeleteResult	stats;
+		IndexTargetDeleteInfo	ivinfo;
 
 		ivinfo.indexRelation = irel;
 		ivinfo.heapRelation = hrel;
@@ -1823,6 +1822,12 @@ quick_vacuum_index(Relation irel, Relation hrel,
 
 		pfree(found);
 		FreeExecutorState(estate);
+	}
+	else
+	{
+		IndexBulkDeleteResult *stats = NULL;
+
+		lazy_vacuum_index(irel, &stats, vacrelstats);
 	}
 }
 

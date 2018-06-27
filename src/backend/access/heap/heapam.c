@@ -9402,7 +9402,7 @@ heap_sync(Relation rel)
  * obtained by WAL records applying on a Hot Standby node.
  */
 static void
-mask_deadhtups_header(Page page)
+mask_dead_tuples(Page page)
 {
 	OffsetNumber	offnum;
 
@@ -9435,7 +9435,7 @@ heap_mask(char *pagedata, BlockNumber blkno)
 
 	mask_page_hint_bits(page);
 	mask_unused_space(page);
-	mask_deadhtups_header(page);
+	mask_dead_tuples(page);
 
 	for (off = 1; off <= PageGetMaxOffsetNumber(page); off++)
 	{
