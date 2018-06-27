@@ -156,7 +156,6 @@ static void lazy_scan_heap(Relation onerel, int options,
 static void lazy_vacuum_heap(Relation onerel, LVRelStats *vacrelstats);
 static bool lazy_check_needs_freeze(Buffer buf, bool *hastup);
 static void quick_vacuum_index(Relation irel, Relation hrel,
-					IndexBulkDeleteResult **stats,
 					LVRelStats *vacrelstats);
 static void lazy_vacuum_index(Relation indrel,
 				  IndexBulkDeleteResult **stats,
@@ -737,10 +736,10 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 			/* Remove index entries */
 			for (i = 0; i < nindexes; i++)
 			{
-				bool use_quick_strategy = true;//(vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
+				bool use_quick_strategy = (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
 
 				if (use_quick_strategy)
-					quick_vacuum_index(Irel[i], onerel, &indstats[i], vacrelstats);
+					quick_vacuum_index(Irel[i], onerel, vacrelstats);
 				else
 					lazy_vacuum_index(Irel[i],
 								  &indstats[i],
@@ -1389,10 +1388,10 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 		/* Remove index entries */
 		for (i = 0; i < nindexes; i++)
 		{
-			bool use_quick_strategy = true;//(vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
+			bool use_quick_strategy = (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
 
 			if (use_quick_strategy)
-				quick_vacuum_index(Irel[i], onerel, &indstats[i], vacrelstats);
+				quick_vacuum_index(Irel[i], onerel, vacrelstats);
 			else
 				lazy_vacuum_index(Irel[i],
 							  &indstats[i],
@@ -1709,8 +1708,10 @@ get_tuple_by_tid(Relation rel, ItemPointer tid)
 	 * VACUUM Races: someone already remove the tuple from HEAP. Ignore it.
 	 */
 	if (!ItemIdIsUsed(lp))
+	{
+		UnlockReleaseBuffer(buffer);
 		return NULL;
-
+	}
 	/* Walk along the chain */
 	while (!ItemIdHasStorage(lp))
 	{
@@ -1746,7 +1747,6 @@ static int tid_comparator(const void* a, const void* b)
  */
 static void
 quick_vacuum_index(Relation irel, Relation hrel,
-				   IndexBulkDeleteResult **overall_stats,
 				   LVRelStats *vacrelstats)
 {
 	IndexTargetDeleteResult	stats;
@@ -1824,11 +1824,6 @@ quick_vacuum_index(Relation irel, Relation hrel,
 		pfree(found);
 		FreeExecutorState(estate);
 	}
-
-	/*
-	 * Collect statistical info
-	 */
-	lazy_cleanup_index(irel, *overall_stats, vacrelstats);
 }
 
 /*
@@ -1857,7 +1852,7 @@ lazy_vacuum_index(Relation indrel,
 
 	/* Do bulk deletion */
 	*stats = index_bulk_delete(&ivinfo, *stats,
-								lazy_tid_reaped, (void *) vacrelstats);
+							   lazy_tid_reaped, (void *) vacrelstats);
 
 	ereport(elevel,
 			(errmsg("scanned index \"%s\" to remove %d row versions",

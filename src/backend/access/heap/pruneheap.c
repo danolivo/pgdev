@@ -610,7 +610,10 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 					heap_prune_record_unused(prstate, latestdead);
 				else
 				{
-					ItemIdSetDeadRedirect(rootlp, latestdead);
+					/*
+					 * We allow overlapping of redirected and dead items
+					 */
+					heap_prune_record_redirect(prstate, rootoffnum, latestdead);
 					heap_prune_record_dead(prstate, latestdead);
 				}
 			}
@@ -674,7 +677,12 @@ heap_prune_record_dead(PruneState *prstate, OffsetNumber offnum)
 	Assert(prstate->ndead < MaxHeapTuplesPerPage);
 	prstate->nowdead[prstate->ndead] = offnum;
 	prstate->ndead++;
-	Assert(!prstate->marked[offnum]);
+
+	/*
+	 * We suppress checking prstate->marked[offnum]. It is not the best idea,
+	 * but this is most simplistic way to enable Dead Redirecting by
+	 * overlapping Dead and Redirected states.
+	 */
 	prstate->marked[offnum] = true;
 }
 
