@@ -29,6 +29,7 @@
 #include "nodes/makefuncs.h"
 #include "pg_getopt.h"
 #include "pgstat.h"
+#include "postmaster/bgheap.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/startup.h"
 #include "postmaster/walwriter.h"
@@ -323,6 +324,9 @@ AuxiliaryProcessMain(int argc, char *argv[])
 			case StartupProcess:
 				statmsg = pgstat_get_backend_desc(B_STARTUP);
 				break;
+			case BgHeapProcess:
+				statmsg = pgstat_get_backend_desc(B_BG_HEAP);
+				break;
 			case BgWriterProcess:
 				statmsg = pgstat_get_backend_desc(B_BG_WRITER);
 				break;
@@ -440,6 +444,11 @@ AuxiliaryProcessMain(int argc, char *argv[])
 			/* don't set signals, startup process has its own agenda */
 			StartupProcessMain();
 			proc_exit(1);		/* should never return */
+
+		case BgHeapProcess:
+			/* don't set signals, BgHeap has its own agenda */
+			BackgroundHeapCleanerMain();
+			proc_exit(1);
 
 		case BgWriterProcess:
 			/* don't set signals, bgwriter has its own agenda */

@@ -93,7 +93,6 @@
 #include <pthread.h>
 #endif
 
-#include "access/bgheap.h"
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "bootstrap/bootstrap.h"
@@ -110,6 +109,7 @@
 #include "pgstat.h"
 #include "port/pg_bswap.h"
 #include "postmaster/autovacuum.h"
+#include "postmaster/bgheap.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/fork_process.h"
 #include "postmaster/pgarch.h"
@@ -248,6 +248,7 @@ bool		restart_after_crash = true;
 
 /* PIDs of special child processes; 0 when not running */
 static pid_t StartupPID = 0,
+			BgHeapPID = 0,
 			BgWriterPID = 0,
 			CheckpointerPID = 0,
 			WalWriterPID = 0,
@@ -548,6 +549,7 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #endif							/* EXEC_BACKEND */
 
 #define StartupDataBase()		StartChildProcess(StartupProcess)
+#define StartBgHeapCleaner() 	StartChildProcess(BgHeapProcess)
 #define StartBackgroundWriter() StartChildProcess(BgWriterProcess)
 #define StartCheckpointer()		StartChildProcess(CheckpointerProcess)
 #define StartWalWriter()		StartChildProcess(WalWriterProcess)
@@ -1306,12 +1308,12 @@ PostmasterMain(int argc, char *argv[])
 	 */
 	pgstat_init();
 
-//	relcleaner_init();
 	/*
 	 * Initialize the autovacuum subsystem (again, no process start yet)
 	 */
 	autovac_init();
 
+	bgheap_init();
 	/*
 	 * Load configuration files for client authentication.
 	 */
@@ -1758,6 +1760,10 @@ ServerLoop(void)
 			if (AutoVacPID != 0)
 				start_autovac_launcher = false; /* signal processed */
 		}
+
+		/* If we have lost the heap cleaner, try to start a new one */
+		if (BgHeapPID == 0 && pmState == PM_RUN)
+			BgHeapPID = StartBgHeapCleaner();
 
 		/* If we have lost the stats collector, try to start a new one */
 		if (PgStatPID == 0 &&
@@ -2533,6 +2539,8 @@ SIGHUP_handler(SIGNAL_ARGS)
 		SignalChildren(SIGHUP);
 		if (StartupPID != 0)
 			signal_child(StartupPID, SIGHUP);
+		if (BgHeapPID != 0)
+			signal_child(BgHeapPID, SIGHUP);
 		if (BgWriterPID != 0)
 			signal_child(BgWriterPID, SIGHUP);
 		if (CheckpointerPID != 0)
@@ -2879,6 +2887,8 @@ reaper(SIGNAL_ARGS)
 				AutoVacPID = StartAutoVacLauncher();
 			if (PgArchStartupAllowed() && PgArchPID == 0)
 				PgArchPID = pgarch_start();
+			if (BgHeapPID == 0)
+				BgHeapPID = StartBgHeapCleaner();
 			if (PgStatPID == 0)
 				PgStatPID = pgstat_start();
 
@@ -3415,6 +3425,18 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 								 (int) StartupPID)));
 		signal_child(StartupPID, (SendStop ? SIGSTOP : SIGQUIT));
 		StartupStatus = STARTUP_SIGNALED;
+	}
+
+	/* Take care of the freezer too */
+	if (pid == BgHeapPID)
+		BgHeapPID = 0;
+	else if (BgHeapPID != 0 && take_action)
+	{
+		ereport(DEBUG2,
+				(errmsg_internal("sending %s to process %d",
+				(SendStop ? "SIGSTOP" : "SIGQUIT"),
+				(int) BgHeapPID)));
+		signal_child(BgHeapPID, (SendStop ? SIGSTOP : SIGQUIT));
 	}
 
 	/* Take care of the bgwriter too */

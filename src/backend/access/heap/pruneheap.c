@@ -14,7 +14,6 @@
  */
 #include "postgres.h"
 
-#include "access/bgheap.h"
 #include "access/heapam.h"
 #include "access/heapam_xlog.h"
 #include "access/transam.h"
@@ -23,6 +22,7 @@
 #include "catalog/catalog.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "postmaster/bgheap.h"
 #include "storage/bufmgr.h"
 #include "utils/snapmgr.h"
 #include "utils/rel.h"

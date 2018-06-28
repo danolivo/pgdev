@@ -396,6 +396,7 @@ typedef enum
 	CheckerProcess = 0,
 	BootstrapProcess,
 	StartupProcess,
+	BgHeapProcess,
 	BgWriterProcess,
 	CheckpointerProcess,
 	WalWriterProcess,

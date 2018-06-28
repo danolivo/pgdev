@@ -1,5 +1,0 @@
-# relcleaner extension
-comment = 'Relation Cleaner by Retail IndexTuple deletion Patch'
-default_version = '0.1'
-module_pathname = '$libdir/relcleaner'
-relocatable = true

@@ -2858,6 +2858,9 @@ pgstat_bestart(void)
 			case StartupProcess:
 				beentry->st_backendType = B_STARTUP;
 				break;
+			case BgHeapProcess:
+				beentry->st_backendType = B_BG_HEAP;
+				break;
 			case BgWriterProcess:
 				beentry->st_backendType = B_BG_WRITER;
 				break;
@@ -2892,6 +2895,7 @@ pgstat_bestart(void)
 	/* We have userid for client-backends, wal-sender and bgworker processes */
 	if (beentry->st_backendType == B_BACKEND
 		|| beentry->st_backendType == B_WAL_SENDER
+/*		|| beentry->st_backendType == B_BG_HEAP */
 		|| beentry->st_backendType == B_BG_WORKER)
 		beentry->st_userid = GetSessionUserId();
 	else
@@ -3482,6 +3486,9 @@ pgstat_get_wait_activity(WaitEventActivity w)
 			break;
 		case WAIT_EVENT_AUTOVACUUM_MAIN:
 			event_name = "AutoVacuumMain";
+			break;
+		case WAIT_EVENT_BGHEAP_MAIN:
+			event_name = "BgHeapMain";
 			break;
 		case WAIT_EVENT_BGWRITER_HIBERNATE:
 			event_name = "BgWriterHibernate";
@@ -4110,6 +4117,9 @@ pgstat_get_backend_desc(BackendType backendType)
 			break;
 		case B_BACKEND:
 			backendDesc = "client backend";
+			break;
+		case B_BG_HEAP:
+			backendDesc = "background heap cleaner";
 			break;
 		case B_BG_WORKER:
 			backendDesc = "background worker";
