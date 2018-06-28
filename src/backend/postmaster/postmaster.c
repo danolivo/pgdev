@@ -93,6 +93,7 @@
 #include <pthread.h>
 #endif
 
+#include "access/bgheap.h"
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "bootstrap/bootstrap.h"
@@ -1305,6 +1306,7 @@ PostmasterMain(int argc, char *argv[])
 	 */
 	pgstat_init();
 
+//	relcleaner_init();
 	/*
 	 * Initialize the autovacuum subsystem (again, no process start yet)
 	 */

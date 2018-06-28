@@ -31,7 +31,12 @@ win32ver.rc
 *.exe
 lib*dll.def
 lib*.pc
-
+*.sh
+PGDATA/
+*.log
+.settings/
+.cproject
+.project
 # Local excludes in root directory
 /GNUmakefile
 /config.cache

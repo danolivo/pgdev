@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include "access/bgheap.h"
 #include "access/heapam.h"
 #include "access/heapam_xlog.h"
 #include "access/transam.h"
@@ -25,6 +26,7 @@
 #include "storage/bufmgr.h"
 #include "utils/snapmgr.h"
 #include "utils/rel.h"
+#include "utils/relfilenodemap.h"
 #include "utils/tqual.h"
 
 /* Working data for heap_page_prune and subroutines */
@@ -322,7 +324,8 @@ heap_page_prune(Relation relation, Buffer buffer, TransactionId OldestXmin,
 	 * One possibility is to leave "fillfactor" worth of space in this page
 	 * and update FSM with the remaining space.
 	 */
-
+	if (prstate.ndead > 0)
+		relcleaner_send(relation->rd_node, BufferGetBlockNumber(buffer), prstate.nowdead, prstate.ndead);
 	return ndeleted;
 }
 
