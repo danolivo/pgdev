@@ -1688,7 +1688,7 @@ lazy_check_needs_freeze(Buffer buf, bool *hastup)
 /*
  * Get tuple from heap for a scan key building.
  */
-static HeapTuple
+HeapTuple
 get_tuple_by_tid(Relation rel, ItemPointer tid)
 {
 	Buffer			buffer;
