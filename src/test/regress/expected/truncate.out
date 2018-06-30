@@ -278,9 +278,9 @@ SELECT * FROM trunc_faa;
 ROLLBACK;
 DROP TABLE trunc_f CASCADE;
 NOTICE:  drop cascades to 3 other objects
-DETAIL:  drop cascades to table trunc_fa
+DETAIL:  drop cascades to table trunc_fb
+drop cascades to table trunc_fa
 drop cascades to table trunc_faa
-drop cascades to table trunc_fb
 -- Test ON TRUNCATE triggers
 CREATE TABLE trunc_trigger_test (f1 int, f2 text, f3 text);
 CREATE TABLE trunc_trigger_log (tgop text, tglevel text, tgwhen text,

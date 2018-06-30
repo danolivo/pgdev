@@ -252,6 +252,9 @@ btree_xlog_split(bool onleft, bool lhighkey, XLogReaderState *record)
 	 * When the high key isn't present is the wal record, then we assume it to
 	 * be equal to the first key on the right page.  It must be from the leaf
 	 * level.
+	 *
+	 * FIXME:  We current always log the high key.  Is it worth trying to
+	 * salvage case where logging isn't strictly necessary, and can be avoided?
 	 */
 	if (!lhighkey)
 	{

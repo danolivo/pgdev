@@ -558,9 +558,9 @@ LINE 2: FOR EACH STATEMENT WHEN (OLD.* IS DISTINCT FROM NEW.*)
 -- check dependency restrictions
 ALTER TABLE main_table DROP COLUMN b;
 ERROR:  cannot drop column b of table main_table because other objects depend on it
-DETAIL:  trigger after_upd_b_row_trig on table main_table depends on column b of table main_table
+DETAIL:  trigger after_upd_b_stmt_trig on table main_table depends on column b of table main_table
 trigger after_upd_a_b_row_trig on table main_table depends on column b of table main_table
-trigger after_upd_b_stmt_trig on table main_table depends on column b of table main_table
+trigger after_upd_b_row_trig on table main_table depends on column b of table main_table
 HINT:  Use DROP ... CASCADE to drop the dependent objects too.
 -- this should succeed, but we'll roll it back to keep the triggers around
 begin;
@@ -1886,14 +1886,14 @@ select tgrelid::regclass, tgname, tgfoid::regproc from pg_trigger
 (4 rows)
 
 drop trigger trg1 on trigpart1;	-- fail
-ERROR:  cannot drop trigger trg1 on table trigpart1 because trigger trg1 on table trigpart requires it
-HINT:  You can drop trigger trg1 on table trigpart instead.
+ERROR:  cannot drop trigger trg1 on table trigpart1 because table trigpart1 requires it
+HINT:  You can drop table trigpart1 instead.
 drop trigger trg1 on trigpart2;	-- fail
-ERROR:  cannot drop trigger trg1 on table trigpart2 because trigger trg1 on table trigpart requires it
-HINT:  You can drop trigger trg1 on table trigpart instead.
+ERROR:  cannot drop trigger trg1 on table trigpart2 because table trigpart2 requires it
+HINT:  You can drop table trigpart2 instead.
 drop trigger trg1 on trigpart3;	-- fail
-ERROR:  cannot drop trigger trg1 on table trigpart3 because trigger trg1 on table trigpart requires it
-HINT:  You can drop trigger trg1 on table trigpart instead.
+ERROR:  cannot drop trigger trg1 on table trigpart3 because table trigpart3 requires it
+HINT:  You can drop table trigpart3 instead.
 drop table trigpart2;			-- ok, trigger should be gone in that partition
 select tgrelid::regclass, tgname, tgfoid::regproc from pg_trigger
   where tgrelid::regclass::text like 'trigpart%' order by tgrelid::regclass::text;

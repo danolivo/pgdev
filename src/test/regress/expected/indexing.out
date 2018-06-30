@@ -101,8 +101,8 @@ create table idxpart (a int) partition by range (a);
 create index on idxpart (a);
 create table idxpart1 partition of idxpart for values from (0) to (10);
 drop index idxpart1_a_idx;	-- no way
-ERROR:  cannot drop index idxpart1_a_idx because index idxpart_a_idx requires it
-HINT:  You can drop index idxpart_a_idx instead.
+ERROR:  cannot drop index idxpart1_a_idx because column a of table idxpart1 requires it
+HINT:  You can drop column a of table idxpart1 instead.
 drop index idxpart_a_idx;	-- both indexes go away
 select relname, relkind from pg_class
   where relname like 'idxpart%' order by relname;
@@ -931,11 +931,11 @@ select indrelid::regclass, indexrelid::regclass, inhparent::regclass, indisvalid
 (3 rows)
 
 drop index idxpart0_pkey;								-- fail
-ERROR:  cannot drop index idxpart0_pkey because index idxpart_pkey requires it
-HINT:  You can drop index idxpart_pkey instead.
+ERROR:  cannot drop index idxpart0_pkey because constraint idxpart0_pkey on table idxpart0 requires it
+HINT:  You can drop constraint idxpart0_pkey on table idxpart0 instead.
 drop index idxpart1_pkey;								-- fail
-ERROR:  cannot drop index idxpart1_pkey because index idxpart_pkey requires it
-HINT:  You can drop index idxpart_pkey instead.
+ERROR:  cannot drop index idxpart1_pkey because constraint idxpart1_pkey on table idxpart1 requires it
+HINT:  You can drop constraint idxpart1_pkey on table idxpart1 instead.
 alter table idxpart0 drop constraint idxpart0_pkey;		-- fail
 ERROR:  cannot drop inherited constraint "idxpart0_pkey" of relation "idxpart0"
 alter table idxpart1 drop constraint idxpart1_pkey;		-- fail
