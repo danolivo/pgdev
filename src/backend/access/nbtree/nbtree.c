@@ -954,12 +954,12 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	skey = _bt_mkscankey(irel, itup);
 
 	/* Descend the tree and position ourselves on the target leaf page. */
-	stack = _bt_search(irel, keysCount, skey, false, &buf, BT_READ, NULL);
+	stack = _bt_search(irel, keysCount, skey, NULL, false, &buf, BT_READ, NULL);
 	_bt_freestack(stack);
 
 	/* To prepare tuple entries search across index pages */
 	Assert(BufferIsValid(buf));
-	offnum = _bt_binsrch(irel, buf, keysCount, skey, false);
+	offnum = _bt_binsrch(irel, buf, keysCount, skey, NULL, false);
 	page = BufferGetPage(buf);
 	_bt_checkpage(irel, buf);
 	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
@@ -1010,7 +1010,7 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 		/*
 		 * This index entry satisfied to the scan key?
 		 */
-		cmpval = _bt_compare(irel, keysCount, skey, page, offnum);
+		cmpval = _bt_compare(irel, keysCount, skey, NULL, page, offnum);
 
 		if (cmpval != 0)
 			/* End of index entries, satisfied to the scan key */
