@@ -888,43 +888,11 @@ btbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 }
 
 static int
-tid_list_search(ItemPointer tid, ItemPointer tid_list, int ntid, bool IsSorted)
+tid_list_search(ItemPointer tid, ItemPointer tid_list, int ntid)
 {
-	if (!IsSorted)
-	{
-		for (int i = 0; i < ntid; i++)
-			if (ItemPointerEquals(tid, &(tid_list[i])))
-				return i;
-	}
-	else
-	{
-		int low = 0,
-			high = ntid,
-			mid;
-		/* Search at sorted list of TID*/
-		if ((ItemPointerCompare(tid, &tid_list[low]) >= 0) && (ItemPointerCompare(tid, &tid_list[high]) <= 0))
-		{
-			for (;;)
-			{
-				mid = (low + high)/2;
-
-				if ((mid == low) || (mid == high))
-					break;
-				if (ItemPointerCompare(tid, &tid_list[mid]) < 0)
-					if (high == mid)
-						break;
-					else
-						high = mid;
-				else if (ItemPointerCompare(tid, &tid_list[mid]) > 0)
-					if (low == mid)
-						break;
-					else
-						low = mid;
-				else
-					return mid;
-			}
-		}
-	}
+	for (int i = 0; i < ntid; i++)
+		if (ItemPointerEquals(tid, &(tid_list[i])))
+			return i;
 	return -1;
 }
 
@@ -1022,7 +990,7 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 		 */
 		itemid = PageGetItemId(page, offnum);
 		itup = (IndexTuple) PageGetItem(page, itemid);
-		pos = tid_list_search(&(itup->t_tid), info->dead_tuples, info->num_dead_tuples, false);
+		pos = tid_list_search(&(itup->t_tid), info->dead_tuples, info->num_dead_tuples);
 
 		if ((pos >= 0) && (!info->found_dead_tuples[pos]))
 		{
