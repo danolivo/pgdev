@@ -946,6 +946,7 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	int				ndeletable = 0;
 	OffsetNumber	deletable[MaxOffsetNumber];
 	IndexTuple		itup;
+	int				pos = 0;
 
 	if (stats == NULL)
 		stats = (IndexTargetDeleteResult *) palloc0(sizeof(IndexTargetDeleteResult));
@@ -969,7 +970,6 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 		int32		cmpval;
 		ItemId		itemid;
 		IndexTuple	itup;
-		int			pos;
 
 		/* Switch to the next page */
 		if (P_IGNORE(opaque) || (offnum > PageGetMaxOffsetNumber(page)))
@@ -1022,13 +1022,24 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 		 */
 		itemid = PageGetItemId(page, offnum);
 		itup = (IndexTuple) PageGetItem(page, itemid);
-		pos = tid_list_search(&(itup->t_tid), info->dead_tuples, info->num_dead_tuples, false);
 
-		if ((pos >= 0) && (!info->found_dead_tuples[pos]))
+		/*
+		 * Search for next TID from presorted btree result comparable
+		 * to TID from presorted dead_tuples tid list
+		 */
+		while (pos < info->num_dead_tuples)
 		{
-			/* index entry for TID of dead tuple is found */
-			deletable[ndeletable++] = offnum;
-			info->found_dead_tuples[pos] = true;
+			int res = ItemPointerCompare(&(itup->t_tid), &info->dead_tuples[pos]);
+			if ((res == 0) && (!info->found_dead_tuples[pos]))
+			{
+				/* index entry for TID of dead tuple is found */
+				deletable[ndeletable++] = offnum;
+				info->found_dead_tuples[pos] = true;
+			}
+			else if (res < 0)
+				break;
+
+			pos++;
 		}
 
 		offnum = OffsetNumberNext(offnum);
