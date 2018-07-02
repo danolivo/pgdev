@@ -1711,4 +1711,4 @@ select pg_get_ruledef(oid, true) from pg_rewrite
 DROP SCHEMA temp_view_test CASCADE;
 NOTICE:  drop cascades to 27 other objects
 DROP SCHEMA testviewschm2 CASCADE;
-NOTICE:  drop cascades to 62 other objects
+NOTICE:  drop cascades to 63 other objects
