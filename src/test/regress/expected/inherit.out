@@ -952,8 +952,8 @@ Inherits: c1,
 
 drop table p1 cascade;
 NOTICE:  drop cascades to 3 other objects
-DETAIL:  drop cascades to table c1
-drop cascades to table c2
+DETAIL:  drop cascades to table c2
+drop cascades to table c1
 drop cascades to table c3
 drop table p2 cascade;
 create table pp1 (f1 int);
@@ -1098,9 +1098,9 @@ SELECT a.attrelid::regclass, a.attname, a.attinhcount, e.expected
 
 DROP TABLE inht1, inhs1 CASCADE;
 NOTICE:  drop cascades to 4 other objects
-DETAIL:  drop cascades to table inht2
+DETAIL:  drop cascades to table inht3
+drop cascades to table inht2
 drop cascades to table inhts
-drop cascades to table inht3
 drop cascades to table inht4
 -- Test non-inheritable indices [UNIQUE, EXCLUDE] constraints
 CREATE TABLE test_constraints (id int, val1 varchar, val2 int, UNIQUE(val1, val2));
@@ -1352,8 +1352,8 @@ select * from patest0 join (select f1 from int4_tbl limit 1) ss on id = f1;
 
 drop table patest0 cascade;
 NOTICE:  drop cascades to 2 other objects
-DETAIL:  drop cascades to table patest1
-drop cascades to table patest2
+DETAIL:  drop cascades to table patest2
+drop cascades to table patest1
 --
 -- Test merge-append plans for inheritance trees
 --
@@ -1499,9 +1499,9 @@ reset enable_seqscan;
 reset enable_parallel_append;
 drop table matest0 cascade;
 NOTICE:  drop cascades to 3 other objects
-DETAIL:  drop cascades to table matest1
+DETAIL:  drop cascades to table matest3
 drop cascades to table matest2
-drop cascades to table matest3
+drop cascades to table matest1
 --
 -- Check that use of an index with an extraneous column doesn't produce
 -- a plan with extraneous sorting

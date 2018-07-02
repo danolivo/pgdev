@@ -30,10 +30,10 @@ NOTICE:  installing required extension "test_ext_cyclic2"
 ERROR:  cyclic dependency detected between extensions "test_ext_cyclic1" and "test_ext_cyclic2"
 DROP SCHEMA test_ext CASCADE;
 NOTICE:  drop cascades to 5 other objects
-DETAIL:  drop cascades to extension test_ext3
-drop cascades to extension test_ext5
-drop cascades to extension test_ext2
+DETAIL:  drop cascades to extension test_ext5
 drop cascades to extension test_ext4
+drop cascades to extension test_ext3
+drop cascades to extension test_ext2
 drop cascades to extension test_ext1
 CREATE EXTENSION test_ext6;
 DROP EXTENSION test_ext6;

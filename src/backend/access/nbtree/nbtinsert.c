@@ -180,7 +180,7 @@ top:
 				!P_IGNORE(lpageop) &&
 				(PageGetFreeSpace(page) > itemsz) &&
 				PageGetMaxOffsetNumber(page) >= P_FIRSTDATAKEY(lpageop) &&
-				_bt_compare(rel, indnkeyatts, itup_scankey, page,
+				_bt_compare(rel, indnkeyatts, itup_scankey, &itup->t_tid, page,
 							P_FIRSTDATAKEY(lpageop)) > 0)
 			{
 				/*
@@ -216,9 +216,12 @@ top:
 
 	if (!fastpath)
 	{
+		ItemPointer scantid =
+			(checkUnique != UNIQUE_CHECK_NO ? NULL : &itup->t_tid);
+
 		/* find the first page containing this key */
-		stack = _bt_search(rel, indnkeyatts, itup_scankey, false, &buf, BT_WRITE,
-						   NULL);
+		stack = _bt_search(rel, indnkeyatts, itup_scankey, scantid, false,
+						   &buf, BT_WRITE, NULL);
 
 		/* trade in our read lock for a write lock */
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
@@ -231,8 +234,8 @@ top:
 		 * need to move right in the tree.  See Lehman and Yao for an
 		 * excruciatingly precise description.
 		 */
-		buf = _bt_moveright(rel, buf, indnkeyatts, itup_scankey, false,
-							true, stack, BT_WRITE, NULL);
+		buf = _bt_moveright(rel, buf, indnkeyatts, itup_scankey, scantid,
+							false, true, stack, BT_WRITE, NULL);
 	}
 
 	/*
@@ -261,7 +264,8 @@ top:
 		TransactionId xwait;
 		uint32		speculativeToken;
 
-		offset = _bt_binsrch(rel, buf, indnkeyatts, itup_scankey, false);
+		/* Find position while excluding heap TID attribute */
+		offset = _bt_binsrch(rel, buf, indnkeyatts, itup_scankey, NULL, false);
 		xwait = _bt_check_unique(rel, itup, heapRel, buf, offset, itup_scankey,
 								 checkUnique, &is_unique, &speculativeToken);
 
@@ -285,6 +289,25 @@ top:
 				_bt_freestack(stack);
 			goto top;
 		}
+
+		/*
+		 * Be careful to not get confused about user attribute position and
+		 * insertion position.
+		 *
+		 * XXX: This is ugly as sin, and clearly needs a lot more work.  While
+		 * not having this code does not seem to affect regression tests, we
+		 * almost certainly need to do something here for the case where
+		 * _bt_check_unique() traverses many pages, each filled with logical
+		 * duplicates.
+		 */
+		buf = _bt_moveright(rel, buf, indnkeyatts, itup_scankey, &itup->t_tid,
+							false, true, stack, BT_WRITE, NULL);
+		/*
+		 * Always invalidate hint
+		 *
+		 * FIXME: This is unacceptable.
+		 */
+		offset = InvalidOffsetNumber;
 	}
 
 	if (checkUnique != UNIQUE_CHECK_EXISTING)
@@ -564,11 +587,11 @@ _bt_check_unique(Relation rel, IndexTuple itup, Relation heapRel,
 			offset = OffsetNumberNext(offset);
 		else
 		{
-			/* If scankey == hikey we gotta check the next page too */
+			/* If scankey <= hikey we gotta check the next page too */
 			if (P_RIGHTMOST(opaque))
 				break;
-			if (!_bt_isequal(itupdesc, page, P_HIKEY,
-							 indnkeyatts, itup_scankey))
+			/* _bt_isequal()'s special NULL semantics not required here */
+			if (_bt_compare(rel, indnkeyatts, itup_scankey, NULL, page, P_HIKEY) > 0)
 				break;
 			/* Advance to next non-dead page --- there must be one */
 			for (;;)
@@ -700,6 +723,18 @@ _bt_findinsertloc(Relation rel,
 	 * pages).  Currently the probability of moving right is set at 0.99,
 	 * which may seem too high to change the behavior much, but it does an
 	 * excellent job of preventing O(N^2) behavior with many equal keys.
+	 *
+	 * TODO: Support this old approach for pre-pg_upgrade indexes.
+	 *
+	 * None of this applies when all items in the tree are unique, since the
+	 * new item cannot go on either page if it's equal to the high key.  The
+	 * original L&Y invariant that we now follow is that high keys must be
+	 * less than or equal to all items on the page, and strictly less than
+	 * the right sibling items (since the high key also becomes the downlink
+	 * to the right sibling in parent after a page split).  It's very
+	 * unlikely that it will be equal anyway, since there will be explicit
+	 * heap TIDs in pivot tuples in the event of many duplicates, but it can
+	 * happen when heap TID recycling takes place.
 	 *----------
 	 */
 	movedright = false;
@@ -731,8 +766,7 @@ _bt_findinsertloc(Relation rel,
 		 * nope, so check conditions (b) and (c) enumerated above
 		 */
 		if (P_RIGHTMOST(lpageop) ||
-			_bt_compare(rel, keysz, scankey, page, P_HIKEY) != 0 ||
-			random() <= (MAX_RANDOM_VALUE / 100))
+			_bt_compare(rel, keysz, scankey, &newtup->t_tid, page, P_HIKEY) <= 0)
 			break;
 
 		/*
@@ -792,7 +826,7 @@ _bt_findinsertloc(Relation rel,
 	else if (firstlegaloff != InvalidOffsetNumber && !vacuumed)
 		newitemoff = firstlegaloff;
 	else
-		newitemoff = _bt_binsrch(rel, buf, keysz, scankey, false);
+		newitemoff = _bt_binsrch(rel, buf, keysz, scankey, &newtup->t_tid, false);
 
 	*bufptr = buf;
 	*offsetptr = newitemoff;
@@ -851,11 +885,12 @@ _bt_insertonpg(Relation rel,
 	/* child buffer must be given iff inserting on an internal page */
 	Assert(P_ISLEAF(lpageop) == !BufferIsValid(cbuf));
 	/* tuple must have appropriate number of attributes */
+	Assert(BTreeTupleGetNAtts(itup, rel) > 0);
 	Assert(!P_ISLEAF(lpageop) ||
 		   BTreeTupleGetNAtts(itup, rel) ==
 		   IndexRelationGetNumberOfAttributes(rel));
 	Assert(P_ISLEAF(lpageop) ||
-		   BTreeTupleGetNAtts(itup, rel) ==
+		   BTreeTupleGetNAtts(itup, rel) <=
 		   IndexRelationGetNumberOfKeyAttributes(rel));
 
 	/* The caller should've finished any incomplete splits already. */
@@ -1143,8 +1178,6 @@ _bt_split(Relation rel, Buffer buf, Buffer cbuf, OffsetNumber firstright,
 	OffsetNumber i;
 	bool		isleaf;
 	IndexTuple	lefthikey;
-	int			indnatts = IndexRelationGetNumberOfAttributes(rel);
-	int			indnkeyatts = IndexRelationGetNumberOfKeyAttributes(rel);
 
 	/* Acquire a new page to split into */
 	rbuf = _bt_getbuf(rel, P_NEW, BT_WRITE);
@@ -1214,7 +1247,9 @@ _bt_split(Relation rel, Buffer buf, Buffer cbuf, OffsetNumber firstright,
 		itemid = PageGetItemId(origpage, P_HIKEY);
 		itemsz = ItemIdGetLength(itemid);
 		item = (IndexTuple) PageGetItem(origpage, itemid);
-		Assert(BTreeTupleGetNAtts(item, rel) == indnkeyatts);
+		Assert(BTreeTupleGetNAtts(item, rel) > 0);
+		Assert(BTreeTupleGetNAtts(item, rel) <=
+			   IndexRelationGetNumberOfKeyAttributes(rel));
 		if (PageAddItem(rightpage, (Item) item, itemsz, rightoff,
 						false, false) == InvalidOffsetNumber)
 		{
@@ -1247,25 +1282,35 @@ _bt_split(Relation rel, Buffer buf, Buffer cbuf, OffsetNumber firstright,
 	}
 
 	/*
-	 * Truncate non-key (INCLUDE) attributes of the high key item before
-	 * inserting it on the left page.  This only needs to happen at the leaf
-	 * level, since in general all pivot tuple values originate from leaf
-	 * level high keys.  This isn't just about avoiding unnecessary work,
-	 * though; truncating unneeded key attributes (more aggressive suffix
-	 * truncation) can only be performed at the leaf level anyway.  This is
-	 * because a pivot tuple in a grandparent page must guide a search not
-	 * only to the correct parent page, but also to the correct leaf page.
+	 * Truncate attributes of the high key item before inserting it on the left
+	 * page.  This can only happen at the leaf level, since in general all
+	 * pivot tuple values originate from leaf level high keys.  This isn't just
+	 * about avoiding unnecessary work, though; truncating unneeded key suffix
+	 * attributes can only be performed at the leaf level anyway.  This is
+	 * because a pivot tuple in a grandparent page must guide a search not only
+	 * to the correct parent page, but also to the correct leaf page.
+	 *
+	 * Note that non-key (INCLUDE) attributes are always truncated away here.
+	 * Additional key attributes are truncated away when they're not required
+	 * to correctly separate the key space.
+	 *
+	 * TODO: Give a little weight to how large the final downlink will be when
+	 * deciding on a split point.
 	 */
-	if (indnatts != indnkeyatts && isleaf)
+	if (isleaf)
 	{
-		lefthikey = _bt_nonkey_truncate(rel, item);
+		OffsetNumber	lastleftoffnum = OffsetNumberPrev(firstright);
+
+		lefthikey = _bt_suffix_truncate(rel, origpage, lastleftoffnum , item);
 		itemsz = IndexTupleSize(lefthikey);
 		itemsz = MAXALIGN(itemsz);
 	}
 	else
 		lefthikey = item;
 
-	Assert(BTreeTupleGetNAtts(lefthikey, rel) == indnkeyatts);
+	Assert(BTreeTupleGetNAtts(lefthikey, rel) > 0);
+	Assert(BTreeTupleGetNAtts(lefthikey, rel) <=
+		   IndexRelationGetNumberOfKeyAttributes(rel));
 	if (PageAddItem(leftpage, (Item) lefthikey, itemsz, leftoff,
 					false, false) == InvalidOffsetNumber)
 	{
@@ -1487,22 +1532,11 @@ _bt_split(Relation rel, Buffer buf, Buffer cbuf, OffsetNumber firstright,
 		if (newitemonleft)
 			XLogRegisterBufData(0, (char *) newitem, MAXALIGN(newitemsz));
 
-		/* Log left page */
-		if (!isleaf || indnatts != indnkeyatts)
-		{
-			/*
-			 * We must also log the left page's high key.  There are two
-			 * reasons for that: right page's leftmost key is suppressed on
-			 * non-leaf levels and in covering indexes included columns are
-			 * truncated from high keys.  Show it as belonging to the left
-			 * page buffer, so that it is not stored if XLogInsert decides it
-			 * needs a full-page image of the left page.
-			 */
-			itemid = PageGetItemId(origpage, P_HIKEY);
-			item = (IndexTuple) PageGetItem(origpage, itemid);
-			XLogRegisterBufData(0, (char *) item, MAXALIGN(IndexTupleSize(item)));
-			loglhikey = true;
-		}
+		/* Log left page.  We must also log the left page's high key. */
+		itemid = PageGetItemId(origpage, P_HIKEY);
+		item = (IndexTuple) PageGetItem(origpage, itemid);
+		XLogRegisterBufData(0, (char *) item, MAXALIGN(IndexTupleSize(item)));
+		loglhikey = true;
 
 		/*
 		 * Log the contents of the right page in the format understood by
@@ -2210,7 +2244,8 @@ _bt_newroot(Relation rel, Buffer lbuf, Buffer rbuf)
 	/*
 	 * insert the right page pointer into the new root page.
 	 */
-	Assert(BTreeTupleGetNAtts(right_item, rel) ==
+	Assert(BTreeTupleGetNAtts(right_item, rel) > 0);
+	Assert(BTreeTupleGetNAtts(right_item, rel) <=
 		   IndexRelationGetNumberOfKeyAttributes(rel));
 	if (PageAddItem(rootpage, (Item) right_item, right_item_sz, P_FIRSTKEY,
 					false, false) == InvalidOffsetNumber)
@@ -2322,8 +2357,8 @@ _bt_pgaddtup(Page page,
 /*
  * _bt_isequal - used in _bt_doinsert in check for duplicates.
  *
- * This is very similar to _bt_compare, except for NULL handling.
- * Rule is simple: NOT_NULL not equal NULL, NULL not equal NULL too.
+ * This is very similar to _bt_compare, except for NULL and negative infinity
+ * handling.  Rule is simple: NOT_NULL not equal NULL, NULL not equal NULL too.
  */
 static bool
 _bt_isequal(TupleDesc itupdesc, Page page, OffsetNumber offnum,
@@ -2337,12 +2372,6 @@ _bt_isequal(TupleDesc itupdesc, Page page, OffsetNumber offnum,
 
 	itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, offnum));
 
-	/*
-	 * It's okay that we might perform a comparison against a truncated page
-	 * high key when caller needs to determine if _bt_check_unique scan must
-	 * continue on to the next page.  Caller never asks us to compare non-key
-	 * attributes within an INCLUDE index.
-	 */
 	for (i = 1; i <= keysz; i++)
 	{
 		AttrNumber	attno;
