@@ -56,7 +56,6 @@ typedef struct IndexTargetDeleteInfo
 	Relation	heapRelation;
 	Relation	indexRelation;			/* the index being vacuumed */
 	int			num_dead_tuples;
-	bool		isSorted;				/* dead tuples list sorted */
 	ItemPointer	dead_tuples;
 	bool*		found_dead_tuples;
 } IndexTargetDeleteInfo;

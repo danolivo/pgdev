@@ -892,7 +892,7 @@ tid_list_search(ItemPointer tid, ItemPointer tid_list, int ntid, bool IsSorted)
 {
 	if (!IsSorted)
 	{
-		for (int i=0; i< ntid; i++)
+		for (int i = 0; i < ntid; i++)
 			if (ItemPointerEquals(tid, &(tid_list[i])))
 				return i;
 	}
@@ -906,7 +906,7 @@ tid_list_search(ItemPointer tid, ItemPointer tid_list, int ntid, bool IsSorted)
 		{
 			for (;;)
 			{
-				mid = (low+high)/2;
+				mid = (low + high)/2;
 
 				if ((mid == low) || (mid == high))
 					break;
