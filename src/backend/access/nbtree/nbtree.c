@@ -972,7 +972,7 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 			 * Traverse to a next reliable index page
 			 */
 			buf = _bt_moveright(irel, buf, keysCount, skey, &info->dead_tuples[pos],
-										false, true, stack, BT_READ, NULL);
+												false, true, stack, BT_READ, NULL);
 			page = BufferGetPage(buf);
 			_bt_checkpage(irel, buf);
 			opaque = (BTPageOpaque) PageGetSpecialPointer(page);

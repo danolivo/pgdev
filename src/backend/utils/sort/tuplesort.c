@@ -4057,23 +4057,26 @@ comparetup_index_btree(const SortTuple *a, const SortTuple *b,
 	}
 
 	/*
-	 * If key values are equal, we sort on ItemPointer.  This does not affect
-	 * validity of the finished index, but it may be useful to have index
-	 * scans in physical order.
+	 * If key values are equal, we sort on ItemPointer.  This is required
+	 * for btree indexes, since heap TID is treated as an implicit last
+	 * key attribute in order to ensure that all keys in the index are
+	 * physically unique.
+	 *
+	 * Deliberately invert the order, since TIDs "sort DESC".
 	 */
 	{
 		BlockNumber blk1 = ItemPointerGetBlockNumber(&tuple1->t_tid);
 		BlockNumber blk2 = ItemPointerGetBlockNumber(&tuple2->t_tid);
 
 		if (blk1 != blk2)
-			return (blk1 < blk2) ? -1 : 1;
+			return (blk1 < blk2) ? 1 : -1;
 	}
 	{
 		OffsetNumber pos1 = ItemPointerGetOffsetNumber(&tuple1->t_tid);
 		OffsetNumber pos2 = ItemPointerGetOffsetNumber(&tuple2->t_tid);
 
 		if (pos1 != pos2)
-			return (pos1 < pos2) ? -1 : 1;
+			return (pos1 < pos2) ? 1 : -1;
 	}
 
 	return 0;
