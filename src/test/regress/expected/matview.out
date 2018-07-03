@@ -310,15 +310,15 @@ SELECT type, m.totamt AS mtot, v.totamt AS vtot FROM mvtest_tm m LEFT JOIN mvtes
 -- make sure that dependencies are reported properly when they block the drop
 DROP TABLE mvtest_t;
 ERROR:  cannot drop table mvtest_t because other objects depend on it
-DETAIL:  materialized view mvtest_tm depends on table mvtest_t
-materialized view mvtest_tmm depends on materialized view mvtest_tm
-view mvtest_tv depends on table mvtest_t
+DETAIL:  view mvtest_tv depends on table mvtest_t
 view mvtest_tvv depends on view mvtest_tv
 materialized view mvtest_tvvm depends on view mvtest_tvv
 view mvtest_tvvmv depends on materialized view mvtest_tvvm
 materialized view mvtest_bb depends on view mvtest_tvvmv
 materialized view mvtest_mvschema.mvtest_tvm depends on view mvtest_tv
 materialized view mvtest_tvmm depends on materialized view mvtest_mvschema.mvtest_tvm
+materialized view mvtest_tm depends on table mvtest_t
+materialized view mvtest_tmm depends on materialized view mvtest_tm
 HINT:  Use DROP ... CASCADE to drop the dependent objects too.
 -- make sure dependencies are dropped and reported
 -- and make sure that transactional behavior is correct on rollback
@@ -326,15 +326,15 @@ HINT:  Use DROP ... CASCADE to drop the dependent objects too.
 BEGIN;
 DROP TABLE mvtest_t CASCADE;
 NOTICE:  drop cascades to 9 other objects
-DETAIL:  drop cascades to materialized view mvtest_tm
-drop cascades to materialized view mvtest_tmm
-drop cascades to view mvtest_tv
+DETAIL:  drop cascades to view mvtest_tv
 drop cascades to view mvtest_tvv
 drop cascades to materialized view mvtest_tvvm
 drop cascades to view mvtest_tvvmv
 drop cascades to materialized view mvtest_bb
 drop cascades to materialized view mvtest_mvschema.mvtest_tvm
 drop cascades to materialized view mvtest_tvmm
+drop cascades to materialized view mvtest_tm
+drop cascades to materialized view mvtest_tmm
 ROLLBACK;
 -- some additional tests not using base tables
 CREATE VIEW mvtest_vt1 AS SELECT 1 moo;
@@ -484,10 +484,10 @@ SELECT * FROM mvtest_mv_v_4;
 
 DROP TABLE mvtest_v CASCADE;
 NOTICE:  drop cascades to 4 other objects
-DETAIL:  drop cascades to materialized view mvtest_mv_v_4
-drop cascades to materialized view mvtest_mv_v_3
+DETAIL:  drop cascades to materialized view mvtest_mv_v
 drop cascades to materialized view mvtest_mv_v_2
-drop cascades to materialized view mvtest_mv_v
+drop cascades to materialized view mvtest_mv_v_3
+drop cascades to materialized view mvtest_mv_v_4
 -- Check that unknown literals are converted to "text" in CREATE MATVIEW,
 -- so that we don't end up with unknown-type columns.
 CREATE MATERIALIZED VIEW mv_unspecified_types AS

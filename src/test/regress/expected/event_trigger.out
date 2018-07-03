@@ -152,9 +152,9 @@ ERROR:  event trigger "regress_event_trigger" does not exist
 -- should fail, regress_evt_user owns some objects
 drop role regress_evt_user;
 ERROR:  role "regress_evt_user" cannot be dropped because some objects depend on it
-DETAIL:  owner of user mapping for regress_evt_user on server useless_server
+DETAIL:  owner of event trigger regress_event_trigger3
 owner of default privileges on new relations belonging to role regress_evt_user
-owner of event trigger regress_event_trigger3
+owner of user mapping for regress_evt_user on server useless_server
 -- cleanup before next test
 -- these are all OK; the second one should emit a NOTICE
 drop event trigger if exists regress_event_trigger2;
@@ -241,13 +241,14 @@ CREATE EVENT TRIGGER regress_event_trigger_drop_objects ON sql_drop
 ALTER TABLE schema_one.table_one DROP COLUMN a;
 DROP SCHEMA schema_one, schema_two CASCADE;
 NOTICE:  drop cascades to 7 other objects
-DETAIL:  drop cascades to function schema_two.add(integer,integer)
-drop cascades to function schema_two.newton(integer)
+DETAIL:  drop cascades to table schema_two.table_two
 drop cascades to table schema_two.table_three
-drop cascades to table schema_two.table_two
-drop cascades to table schema_one.table_three
-drop cascades to table schema_one."table two"
+drop cascades to function schema_two.add(integer,integer)
+drop cascades to function schema_two.newton(integer)
 drop cascades to table schema_one.table_one
+drop cascades to table schema_one."table two"
+drop cascades to table schema_one.table_three
+NOTICE:  table "schema_two_table_two" does not exist, skipping
 NOTICE:  table "audit_tbls_schema_two_table_three" does not exist, skipping
 ERROR:  object audit_tbls.schema_two_table_three of type table cannot be dropped
 CONTEXT:  PL/pgSQL function undroppable() line 14 at RAISE
@@ -256,61 +257,61 @@ PL/pgSQL function test_evtrig_dropped_objects() line 8 at EXECUTE
 DELETE FROM undroppable_objs WHERE object_identity = 'audit_tbls.schema_two_table_three';
 DROP SCHEMA schema_one, schema_two CASCADE;
 NOTICE:  drop cascades to 7 other objects
-DETAIL:  drop cascades to function schema_two.add(integer,integer)
-drop cascades to function schema_two.newton(integer)
+DETAIL:  drop cascades to table schema_two.table_two
 drop cascades to table schema_two.table_three
-drop cascades to table schema_two.table_two
-drop cascades to table schema_one.table_three
-drop cascades to table schema_one."table two"
+drop cascades to function schema_two.add(integer,integer)
+drop cascades to function schema_two.newton(integer)
 drop cascades to table schema_one.table_one
-NOTICE:  table "audit_tbls_schema_two_table_three" does not exist, skipping
+drop cascades to table schema_one."table two"
+drop cascades to table schema_one.table_three
 NOTICE:  table "schema_two_table_two" does not exist, skipping
-NOTICE:  table "schema_one_table_three" does not exist, skipping
-NOTICE:  table "schema_one_table two" does not exist, skipping
+NOTICE:  table "audit_tbls_schema_two_table_three" does not exist, skipping
 NOTICE:  table "schema_one_table_one" does not exist, skipping
+NOTICE:  table "schema_one_table two" does not exist, skipping
+NOTICE:  table "schema_one_table_three" does not exist, skipping
 ERROR:  object schema_one.table_three of type table cannot be dropped
 CONTEXT:  PL/pgSQL function undroppable() line 14 at RAISE
 DELETE FROM undroppable_objs WHERE object_identity = 'schema_one.table_three';
 DROP SCHEMA schema_one, schema_two CASCADE;
 NOTICE:  drop cascades to 7 other objects
-DETAIL:  drop cascades to function schema_two.add(integer,integer)
-drop cascades to function schema_two.newton(integer)
+DETAIL:  drop cascades to table schema_two.table_two
 drop cascades to table schema_two.table_three
-drop cascades to table schema_two.table_two
-drop cascades to table schema_one.table_three
-drop cascades to table schema_one."table two"
+drop cascades to function schema_two.add(integer,integer)
+drop cascades to function schema_two.newton(integer)
 drop cascades to table schema_one.table_one
-NOTICE:  table "audit_tbls_schema_two_table_three" does not exist, skipping
+drop cascades to table schema_one."table two"
+drop cascades to table schema_one.table_three
 NOTICE:  table "schema_two_table_two" does not exist, skipping
-NOTICE:  table "schema_one_table_three" does not exist, skipping
-NOTICE:  table "schema_one_table two" does not exist, skipping
+NOTICE:  table "audit_tbls_schema_two_table_three" does not exist, skipping
 NOTICE:  table "schema_one_table_one" does not exist, skipping
+NOTICE:  table "schema_one_table two" does not exist, skipping
+NOTICE:  table "schema_one_table_three" does not exist, skipping
 SELECT * FROM dropped_objects WHERE schema IS NULL OR schema <> 'pg_toast';
      type     |   schema   |               object                
 --------------+------------+-------------------------------------
  table column | schema_one | schema_one.table_one.a
  schema       |            | schema_two
- function     | schema_two | schema_two.add(integer,integer)
- aggregate    | schema_two | schema_two.newton(integer)
+ table        | schema_two | schema_two.table_two
+ type         | schema_two | schema_two.table_two
+ type         | schema_two | schema_two.table_two[]
  table        | audit_tbls | audit_tbls.schema_two_table_three
  type         | audit_tbls | audit_tbls.schema_two_table_three
  type         | audit_tbls | audit_tbls.schema_two_table_three[]
  table        | schema_two | schema_two.table_three
  type         | schema_two | schema_two.table_three
  type         | schema_two | schema_two.table_three[]
- table        | schema_two | schema_two.table_two
- type         | schema_two | schema_two.table_two
- type         | schema_two | schema_two.table_two[]
+ function     | schema_two | schema_two.add(integer,integer)
+ aggregate    | schema_two | schema_two.newton(integer)
  schema       |            | schema_one
- table        | schema_one | schema_one.table_three
- type         | schema_one | schema_one.table_three
- type         | schema_one | schema_one.table_three[]
- table        | schema_one | schema_one."table two"
- type         | schema_one | schema_one."table two"
- type         | schema_one | schema_one."table two"[]
  table        | schema_one | schema_one.table_one
  type         | schema_one | schema_one.table_one
  type         | schema_one | schema_one.table_one[]
+ table        | schema_one | schema_one."table two"
+ type         | schema_one | schema_one."table two"
+ type         | schema_one | schema_one."table two"[]
+ table        | schema_one | schema_one.table_three
+ type         | schema_one | schema_one.table_three
+ type         | schema_one | schema_one.table_three[]
 (23 rows)
 
 DROP OWNED BY regress_evt_user;
@@ -359,13 +360,13 @@ DROP INDEX evttrig.one_idx;
 NOTICE:  NORMAL: orig=t normal=f istemp=f type=index identity=evttrig.one_idx name={evttrig,one_idx} args={}
 DROP SCHEMA evttrig CASCADE;
 NOTICE:  drop cascades to 2 other objects
-DETAIL:  drop cascades to table evttrig.two
-drop cascades to table evttrig.one
+DETAIL:  drop cascades to table evttrig.one
+drop cascades to table evttrig.two
 NOTICE:  NORMAL: orig=t normal=f istemp=f type=schema identity=evttrig name={evttrig} args={}
-NOTICE:  NORMAL: orig=f normal=t istemp=f type=table identity=evttrig.two name={evttrig,two} args={}
 NOTICE:  NORMAL: orig=f normal=t istemp=f type=table identity=evttrig.one name={evttrig,one} args={}
 NOTICE:  NORMAL: orig=f normal=t istemp=f type=sequence identity=evttrig.one_col_a_seq name={evttrig,one_col_a_seq} args={}
 NOTICE:  NORMAL: orig=f normal=t istemp=f type=default value identity=for evttrig.one.col_a name={evttrig,one,col_a} args={}
+NOTICE:  NORMAL: orig=f normal=t istemp=f type=table identity=evttrig.two name={evttrig,two} args={}
 DROP TABLE a_temp_tbl;
 NOTICE:  NORMAL: orig=t normal=f istemp=t type=table identity=pg_temp.a_temp_tbl name={pg_temp,a_temp_tbl} args={}
 DROP EVENT TRIGGER regress_event_trigger_report_dropped;

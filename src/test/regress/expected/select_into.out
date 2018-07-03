@@ -46,9 +46,9 @@ CREATE TABLE selinto_schema.tmp3 (a,b,c)
 RESET SESSION AUTHORIZATION;
 DROP SCHEMA selinto_schema CASCADE;
 NOTICE:  drop cascades to 3 other objects
-DETAIL:  drop cascades to table selinto_schema.tmp3
+DETAIL:  drop cascades to table selinto_schema.tmp1
 drop cascades to table selinto_schema.tmp2
-drop cascades to table selinto_schema.tmp1
+drop cascades to table selinto_schema.tmp3
 DROP USER regress_selinto_user;
 -- Tests for WITH NO DATA and column name consistency
 CREATE TABLE ctas_base (i int, j int);

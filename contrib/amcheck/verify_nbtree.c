@@ -46,13 +46,6 @@ PG_MODULE_MAGIC;
 #define InvalidBtreeLevel	((uint32) InvalidBlockNumber)
 
 /*
- * Convenience macro to get number of key attributes in tuple in low-context
- * fashion
- */
-#define BTreeTupleGetNKeyAtts(itup, rel)   \
-	Min(IndexRelationGetNumberOfKeyAttributes(rel), BTreeTupleGetNAtts(itup, rel))
-
-/*
  * State associated with verifying a B-Tree index
  *
  * target is the point of reference for a verification operation.
@@ -132,27 +125,25 @@ static void bt_check_every_level(Relation rel, Relation heaprel,
 static BtreeLevel bt_check_level_from_leftmost(BtreeCheckState *state,
 							 BtreeLevel level);
 static void bt_target_page_check(BtreeCheckState *state);
-static IndexTuple bt_right_page_check_tuple(BtreeCheckState *state);
+static ScanKey bt_right_page_check_scankey(BtreeCheckState *state);
 static void bt_downlink_check(BtreeCheckState *state, BlockNumber childblock,
-				  ScanKey targetkey, ItemPointer scantid, int tupnkeyatts);
+				  ScanKey targetkey);
 static void bt_downlink_missing_check(BtreeCheckState *state);
 static void bt_tuple_present_callback(Relation index, HeapTuple htup,
 						  Datum *values, bool *isnull,
 						  bool tupleIsAlive, void *checkstate);
 static inline bool offset_is_negative_infinity(BTPageOpaque opaque,
 							OffsetNumber offset);
-static inline bool invariant_l_offset(BtreeCheckState *state,
-					 int tupnkeyatts, ScanKey key, ItemPointer scantid,
-					 OffsetNumber upperbound);
 static inline bool invariant_leq_offset(BtreeCheckState *state,
-					 int tupnkeyatts, ScanKey key, ItemPointer scantid,
+					 ScanKey key,
 					 OffsetNumber upperbound);
-static inline bool invariant_g_offset(BtreeCheckState *state,
-					 int tupnkeyatts, ScanKey key, ItemPointer scantid,
+static inline bool invariant_geq_offset(BtreeCheckState *state,
+					 ScanKey key,
 					 OffsetNumber lowerbound);
-static inline bool invariant_l_nontarget_offset(BtreeCheckState *state,
-							   Page other, int tupnkeyatts, ScanKey key,
-							   ItemPointer scantid, OffsetNumber upperbound);
+static inline bool invariant_leq_nontarget_offset(BtreeCheckState *state,
+							   Page other,
+							   ScanKey key,
+							   OffsetNumber upperbound);
 static Page palloc_btree_page(BtreeCheckState *state, BlockNumber blocknum);
 
 /*
@@ -843,10 +834,8 @@ bt_target_page_check(BtreeCheckState *state)
 	{
 		ItemId		itemid;
 		IndexTuple	itup;
-		size_t		tupsize;
-		int			tupnkeyatts;
 		ScanKey		skey;
-		ItemPointer scantid;
+		size_t		tupsize;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -913,17 +902,8 @@ bt_target_page_check(BtreeCheckState *state)
 		if (offset_is_negative_infinity(topaque, offset))
 			continue;
 
-		/*
-		 * Build insertion scankey for current page offset/tuple.
-		 *
-		 * As required by _bt_mkscankey(), track number of key attributes,
-		 * which is needed so that _bt_compare() calls handle truncated
-		 * attributes correctly.  Never count non-key attributes in
-		 * non-truncated tuples as key attributes, though.
-		 */
-		tupnkeyatts = BTreeTupleGetNKeyAtts(itup, state->rel);
+		/* Build insertion scankey for current page offset */
 		skey = _bt_mkscankey(state->rel, itup);
-		scantid = BTreeTupleGetHeapTID(itup);
 
 		/* Fingerprint leaf page tuples (those that point to the heap) */
 		if (state->heapallindexed && P_ISLEAF(topaque) && !ItemIdIsDead(itemid))
@@ -950,7 +930,7 @@ bt_target_page_check(BtreeCheckState *state)
 		 * and probably not markedly more effective in practice.
 		 */
 		if (!P_RIGHTMOST(topaque) &&
-			!invariant_leq_offset(state, tupnkeyatts, skey, scantid, P_HIKEY))
+			!invariant_leq_offset(state, skey, P_HIKEY))
 		{
 			char	   *itid,
 					   *htid;
@@ -976,11 +956,11 @@ bt_target_page_check(BtreeCheckState *state)
 		 * * Item order check *
 		 *
 		 * Check that items are stored on page in logical order, by checking
-		 * current item is strictly less than next item (if any).
+		 * current item is less than or equal to next item (if any).
 		 */
 		if (OffsetNumberNext(offset) <= max &&
-			!invariant_l_offset(state, tupnkeyatts, skey, scantid,
-								OffsetNumberNext(offset)))
+			!invariant_leq_offset(state, skey,
+								  OffsetNumberNext(offset)))
 		{
 			char	   *itid,
 					   *htid,
@@ -1037,28 +1017,16 @@ bt_target_page_check(BtreeCheckState *state)
 		 */
 		else if (offset == max)
 		{
-			IndexTuple	righttup;
 			ScanKey		rightkey;
-			int			righttupnkeyatts;
-			ItemPointer rightscantid;
 
 			/* Get item in next/right page */
-			righttup = bt_right_page_check_tuple(state);
+			rightkey = bt_right_page_check_scankey(state);
 
-			/* Set up right item scankey */
-			if (righttup)
-			{
-				righttupnkeyatts = BTreeTupleGetNKeyAtts(righttup, state->rel);
-				rightkey = _bt_mkscankey(state->rel, righttup);
-				rightscantid = BTreeTupleGetHeapTID(righttup);
-			}
-
-			if (righttup &&
-				!invariant_g_offset(state, righttupnkeyatts, rightkey,
-									rightscantid, max))
+			if (rightkey &&
+				!invariant_geq_offset(state, rightkey, max))
 			{
 				/*
-				 * As explained at length in bt_right_page_check_tuple(),
+				 * As explained at length in bt_right_page_check_scankey(),
 				 * there is a known !readonly race that could account for
 				 * apparent violation of invariant, which we must check for
 				 * before actually proceeding with raising error.  Our canary
@@ -1101,7 +1069,7 @@ bt_target_page_check(BtreeCheckState *state)
 		{
 			BlockNumber childblock = BTreeInnerTupleGetDownLink(itup);
 
-			bt_downlink_check(state, childblock, skey, scantid, tupnkeyatts);
+			bt_downlink_check(state, childblock, skey);
 		}
 	}
 
@@ -1115,9 +1083,9 @@ bt_target_page_check(BtreeCheckState *state)
 }
 
 /*
- * Return an index tuple for an item on page to right of current target (or the
+ * Return a scankey for an item on page to right of current target (or the
  * first non-ignorable page), sufficient to check ordering invariant on last
- * item in current target page.  Returned tuple relies on local memory
+ * item in current target page.  Returned scankey relies on local memory
  * allocated for the child page, which caller cannot pfree().  Caller's memory
  * context should be reset between calls here.
  *
@@ -1130,8 +1098,8 @@ bt_target_page_check(BtreeCheckState *state)
  * Note that !readonly callers must reverify that target page has not
  * been concurrently deleted.
  */
-static IndexTuple
-bt_right_page_check_tuple(BtreeCheckState *state)
+static ScanKey
+bt_right_page_check_scankey(BtreeCheckState *state)
 {
 	BTPageOpaque opaque;
 	ItemId		rightitem;
@@ -1319,10 +1287,11 @@ bt_right_page_check_tuple(BtreeCheckState *state)
 	}
 
 	/*
-	 * Return first real item.  Note that this relies on right page memory
-	 * remaining allocated.
+	 * Return first real item scankey.  Note that this relies on right page
+	 * memory remaining allocated.
 	 */
-	return (IndexTuple) PageGetItem(rightpage, rightitem);
+	return _bt_mkscankey(state->rel,
+						 (IndexTuple) PageGetItem(rightpage, rightitem));
 }
 
 /*
@@ -1336,7 +1305,7 @@ bt_right_page_check_tuple(BtreeCheckState *state)
  */
 static void
 bt_downlink_check(BtreeCheckState *state, BlockNumber childblock,
-				  ScanKey targetkey, ItemPointer scantid, int tupnkeyatts)
+				  ScanKey targetkey)
 {
 	OffsetNumber offset;
 	OffsetNumber maxoffset;
@@ -1385,7 +1354,7 @@ bt_downlink_check(BtreeCheckState *state, BlockNumber childblock,
 
 	/*
 	 * Verify child page has the downlink key from target page (its parent) as
-	 * a lower bound; downlink must be strictly less than all keys on the page.
+	 * a lower bound.
 	 *
 	 * Check all items, rather than checking just the first and trusting that
 	 * the operator class obeys the transitive law.
@@ -1435,14 +1404,14 @@ bt_downlink_check(BtreeCheckState *state, BlockNumber childblock,
 		/*
 		 * Skip comparison of target page key against "negative infinity"
 		 * item, if any.  Checking it would indicate that it's not an upper
-		 * bound, but that's only because of the hard-coding for negative
-		 * inifinity items within _bt_compare().
+		 * bound, but that's only because of the hard-coding within
+		 * _bt_compare().
 		 */
 		if (offset_is_negative_infinity(copaque, offset))
 			continue;
 
-		if (!invariant_l_nontarget_offset(state, child, tupnkeyatts, targetkey,
-										  scantid, offset))
+		if (!invariant_leq_nontarget_offset(state, child,
+											targetkey, offset))
 			ereport(ERROR,
 					(errcode(ERRCODE_INDEX_CORRUPTED),
 					 errmsg("down-link lower bound invariant violated for index \"%s\"",
@@ -1783,51 +1752,6 @@ offset_is_negative_infinity(BTPageOpaque opaque, OffsetNumber offset)
 }
 
 /*
- * Does the invariant hold that the key is strictly less than a given upper
- * bound offset item?
- *
- * If this function returns false, convention is that caller throws error due
- * to corruption.
- */
-static inline bool
-invariant_l_offset(BtreeCheckState *state, int tupnkeyatts, ScanKey key,
-				   ItemPointer scantid, OffsetNumber upperbound)
-{
-	int32		cmp;
-
-	cmp = _bt_compare(state->rel, tupnkeyatts, key, scantid, state->target,
-					  upperbound);
-
-	/*
-	 * _bt_compare interprets the absence of attributes in scan keys as meaning
-	 * that they're not participating in a search, not as negative infinity
-	 * (only tuples within the index are treated as negative infinity).
-	 * Compensate for that here.
-	 */
-	if (cmp == 0)
-	{
-		ItemId		itemid;
-		IndexTuple	ritup;
-		int			uppnkeyatts;
-		ItemPointer rheaptid;
-
-		itemid = PageGetItemId(state->target, upperbound);
-		ritup = (IndexTuple) PageGetItem(state->target, itemid);
-		uppnkeyatts = BTreeTupleGetNKeyAtts(ritup, state->rel);
-
-		/* Get heap TID for item to the right */
-		rheaptid = BTreeTupleGetHeapTID(ritup);
-
-		if (uppnkeyatts == tupnkeyatts)
-			return scantid == NULL && rheaptid != NULL;
-
-		return tupnkeyatts < uppnkeyatts;
-	}
-
-	return cmp < 0;
-}
-
-/*
  * Does the invariant hold that the key is less than or equal to a given upper
  * bound offset item?
  *
@@ -1835,90 +1759,57 @@ invariant_l_offset(BtreeCheckState *state, int tupnkeyatts, ScanKey key,
  * to corruption.
  */
 static inline bool
-invariant_leq_offset(BtreeCheckState *state, int tupnkeyatts, ScanKey key,
-					 ItemPointer scantid, OffsetNumber upperbound)
+invariant_leq_offset(BtreeCheckState *state, ScanKey key,
+					 OffsetNumber upperbound)
 {
+	int16		nkeyatts = IndexRelationGetNumberOfKeyAttributes(state->rel);
 	int32		cmp;
 
-	cmp = _bt_compare(state->rel, tupnkeyatts, key, scantid, state->target,
-					  upperbound);
+	cmp = _bt_compare(state->rel, nkeyatts, key, state->target, upperbound);
 
 	return cmp <= 0;
 }
 
 /*
- * Does the invariant hold that the key is strictly greater than a given lower
- * bound offset item?
+ * Does the invariant hold that the key is greater than or equal to a given
+ * lower bound offset item?
  *
  * If this function returns false, convention is that caller throws error due
  * to corruption.
  */
 static inline bool
-invariant_g_offset(BtreeCheckState *state, int tupnkeyatts, ScanKey key,
-				   ItemPointer scantid, OffsetNumber lowerbound)
+invariant_geq_offset(BtreeCheckState *state, ScanKey key,
+					 OffsetNumber lowerbound)
 {
+	int16		nkeyatts = IndexRelationGetNumberOfKeyAttributes(state->rel);
 	int32		cmp;
 
-	/*
-	 * No need to consider possibility that scankey has attributes that we need
-	 * to force to be interpreted as negative infinity, since scan key has to
-	 * be strictly greater than lower bound offset.
-	 */
-	cmp = _bt_compare(state->rel, tupnkeyatts, key, scantid, state->target,
-					  lowerbound);
+	cmp = _bt_compare(state->rel, nkeyatts, key, state->target, lowerbound);
 
-	return cmp > 0;
+	return cmp >= 0;
 }
 
 /*
- * Does the invariant hold that the key is strictly less than a given upper
+ * Does the invariant hold that the key is less than or equal to a given upper
  * bound offset item, with the offset relating to a caller-supplied page that
- * is not the current target page?
- *
- * Caller's non-target page is a child page of the target, checked as part of
- * checking a property of the target page (i.e.  the key comes from the
- * target).
+ * is not the current target page? Caller's non-target page is typically a
+ * child page of the target, checked as part of checking a property of the
+ * target page (i.e. the key comes from the target).
  *
  * If this function returns false, convention is that caller throws error due
  * to corruption.
  */
 static inline bool
-invariant_l_nontarget_offset(BtreeCheckState *state, Page nontarget,
-							 int tupnkeyatts, ScanKey key, ItemPointer scantid,
-							 OffsetNumber upperbound)
+invariant_leq_nontarget_offset(BtreeCheckState *state,
+							   Page nontarget, ScanKey key,
+							   OffsetNumber upperbound)
 {
+	int16		nkeyatts = IndexRelationGetNumberOfKeyAttributes(state->rel);
 	int32		cmp;
 
-	cmp = _bt_compare(state->rel, tupnkeyatts, key, scantid, nontarget,
-					  upperbound);
+	cmp = _bt_compare(state->rel, nkeyatts, key, nontarget, upperbound);
 
-	/*
-	 * _bt_compare interprets the absence of attributes in scan keys as meaning
-	 * that they're not participating in a search, not as negative infinity
-	 * (only tuples within the index are treated as negative infinity).
-	 * Compensate for that here.
-	 */
-	if (cmp == 0)
-	{
-		ItemId		itemid;
-		IndexTuple	child;
-		int			uppnkeyatts;
-		ItemPointer childheaptid;
-
-		itemid = PageGetItemId(nontarget, upperbound);
-		child = (IndexTuple) PageGetItem(nontarget, itemid);
-		uppnkeyatts = BTreeTupleGetNKeyAtts(child, state->rel);
-
-		/* Get heap TID for item from child/non-target */
-		childheaptid = BTreeTupleGetHeapTID(child);
-
-		if (uppnkeyatts == tupnkeyatts)
-			return scantid == NULL && childheaptid != NULL;
-
-		return tupnkeyatts < uppnkeyatts;
-	}
-
-	return cmp < 0;
+	return cmp <= 0;
 }
 
 /*

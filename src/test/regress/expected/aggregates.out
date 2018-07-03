@@ -942,9 +942,9 @@ select distinct min(f1), max(f1) from minmaxtest;
 
 drop table minmaxtest cascade;
 NOTICE:  drop cascades to 3 other objects
-DETAIL:  drop cascades to table minmaxtest3
+DETAIL:  drop cascades to table minmaxtest1
 drop cascades to table minmaxtest2
-drop cascades to table minmaxtest1
+drop cascades to table minmaxtest3
 -- check for correct detection of nested-aggregate errors
 select max(min(unique1)) from tenk1;
 ERROR:  aggregate function calls cannot be nested

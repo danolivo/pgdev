@@ -668,4 +668,4 @@ SELECT collation for ((SELECT b FROM collate_test1 LIMIT 1));
 --
 \set VERBOSITY terse
 DROP SCHEMA collate_tests CASCADE;
-NOTICE:  drop cascades to 20 other objects
+NOTICE:  drop cascades to 17 other objects

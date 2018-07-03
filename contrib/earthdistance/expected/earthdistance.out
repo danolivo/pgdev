@@ -968,7 +968,7 @@ SELECT abs(cube_distance(ll_to_earth(-30,-90), '(0)'::cube) / earth() - 1) <
 
 drop extension cube;  -- fail, earthdistance requires it
 ERROR:  cannot drop extension cube because other objects depend on it
-DETAIL:  extension earthdistance depends on function cube_out(cube)
+DETAIL:  extension earthdistance depends on extension cube
 HINT:  Use DROP ... CASCADE to drop the dependent objects too.
 drop extension earthdistance;
 drop type cube;  -- fail, extension cube requires it

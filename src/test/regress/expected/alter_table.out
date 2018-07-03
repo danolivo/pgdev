@@ -2672,19 +2672,19 @@ select alter2.plus1(41);
 -- clean up
 drop schema alter2 cascade;
 NOTICE:  drop cascades to 13 other objects
-DETAIL:  drop cascades to text search template alter2.tmpl
-drop cascades to text search dictionary alter2.dict
-drop cascades to text search parser alter2.prs
-drop cascades to text search configuration alter2.cfg
-drop cascades to conversion alter2.ascii_to_utf8
+DETAIL:  drop cascades to table alter2.t1
+drop cascades to view alter2.v1
+drop cascades to function alter2.plus1(integer)
+drop cascades to type alter2.posint
+drop cascades to operator family alter2.ctype_hash_ops for access method hash
 drop cascades to type alter2.ctype
 drop cascades to function alter2.same(alter2.ctype,alter2.ctype)
 drop cascades to operator alter2.=(alter2.ctype,alter2.ctype)
-drop cascades to operator family alter2.ctype_hash_ops for access method hash
-drop cascades to type alter2.posint
-drop cascades to function alter2.plus1(integer)
-drop cascades to table alter2.t1
-drop cascades to view alter2.v1
+drop cascades to conversion alter2.ascii_to_utf8
+drop cascades to text search parser alter2.prs
+drop cascades to text search configuration alter2.cfg
+drop cascades to text search template alter2.tmpl
+drop cascades to text search dictionary alter2.dict
 --
 -- composite types
 --

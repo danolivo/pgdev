@@ -328,10 +328,24 @@ UPDATE ro_view20 SET b=upper(b);
 ERROR:  cannot update view "ro_view20"
 DETAIL:  Views that return set-returning functions are not automatically updatable.
 HINT:  To enable updating the view, provide an INSTEAD OF UPDATE trigger or an unconditional ON UPDATE DO INSTEAD rule.
-\set VERBOSITY terse
 DROP TABLE base_tbl CASCADE;
 NOTICE:  drop cascades to 16 other objects
-\set VERBOSITY default
+DETAIL:  drop cascades to view ro_view1
+drop cascades to view ro_view17
+drop cascades to view ro_view2
+drop cascades to view ro_view3
+drop cascades to view ro_view5
+drop cascades to view ro_view6
+drop cascades to view ro_view7
+drop cascades to view ro_view8
+drop cascades to view ro_view9
+drop cascades to view ro_view11
+drop cascades to view ro_view13
+drop cascades to view rw_view15
+drop cascades to view rw_view16
+drop cascades to view ro_view20
+drop cascades to view ro_view4
+drop cascades to view rw_view14
 DROP VIEW ro_view10, ro_view12, ro_view18;
 DROP SEQUENCE uv_seq CASCADE;
 NOTICE:  drop cascades to view ro_view19
@@ -1042,8 +1056,8 @@ SELECT * FROM base_tbl;
 RESET SESSION AUTHORIZATION;
 DROP TABLE base_tbl CASCADE;
 NOTICE:  drop cascades to 2 other objects
-DETAIL:  drop cascades to view rw_view2
-drop cascades to view rw_view1
+DETAIL:  drop cascades to view rw_view1
+drop cascades to view rw_view2
 -- nested-view permissions
 CREATE TABLE base_tbl(a int, b text, c float);
 INSERT INTO base_tbl VALUES (1, 'Row 1', 1.0);
@@ -1428,8 +1442,8 @@ SELECT events & 4 != 0 AS upd,
 DROP TABLE base_tbl CASCADE;
 NOTICE:  drop cascades to 3 other objects
 DETAIL:  drop cascades to view rw_view1
-drop cascades to view rw_view3
 drop cascades to view rw_view2
+drop cascades to view rw_view3
 -- inheritance tests
 CREATE TABLE base_tbl_parent (a int);
 CREATE TABLE base_tbl_child (CHECK (a > 0)) INHERITS (base_tbl_parent);
@@ -1528,8 +1542,8 @@ SELECT * FROM base_tbl_child ORDER BY a;
 
 DROP TABLE base_tbl_parent, base_tbl_child CASCADE;
 NOTICE:  drop cascades to 2 other objects
-DETAIL:  drop cascades to view rw_view2
-drop cascades to view rw_view1
+DETAIL:  drop cascades to view rw_view1
+drop cascades to view rw_view2
 -- simple WITH CHECK OPTION
 CREATE TABLE base_tbl (a int, b int DEFAULT 10);
 INSERT INTO base_tbl VALUES (1,2), (2,3), (1,-1);
