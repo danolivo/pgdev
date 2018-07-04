@@ -3483,6 +3483,9 @@ pgstat_get_wait_activity(WaitEventActivity w)
 		case WAIT_EVENT_AUTOVACUUM_MAIN:
 			event_name = "AutoVacuumMain";
 			break;
+		case WAIT_EVENT_BGHEAP_MAIN:
+			event_name = "BgHeapMain";
+			break;
 		case WAIT_EVENT_BGWRITER_HIBERNATE:
 			event_name = "BgWriterHibernate";
 			break;
@@ -4110,6 +4113,9 @@ pgstat_get_backend_desc(BackendType backendType)
 			break;
 		case B_BACKEND:
 			backendDesc = "client backend";
+			break;
+		case B_BG_HEAP:
+			backendDesc = "background heap cleaner";
 			break;
 		case B_BG_WORKER:
 			backendDesc = "background worker";
