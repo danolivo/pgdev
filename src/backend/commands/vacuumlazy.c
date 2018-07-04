@@ -41,13 +41,16 @@
 #include "access/heapam_xlog.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/nbtree.h"
 #include "access/transam.h"
 #include "access/visibilitymap.h"
 #include "access/xlog.h"
+#include "catalog/index.h"
 #include "catalog/storage.h"
 #include "commands/dbcommands.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
+#include "executor/executor.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "portability/instr_time.h"
@@ -738,7 +741,7 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 			{
 				bool use_quick_strategy = true; // (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
 
-				if (use_quick_strategy)
+				if (use_quick_strategy && (Irel[i]->rd_amroutine->amtargetdelete != NULL))
 					quick_vacuum_index(Irel[i], onerel, vacrelstats);
 				else
 					lazy_vacuum_index(Irel[i],
@@ -1390,7 +1393,7 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 		{
 			bool use_quick_strategy = true; // (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
 
-			if (use_quick_strategy)
+			if (use_quick_strategy && (Irel[i]->rd_amroutine->amtargetdelete != NULL))
 				quick_vacuum_index(Irel[i], onerel, vacrelstats);
 			else
 				lazy_vacuum_index(Irel[i],
@@ -1697,6 +1700,17 @@ get_tuple_by_tid(Relation rel, ItemPointer tid)
 	ItemId			lp;
 	HeapTuple		tuple;
 
+	bool			needLock = !RELATION_IS_LOCAL(rel);
+	BlockNumber		npages;
+
+	if (needLock)
+		LockRelationForExtension(rel, ExclusiveLock);
+	npages = RelationGetNumberOfBlocks(rel);
+	if (needLock)
+		UnlockRelationForExtension(rel, ExclusiveLock);
+	if (ItemPointerGetBlockNumber(tid) > npages)
+		return NULL;
+
 	buffer = ReadBufferExtended(rel, MAIN_FORKNUM, ItemPointerGetBlockNumber(tid), RBM_NORMAL, NULL);
 	LockBuffer(buffer, BUFFER_LOCK_SHARE);
 
@@ -1730,15 +1744,6 @@ get_tuple_by_tid(Relation rel, ItemPointer tid)
 	return tuple;
 }
 
-#include "access/nbtree.h"
-#include "catalog/index.h"
-#include "executor/executor.h"
-
-static int tid_comparator(const void* a, const void* b)
-{
-	return ItemPointerCompare((ItemPointer)a, (ItemPointer)b);
-}
-
 /*
  *	quick_vacuum_index() -- quick vacuum one index relation.
  *
@@ -1749,86 +1754,76 @@ static void
 quick_vacuum_index(Relation irel, Relation hrel,
 				   LVRelStats *vacrelstats)
 {
-	if (irel->rd_amroutine->amtargetdelete != NULL)
+	int				tnum;
+	bool*			found = palloc0(vacrelstats->num_dead_tuples*sizeof(bool));
+	IndexInfo* 		indexInfo = BuildIndexInfo(irel);
+	EState*			estate = CreateExecutorState();
+	ExprContext*	econtext = GetPerTupleExprContext(estate);
+	ExprState*		predicate = ExecPrepareQual(indexInfo->ii_Predicate, estate);
+	TupleTableSlot*	slot = MakeSingleTupleTableSlot(RelationGetDescr(hrel));
+
+	IndexTargetDeleteResult	stats;
+	IndexTargetDeleteInfo	ivinfo;
+
+	ivinfo.indexRelation = irel;
+	ivinfo.heapRelation = hrel;
+
+	econtext->ecxt_scantuple = slot;
+
+	/* Get tuple from heap */
+	for (tnum = vacrelstats->num_dead_tuples-1; tnum >= 0; tnum--)
 	{
-		int				tnum;
-		bool*			found = palloc0(vacrelstats->num_dead_tuples*sizeof(bool));
-		IndexInfo* 		indexInfo = BuildIndexInfo(irel);
-		EState*			estate = CreateExecutorState();
-		ExprContext*	econtext = GetPerTupleExprContext(estate);
-		ExprState*		predicate = ExecPrepareQual(indexInfo->ii_Predicate, estate);
-		IndexTargetDeleteResult	stats;
-		IndexTargetDeleteInfo	ivinfo;
+		HeapTuple		tuple;
+		Datum			values[INDEX_MAX_KEYS];
+		bool			isnull[INDEX_MAX_KEYS];
 
-		ivinfo.indexRelation = irel;
-		ivinfo.heapRelation = hrel;
-		qsort((void *)vacrelstats->dead_tuples, vacrelstats->num_dead_tuples, sizeof(ItemPointerData), tid_comparator);
-		ivinfo.isSorted = true;
+		/* Index entry for the TID was deleted early */
+		if (found[tnum])
+			continue;
 
-		/* Get tuple from heap */
-		for (tnum = 0; tnum < vacrelstats->num_dead_tuples; tnum++)
+		/* Get a tuple from heap */
+		if ((tuple = get_tuple_by_tid(hrel, &(vacrelstats->dead_tuples[tnum]))) == NULL)
 		{
-			HeapTuple		tuple;
-			TupleTableSlot*	slot;
-			Datum			values[INDEX_MAX_KEYS];
-			bool			isnull[INDEX_MAX_KEYS];
-
-			/* Index entry for the TID was deleted early */
-			if (found[tnum])
-				continue;
-
-			/* Get a tuple from heap */
-			if ((tuple = get_tuple_by_tid(hrel, &(vacrelstats->dead_tuples[tnum]))) == NULL)
-			{
-				/*
-				 * Tuple has 'not used' status.
-				 */
-				found[tnum] = true;
-				continue;
-			}
-
 			/*
-			 * Form values[] and isnull[] arrays from for index tuple
-			 * by heap tuple
+			 * Tuple has 'not used' status.
 			 */
-			slot = MakeSingleTupleTableSlot(RelationGetDescr(hrel));
-			econtext->ecxt_scantuple = slot;
-
-			ExecStoreTuple(tuple, slot, InvalidBuffer, false);
-
-			/*
-			 * In a partial index, ignore tuples that don't satisfy the
-			 * predicate.
-			 */
-			if ((predicate != NULL) && (!ExecQual(predicate, econtext)))
-			{
-				found[tnum] = true;
-				continue;
-			}
-
-			FormIndexDatum(indexInfo, slot, estate, values, isnull);
-
-			ExecDropSingleTupleTableSlot(slot);
-
-			/*
-			 * Make attempt to delete some index entries by one tree descent.
-			 * We use only a part of TID list, which contains not found TID's.
-			 */
-			ivinfo.dead_tuples = &(vacrelstats->dead_tuples[tnum]);
-			ivinfo.num_dead_tuples = vacrelstats->num_dead_tuples-tnum;
-			ivinfo.found_dead_tuples = found+tnum;
-			index_target_delete(&ivinfo, &stats, values, isnull);
+			found[tnum] = true;
+			continue;
 		}
 
-		pfree(found);
-		FreeExecutorState(estate);
-	}
-	else
-	{
-		IndexBulkDeleteResult *stats = NULL;
+		/*
+		 * Form values[] and isnull[] arrays from for index tuple
+		 * by heap tuple
+		 */
+		MemoryContextReset(econtext->ecxt_per_tuple_memory);
 
-		lazy_vacuum_index(irel, &stats, vacrelstats);
+		ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+
+		/*
+		 * In a partial index, ignore tuples that don't satisfy the
+		 * predicate.
+		 */
+		if ((predicate != NULL) && (!ExecQual(predicate, econtext)))
+		{
+			found[tnum] = true;
+			continue;
+		}
+
+		FormIndexDatum(indexInfo, slot, estate, values, isnull);
+
+		/*
+		 * Make attempt to delete some index entries by one tree descent.
+		 * We use only a part of TID list, which contains not found TID's.
+		 */
+		ivinfo.dead_tuples = vacrelstats->dead_tuples;
+		ivinfo.last_dead_tuple = tnum;
+		ivinfo.found_dead_tuples = found;
+		index_target_delete(&ivinfo, &stats, values, isnull);
 	}
+
+	pfree(found);
+	ExecDropSingleTupleTableSlot(slot);
+	FreeExecutorState(estate);
 }
 
 /*
