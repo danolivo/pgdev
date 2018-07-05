@@ -186,6 +186,9 @@ extern void vacuum_set_xid_limits(Relation rel,
 extern void vac_update_datfrozenxid(void);
 extern void vacuum_delay_point(void);
 
+extern void quick_vacuum_index(Relation irel, Relation hrel,
+		   ItemPointer dead_tuples,
+		   int num_dead_tuples);
 /* in commands/vacuumlazy.c */
 extern void lazy_vacuum_rel(Relation onerel, int options,
 				VacuumParams *params, BufferAccessStrategy bstrategy);

@@ -22,6 +22,7 @@
 #include "catalog/catalog.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "postmaster/bgheap.h"
 #include "storage/bufmgr.h"
 #include "utils/snapmgr.h"
 #include "utils/rel.h"

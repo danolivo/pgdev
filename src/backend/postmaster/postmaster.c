@@ -5500,7 +5500,7 @@ static int
 StartBgHeapWorker(void)
 {
 	Backend    *bn;
-
+return 0;
 	/*
 	 * If not in condition to run a process, don't try, but handle it like a
 	 * fork failure.  This does not normally happen, since the signal is only

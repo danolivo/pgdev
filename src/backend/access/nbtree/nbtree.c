@@ -932,11 +932,14 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 
 	/* To prepare tuple entries search across index pages */
 	Assert(BufferIsValid(buf));
+//	_bt_relbuf(irel, buf);
+//	LockBufferForCleanup(buf);
+//	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 	offnum = _bt_binsrch(irel, buf, keysCount, skey, &info->dead_tuples[pos], false);
 	page = BufferGetPage(buf);
 	_bt_checkpage(irel, buf);
 	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
-
+//	elog(LOG, "index_target_delete");
 	for (;;)
 	{
 		int32		cmpval;
@@ -952,9 +955,10 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 			 */
 			if (ndeletable > 0)
 			{
+				/* trade in our read lock for a write lock */
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-				LockBufferForCleanup(buf);
-
+//				LockBuffer(buf, BT_WRITE);
+				while (!ConditionalLockBufferForCleanup(buf)) pg_usleep(10);
 				_bt_delitems_delete(irel, buf, deletable, ndeletable, hrel);
 
 				stats->tuples_removed += ndeletable;
@@ -1025,20 +1029,22 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 
 		offnum = OffsetNumberNext(offnum);
 	}
-
+//	elog(LOG, "index_target_delete end");
 	/*
 	 * Delete all found index tuples
 	 */
 	if (ndeletable > 0)
 	{
+		/* trade in our read lock for a write lock */
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-		LockBufferForCleanup(buf);
-
+		while (!ConditionalLockBufferForCleanup(buf)) pg_usleep(10);
+//		LockBuffer(buf, BT_WRITE);
+//		elog(LOG, "index_target_delete end-1");
 		_bt_delitems_delete(irel, buf, deletable, ndeletable, hrel);
-
+//		elog(LOG, "index_target_delete end-1.2");
 		stats->tuples_removed += ndeletable;
 	}
-
+//	elog(LOG, "index_target_delete end-2");
 	/* Release stack, scan key, unpin and unlock buffer */
 	_bt_freestack(stack);
 	_bt_freeskey(skey);
