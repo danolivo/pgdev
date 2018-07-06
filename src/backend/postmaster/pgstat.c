@@ -2833,6 +2833,11 @@ pgstat_bestart(void)
 			/* Autovacuum Worker */
 			beentry->st_backendType = B_AUTOVAC_WORKER;
 		}
+		else if (IsBgHeapCleanerProcess())
+		{
+			/* Autovacuum Worker */
+			beentry->st_backendType = B_BG_HEAP;
+		}
 		else if (am_walsender)
 		{
 			/* Wal sender */

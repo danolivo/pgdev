@@ -359,6 +359,8 @@ bool		redirection_done = false;	/* stderr redirected for syslogger? */
 /* received START_AUTOVAC_LAUNCHER signal */
 static volatile sig_atomic_t start_autovac_launcher = false;
 
+static volatile sig_atomic_t start_bgheap_cleaner = false;
+
 /* the launcher needs to be signalled to communicate some condition */
 static volatile bool avlauncher_needs_signal = false;
 
@@ -1787,9 +1789,13 @@ ServerLoop(void)
 		if (StartWorkerNeeded || HaveCrashedWorker)
 			maybe_start_bgworkers();
 
-		if (!IsBinaryUpgrade && BgHeapPID == 0 && pmState == PM_RUN)
+		/* If we have lost the background heap cleaner, try to start a new one. */
+		if (!IsBinaryUpgrade && BgHeapPID == 0 && pmState == PM_RUN )
+		{
 			BgHeapPID = StartBgHeapWorker();
-
+			if (BgHeapPID != 0)
+				start_bgheap_cleaner = false;
+		}
 #ifdef HAVE_PTHREAD_IS_THREADED_NP
 
 		/*
@@ -2549,6 +2555,8 @@ SIGHUP_handler(SIGNAL_ARGS)
 			signal_child(WalReceiverPID, SIGHUP);
 		if (AutoVacPID != 0)
 			signal_child(AutoVacPID, SIGHUP);
+		if (BgHeapPID != 0)
+			signal_child(BgHeapPID, SIGHUP);
 		if (PgArchPID != 0)
 			signal_child(PgArchPID, SIGHUP);
 		if (SysLoggerPID != 0)
@@ -2695,7 +2703,7 @@ pmdie(SIGNAL_ARGS)
 				signal_child(WalReceiverPID, SIGTERM);
 			if (pmState == PM_RECOVERY)
 			{
-				SignalSomeChildren(SIGTERM, BACKEND_TYPE_BGWORKER);
+				SignalSomeChildren(SIGTERM, BACKEND_TYPE_BGWORKER /*| BACKEND_TYPE_BGHEAP*/);
 
 				/*
 				 * Only startup, bgwriter, walreceiver, possibly bgworkers,
@@ -2716,7 +2724,7 @@ pmdie(SIGNAL_ARGS)
 				/* shut down all backends and workers */
 				SignalSomeChildren(SIGTERM,
 								   BACKEND_TYPE_NORMAL | BACKEND_TYPE_AUTOVAC |
-								   BACKEND_TYPE_BGWORKER | BACKEND_TYPE_BGHEAP);
+								   BACKEND_TYPE_BGWORKER  | BACKEND_TYPE_BGHEAP);
 				/* and the autovac launcher too */
 				if (AutoVacPID != 0)
 					signal_child(AutoVacPID, SIGTERM);
@@ -3019,7 +3027,16 @@ reaper(SIGNAL_ARGS)
 								 _("autovacuum launcher process"));
 			continue;
 		}
-
+/*		if (pid == BgHeapPID)
+		{
+//			signal_child(BgHeapPID, (SIGQUIT));
+			BgHeapPID = 0;
+	//		if (!EXIT_STATUS_0(exitstatus) && !EXIT_STATUS_1(exitstatus))
+				HandleChildCrash(pid, exitstatus,
+								 _("bgheap process"));
+			continue;
+		}
+*/
 		/*
 		 * Was it the archiver?  If so, just try to start a new one; no need
 		 * to force reset of the rest of the system.  (If fail, we'll try
@@ -3244,6 +3261,8 @@ CleanupBackend(int pid,
 
 		if (bp->pid == pid)
 		{
+			if (pid == BgHeapPID)
+				BgHeapPID = 0;
 			if (!bp->dead_end)
 			{
 				if (!ReleasePostmasterChildSlot(bp->child_slot))
@@ -3485,6 +3504,15 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 		signal_child(AutoVacPID, (SendStop ? SIGSTOP : SIGQUIT));
 	}
 
+	if (BgHeapPID != 0 && take_action)
+	{
+		ereport(DEBUG2,
+				(errmsg_internal("sending %s to process %d",
+								 "SIGQUIT",
+								 (int) BgHeapPID)));
+		signal_child(BgHeapPID, SIGQUIT);
+	}
+
 	/*
 	 * Force a power-cycle of the pgarch process too.  (This isn't absolutely
 	 * necessary, but it seems like a good idea for robustness, and it
@@ -3519,8 +3547,10 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 	/* We do NOT restart the syslogger */
 
 	if (Shutdown != ImmediateShutdown)
+	{
 		FatalError = true;
-
+		elog(LOG, "---- Shutdown = %d ----", Shutdown);
+	}
 	/* We now transit into a state of waiting for children to die */
 	if (pmState == PM_RECOVERY ||
 		pmState == PM_HOT_STANDBY ||
@@ -3769,6 +3799,7 @@ PostmasterStateMachine(void)
 			Assert(CheckpointerPID == 0);
 			Assert(WalWriterPID == 0);
 			Assert(AutoVacPID == 0);
+//			Assert(BgHeapPID == 0);
 			/* syslogger is not considered here */
 			pmState = PM_NO_CHILDREN;
 		}
@@ -5154,7 +5185,12 @@ sigusr1_handler(SIGNAL_ARGS)
 		/* The autovacuum launcher wants us to start a worker process. */
 		StartAutovacuumWorker();
 	}
-
+	if (CheckPostmasterSignal(PMSIGNAL_START_BGHEAP) &&
+			Shutdown == NoShutdown)
+		{
+			/* The autovacuum launcher wants us to start a worker process. */
+			start_bgheap_cleaner = true;
+		}
 	if (CheckPostmasterSignal(PMSIGNAL_START_WALRECEIVER))
 	{
 		/* Startup Process wants us to start the walreceiver process. */
@@ -5500,7 +5536,7 @@ static int
 StartBgHeapWorker(void)
 {
 	Backend    *bn;
-return 0;
+
 	/*
 	 * If not in condition to run a process, don't try, but handle it like a
 	 * fork failure.  This does not normally happen, since the signal is only
@@ -5535,6 +5571,7 @@ return 0;
 			bn->bgworker_notify = false;
 
 			bn->pid = StartBgHeapCleaner();
+
 			if (bn->pid > 0)
 			{
 				bn->bkend_type = BACKEND_TYPE_BGHEAP;
