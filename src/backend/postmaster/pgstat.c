@@ -48,6 +48,7 @@
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "postmaster/autovacuum.h"
+#include "postmaster/bgheap.h"
 #include "postmaster/fork_process.h"
 #include "postmaster/postmaster.h"
 #include "replication/walsender.h"
@@ -2833,10 +2834,13 @@ pgstat_bestart(void)
 			/* Autovacuum Worker */
 			beentry->st_backendType = B_AUTOVAC_WORKER;
 		}
-		else if (IsBgHeapCleanerProcess())
+		else if (IsHeapCleanerLauncherProcess())
 		{
-			/* Autovacuum Worker */
-			beentry->st_backendType = B_BG_HEAP;
+			beentry->st_backendType = B_BG_HEAPCLNR_LAUNCHER;
+		}
+		else if (IsHeapCleanerWorkerProcess())
+		{
+			beentry->st_backendType = B_BG_HEAPCLNR_WORKER;
 		}
 		else if (am_walsender)
 		{
@@ -4116,11 +4120,14 @@ pgstat_get_backend_desc(BackendType backendType)
 		case B_AUTOVAC_WORKER:
 			backendDesc = "autovacuum worker";
 			break;
+		case B_BG_HEAPCLNR_LAUNCHER:
+			backendDesc = "background heap cleaner launcher";
+			break;
+		case B_BG_HEAPCLNR_WORKER:
+			backendDesc = "background heap cleaner worker";
+			break;
 		case B_BACKEND:
 			backendDesc = "client backend";
-			break;
-		case B_BG_HEAP:
-			backendDesc = "background heap cleaner";
 			break;
 		case B_BG_WORKER:
 			backendDesc = "background worker";

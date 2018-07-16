@@ -165,7 +165,7 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 		/* And release buffer lock */
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 		if (IsPruned && relation->rd_node.dbNode != 0)
-			relcleaner_send_block(relation->rd_node, BufferGetBlockNumber(buffer));
+			HeapCleanerSend(relation, BufferGetBlockNumber(buffer));
 	}
 }
 

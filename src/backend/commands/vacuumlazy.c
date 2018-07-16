@@ -1765,11 +1765,13 @@ quick_vacuum_index(Relation irel, Relation hrel,
 	IndexTargetDeleteResult	stats;
 	IndexTargetDeleteInfo	ivinfo;
 
+	stats.tuples_removed = 0;
 	ivinfo.indexRelation = irel;
 	ivinfo.heapRelation = hrel;
 
 	econtext->ecxt_scantuple = slot;
 
+	memset(found, 0, MaxOffsetNumber*sizeof(bool));
 	/* Get tuple from heap */
 	for (tnum = num_dead_tuples-1; tnum >= 0; tnum--)
 	{
@@ -1788,6 +1790,7 @@ quick_vacuum_index(Relation irel, Relation hrel,
 			 * Tuple has 'not used' status.
 			 */
 			found[tnum] = true;
+			elog(LOG, "---> get_tuple_by_tid == NULL");
 			continue;
 		}
 
@@ -1806,6 +1809,7 @@ quick_vacuum_index(Relation irel, Relation hrel,
 		if ((predicate != NULL) && (!ExecQual(predicate, econtext)))
 		{
 			found[tnum] = true;
+			elog(LOG, "---> PREDICATE");
 			continue;
 		}
 
@@ -1821,7 +1825,12 @@ quick_vacuum_index(Relation irel, Relation hrel,
 
 		index_target_delete(&ivinfo, &stats, values, isnull);
 	}
-
+	{
+		FILE *f=fopen("/home/andrey/test.log", "a+");
+		fprintf(f, "del: %d (%d) -> %s\n", stats.tuples_removed, num_dead_tuples, RelationGetRelationName(irel));
+		fclose(f);
+	}
+	elog(LOG, "del: %d (%d) -> %s", stats.tuples_removed, num_dead_tuples, RelationGetRelationName(irel));
 	ExecDropSingleTupleTableSlot(slot);
 	FreeExecutorState(estate);
 }

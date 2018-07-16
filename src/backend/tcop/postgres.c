@@ -56,6 +56,7 @@
 #include "parser/parser.h"
 #include "pg_getopt.h"
 #include "postmaster/autovacuum.h"
+#include "postmaster/bgheap.h"
 #include "postmaster/postmaster.h"
 #include "replication/logicallauncher.h"
 #include "replication/logicalworker.h"
@@ -2889,7 +2890,7 @@ ProcessInterrupts(void)
 			ereport(FATAL,
 					(errcode(ERRCODE_ADMIN_SHUTDOWN),
 					 errmsg("terminating autovacuum process due to administrator command")));
-		else if (IsBgHeapCleanerProcess())
+		else if (IsHeapCleanerWorkerProcess())
 					ereport(FATAL,
 							(errcode(ERRCODE_ADMIN_SHUTDOWN),
 							 errmsg("terminating bgheap process due to administrator command")));
@@ -3021,12 +3022,12 @@ ProcessInterrupts(void)
 					(errcode(ERRCODE_QUERY_CANCELED),
 					 errmsg("canceling autovacuum task")));
 		}
-		if (IsBgHeapCleanerProcess())
+		if (IsHeapCleanerWorkerProcess())
 		{
 			LockErrorCleanup();
 			ereport(ERROR,
 					(errcode(ERRCODE_QUERY_CANCELED),
-					 errmsg("canceling bgheap task")));
+					 errmsg("canceling bgheap worker task")));
 		}
 		if (RecoveryConflictPending)
 		{
