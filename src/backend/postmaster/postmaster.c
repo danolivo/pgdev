@@ -669,10 +669,10 @@ PostmasterMain(int argc, char *argv[])
 	pqsignal(SIGXFSZ, SIG_IGN); /* ignored */
 #endif
 	{
-		FILE *f = fopen("/home/andrey/test.log", "wt");
+		FILE *f = fopen("/home/andrey/test.log", "at");
 		fprintf(f, "Begin Test\n");
 		fclose(f);
-		f = fopen("/home/andrey/test1.log", "wt");
+		f = fopen("/home/andrey/test1.log", "at");
 		fprintf(f, "Begin Test\n");
 		fclose(f);
 	}
