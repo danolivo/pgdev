@@ -30,7 +30,8 @@
 #include "access/nbtree.h"
 #include "access/xact.h"
 #include "access/xlog.h"
-#include "catalog/pg_class.h"
+#include "catalog/catalog.h"
+//#include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/index.h"
@@ -58,7 +59,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
-#include "utils/relcache.h"
+//#include "utils/relcache.h"
 #include "utils/resowner.h"
 #include "utils/syscache.h"
 #include "utils/timeout.h"
@@ -131,8 +132,8 @@ static volatile sig_atomic_t got_SIGHUP = false;
 static volatile sig_atomic_t got_SIGTERM = false;
 static volatile sig_atomic_t got_SIGUSR2 = false;
 
-NON_EXEC_STATIC pgsocket RelCleanerSock = PGINVALID_SOCKET;
-static struct sockaddr_storage pgStatAddr;
+NON_EXEC_STATIC pgsocket HeapCleanerSock = PGINVALID_SOCKET;
+static struct sockaddr_storage HeapCleanerSockAddr;
 
 static int TrancheId;
 
@@ -301,7 +302,7 @@ HeapCleanerInit()
 			ereport(LOG,
 					(errmsg("trying another address for the statistics collector")));
 
-		if ((RelCleanerSock = socket(addr->ai_family, SOCK_DGRAM, 0)) == PGINVALID_SOCKET)
+		if ((HeapCleanerSock = socket(addr->ai_family, SOCK_DGRAM, 0)) == PGINVALID_SOCKET)
 		{
 			ereport(LOG,
 					(errcode_for_socket_access(),
@@ -309,34 +310,34 @@ HeapCleanerInit()
 			continue;
 		}
 
-		if (bind(RelCleanerSock, addr->ai_addr, addr->ai_addrlen) < 0)
+		if (bind(HeapCleanerSock, addr->ai_addr, addr->ai_addrlen) < 0)
 		{
 			ereport(LOG,
 					(errcode_for_socket_access(),
 					 errmsg("could not bind socket for relation cleaner: %m")));
-			closesocket(RelCleanerSock);
-			RelCleanerSock = PGINVALID_SOCKET;
+			closesocket(HeapCleanerSock);
+			HeapCleanerSock = PGINVALID_SOCKET;
 			continue;
 		}
 
-		alen = sizeof(pgStatAddr);
-		if (getsockname(RelCleanerSock, (struct sockaddr *) &pgStatAddr, &alen) < 0)
+		alen = sizeof(HeapCleanerSockAddr);
+		if (getsockname(HeapCleanerSock, (struct sockaddr *) &HeapCleanerSockAddr, &alen) < 0)
 		{
 			ereport(LOG,
 					(errcode_for_socket_access(),
 					 errmsg("could not get address of socket for statistics collector: %m")));
-			closesocket(RelCleanerSock);
-			RelCleanerSock = PGINVALID_SOCKET;
+			closesocket(HeapCleanerSock);
+			HeapCleanerSock = PGINVALID_SOCKET;
 			continue;
 		}
 
-		if (connect(RelCleanerSock, (struct sockaddr *) &pgStatAddr, alen) < 0)
+		if (connect(HeapCleanerSock, (struct sockaddr *) &HeapCleanerSockAddr, alen) < 0)
 		{
 			ereport(LOG,
 					(errcode_for_socket_access(),
 					 errmsg("could not connect socket for statistics collector: %m")));
-			closesocket(RelCleanerSock);
-			RelCleanerSock = PGINVALID_SOCKET;
+			closesocket(HeapCleanerSock);
+			HeapCleanerSock = PGINVALID_SOCKET;
 			continue;
 		}
 		/*
@@ -348,15 +349,15 @@ HeapCleanerInit()
 		test_byte = TESTBYTEVAL;
 
 retry1:
-		if (send(RelCleanerSock, &test_byte, 1, 0) != 1)
+		if (send(HeapCleanerSock, &test_byte, 1, 0) != 1)
 		{
 			if (errno == EINTR)
 				goto retry1;	/* if interrupted, just retry */
 			ereport(LOG,
 					(errcode_for_socket_access(),
 					 errmsg("could not send test message on socket for statistics collector: %m")));
-			closesocket(RelCleanerSock);
-			RelCleanerSock = PGINVALID_SOCKET;
+			closesocket(HeapCleanerSock);
+			HeapCleanerSock = PGINVALID_SOCKET;
 			continue;
 		}
 
@@ -368,11 +369,11 @@ retry1:
 		for (;;)				/* need a loop to handle EINTR */
 		{
 			FD_ZERO(&rset);
-			FD_SET(RelCleanerSock, &rset);
+			FD_SET(HeapCleanerSock, &rset);
 
 			tv.tv_sec = 0;
 			tv.tv_usec = 500000;
-			sel_res = select(RelCleanerSock + 1, &rset, NULL, NULL, &tv);
+			sel_res = select(HeapCleanerSock + 1, &rset, NULL, NULL, &tv);
 			if (sel_res >= 0 || errno != EINTR)
 				break;
 		}
@@ -381,11 +382,11 @@ retry1:
 			ereport(LOG,
 					(errcode_for_socket_access(),
 					 errmsg("select() failed in statistics collector: %m")));
-			closesocket(RelCleanerSock);
-			RelCleanerSock = PGINVALID_SOCKET;
+			closesocket(HeapCleanerSock);
+			HeapCleanerSock = PGINVALID_SOCKET;
 			continue;
 		}
-		if (sel_res == 0 || !FD_ISSET(RelCleanerSock, &rset))
+		if (sel_res == 0 || !FD_ISSET(HeapCleanerSock, &rset))
 		{
 			/*
 			 * This is the case we actually think is likely, so take pains to
@@ -396,23 +397,23 @@ retry1:
 			ereport(LOG,
 					(errcode(ERRCODE_CONNECTION_FAILURE),
 					 errmsg("test message did not get through on socket for statistics collector")));
-			closesocket(RelCleanerSock);
-			RelCleanerSock = PGINVALID_SOCKET;
+			closesocket(HeapCleanerSock);
+			HeapCleanerSock = PGINVALID_SOCKET;
 			continue;
 		}
 
 		test_byte++;			/* just make sure variable is changed */
 
 retry2:
-		if (recv(RelCleanerSock, &test_byte, 1, 0) != 1)
+		if (recv(HeapCleanerSock, &test_byte, 1, 0) != 1)
 		{
 			if (errno == EINTR)
 				goto retry2;	/* if interrupted, just retry */
 			ereport(LOG,
 					(errcode_for_socket_access(),
 					 errmsg("could not receive test message on socket for statistics collector: %m")));
-			closesocket(RelCleanerSock);
-			RelCleanerSock = PGINVALID_SOCKET;
+			closesocket(HeapCleanerSock);
+			HeapCleanerSock = PGINVALID_SOCKET;
 			continue;
 		}
 
@@ -421,8 +422,8 @@ retry2:
 			ereport(LOG,
 					(errcode(ERRCODE_INTERNAL_ERROR),
 					 errmsg("incorrect test message transmission on socket for statistics collector")));
-			closesocket(RelCleanerSock);
-			RelCleanerSock = PGINVALID_SOCKET;
+			closesocket(HeapCleanerSock);
+			HeapCleanerSock = PGINVALID_SOCKET;
 			continue;
 		}
 
@@ -432,7 +433,7 @@ retry2:
 	}
 
 	/* Did we find a working address? */
-	if (!addr || RelCleanerSock == PGINVALID_SOCKET)
+	if (!addr || HeapCleanerSock == PGINVALID_SOCKET)
 		goto startup_failed;
 
 	/*
@@ -440,7 +441,7 @@ retry2:
 	 * falls behind, statistics messages will be discarded; backends won't
 	 * block waiting to send messages to the collector.
 	 */
-	if (!pg_set_noblock(RelCleanerSock))
+	if (!pg_set_noblock(HeapCleanerSock))
 	{
 		ereport(LOG,
 				(errcode_for_socket_access(),
@@ -458,9 +459,9 @@ startup_failed:
 	if (addrs)
 		pg_freeaddrinfo_all(hints.ai_family, addrs);
 
-	if (RelCleanerSock != PGINVALID_SOCKET)
-		closesocket(RelCleanerSock);
-	RelCleanerSock = PGINVALID_SOCKET;
+	if (HeapCleanerSock != PGINVALID_SOCKET)
+		closesocket(HeapCleanerSock);
+	HeapCleanerSock = PGINVALID_SOCKET;
 }
 
 /*
@@ -584,7 +585,7 @@ HeapCleanerLauncherMain(int argc, char *argv[])
 
 	WaitingList = palloc((heapcleaner_max_workers+1) * sizeof(dlist_head));
 	on_shmem_exit(FreeLauncherInfo, 0);
-
+elog(LOG, "-> Launcher Started!");
 	main_launcher_loop();
 
 	proc_exit(0);
@@ -653,6 +654,78 @@ HeapCleanerShmemSize(void)
 	return size;
 }
 
+#define BLOCKS_TABLE_ITEMS_MAX	(10)
+
+typedef struct CleanerMessagesHashTable
+{
+	int order;
+	CleanerMessage msg;
+} CleanerMessagesHashTable;
+static CleanerMessagesHashTable	htblocks[BLOCKS_TABLE_ITEMS_MAX];
+static int records_num = -1;
+
+static void clean_blocks_table(void)
+{
+	memset(htblocks, 0, BLOCKS_TABLE_ITEMS_MAX*sizeof(CleanerMessagesHashTable));
+	records_num = 0;
+}
+
+static bool
+isEqualMsgs(CleanerMessage *msg1, CleanerMessage *msg2)
+{
+	if (msg1->blkno != msg2->blkno)
+		return false;
+	if (msg1->relid != msg2->relid)
+		return false;
+	if (msg1->dbNode != msg2->dbNode)
+		return false;
+	if (msg1->spcNode != msg2->spcNode)
+		return false;
+
+	return true;
+}
+
+static bool
+hash_blocks(CleanerMessage *msg)
+{
+	int position = msg->blkno%BLOCKS_TABLE_ITEMS_MAX;
+
+	if (records_num < 0)
+		clean_blocks_table();
+
+	Assert(records_num < BLOCKS_TABLE_ITEMS_MAX);
+
+	/* Search for new position of msg or duplicate */
+	for (;;)
+	{
+		if (htblocks[position].order == 0)
+		{
+			/* Position found */
+			htblocks[position].msg = *msg;
+			htblocks[position].order = ++records_num;
+/*			{
+				FILE *f = fopen("/home/andrey/test.log", "a+");
+				fprintf(f, "position: %d %d %d %d\n", htblocks[position].msg.blkno, htblocks[position].msg.dbNode,  htblocks[position].msg.relid, htblocks[position].msg.spcNode);
+				fprintf(f, "p--> %d %d %d %d\n", msg->blkno, msg->dbNode, msg->relid, msg->spcNode);
+				fclose(f);
+			} */
+			if ((double)(BLOCKS_TABLE_ITEMS_MAX-records_num)/BLOCKS_TABLE_ITEMS_MAX < 0.25)
+			{
+				return true;
+			}
+		}
+
+		if (isEqualMsgs(&htblocks[position].msg, msg))
+		{
+			/* found full duplicate */
+			return false;
+		}
+		position = (position+1)%BLOCKS_TABLE_ITEMS_MAX;
+	}
+
+	return false;
+}
+
 /*
  * Send a dirty block of relation to Heap cleaner launcher
  */
@@ -664,8 +737,11 @@ HeapCleanerSend(Relation relation, BlockNumber blkno)
 
 	if (RecoveryInProgress())
 			return;
+//elog(LOG, "-> Send!");
+	if (HeapCleanerSock == PGINVALID_SOCKET)
+		return;
 
-	if (RelCleanerSock == PGINVALID_SOCKET)
+	if (IsSystemRelation(relation))
 		return;
 
 	msg.relid = RelationGetRelid(relation);
@@ -673,11 +749,45 @@ HeapCleanerSend(Relation relation, BlockNumber blkno)
 	msg.spcNode = relation->rd_node.spcNode;
 	msg.blkno = blkno;
 
-	/* We'll retry after EINTR, but ignore all other failures */
-	do
+	if (hash_blocks(&msg))
 	{
-		rc = send(RelCleanerSock, &msg, sizeof(CleanerMessage), 0);
-	} while (rc < 0 && errno == EINTR);
+		CleanerMessagesHashTable	*htptr;
+		CleanerMessage				data[BLOCKS_TABLE_ITEMS_MAX];
+		int							nitems = records_num;
+
+		Assert(nitems <= BLOCKS_TABLE_ITEMS_MAX);
+
+		for (htptr = htblocks; records_num > 0; htptr++)
+		{
+			if (htptr->order != 0)
+			{
+				data[htptr->order-1] = htptr->msg;
+//				{
+//					FILE *f = fopen("/home/andrey/test.log", "a+");
+//					fprintf(f, "Add to package: %d %d %d (order=%d)\n", data[htptr->order-1].blkno, data[htptr->order-1].dbNode, data[htptr->order-1].relid, htptr->order);
+//					fprintf(f, "->: %d %d %d (order=%d)\n", htptr->msg.blkno, htptr->msg.dbNode, htptr->msg.relid, htptr->order);
+//					fclose(f);
+//				}
+				htptr->order = 0;
+				records_num--;
+//				elog(LOG, "Add to send %d %d %d %d", htptr->order, data[htptr->order].blkno, data[htptr->order].dbNode, data[htptr->order].relid);
+			}
+		}
+		{
+//			FILE *f = fopen("/home/andrey/test.log", "a+");
+//			fprintf(f, "Send %d records\n", nitems);
+//			fclose(f);
+		}
+		/* Send data to launcher.
+		 * We'll retry after EINTR, but ignore all other failures
+		 */
+		do
+		{
+			rc = send(HeapCleanerSock, data, nitems*sizeof(CleanerMessage), 0);
+		} while (rc < 0 && errno == EINTR);
+	} else
+		return;
+
 }
 
 /*
@@ -758,7 +868,7 @@ HeapCleanerWorkerMain(int argc, char *argv[])
 		main_worker_loop();
 	}
 	else
-		elog(ERROR, "dbid not valid!");
+		elog(ERROR, "dbid %d not valid!", MyWorkerInfo->dbOid);
 
 	proc_exit(0);
 }
@@ -794,38 +904,43 @@ index_cleanup(Oid spcNode, Oid relid, BlockNumber blkno)
 	if (RecoveryInProgress())
 		return;
 
-	StartTransactionCommand();
-	PushActiveSnapshot(GetTransactionSnapshot());
-
 	CHECK_FOR_INTERRUPTS();
 
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	elog(LOG, "-> Worker cleanup: spcNode=%d relid=%d blkno=%d", spcNode, relid, blkno);
 	/*
-	 * At this point relation relation availability is not guaranteed.
+	 * At this point relation availability is not guaranteed.
 	 * Make safe test to check this.
 	 */
-	if (ConditionalLockRelationOid(relid, lmode))
+//	if (ConditionalLockRelationOid(relid, lmode))
 		heapRelation = try_relation_open(relid, AccessExclusiveLock);
-	else
-		heapRelation = NULL;
+//	else
+//	{
+//		heapRelation = NULL;
+//		elog(LOG, "Cleanup: UnSuccessful lock");
+//	}
 
 	if (!heapRelation)
 	{
+		elog(LOG, "Cleanup: UnSuccessful opening");
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 		return;
 	}
-
+	elog(LOG, "Cleanup: Success lock");
 	/* Now we not clean system tables because it will induce some
 	 * random stdout logging and we need to change regression tests
 	 * (it is frequently seen on DROP CASCADE operations)
 	 */
-	if (IsSystemNamespace(heapRelation->rd_rel->relnamespace))
+/*	if (IsSystemNamespace(heapRelation->rd_rel->relnamespace) || IsSystemRelation(heapRelation) || IsCatalogRelation(heapRelation))
 	{
 		relation_close(heapRelation, lmode);
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 		return;
-	}
+	} */
+//	elog(LOG, "Cleanup timestamp: %s rel=%s", timestamptz_to_str(GetCurrentTimestamp()), RelationGetRelationName(heapRelation));
 	/*
 	 * Check relation type similarly vacuum
 	 */
@@ -882,6 +997,12 @@ index_cleanup(Oid spcNode, Oid relid, BlockNumber blkno)
 
 	onerelid = heapRelation->rd_lockInfo.lockRelId;
 	LockRelationIdForSession(&onerelid, lmode);
+	relation_close(heapRelation, NoLock);
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+	heapRelation = try_relation_open(relid, AccessExclusiveLock);
 
 	needLock = !RELATION_IS_LOCAL(heapRelation);
 	if (needLock)
@@ -889,8 +1010,8 @@ index_cleanup(Oid spcNode, Oid relid, BlockNumber blkno)
 	nblocks = RelationGetNumberOfBlocks(heapRelation);
 	if (needLock)
 		UnlockRelationForExtension(heapRelation, ExclusiveLock);
-
-	if (blkno > nblocks)
+elog(LOG, "Cleaner: blkno=%d nblocks=%d", blkno, nblocks);
+	if (blkno >= nblocks)
 	{
 		relation_close(heapRelation, lmode);
 		UnlockRelationIdForSession(&onerelid, lmode);
@@ -938,7 +1059,12 @@ index_cleanup(Oid spcNode, Oid relid, BlockNumber blkno)
 							num_dead_tuples);
 
 	}
-
+	if (nindexes == 0)
+	{
+		FILE *f=fopen("/home/andrey/test.log", "a+");
+		fprintf(f, "NO INDEX\n");
+		fclose(f);
+	}
 	vac_close_indexes(nindexes, IndexRelations, NoLock);
 
 	/* Roll back any GUC changes executed by index functions */
@@ -970,7 +1096,11 @@ index_cleanup(Oid spcNode, Oid relid, BlockNumber blkno)
 			ItemIdSetUnused(lp);
 			unusable[nunusable++] = offnum;
 		}
-
+		{
+			FILE *f=fopen("/home/andrey/test.log", "a+");
+			fprintf(f, "heap del: %d (%d) -> %s\n", nunusable, num_dead_tuples, RelationGetRelationName(heapRelation));
+			fclose(f);
+		}
 		if (nunusable > 0)
 		{
 			XLogRecPtr	recptr;
@@ -993,6 +1123,11 @@ index_cleanup(Oid spcNode, Oid relid, BlockNumber blkno)
 
 		END_CRIT_SECTION();
 		UnlockReleaseBuffer(buffer);
+	} else
+	{
+		FILE *f=fopen("/home/andrey/test.log", "a+");
+		fprintf(f, "NON NBTREE! %s\n", RelationGetRelationName(heapRelation));
+		fclose(f);
 	}
 
 	toast_relid = heapRelation->rd_rel->reltoastrelid;
@@ -1082,13 +1217,15 @@ look_for_worker(Oid dbNode)
 static void
 main_launcher_loop()
 {
-	Assert(RelCleanerSock != PGINVALID_SOCKET);
+	Assert(HeapCleanerSock != PGINVALID_SOCKET);
+	dlist_init(&WaitingList[heapcleaner_max_workers]);
 
 	while (!got_SIGTERM)
 	{
 		int				rc;
 		int				len;
 		CleanerMessage	msg;
+		CleanerMessage	table[BLOCKS_TABLE_ITEMS_MAX];
 		WorkerInfo		startingWorker;
 		long			timeout;
 		dlist_node		*node;
@@ -1105,43 +1242,27 @@ main_launcher_loop()
 		ResetLatch(MyLatch);
 
 		/* At First, receive a message from backend */
-		len = recv(RelCleanerSock, &msg, sizeof(CleanerMessage), 0);
+		len = recv(HeapCleanerSock, table, BLOCKS_TABLE_ITEMS_MAX*sizeof(CleanerMessage), 0);
 
 		LWLockAcquire(HeapCleanerLock, LW_EXCLUSIVE);
 		startingWorker = HeapCleanerShmem->startingWorker;
 
 		if (len > 0)
 		{
-			WorkerInfo worker;
+//			WorkerInfo worker;
+			CleanerMessage *mptr;
 
-			/* Base consistency check */
-			if (len != sizeof(CleanerMessage))
-				elog(ERROR, "Cleaner message size not consistent: %d. expected: %lu", len, sizeof(CleanerMessage));
-
-			worker = look_for_worker(msg.dbNode);
-
-			if (worker == NULL)
-				/* Add to special list, which contains messages to non-launched workers */
-				push_waiting_list(heapcleaner_max_workers, &msg);
-
-			else if (dlist_is_empty(&WaitingList[worker->id]))
-			{
-
-
-				// TODO: check WaitList
-
-				/* Try to send into the shared buffer */
-				if (!try_send_message(worker, &msg))
-					push_waiting_list(worker->id, &msg);
-			}
-			else
-				/* Worker is lazy */
-				push_waiting_list(worker->id, &msg);
+			if (len%sizeof(CleanerMessage) != 0)
+				elog(ERROR, "INCORRECT Message size!");
+elog(LOG, "Receive %lu", len/sizeof(CleanerMessage));
+			/* Push all data from httable to waiting list */
+			for (mptr = table; ((char *)mptr-(char *)table) < len; mptr++)
+				push_waiting_list(heapcleaner_max_workers, mptr);
 		}
 
-		if ((startingWorker == NULL) && !dlist_is_empty(&WaitingList[heapcleaner_max_workers]))
+		if (!dlist_is_empty(&WaitingList[heapcleaner_max_workers]))
 		{
-			bool startWorker = false;
+			bool startWorker = ((startingWorker != NULL));
 
 			/*
 			 * Try to send messages to active worker
@@ -1191,10 +1312,12 @@ main_launcher_loop()
 						continue;
 				}
 
-				LWLockAcquire(&MyWorkerInfo->WorkItemLock, LW_EXCLUSIVE);
+				LWLockAcquire(&worker->WorkItemLock, LW_EXCLUSIVE);
+
 				while ((worker->nitems < WORK_ITEMS_MAX) && !dlist_is_empty(&WaitingList[worker->id]))
 					worker->buffer[worker->nitems++] = pop_waiting_list(worker->id);
-				LWLockRelease(&MyWorkerInfo->WorkItemLock);
+
+				LWLockRelease(&worker->WorkItemLock);
 
 				if (!dlist_is_empty(&WaitingList[worker->id]))
 					haveWork = true;
@@ -1214,15 +1337,10 @@ main_launcher_loop()
 			/* Wait data or signals */
 			rc = WaitLatchOrSocket(MyLatch,
 							WL_LATCH_SET | WL_POSTMASTER_DEATH | WL_SOCKET_READABLE,
-							RelCleanerSock, timeout,
+							HeapCleanerSock, timeout,
 							WAIT_EVENT_BGHEAP_MAIN);
 		}
-/*		else
-		{
-			pg_usleep(1);
-			continue;
-		}
-*/
+
 		/* Emergency bailout if postmaster has died */
 		if (rc & WL_POSTMASTER_DEATH)
 		{
@@ -1270,14 +1388,14 @@ main_worker_loop(void)
 			MyWorkerInfo->nitems = 0;
 		}
 		LWLockRelease(&MyWorkerInfo->WorkItemLock);
-
+elog(LOG, "-> Worker got %d nitems!", nitems);
 		if (nitems > 0)
 		{
 			int i;
 
 			PG_TRY();
 			{
-				for (i=0; i < nitems; i++)
+				for (i = 0; i < nitems; i++)
 					index_cleanup(lbuf[i].spcNode, lbuf[i].relid, lbuf[i].blkno);
 
 				nitems = 0;

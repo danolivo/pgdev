@@ -1827,10 +1827,10 @@ quick_vacuum_index(Relation irel, Relation hrel,
 	}
 	{
 		FILE *f=fopen("/home/andrey/test.log", "a+");
-		fprintf(f, "del: %d (%d) -> %s\n", stats.tuples_removed, num_dead_tuples, RelationGetRelationName(irel));
+		fprintf(f, "index del: %d (%d) -> %s\n", stats.tuples_removed, num_dead_tuples, RelationGetRelationName(irel));
 		fclose(f);
 	}
-	elog(LOG, "del: %d (%d) -> %s", stats.tuples_removed, num_dead_tuples, RelationGetRelationName(irel));
+//	elog(LOG, "del: %d (%d) -> %s", stats.tuples_removed, num_dead_tuples, RelationGetRelationName(irel));
 	ExecDropSingleTupleTableSlot(slot);
 	FreeExecutorState(estate);
 }

@@ -46,6 +46,7 @@
 #include "foreign/fdwapi.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "postmaster/bgheap.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
@@ -837,6 +838,9 @@ ldelete:;
 	ExecARDeleteTriggers(estate, resultRelInfo, tupleid, oldtuple,
 						 ar_delete_trig_tcs);
 
+	if (resultRelationDesc->rd_node.dbNode != 0)
+		HeapCleanerSend(resultRelationDesc, ItemPointerGetBlockNumber(tupleid));
+
 	/* Process RETURNING if present and if requested */
 	if (processReturning && resultRelInfo->ri_projectReturning)
 	{
@@ -1286,6 +1290,10 @@ lreplace:;
 						 mtstate->mt_transition_capture);
 
 	list_free(recheckIndexes);
+
+	/* Collect info about dirty blocks */
+	if (resultRelationDesc->rd_node.dbNode != 0)
+		HeapCleanerSend(resultRelationDesc, ItemPointerGetBlockNumber(tupleid));
 
 	/*
 	 * Check any WITH CHECK OPTION constraints from parent views.  We are

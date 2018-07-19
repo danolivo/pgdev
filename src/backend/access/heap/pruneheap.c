@@ -22,7 +22,6 @@
 #include "catalog/catalog.h"
 #include "miscadmin.h"
 #include "pgstat.h"
-#include "postmaster/bgheap.h"
 #include "storage/bufmgr.h"
 #include "utils/snapmgr.h"
 #include "utils/rel.h"
@@ -140,8 +139,6 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 
 	if (PageIsFull(page) || PageGetHeapFreeSpace(page) < minfree)
 	{
-		bool IsPruned = false;
-
 		/* OK, try to get exclusive buffer lock */
 		if (!ConditionalLockBufferForCleanup(buffer))
 			return;
@@ -159,13 +156,10 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 
 			/* OK to prune */
 			(void) heap_page_prune(relation, buffer, OldestXmin, true, &ignore);
-			IsPruned = true;
 		}
 
 		/* And release buffer lock */
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-		if (IsPruned && relation->rd_node.dbNode != 0)
-			HeapCleanerSend(relation, BufferGetBlockNumber(buffer));
 	}
 }
 

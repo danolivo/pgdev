@@ -3259,6 +3259,7 @@ l1:
 			UnlockTupleTuplock(relation, &(tp.t_self), LockTupleExclusive);
 		if (vmbuffer != InvalidBuffer)
 			ReleaseBuffer(vmbuffer);
+elog(LOG, "-> Result!");
 		return result;
 	}
 
