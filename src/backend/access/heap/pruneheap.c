@@ -22,6 +22,7 @@
 #include "catalog/catalog.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "postmaster/bgheap.h"
 #include "storage/bufmgr.h"
 #include "utils/snapmgr.h"
 #include "utils/rel.h"
@@ -323,6 +324,12 @@ heap_page_prune(Relation relation, Buffer buffer, TransactionId OldestXmin,
 	 * and update FSM with the remaining space.
 	 */
 
+	/* I am not under vacuum */
+	if ((MyPgXact->vacuumFlags == 0) && (prstate.ndead > 0))
+	{
+		if (relation->rd_node.dbNode != 0)
+			HeapCleanerSend(relation, BufferGetBlockNumber(buffer));
+	}
 	return ndeleted;
 }
 

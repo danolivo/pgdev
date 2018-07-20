@@ -23,15 +23,16 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+//#include "access/commit_ts.h"
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/heapam_xlog.h"
 #include "access/htup_details.h"
 #include "access/nbtree.h"
+#include "access/visibilitymap.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/catalog.h"
-//#include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/index.h"
@@ -52,6 +53,7 @@
 #include "storage/lmgr.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
+#include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
@@ -59,7 +61,6 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
-//#include "utils/relcache.h"
 #include "utils/resowner.h"
 #include "utils/syscache.h"
 #include "utils/timeout.h"
@@ -74,6 +75,7 @@ typedef struct CleanerMessage
 	Oid	dbNode;		/* Database ID */
 	Oid	spcNode;	/* Tablespace ID*/
 	int	blkno;		/* Block number */
+	TransactionId	xid;
 } CleanerMessage;
 
 /*
@@ -654,7 +656,7 @@ HeapCleanerShmemSize(void)
 	return size;
 }
 
-#define BLOCKS_TABLE_ITEMS_MAX	(10)
+#define BLOCKS_TABLE_ITEMS_MAX	(1)
 
 typedef struct CleanerMessagesHashTable
 {
@@ -748,6 +750,7 @@ HeapCleanerSend(Relation relation, BlockNumber blkno)
 	msg.dbNode = relation->rd_node.dbNode;
 	msg.spcNode = relation->rd_node.spcNode;
 	msg.blkno = blkno;
+	msg.xid = GetCurrentTransactionIdIfAny();
 
 	if (hash_blocks(&msg))
 	{
@@ -873,6 +876,7 @@ HeapCleanerWorkerMain(int argc, char *argv[])
 	proc_exit(0);
 }
 
+#include "utils/tqual.h"
 /*
  * Main logic of HEAP and index relations cleaning
  */
@@ -886,20 +890,19 @@ index_cleanup(Oid spcNode, Oid relid, BlockNumber blkno)
 	ItemPointerData	dead_tuples[MaxOffsetNumber];
 	int				num_dead_tuples = 0;
 	Buffer			buffer;
+	Buffer			vmbuffer;
 	OffsetNumber	offnum;
 	Page 			page;
 	ItemId 			lp;
 	bool			needLock;
 	BlockNumber		nblocks;
-
-	LOCKMODE	lmode = AccessExclusiveLock; /* ShareUpdateExclusiveLock; */
-	LockRelId	onerelid;
 	int tnum;
 	Oid toast_relid;
 	bool found_non_nbtree = false;
-	Oid			save_userid;
-	int			save_sec_context;
-	int			save_nestlevel;
+//	Oid			save_userid;
+//	int			save_sec_context;
+//	int			save_nestlevel;
+	LOCKMODE lockmode = AccessShareLock; //AccessExclusiveLock;
 
 	if (RecoveryInProgress())
 		return;
@@ -907,40 +910,27 @@ index_cleanup(Oid spcNode, Oid relid, BlockNumber blkno)
 	CHECK_FOR_INTERRUPTS();
 
 	StartTransactionCommand();
-	PushActiveSnapshot(GetTransactionSnapshot());
+//	PushActiveSnapshot(GetTransactionSnapshot());
 	elog(LOG, "-> Worker cleanup: spcNode=%d relid=%d blkno=%d", spcNode, relid, blkno);
+
+//	LockRelationOid(relid, lockmode);
+
 	/*
 	 * At this point relation availability is not guaranteed.
 	 * Make safe test to check this.
 	 */
-//	if (ConditionalLockRelationOid(relid, lmode))
-		heapRelation = try_relation_open(relid, AccessExclusiveLock);
-//	else
-//	{
-//		heapRelation = NULL;
-//		elog(LOG, "Cleanup: UnSuccessful lock");
-//	}
+	heapRelation = try_relation_open(relid, lockmode);
 
 	if (!heapRelation)
 	{
-		elog(LOG, "Cleanup: UnSuccessful opening");
-		PopActiveSnapshot();
+		elog(LOG, "[%d] Cleanup: UnSuccessful opening. Relation deleted?", blkno);
+//		PopActiveSnapshot();
 		CommitTransactionCommand();
 		return;
+	} else {
+		elog(LOG, "[%d] Cleanup: Successful opening!", blkno);
 	}
-	elog(LOG, "Cleanup: Success lock");
-	/* Now we not clean system tables because it will induce some
-	 * random stdout logging and we need to change regression tests
-	 * (it is frequently seen on DROP CASCADE operations)
-	 */
-/*	if (IsSystemNamespace(heapRelation->rd_rel->relnamespace) || IsSystemRelation(heapRelation) || IsCatalogRelation(heapRelation))
-	{
-		relation_close(heapRelation, lmode);
-		PopActiveSnapshot();
-		CommitTransactionCommand();
-		return;
-	} */
-//	elog(LOG, "Cleanup timestamp: %s rel=%s", timestamptz_to_str(GetCurrentTimestamp()), RelationGetRelationName(heapRelation));
+
 	/*
 	 * Check relation type similarly vacuum
 	 */
@@ -959,8 +949,8 @@ index_cleanup(Oid spcNode, Oid relid, BlockNumber blkno)
 			ereport(WARNING,
 					(errmsg("skipping \"%s\" --- only table or database owner can vacuum it",
 							RelationGetRelationName(heapRelation))));
-		relation_close(heapRelation, lmode);
-		PopActiveSnapshot();
+		relation_close(heapRelation, lockmode);
+//		PopActiveSnapshot();
 		CommitTransactionCommand();
 		return;
 	}
@@ -973,36 +963,26 @@ index_cleanup(Oid spcNode, Oid relid, BlockNumber blkno)
 		ereport(WARNING,
 				(errmsg("skipping \"%s\" --- cannot vacuum non-tables or special system tables",
 						RelationGetRelationName(heapRelation))));
-		relation_close(heapRelation, lmode);
-		PopActiveSnapshot();
+		relation_close(heapRelation, lockmode);
+//		PopActiveSnapshot();
 		CommitTransactionCommand();
 		return;
 	}
 	if (RELATION_IS_OTHER_TEMP(heapRelation))
 	{
-		relation_close(heapRelation, lmode);
-		elog(LOG, "--- S problem");
-		PopActiveSnapshot();
+		relation_close(heapRelation, lockmode);
+//		PopActiveSnapshot();
 		CommitTransactionCommand();
 		return;
 	}
 
 	if (heapRelation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 	{
-		relation_close(heapRelation, lmode);
-		PopActiveSnapshot();
+		relation_close(heapRelation, lockmode);
+//		PopActiveSnapshot();
 		CommitTransactionCommand();
 		return;
 	}
-
-	onerelid = heapRelation->rd_lockInfo.lockRelId;
-	LockRelationIdForSession(&onerelid, lmode);
-	relation_close(heapRelation, NoLock);
-	PopActiveSnapshot();
-	CommitTransactionCommand();
-	StartTransactionCommand();
-	PushActiveSnapshot(GetTransactionSnapshot());
-	heapRelation = try_relation_open(relid, AccessExclusiveLock);
 
 	needLock = !RELATION_IS_LOCAL(heapRelation);
 	if (needLock)
@@ -1010,25 +990,46 @@ index_cleanup(Oid spcNode, Oid relid, BlockNumber blkno)
 	nblocks = RelationGetNumberOfBlocks(heapRelation);
 	if (needLock)
 		UnlockRelationForExtension(heapRelation, ExclusiveLock);
-elog(LOG, "Cleaner: blkno=%d nblocks=%d", blkno, nblocks);
+	elog(LOG, "[%d] Cleanup: Pass checks. nblocks=%d.", blkno, nblocks);
 	if (blkno >= nblocks)
 	{
-		relation_close(heapRelation, lmode);
-		UnlockRelationIdForSession(&onerelid, lmode);
-		PopActiveSnapshot();
+		relation_close(heapRelation, lockmode);
+//		PopActiveSnapshot();
 		CommitTransactionCommand();
 		return;
 	}
 
-	GetUserIdAndSecContext(&save_userid, &save_sec_context);
-	SetUserIdAndSecContext(heapRelation->rd_rel->relowner,
-						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
-	save_nestlevel = NewGUCNestLevel();
-
 	/* Create TID list */
-	buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, blkno, RBM_NORMAL, NULL);
+//	visibilitymap_pin(heapRelation, blkno, &vmbuffer);
+	buffer = ReadBuffer(heapRelation, blkno);
+
+//	heap_page_prune_opt(heapRelation, buffer);
+
+//	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+//	SetUserIdAndSecContext(heapRelation->rd_rel->relowner,
+//						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+//	save_nestlevel = NewGUCNestLevel();
+
+//	buffer = ReadBufferWithoutRelcache(heapRelation->rd_node,
+	//											   MAIN_FORKNUM,
+		//										   blkno,
+			//									   RBM_NORMAL,
+				//								   NULL);
+
+	page = BufferGetPage(buffer);
+
+	if (PageIsAllVisible(page))
+		visibilitymap_pin(heapRelation, blkno, &vmbuffer);
+
 	LockBuffer(buffer, BUFFER_LOCK_SHARE);
-	page = (Page) BufferGetPage(buffer);
+
+	if (vmbuffer == InvalidBuffer && PageIsAllVisible(page))
+	{
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+		visibilitymap_pin(heapRelation, blkno, &vmbuffer);
+		LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	}
+
 	for (offnum = FirstOffsetNumber; offnum < PageGetMaxOffsetNumber(page); offnum = OffsetNumberNext(offnum))
 	{
 		lp = PageGetItemId(page, offnum);
@@ -1039,9 +1040,17 @@ elog(LOG, "Cleaner: blkno=%d nblocks=%d", blkno, nblocks);
 		}
 	}
 
-//	UnlockReleaseBuffer(buffer);
+	if (num_dead_tuples == 0)
+	{
+		UnlockReleaseBuffer(buffer);
+		elog(LOG, "[%d] Cleanup: Do nothing.", blkno);
+		relation_close(heapRelation, NoLock);
+//		PopActiveSnapshot();
+		CommitTransactionCommand();
+		return;
+	}
 
-//	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 	/* Open and lock index relations correspond to the heap relation */
 	vac_open_indexes(heapRelation, RowExclusiveLock, &nindexes, &IndexRelations);
 
@@ -1059,33 +1068,25 @@ elog(LOG, "Cleaner: blkno=%d nblocks=%d", blkno, nblocks);
 							num_dead_tuples);
 
 	}
-	if (nindexes == 0)
-	{
-		FILE *f=fopen("/home/andrey/test.log", "a+");
-		fprintf(f, "NO INDEX\n");
-		fclose(f);
-	}
+
 	vac_close_indexes(nindexes, IndexRelations, NoLock);
 
 	/* Roll back any GUC changes executed by index functions */
-	AtEOXact_GUC(false, save_nestlevel);
+//	AtEOXact_GUC(false, save_nestlevel);
 
 	/* Restore userid and security context */
-	SetUserIdAndSecContext(save_userid, save_sec_context);
+//	SetUserIdAndSecContext(save_userid, save_sec_context);
 
-	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 	if (!found_non_nbtree)
 	{
 		OffsetNumber	unusable[MaxOffsetNumber];
 		int				nunusable = 0;
 
-//		buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, blkno, RBM_NORMAL, NULL);
-//		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+//		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 		LockBufferForCleanup(buffer);
-
 		START_CRIT_SECTION();
 
-		page = BufferGetPage(buffer);
+//		page = BufferGetPage(buffer);
 		/* Release DEAD heap tuples storage */
 		for (tnum = 0; tnum < num_dead_tuples; tnum++)
 		{
@@ -1098,7 +1099,7 @@ elog(LOG, "Cleaner: blkno=%d nblocks=%d", blkno, nblocks);
 		}
 		{
 			FILE *f=fopen("/home/andrey/test.log", "a+");
-			fprintf(f, "heap del: %d (%d) -> %s\n", nunusable, num_dead_tuples, RelationGetRelationName(heapRelation));
+			fprintf(f, "[%d] heap del: %d (%d) -> %s\n", blkno, nunusable, num_dead_tuples, RelationGetRelationName(heapRelation));
 			fclose(f);
 		}
 		if (nunusable > 0)
@@ -1123,23 +1124,16 @@ elog(LOG, "Cleaner: blkno=%d nblocks=%d", blkno, nblocks);
 
 		END_CRIT_SECTION();
 		UnlockReleaseBuffer(buffer);
-	} else
-	{
-		FILE *f=fopen("/home/andrey/test.log", "a+");
-		fprintf(f, "NON NBTREE! %s\n", RelationGetRelationName(heapRelation));
-		fclose(f);
 	}
 
 	toast_relid = heapRelation->rd_rel->reltoastrelid;
-	relation_close(heapRelation, NoLock);
-	PopActiveSnapshot();
+	relation_close(heapRelation, lockmode);
+//	PopActiveSnapshot();
 	CommitTransactionCommand();
 
 	/* Clean next TOAST relation */
 	if (toast_relid != InvalidOid)
 		index_cleanup(spcNode, toast_relid, blkno);
-
-	UnlockRelationIdForSession(&onerelid, lmode);
 }
 
 /*
@@ -1254,7 +1248,7 @@ main_launcher_loop()
 
 			if (len%sizeof(CleanerMessage) != 0)
 				elog(ERROR, "INCORRECT Message size!");
-elog(LOG, "Receive %lu", len/sizeof(CleanerMessage));
+//elog(LOG, "Receive %lu", len/sizeof(CleanerMessage));
 			/* Push all data from httable to waiting list */
 			for (mptr = table; ((char *)mptr-(char *)table) < len; mptr++)
 				push_waiting_list(heapcleaner_max_workers, mptr);
@@ -1396,7 +1390,11 @@ elog(LOG, "-> Worker got %d nitems!", nitems);
 			PG_TRY();
 			{
 				for (i = 0; i < nitems; i++)
+				{
+					while (TransactionIdIsInProgress(lbuf[i].xid))
+						pg_usleep(10);
 					index_cleanup(lbuf[i].spcNode, lbuf[i].relid, lbuf[i].blkno);
+				}
 
 				nitems = 0;
 				QueryCancelPending = false;
