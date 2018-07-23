@@ -216,12 +216,12 @@ static const struct config_enum_entry bytea_output_options[] = {
  * they sort slightly different (see "log" level)
  */
 static const struct config_enum_entry client_message_level_options[] = {
-	{"debug", DEBUG2, true},
 	{"debug5", DEBUG5, false},
 	{"debug4", DEBUG4, false},
 	{"debug3", DEBUG3, false},
 	{"debug2", DEBUG2, false},
 	{"debug1", DEBUG1, false},
+	{"debug", DEBUG2, true},
 	{"log", LOG, false},
 	{"info", INFO, true},
 	{"notice", NOTICE, false},
@@ -233,12 +233,12 @@ static const struct config_enum_entry client_message_level_options[] = {
 };
 
 static const struct config_enum_entry server_message_level_options[] = {
-	{"debug", DEBUG2, true},
 	{"debug5", DEBUG5, false},
 	{"debug4", DEBUG4, false},
 	{"debug3", DEBUG3, false},
 	{"debug2", DEBUG2, false},
 	{"debug1", DEBUG1, false},
+	{"debug", DEBUG2, true},
 	{"info", INFO, false},
 	{"notice", NOTICE, false},
 	{"warning", WARNING, false},
@@ -402,6 +402,13 @@ static const struct config_enum_entry force_parallel_mode_options[] = {
 	{"no", FORCE_PARALLEL_OFF, true},
 	{"1", FORCE_PARALLEL_ON, true},
 	{"0", FORCE_PARALLEL_OFF, true},
+	{NULL, 0, false}
+};
+
+static const struct config_enum_entry plan_cache_mode_options[] = {
+	{"auto", PLAN_CACHE_MODE_AUTO, false},
+	{"force_generic_plan", PLAN_CACHE_MODE_FORCE_GENERIC_PLAN, false},
+	{"force_custom_plan", PLAN_CACHE_MODE_FORCE_CUSTOM_PLAN, false},
 	{NULL, 0, false}
 };
 
@@ -3248,12 +3255,12 @@ static struct config_real ConfigureNamesReal[] =
 	},
 
 	{
-		{"vacuum_cleanup_index_scale_factor", PGC_USERSET, AUTOVACUUM,
+		{"vacuum_cleanup_index_scale_factor", PGC_USERSET, CLIENT_CONN_STATEMENT,
 			gettext_noop("Number of tuple inserts prior to index cleanup as a fraction of reltuples."),
 			NULL
 		},
 		&vacuum_cleanup_index_scale_factor,
-		0.1, 0.0, 100.0,
+		0.1, 0.0, 1e10,
 		NULL, NULL, NULL
 	},
 
@@ -4147,6 +4154,18 @@ static struct config_enum ConfigureNamesEnum[] =
 		},
 		&Password_encryption,
 		PASSWORD_TYPE_MD5, password_encryption_options,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"plan_cache_mode", PGC_USERSET, QUERY_TUNING_OTHER,
+			gettext_noop("Controls the planner's selection of custom or generic plan."),
+			gettext_noop("Prepared statements can have custom and generic plans, and the planner "
+						 "will attempt to choose which is better.  This can be set to override "
+						 "the default behavior.")
+		},
+		&plan_cache_mode,
+		PLAN_CACHE_MODE_AUTO, plan_cache_mode_options,
 		NULL, NULL, NULL
 	},
 

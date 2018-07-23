@@ -1418,7 +1418,7 @@ postgres   27093  0.0  0.0  30096  2752 ?        Ss   11:34   0:00 postgres: ser
          <entry>Waiting to apply WAL at recovery because it is delayed.</entry>
         </row>
         <row>
-         <entry morerows="65"><literal>IO</literal></entry>
+         <entry morerows="66"><literal>IO</literal></entry>
          <entry><literal>BufFileRead</literal></entry>
          <entry>Waiting for a read from a buffered file.</entry>
         </row>
@@ -1673,6 +1673,10 @@ postgres   27093  0.0  0.0  30096  2752 ?        Ss   11:34   0:00 postgres: ser
         <row>
          <entry><literal>WALSenderTimelineHistoryRead</literal></entry>
          <entry>Waiting for a read from a timeline history file during walsender timeline command.</entry>
+        </row>
+        <row>
+         <entry><literal>WALSync</literal></entry>
+         <entry>Waiting for a WAL file to reach stable storage.</entry>
         </row>
         <row>
          <entry><literal>WALSyncMethodAssign</literal></entry>

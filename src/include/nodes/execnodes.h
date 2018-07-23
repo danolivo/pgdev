@@ -676,7 +676,7 @@ typedef struct TupleHashTableData
 	/* The following fields are set transiently for each table search: */
 	TupleTableSlot *inputslot;	/* current input tuple's slot */
 	FmgrInfo   *in_hash_funcs;	/* hash functions for input datatype(s) */
-	ExprState  *cur_eq_func;	/* comparator for for input vs. table */
+	ExprState  *cur_eq_func;	/* comparator for input vs. table */
 	uint32		hash_iv;		/* hash-function IV */
 	ExprContext *exprcontext;	/* expression context */
 }			TupleHashTableData;
@@ -1106,6 +1106,12 @@ struct AppendState
  *		slots			current output tuple of each subplan
  *		heap			heap of active tuples
  *		initialized		true if we have fetched first tuple from each subplan
+ *		noopscan		true if partition pruning proved that none of the
+ *						mergeplans can contain a record to satisfy this query.
+ *		prune_state		details required to allow partitions to be
+ *						eliminated from the scan, or NULL if not possible.
+ *		valid_subplans	for runtime pruning, valid mergeplans indexes to
+ *						scan.
  * ----------------
  */
 typedef struct MergeAppendState
@@ -1118,6 +1124,9 @@ typedef struct MergeAppendState
 	TupleTableSlot **ms_slots;	/* array of length ms_nplans */
 	struct binaryheap *ms_heap; /* binary heap of slot indices */
 	bool		ms_initialized; /* are subplans started? */
+	bool		ms_noopscan;
+	struct PartitionPruneState *ms_prune_state;
+	Bitmapset  *ms_valid_subplans;
 } MergeAppendState;
 
 /* ----------------

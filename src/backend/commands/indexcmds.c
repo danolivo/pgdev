@@ -369,11 +369,6 @@ DefineIndex(Oid relationId,
 	Snapshot	snapshot;
 	int			i;
 
-	if (list_intersection(stmt->indexParams, stmt->indexIncludingParams) != NIL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
-				 errmsg("included columns must not intersect with key columns")));
-
 	/*
 	 * count key attributes in index
 	 */
@@ -596,7 +591,7 @@ DefineIndex(Oid relationId,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("access method \"%s\" does not support unique indexes",
 						accessMethodName)));
-	if (list_length(stmt->indexIncludingParams) > 0 && !amRoutine->amcaninclude)
+	if (stmt->indexIncludingParams != NIL && !amRoutine->amcaninclude)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("access method \"%s\" does not support included columns",
@@ -993,7 +988,32 @@ DefineIndex(Oid relationId,
 				{
 					IndexStmt  *childStmt = copyObject(stmt);
 					bool		found_whole_row;
+					ListCell   *lc;
 
+					/*
+					 * Adjust any Vars (both in expressions and in the index's
+					 * WHERE clause) to match the partition's column numbering
+					 * in case it's different from the parent's.
+					 */
+					foreach(lc, childStmt->indexParams)
+					{
+						IndexElem  *ielem = lfirst(lc);
+
+						/*
+						 * If the index parameter is an expression, we must
+						 * translate it to contain child Vars.
+						 */
+						if (ielem->expr)
+						{
+							ielem->expr =
+								map_variable_attnos((Node *) ielem->expr,
+													1, 0, attmap, maplen,
+													InvalidOid,
+													&found_whole_row);
+							if (found_whole_row)
+								elog(ERROR, "cannot convert whole-row table reference");
+						}
+					}
 					childStmt->whereClause =
 						map_variable_attnos(stmt->whereClause, 1, 0,
 											attmap, maplen,
@@ -1008,7 +1028,7 @@ DefineIndex(Oid relationId,
 								indexRelationId,	/* this is our child */
 								createdConstraintId,
 								is_alter_table, check_rights, check_not_in_use,
-								false, quiet);
+								skip_build, quiet);
 				}
 
 				pfree(attmap);

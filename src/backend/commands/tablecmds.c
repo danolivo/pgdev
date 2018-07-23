@@ -1421,7 +1421,7 @@ ExecuteTruncateGuts(List *explicit_rels, List *relids, List *relids_logged,
 	Oid		   *logrelids;
 
 	/*
-	 * Open, exclusive-lock, and check all the explicitly-specified relations
+	 * Check the explicitly-specified relations.
 	 *
 	 * In CASCADE mode, suck in all referencing relations as well.  This
 	 * requires multiple iterations to find indirectly-dependent relations. At
@@ -1985,6 +1985,19 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("inherited relation \"%s\" is not a table or foreign table",
 							parent->relname)));
+
+		/*
+		 * If the parent is permanent, so must be all of its partitions.  Note
+		 * that inheritance allows that case.
+		 */
+		if (is_partition &&
+			relation->rd_rel->relpersistence != RELPERSISTENCE_TEMP &&
+			relpersistence == RELPERSISTENCE_TEMP)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("cannot create a temporary relation as partition of permanent relation \"%s\"",
+							RelationGetRelationName(relation))));
+
 		/* Permanent rels cannot inherit from temporary ones */
 		if (relpersistence != RELPERSISTENCE_TEMP &&
 			relation->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
@@ -6491,14 +6504,21 @@ ATExecSetStatistics(Relation rel, const char *colName, int16 colNum, Node *newVa
 				 errmsg("cannot alter system column \"%s\"",
 						colName)));
 
-	if ((rel->rd_rel->relkind == RELKIND_INDEX ||
-		 rel->rd_rel->relkind == RELKIND_PARTITIONED_INDEX) &&
-		rel->rd_index->indkey.values[attnum - 1] != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot alter statistics on non-expression column \"%s\" of index \"%s\"",
-						NameStr(attrtuple->attname), RelationGetRelationName(rel)),
-				 errhint("Alter statistics on table column instead.")));
+	if (rel->rd_rel->relkind == RELKIND_INDEX ||
+		rel->rd_rel->relkind == RELKIND_PARTITIONED_INDEX)
+	{
+		if (attnum > rel->rd_index->indnkeyatts)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot alter statistics on included column \"%s\" of index \"%s\"",
+							NameStr(attrtuple->attname), RelationGetRelationName(rel))));
+		else if (rel->rd_index->indkey.values[attnum - 1] != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot alter statistics on non-expression column \"%s\" of index \"%s\"",
+							NameStr(attrtuple->attname), RelationGetRelationName(rel)),
+					 errhint("Alter statistics on table column instead.")));
+	}
 
 	attrtuple->attstattarget = newtarget;
 
@@ -13608,21 +13628,6 @@ transformPartitionSpec(Relation rel, PartitionSpec *partspec, char *strategy)
 	foreach(l, partspec->partParams)
 	{
 		PartitionElem *pelem = castNode(PartitionElem, lfirst(l));
-		ListCell   *lc;
-
-		/* Check for PARTITION BY ... (foo, foo) */
-		foreach(lc, newspec->partParams)
-		{
-			PartitionElem *pparam = castNode(PartitionElem, lfirst(lc));
-
-			if (pelem->name && pparam->name &&
-				strcmp(pelem->name, pparam->name) == 0)
-				ereport(ERROR,
-						(errcode(ERRCODE_DUPLICATE_COLUMN),
-						 errmsg("column \"%s\" appears more than once in partition key",
-								pelem->name),
-						 parser_errposition(pstate, pelem->location)));
-		}
 
 		if (pelem->expr)
 		{
@@ -14134,6 +14139,14 @@ ATExecAttachPartition(List **wqueue, Relation rel, PartitionCmd *cmd)
 				 errdetail("\"%s\" is already a child of \"%s\".",
 						   RelationGetRelationName(rel),
 						   RelationGetRelationName(attachrel))));
+
+	/* If the parent is permanent, so must be all of its partitions. */
+	if (rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP &&
+		attachrel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("cannot attach a temporary relation as partition of permanent relation \"%s\"",
+						RelationGetRelationName(rel))));
 
 	/* Temp parent cannot have a partition that is itself not a temp */
 	if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&

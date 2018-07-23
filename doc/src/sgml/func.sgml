@@ -9737,10 +9737,10 @@ CREATE TYPE rainbow AS ENUM ('red', 'orange', 'yellow', 'green', 'blue', 'purple
         <entry>
           reduce each value in the document, specified by <replaceable class="parameter">filter</replaceable> to a <type>tsvector</type>,
           and then concatenate those in document order to produce a single <type>tsvector</type>.
-          <replaceable class="parameter">filter</replaceable> is a jsonb array, that enumerates what kind of elements need to be included
+          <replaceable class="parameter">filter</replaceable> is a <type>jsonb</type> array, that enumerates what kind of elements need to be included
           into the resulting <type>tsvector</type>. Possible values for <replaceable class="parameter">filter</replaceable> are
           <literal>"string"</literal> (to include all string values), <literal>"numeric"</literal> (to include all numeric values in the string format),
-          <literal>"boolean"</literal> (to include all boolean values in the string format "true"/"false"),
+          <literal>"boolean"</literal> (to include all Boolean values in the string format <literal>"true"</literal>/<literal>"false"</literal>),
           <literal>"key"</literal> (to include all keys) or <literal>"all"</literal> (to include all above). These values
           can be combined together to include, e.g. all string and numeric values.
         </entry>
@@ -10903,7 +10903,7 @@ SELECT xmltable.*
     <para>
      The following example illustrates how
      the <literal>XMLNAMESPACES</literal> clause can be used to specify
-     the default namespace, and a list of additional namespaces
+     a list of namespaces
      used in the XML document as well as in the XPath expressions:
 
   <screen><![CDATA[
@@ -11997,13 +11997,27 @@ table2-mapping
 
   <note>
     <para>
-      In <function>json_populate_record</function>, <function>json_populate_recordset</function>,
-      <function>json_to_record</function> and <function>json_to_recordset</function>,
-      type coercion from the JSON is <quote>best effort</quote> and may not result
-      in desired values for some types.  JSON keys are matched to
-      identical column names in the target row type.  JSON fields that do not
-      appear in the target row type will be omitted from the output, and
-      target columns that do not match any JSON field will simply be NULL.
+      While the examples for the functions
+      <function>json_populate_record</function>,
+      <function>json_populate_recordset</function>,
+      <function>json_to_record</function> and
+      <function>json_to_recordset</function> use constants, the typical use
+      would be to reference a table in the <literal>FROM</literal> clause
+      and use one of its <type>json</type> or <type>jsonb</type> columns
+      as an argument to the function.  Extracted key values can then be
+      referenced in other parts of the query, like <literal>WHERE</literal>
+      clauses and target lists.  Extracting multiple values in this
+      way can improve performance over extracting them separately with
+      per-key operators.
+    </para>
+
+    <para>
+      JSON keys are matched to identical column names in the target
+      row type.  JSON type coercion for these functions is <quote>best
+      effort</quote> and may not result in desired values for some types.
+      JSON fields that do not appear in the target row type will be
+      omitted from the output, and target columns that do not match any
+      JSON field will simply be NULL.
     </para>
   </note>
 
