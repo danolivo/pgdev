@@ -4087,16 +4087,16 @@ DROP FUNCTION f_test(int);
 -- ===================================================================
 ALTER FOREIGN TABLE ft1 ALTER COLUMN c8 TYPE int;
 SELECT * FROM ft1 WHERE c1 = 1;  -- ERROR
-ERROR:  invalid input syntax for integer: "foo"
+ERROR:  invalid input syntax for type integer: "foo"
 CONTEXT:  column "c8" of foreign table "ft1"
 SELECT  ft1.c1,  ft2.c2, ft1.c8 FROM ft1, ft2 WHERE ft1.c1 = ft2.c1 AND ft1.c1 = 1; -- ERROR
-ERROR:  invalid input syntax for integer: "foo"
+ERROR:  invalid input syntax for type integer: "foo"
 CONTEXT:  column "c8" of foreign table "ft1"
 SELECT  ft1.c1,  ft2.c2, ft1 FROM ft1, ft2 WHERE ft1.c1 = ft2.c1 AND ft1.c1 = 1; -- ERROR
-ERROR:  invalid input syntax for integer: "foo"
+ERROR:  invalid input syntax for type integer: "foo"
 CONTEXT:  whole-row reference to foreign table "ft1"
 SELECT sum(c2), array_agg(c8) FROM ft1 GROUP BY c8; -- ERROR
-ERROR:  invalid input syntax for integer: "foo"
+ERROR:  invalid input syntax for type integer: "foo"
 CONTEXT:  processing expression at position 2 in select list
 ALTER FOREIGN TABLE ft1 ALTER COLUMN c8 TYPE user_enum;
 -- ===================================================================
@@ -4233,18 +4233,21 @@ explain (verbose, costs off) select * from ft3 where f2 = 'foo' COLLATE "C";
 
 explain (verbose, costs off) select * from ft3 f, loct3 l
   where f.f3 = l.f3 COLLATE "POSIX" and l.f1 = 'foo';
-                       QUERY PLAN                        
----------------------------------------------------------
- Nested Loop
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Hash Join
    Output: f.f1, f.f2, f.f3, l.f1, l.f2, l.f3
-   Join Filter: ((f.f3)::text = (l.f3)::text)
-   ->  Index Scan using loct3_f1_key on public.loct3 l
-         Output: l.f1, l.f2, l.f3
-         Index Cond: (l.f1 = 'foo'::text)
+   Inner Unique: true
+   Hash Cond: ((f.f3)::text = (l.f3)::text)
    ->  Foreign Scan on public.ft3 f
          Output: f.f1, f.f2, f.f3
          Remote SQL: SELECT f1, f2, f3 FROM public.loct3
-(9 rows)
+   ->  Hash
+         Output: l.f1, l.f2, l.f3
+         ->  Index Scan using loct3_f1_key on public.loct3 l
+               Output: l.f1, l.f2, l.f3
+               Index Cond: (l.f1 = 'foo'::text)
+(12 rows)
 
 -- ===================================================================
 -- test writable foreign table stuff
@@ -6173,10 +6176,12 @@ ALTER FOREIGN TABLE ft1 DROP CONSTRAINT ft1_c2negative;
 -- ===================================================================
 -- test WITH CHECK OPTION constraints
 -- ===================================================================
+CREATE FUNCTION row_before_insupd_trigfunc() RETURNS trigger AS $$BEGIN NEW.a := NEW.a + 10; RETURN NEW; END$$ LANGUAGE plpgsql;
 CREATE TABLE base_tbl (a int, b int);
 ALTER TABLE base_tbl SET (autovacuum_enabled = 'false');
+CREATE TRIGGER row_before_insupd_trigger BEFORE INSERT OR UPDATE ON base_tbl FOR EACH ROW EXECUTE PROCEDURE row_before_insupd_trigfunc();
 CREATE FOREIGN TABLE foreign_tbl (a int, b int)
-  SERVER loopback OPTIONS(table_name 'base_tbl');
+  SERVER loopback OPTIONS (table_name 'base_tbl');
 CREATE VIEW rw_view AS SELECT * FROM foreign_tbl
   WHERE a < b WITH CHECK OPTION;
 \d+ rw_view
@@ -6192,45 +6197,162 @@ View definition:
   WHERE foreign_tbl.a < foreign_tbl.b;
 Options: check_option=cascaded
 
-INSERT INTO rw_view VALUES (0, 10); -- ok
-INSERT INTO rw_view VALUES (10, 0); -- should fail
-ERROR:  new row violates check option for view "rw_view"
-DETAIL:  Failing row contains (10, 0).
 EXPLAIN (VERBOSE, COSTS OFF)
-UPDATE rw_view SET b = 20 WHERE a = 0; -- not pushed down
-                                            QUERY PLAN                                            
---------------------------------------------------------------------------------------------------
- Update on public.foreign_tbl
-   Remote SQL: UPDATE public.base_tbl SET b = $2 WHERE ctid = $1
-   ->  Foreign Scan on public.foreign_tbl
-         Output: foreign_tbl.a, 20, foreign_tbl.ctid
-         Remote SQL: SELECT a, ctid FROM public.base_tbl WHERE ((a < b)) AND ((a = 0)) FOR UPDATE
-(5 rows)
+INSERT INTO rw_view VALUES (0, 5);
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Insert on public.foreign_tbl
+   Remote SQL: INSERT INTO public.base_tbl(a, b) VALUES ($1, $2) RETURNING a, b
+   ->  Result
+         Output: 0, 5
+(4 rows)
 
-UPDATE rw_view SET b = 20 WHERE a = 0; -- ok
-EXPLAIN (VERBOSE, COSTS OFF)
-UPDATE rw_view SET b = -20 WHERE a = 0; -- not pushed down
-                                            QUERY PLAN                                            
---------------------------------------------------------------------------------------------------
- Update on public.foreign_tbl
-   Remote SQL: UPDATE public.base_tbl SET b = $2 WHERE ctid = $1
-   ->  Foreign Scan on public.foreign_tbl
-         Output: foreign_tbl.a, '-20'::integer, foreign_tbl.ctid
-         Remote SQL: SELECT a, ctid FROM public.base_tbl WHERE ((a < b)) AND ((a = 0)) FOR UPDATE
-(5 rows)
-
-UPDATE rw_view SET b = -20 WHERE a = 0; -- should fail
+INSERT INTO rw_view VALUES (0, 5); -- should fail
 ERROR:  new row violates check option for view "rw_view"
-DETAIL:  Failing row contains (0, -20).
+DETAIL:  Failing row contains (10, 5).
+EXPLAIN (VERBOSE, COSTS OFF)
+INSERT INTO rw_view VALUES (0, 15);
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Insert on public.foreign_tbl
+   Remote SQL: INSERT INTO public.base_tbl(a, b) VALUES ($1, $2) RETURNING a, b
+   ->  Result
+         Output: 0, 15
+(4 rows)
+
+INSERT INTO rw_view VALUES (0, 15); -- ok
 SELECT * FROM foreign_tbl;
- a | b  
----+----
- 0 | 20
+ a  | b  
+----+----
+ 10 | 15
+(1 row)
+
+EXPLAIN (VERBOSE, COSTS OFF)
+UPDATE rw_view SET b = b + 5;
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Update on public.foreign_tbl
+   Remote SQL: UPDATE public.base_tbl SET b = $2 WHERE ctid = $1 RETURNING a, b
+   ->  Foreign Scan on public.foreign_tbl
+         Output: foreign_tbl.a, (foreign_tbl.b + 5), foreign_tbl.ctid
+         Remote SQL: SELECT a, b, ctid FROM public.base_tbl WHERE ((a < b)) FOR UPDATE
+(5 rows)
+
+UPDATE rw_view SET b = b + 5; -- should fail
+ERROR:  new row violates check option for view "rw_view"
+DETAIL:  Failing row contains (20, 20).
+EXPLAIN (VERBOSE, COSTS OFF)
+UPDATE rw_view SET b = b + 15;
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Update on public.foreign_tbl
+   Remote SQL: UPDATE public.base_tbl SET b = $2 WHERE ctid = $1 RETURNING a, b
+   ->  Foreign Scan on public.foreign_tbl
+         Output: foreign_tbl.a, (foreign_tbl.b + 15), foreign_tbl.ctid
+         Remote SQL: SELECT a, b, ctid FROM public.base_tbl WHERE ((a < b)) FOR UPDATE
+(5 rows)
+
+UPDATE rw_view SET b = b + 15; -- ok
+SELECT * FROM foreign_tbl;
+ a  | b  
+----+----
+ 20 | 30
 (1 row)
 
 DROP FOREIGN TABLE foreign_tbl CASCADE;
 NOTICE:  drop cascades to view rw_view
+DROP TRIGGER row_before_insupd_trigger ON base_tbl;
 DROP TABLE base_tbl;
+-- test WCO for partitions
+CREATE TABLE child_tbl (a int, b int);
+ALTER TABLE child_tbl SET (autovacuum_enabled = 'false');
+CREATE TRIGGER row_before_insupd_trigger BEFORE INSERT OR UPDATE ON child_tbl FOR EACH ROW EXECUTE PROCEDURE row_before_insupd_trigfunc();
+CREATE FOREIGN TABLE foreign_tbl (a int, b int)
+  SERVER loopback OPTIONS (table_name 'child_tbl');
+CREATE TABLE parent_tbl (a int, b int) PARTITION BY RANGE(a);
+ALTER TABLE parent_tbl ATTACH PARTITION foreign_tbl FOR VALUES FROM (0) TO (100);
+CREATE VIEW rw_view AS SELECT * FROM parent_tbl
+  WHERE a < b WITH CHECK OPTION;
+\d+ rw_view
+                           View "public.rw_view"
+ Column |  Type   | Collation | Nullable | Default | Storage | Description 
+--------+---------+-----------+----------+---------+---------+-------------
+ a      | integer |           |          |         | plain   | 
+ b      | integer |           |          |         | plain   | 
+View definition:
+ SELECT parent_tbl.a,
+    parent_tbl.b
+   FROM parent_tbl
+  WHERE parent_tbl.a < parent_tbl.b;
+Options: check_option=cascaded
+
+EXPLAIN (VERBOSE, COSTS OFF)
+INSERT INTO rw_view VALUES (0, 5);
+         QUERY PLAN          
+-----------------------------
+ Insert on public.parent_tbl
+   ->  Result
+         Output: 0, 5
+(3 rows)
+
+INSERT INTO rw_view VALUES (0, 5); -- should fail
+ERROR:  new row violates check option for view "rw_view"
+DETAIL:  Failing row contains (10, 5).
+EXPLAIN (VERBOSE, COSTS OFF)
+INSERT INTO rw_view VALUES (0, 15);
+         QUERY PLAN          
+-----------------------------
+ Insert on public.parent_tbl
+   ->  Result
+         Output: 0, 15
+(3 rows)
+
+INSERT INTO rw_view VALUES (0, 15); -- ok
+SELECT * FROM foreign_tbl;
+ a  | b  
+----+----
+ 10 | 15
+(1 row)
+
+EXPLAIN (VERBOSE, COSTS OFF)
+UPDATE rw_view SET b = b + 5;
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Update on public.parent_tbl
+   Foreign Update on public.foreign_tbl
+     Remote SQL: UPDATE public.child_tbl SET b = $2 WHERE ctid = $1 RETURNING a, b
+   ->  Foreign Scan on public.foreign_tbl
+         Output: foreign_tbl.a, (foreign_tbl.b + 5), foreign_tbl.ctid
+         Remote SQL: SELECT a, b, ctid FROM public.child_tbl WHERE ((a < b)) FOR UPDATE
+(6 rows)
+
+UPDATE rw_view SET b = b + 5; -- should fail
+ERROR:  new row violates check option for view "rw_view"
+DETAIL:  Failing row contains (20, 20).
+EXPLAIN (VERBOSE, COSTS OFF)
+UPDATE rw_view SET b = b + 15;
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Update on public.parent_tbl
+   Foreign Update on public.foreign_tbl
+     Remote SQL: UPDATE public.child_tbl SET b = $2 WHERE ctid = $1 RETURNING a, b
+   ->  Foreign Scan on public.foreign_tbl
+         Output: foreign_tbl.a, (foreign_tbl.b + 15), foreign_tbl.ctid
+         Remote SQL: SELECT a, b, ctid FROM public.child_tbl WHERE ((a < b)) FOR UPDATE
+(6 rows)
+
+UPDATE rw_view SET b = b + 15; -- ok
+SELECT * FROM foreign_tbl;
+ a  | b  
+----+----
+ 20 | 30
+(1 row)
+
+DROP FOREIGN TABLE foreign_tbl CASCADE;
+DROP TRIGGER row_before_insupd_trigger ON child_tbl;
+DROP TABLE parent_tbl CASCADE;
+NOTICE:  drop cascades to view rw_view
+DROP FUNCTION row_before_insupd_trigfunc;
 -- ===================================================================
 -- test serial columns (ie, sequence-based defaults)
 -- ===================================================================

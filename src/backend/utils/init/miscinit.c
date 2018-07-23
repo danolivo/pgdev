@@ -43,10 +43,12 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/pg_shmem.h"
+#include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/pidfile.h"
 #include "utils/syscache.h"
@@ -304,6 +306,9 @@ InitPostmasterChild(void)
 	if (setsid() < 0)
 		elog(FATAL, "setsid() failed: %m");
 #endif
+
+	/* Request a signal if the postmaster dies, if possible. */
+	PostmasterDeathSignalInit();
 }
 
 /*
@@ -589,6 +594,13 @@ InitializeSessionUserId(const char *rolename, Oid roleid)
 
 	/* call only once */
 	AssertState(!OidIsValid(AuthenticatedUserId));
+
+	/*
+	 * Make sure syscache entries are flushed for recent catalog changes.
+	 * This allows us to find roles that were created on-the-fly during
+	 * authentication.
+	 */
+	AcceptInvalidationMessages();
 
 	if (rolename != NULL)
 	{

@@ -25,6 +25,10 @@
 #include "common/pg_lzcompress.h"
 #include "replication/origin.h"
 
+#ifndef FRONTEND
+#include "utils/memutils.h"
+#endif
+
 static bool allocate_recordbuf(XLogReaderState *state, uint32 reclength);
 
 static bool ValidXLogRecordHeader(XLogReaderState *state, XLogRecPtr RecPtr,
@@ -159,6 +163,25 @@ allocate_recordbuf(XLogReaderState *state, uint32 reclength)
 
 	newSize += XLOG_BLCKSZ - (newSize % XLOG_BLCKSZ);
 	newSize = Max(newSize, 5 * Max(BLCKSZ, XLOG_BLCKSZ));
+
+#ifndef FRONTEND
+
+	/*
+	 * Note that in much unlucky circumstances, the random data read from a
+	 * recycled segment can cause this routine to be called with a size
+	 * causing a hard failure at allocation.  For a standby, this would cause
+	 * the instance to stop suddenly with a hard failure, preventing it to
+	 * retry fetching WAL from one of its sources which could allow it to move
+	 * on with replay without a manual restart. If the data comes from a past
+	 * recycled segment and is still valid, then the allocation may succeed
+	 * but record checks are going to fail so this would be short-lived.  If
+	 * the allocation fails because of a memory shortage, then this is not a
+	 * hard failure either per the guarantee given by MCXT_ALLOC_NO_OOM.
+	 */
+	if (!AllocSizeIsValid(newSize))
+		return false;
+
+#endif
 
 	if (state->readRecordBuf)
 		pfree(state->readRecordBuf);
@@ -724,7 +747,7 @@ XLogReaderValidatePageHeader(XLogReaderState *state, XLogRecPtr recptr,
 	XLByteToSeg(recptr, segno, state->wal_segment_size);
 	offset = XLogSegmentOffset(recptr, state->wal_segment_size);
 
-	XLogSegNoOffsetToRecPtr(segno, offset, recaddr, state->wal_segment_size);
+	XLogSegNoOffsetToRecPtr(segno, offset, state->wal_segment_size, recaddr);
 
 	if (hdr->xlp_magic != XLOG_PAGE_MAGIC)
 	{
@@ -806,9 +829,9 @@ XLogReaderValidatePageHeader(XLogReaderState *state, XLogRecPtr recptr,
 	}
 
 	/*
-	 * Check that the address on the page agrees with what we expected.
-	 * This check typically fails when an old WAL segment is recycled,
-	 * and hasn't yet been overwritten with new data yet.
+	 * Check that the address on the page agrees with what we expected. This
+	 * check typically fails when an old WAL segment is recycled, and hasn't
+	 * yet been overwritten with new data yet.
 	 */
 	if (hdr->xlp_pageaddr != recaddr)
 	{

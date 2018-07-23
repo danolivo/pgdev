@@ -416,7 +416,7 @@ static relopt_real realRelOpts[] =
 			RELOPT_KIND_BTREE,
 			ShareUpdateExclusiveLock
 		},
-		-1, 0.0, 100.0
+		-1, 0.0, 1e10
 	},
 	/* list terminator */
 	{{NULL}}

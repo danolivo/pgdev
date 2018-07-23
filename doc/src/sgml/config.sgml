@@ -1662,9 +1662,9 @@ include_dir 'conf.d'
         should use.  Possible values are <literal>posix</literal> (for POSIX shared
         memory allocated using <literal>shm_open</literal>), <literal>sysv</literal>
         (for System V shared memory allocated via <literal>shmget</literal>),
-        <literal>windows</literal> (for Windows shared memory), <literal>mmap</literal>
-        (to simulate shared memory using memory-mapped files stored in the
-        data directory), and <literal>none</literal> (to disable this feature).
+        <literal>windows</literal> (for Windows shared memory),
+        and <literal>mmap</literal> (to simulate shared memory using
+        memory-mapped files stored in the data directory).
         Not all values are supported on all platforms; the first supported
         option is the default for that platform.  The use of the
         <literal>mmap</literal> option, which is not the default on any platform,
@@ -1880,50 +1880,6 @@ include_dir 'conf.d'
        <varname>vacuum_cost_delay</varname> * 4.
       </para>
      </note>
-    </sect2>
-
-    <sect2 id="runtime-config-index-vacuum">
-     <title>Index Vacuum</title>
-     <variablelist>
-     <varlistentry id="guc-vacuum-cleanup-index-scale-factor" xreflabel="vacuum_cleanup_index_scale_factor">
-      <term><varname>vacuum_cleanup_index_scale_factor</varname> (<type>floating point</type>)
-      <indexterm>
-       <primary><varname>vacuum_cleanup_index_scale_factor</varname> configuration parameter</primary>
-      </indexterm>
-      </term>
-      <listitem>
-       <para>
-        Specifies the fraction of the total number of heap tuples counted in
-        the previous statistics collection that can be inserted without
-        incurring an index scan at the <command>VACUUM</command> cleanup stage.
-        This setting currently applies to B-tree indexes only.
-       </para>
-
-       <para>
-        If no tuples were deleted from the heap, B-tree indexes are still
-        scanned at the <command>VACUUM</command> cleanup stage when at least one
-        of the following conditions is met: the index statistics are stale, or
-        the index contains deleted pages that can be recycled during cleanup.
-        Index statistics are considered to be stale if the number of newly
-        inserted tuples exceeds the <varname>vacuum_cleanup_index_scale_factor</varname>
-        fraction of the total number of heap tuples detected by the previous
-        statistics collection. The total number of heap tuples is stored in
-        the index meta-page. Note that the meta-page does not include this data
-        until <command>VACUUM</command> finds no dead tuples, so B-tree index
-        scan at the cleanup stage can only be skipped if the second and
-        subsequent <command>VACUUM</command> cycles detect no dead tuples.
-       </para>
-
-       <para>
-        The value can range from <literal>0</literal> to <literal>100</literal>.
-        When <varname>vacuum_cleanup_index_scale_factor</varname> is set to
-        <literal>0</literal>, index scans are never skipped during
-        <command>VACUUM</command> cleanup. The default value is <literal>0.1</literal>.
-       </para>
-
-      </listitem>
-     </varlistentry>
-     </variablelist>
     </sect2>
 
     <sect2 id="runtime-config-resource-background-writer">
@@ -2192,7 +2148,7 @@ include_dir 'conf.d'
          pool of processes established by <xref
          linkend="guc-max-worker-processes"/>, limited by <xref
          linkend="guc-max-parallel-workers"/>.  Note that the requested
-         number of workers may not actually be available at runtime.
+         number of workers may not actually be available at run time.
          If this occurs, the utility operation will run with fewer
          workers than expected.  The default value is 2.  Setting this
          value to 0 disables the use of parallel workers by utility
@@ -4660,6 +4616,36 @@ SELECT * FROM parent WHERE key = 2400;
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-plan-cache_mode" xreflabel="plan_cache_mode">
+      <term><varname>plan_cache_mode</varname> (<type>enum</type>)
+      <indexterm>
+       <primary><varname>plan_cache_mode</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Prepared statements (either explicitly prepared or implicitly
+        generated, for example in PL/pgSQL) can be executed using custom or
+        generic plans.  A custom plan is replanned for a new parameter value,
+        a generic plan is reused for repeated executions of the prepared
+        statement.  The choice between them is normally made automatically.
+        This setting overrides the default behavior and forces either a custom
+        or a generic plan.  This can be used to work around performance
+        problems in specific cases.  Note, however, that the plan cache
+        behavior is subject to change, so this setting, like all settings that
+        force the planner's hand, should be reevaluated regularly.
+       </para>
+
+       <para>
+        The allowed values are <literal>auto</literal>,
+        <literal>force_custom_plan</literal> and
+        <literal>force_generic_plan</literal>.  The default value is
+        <literal>auto</literal>.  The setting is applied when a cached plan is
+        to be executed, not when it is prepared.
+       </para>
+      </listitem>
+     </varlistentry>
+
      </variablelist>
     </sect2>
    </sect1>
@@ -7003,6 +6989,46 @@ COPY postgres_log FROM '/full/path/to/logfile.csv' WITH csv;
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-vacuum-cleanup-index-scale-factor" xreflabel="vacuum_cleanup_index_scale_factor">
+      <term><varname>vacuum_cleanup_index_scale_factor</varname> (<type>floating point</type>)
+      <indexterm>
+       <primary><varname>vacuum_cleanup_index_scale_factor</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Specifies the fraction of the total number of heap tuples counted in
+        the previous statistics collection that can be inserted without
+        incurring an index scan at the <command>VACUUM</command> cleanup stage.
+        This setting currently applies to B-tree indexes only.
+       </para>
+
+       <para>
+        If no tuples were deleted from the heap, B-tree indexes are still
+        scanned at the <command>VACUUM</command> cleanup stage when at least one
+        of the following conditions is met: the index statistics are stale, or
+        the index contains deleted pages that can be recycled during cleanup.
+        Index statistics are considered to be stale if the number of newly
+        inserted tuples exceeds the <varname>vacuum_cleanup_index_scale_factor</varname>
+        fraction of the total number of heap tuples detected by the previous
+        statistics collection. The total number of heap tuples is stored in
+        the index meta-page. Note that the meta-page does not include this data
+        until <command>VACUUM</command> finds no dead tuples, so B-tree index
+        scan at the cleanup stage can only be skipped if the second and
+        subsequent <command>VACUUM</command> cycles detect no dead tuples.
+       </para>
+
+       <para>
+        The value can range from <literal>0</literal> to
+        <literal>10000000000</literal>.
+        When <varname>vacuum_cleanup_index_scale_factor</varname> is set to
+        <literal>0</literal>, index scans are never skipped during
+        <command>VACUUM</command> cleanup. The default value is <literal>0.1</literal>.
+       </para>
+
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-bytea-output" xreflabel="bytea_output">
       <term><varname>bytea_output</varname> (<type>enum</type>)
       <indexterm>
@@ -8860,7 +8886,7 @@ LOG:  CleanUpLock: deleting: lock(0xb7acd844) id(24688,24696,0,0,0,1)
       <listitem>
        <para>
         Writes the generated <productname>LLVM</productname> IR out to the
-        filesystem, inside <xref linkend="guc-data-directory"/>. This is only
+        file system, inside <xref linkend="guc-data-directory"/>. This is only
         useful for working on the internals of the JIT implementation.
 
         The default setting is <literal>off</literal>, and it can only be

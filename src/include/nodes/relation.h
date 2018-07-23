@@ -162,6 +162,8 @@ typedef struct PlannerGlobal
  * the passed-in Query data structure; someday that should stop.
  *----------
  */
+struct AppendRelInfo;
+
 typedef struct PlannerInfo
 {
 	NodeTag		type;
@@ -200,6 +202,14 @@ typedef struct PlannerInfo
 	 * been expanded.
 	 */
 	RangeTblEntry **simple_rte_array;	/* rangetable as an array */
+
+	/*
+	 * append_rel_array is the same length as the above arrays, and holds
+	 * pointers to the corresponding AppendRelInfo entry indexed by
+	 * child_relid, or NULL if none.  The array itself is not allocated if
+	 * append_rel_list is empty.
+	 */
+	struct AppendRelInfo **append_rel_array;
 
 	/*
 	 * all_baserels is a Relids set of all base relids (but not "other"
@@ -1643,17 +1653,12 @@ typedef struct MinMaxAggPath
 
 /*
  * WindowAggPath represents generic computation of window functions
- *
- * Note: winpathkeys is separate from path.pathkeys because the actual sort
- * order might be an extension of winpathkeys; but createplan.c needs to
- * know exactly how many pathkeys match the window clause.
  */
 typedef struct WindowAggPath
 {
 	Path		path;
 	Path	   *subpath;		/* path representing input source */
 	WindowClause *winclause;	/* WindowClause we'll be using */
-	List	   *winpathkeys;	/* PathKeys for PARTITION keys + ORDER keys */
 } WindowAggPath;
 
 /*
