@@ -21,6 +21,8 @@ extern void HeapCleanerWorkerMain(int argc, char *argv[]) pg_attribute_noreturn(
 
 extern int heapcleaner_max_workers;
 
+
+extern void AtEOXact_BGHeap_tables(bool isCommit);
 extern bool IsHeapCleanerLauncherProcess(void);
 extern bool IsHeapCleanerWorkerProcess(void);
 

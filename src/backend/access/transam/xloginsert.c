@@ -512,7 +512,7 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 	 * for callers of XLogInsert() to pass XLR_CHECK_CONSISTENCY directly for
 	 * a record.
 	 */
-//	if (wal_consistency_checking[rmid])
+	if (wal_consistency_checking[rmid])
 		info |= XLR_CHECK_CONSISTENCY;
 
 	/*

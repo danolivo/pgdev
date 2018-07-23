@@ -946,6 +946,7 @@ CheckpointerShmemInit(void)
 	}
 }
 
+static int ccounter = 0;
 /*
  * RequestCheckpoint
  *		Called in backend processes to request a checkpoint
@@ -969,7 +970,7 @@ RequestCheckpoint(int flags)
 	int			ntries;
 	int			old_failed,
 				old_started;
-
+elog(LOG, "[%d] RequestCheckpoint", ccounter++);
 	/*
 	 * If in a standalone backend, just do it ourselves.
 	 */
