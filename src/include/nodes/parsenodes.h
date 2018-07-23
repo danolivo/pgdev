@@ -3135,7 +3135,8 @@ typedef enum VacuumOption
 	VACOPT_VERBOSE = 1 << 2,	/* print progress info */
 	VACOPT_FREEZE = 1 << 3,		/* FREEZE option */
 	VACOPT_FULL = 1 << 4,		/* FULL (non-concurrent) vacuum */
-	VACOPT_NOWAIT = 1 << 5,		/* don't wait to get lock (autovacuum only) */
+	VACOPT_SKIP_LOCKED = 1 << 5,	/* skip if cannot get lock (autovacuum
+									 * only) */
 	VACOPT_SKIPTOAST = 1 << 6,	/* don't process the TOAST table, if any */
 	VACOPT_DISABLE_PAGE_SKIPPING = 1 << 7	/* don't skip any pages */
 } VacuumOption;
@@ -3432,7 +3433,7 @@ typedef struct AlterTSConfigurationStmt
 typedef struct CreatePublicationStmt
 {
 	NodeTag		type;
-	char	   *pubname;		/* Name of of the publication */
+	char	   *pubname;		/* Name of the publication */
 	List	   *options;		/* List of DefElem nodes */
 	List	   *tables;			/* Optional list of tables to add */
 	bool		for_all_tables; /* Special publication for all tables in db */
@@ -3441,7 +3442,7 @@ typedef struct CreatePublicationStmt
 typedef struct AlterPublicationStmt
 {
 	NodeTag		type;
-	char	   *pubname;		/* Name of of the publication */
+	char	   *pubname;		/* Name of the publication */
 
 	/* parameters used for ALTER PUBLICATION ... WITH */
 	List	   *options;		/* List of DefElem nodes */
@@ -3455,7 +3456,7 @@ typedef struct AlterPublicationStmt
 typedef struct CreateSubscriptionStmt
 {
 	NodeTag		type;
-	char	   *subname;		/* Name of of the subscription */
+	char	   *subname;		/* Name of the subscription */
 	char	   *conninfo;		/* Connection string to publisher */
 	List	   *publication;	/* One or more publication to subscribe to */
 	List	   *options;		/* List of DefElem nodes */
@@ -3474,7 +3475,7 @@ typedef struct AlterSubscriptionStmt
 {
 	NodeTag		type;
 	AlterSubscriptionType kind; /* ALTER_SUBSCRIPTION_OPTIONS, etc */
-	char	   *subname;		/* Name of of the subscription */
+	char	   *subname;		/* Name of the subscription */
 	char	   *conninfo;		/* Connection string to publisher */
 	List	   *publication;	/* One or more publication to subscribe to */
 	List	   *options;		/* List of DefElem nodes */
@@ -3483,7 +3484,7 @@ typedef struct AlterSubscriptionStmt
 typedef struct DropSubscriptionStmt
 {
 	NodeTag		type;
-	char	   *subname;		/* Name of of the subscription */
+	char	   *subname;		/* Name of the subscription */
 	bool		missing_ok;		/* Skip error if missing? */
 	DropBehavior behavior;		/* RESTRICT or CASCADE behavior */
 } DropSubscriptionStmt;

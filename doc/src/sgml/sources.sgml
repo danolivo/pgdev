@@ -709,8 +709,8 @@ BETTER: could not open file %s (I/O failure)
     not helpful information.  If the error text doesn't make as much sense
     without the function name, reword it.
 <programlisting>
-BAD:    pg_atoi: error in "z": cannot parse "z"
-BETTER: invalid input syntax for integer: "z"
+BAD:    pg_strtoint32: error in "z": cannot parse "z"
+BETTER: invalid input syntax for type integer: "z"
 </programlisting>
    </para>
 

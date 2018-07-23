@@ -417,7 +417,7 @@ ExecSimpleRelationInsert(EState *estate, TupleTableSlot *slot)
 		if (resultRelInfo->ri_PartitionCheck)
 			ExecPartitionCheck(resultRelInfo, slot, estate, true);
 
-		/* Store the slot into tuple that we can inspect. */
+		/* Materialize slot into a tuple that we can scribble upon. */
 		tuple = ExecMaterializeSlot(slot);
 
 		/* OK, store the tuple and create index entries for it */
@@ -484,7 +484,7 @@ ExecSimpleRelationUpdate(EState *estate, EPQState *epqstate,
 		if (resultRelInfo->ri_PartitionCheck)
 			ExecPartitionCheck(resultRelInfo, slot, estate, true);
 
-		/* Store the slot into tuple that we can write. */
+		/* Materialize slot into a tuple that we can scribble upon. */
 		tuple = ExecMaterializeSlot(slot);
 
 		/* OK, update the tuple and index entries for it */
@@ -531,7 +531,7 @@ ExecSimpleRelationDelete(EState *estate, EPQState *epqstate,
 	{
 		skip_tuple = !ExecBRDeleteTriggers(estate, epqstate, resultRelInfo,
 										   &searchslot->tts_tuple->t_self,
-										   NULL);
+										   NULL, NULL);
 	}
 
 	if (!skip_tuple)

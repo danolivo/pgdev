@@ -37,7 +37,6 @@
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
-#include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #include "utils/typcache.h"
 
@@ -160,13 +159,6 @@ CreateParallelContext(const char *library_name, const char *function_name,
 
 	/* Number of workers should be non-negative. */
 	Assert(nworkers >= 0);
-
-	/*
-	 * If dynamic shared memory is not available, we won't be able to use
-	 * background workers.
-	 */
-	if (dynamic_shared_memory_type == DSM_IMPL_NONE)
-		nworkers = 0;
 
 	/*
 	 * If we are running under serializable isolation, we can't use parallel
@@ -1227,16 +1219,19 @@ ParallelWorkerMain(Datum main_arg)
 	Assert(ParallelWorkerNumber == -1);
 	memcpy(&ParallelWorkerNumber, MyBgworkerEntry->bgw_extra, sizeof(int));
 
-	/* Set up a memory context and resource owner. */
-	Assert(CurrentResourceOwner == NULL);
-	CurrentResourceOwner = ResourceOwnerCreate(NULL, "parallel toplevel");
+	/* Set up a memory context to work in, just for cleanliness. */
 	CurrentMemoryContext = AllocSetContextCreate(TopMemoryContext,
 												 "Parallel worker",
 												 ALLOCSET_DEFAULT_SIZES);
 
 	/*
-	 * Now that we have a resource owner, we can attach to the dynamic shared
-	 * memory segment and read the table of contents.
+	 * Attach to the dynamic shared memory segment for the parallel query, and
+	 * find its table of contents.
+	 *
+	 * Note: at this point, we have not created any ResourceOwner in this
+	 * process.  This will result in our DSM mapping surviving until process
+	 * exit, which is fine.  If there were a ResourceOwner, it would acquire
+	 * ownership of the mapping, but we have no need for that.
 	 */
 	seg = dsm_attach(DatumGetUInt32(main_arg));
 	if (seg == NULL)
@@ -1400,7 +1395,7 @@ ParallelWorkerMain(Datum main_arg)
 	/* Must exit parallel mode to pop active snapshot. */
 	ExitParallelMode();
 
-	/* Must pop active snapshot so resowner.c doesn't complain. */
+	/* Must pop active snapshot so snapmgr.c doesn't complain. */
 	PopActiveSnapshot();
 
 	/* Shut down the parallel-worker transaction. */

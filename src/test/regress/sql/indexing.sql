@@ -26,6 +26,15 @@ CREATE TABLE idxpart_two (col2 INT);
 SELECT col2 FROM idxpart_two fk LEFT OUTER JOIN idxpart pk ON (col1 = col2);
 DROP table idxpart, idxpart_two;
 
+-- Verify bugfix with index rewrite on ALTER TABLE / SET DATA TYPE
+-- https://postgr.es/m/CAKcux6mxNCGsgATwf5CGMF8g4WSupCXicCVMeKUTuWbyxHOMsQ@mail.gmail.com
+CREATE TABLE idxpart (a INT, b TEXT, c INT) PARTITION BY RANGE(a);
+CREATE TABLE idxpart1 PARTITION OF idxpart FOR VALUES FROM (MINVALUE) TO (MAXVALUE);
+CREATE INDEX partidx_abc_idx ON idxpart (a, b, c);
+INSERT INTO idxpart (a, b, c) SELECT i, i, i FROM generate_series(1, 50) i;
+ALTER TABLE idxpart ALTER COLUMN c TYPE numeric;
+DROP TABLE idxpart;
+
 -- If a table without index is attached as partition to a table with
 -- an index, the index is automatically created
 create table idxpart (a int, b int, c text) partition by range (a);
@@ -326,6 +335,7 @@ alter table idxpart2 drop column col1, drop column col2;
 create index on idxpart2 (abs(b));
 alter table idxpart attach partition idxpart2 for values from (0) to (1);
 create index on idxpart (abs(b));
+create index on idxpart ((b + 1));
 alter table idxpart attach partition idxpart1 for values from (1) to (2);
 select c.relname, pg_get_indexdef(indexrelid)
   from pg_class c join pg_index i on c.oid = i.indexrelid

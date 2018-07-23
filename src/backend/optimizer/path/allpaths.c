@@ -1383,13 +1383,16 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 	List	   *pa_partial_subpaths = NIL;
 	List	   *pa_nonpartial_subpaths = NIL;
 	bool		partial_subpaths_valid = true;
-	bool		pa_subpaths_valid = enable_parallel_append;
+	bool		pa_subpaths_valid;
 	List	   *all_child_pathkeys = NIL;
 	List	   *all_child_outers = NIL;
 	ListCell   *l;
 	List	   *partitioned_rels = NIL;
 	bool		build_partitioned_rels = false;
 	double		partial_rows = -1;
+
+	/* If appropriate, consider parallel append */
+	pa_subpaths_valid = enable_parallel_append && rel->consider_parallel;
 
 	/*
 	 * AppendPath generated for partitioned tables must record the RT indexes
@@ -3686,6 +3689,21 @@ print_path(PlannerInfo *root, Path *path, int indent)
 		case T_ForeignPath:
 			ptype = "ForeignScan";
 			break;
+		case T_CustomPath:
+			ptype = "CustomScan";
+			break;
+		case T_NestPath:
+			ptype = "NestLoop";
+			join = true;
+			break;
+		case T_MergePath:
+			ptype = "MergeJoin";
+			join = true;
+			break;
+		case T_HashPath:
+			ptype = "HashJoin";
+			join = true;
+			break;
 		case T_AppendPath:
 			ptype = "Append";
 			break;
@@ -3706,6 +3724,10 @@ print_path(PlannerInfo *root, Path *path, int indent)
 		case T_GatherPath:
 			ptype = "Gather";
 			subpath = ((GatherPath *) path)->subpath;
+			break;
+		case T_GatherMergePath:
+			ptype = "GatherMerge";
+			subpath = ((GatherMergePath *) path)->subpath;
 			break;
 		case T_ProjectionPath:
 			ptype = "Projection";
@@ -3759,18 +3781,6 @@ print_path(PlannerInfo *root, Path *path, int indent)
 		case T_LimitPath:
 			ptype = "Limit";
 			subpath = ((LimitPath *) path)->subpath;
-			break;
-		case T_NestPath:
-			ptype = "NestLoop";
-			join = true;
-			break;
-		case T_MergePath:
-			ptype = "MergeJoin";
-			join = true;
-			break;
-		case T_HashPath:
-			ptype = "HashJoin";
-			join = true;
 			break;
 		default:
 			ptype = "???Path";
