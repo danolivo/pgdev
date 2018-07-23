@@ -76,11 +76,6 @@ typedef bool (*aminsert_function) (Relation indexRelation,
 								   IndexUniqueCheck checkUnique,
 								   struct IndexInfo *indexInfo);
 
-/* target delete */
-typedef IndexTargetDeleteResult *(*amtargetdelete_function) (IndexTargetDeleteInfo *info,
-															 IndexTargetDeleteResult *stats,
-															 Datum *values,
-															 bool *isnull);
 /* bulk delete */
 typedef IndexBulkDeleteResult *(*ambulkdelete_function) (IndexVacuumInfo *info,
 														 IndexBulkDeleteResult *stats,
@@ -212,7 +207,6 @@ typedef struct IndexAmRoutine
 	ambuild_function ambuild;
 	ambuildempty_function ambuildempty;
 	aminsert_function aminsert;
-	amtargetdelete_function amtargetdelete;
 	ambulkdelete_function ambulkdelete;
 	amvacuumcleanup_function amvacuumcleanup;
 	amcanreturn_function amcanreturn;	/* can be NULL */
