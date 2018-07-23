@@ -805,6 +805,8 @@ _bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup)
 	OffsetNumber last_off;
 	Size		pgspc;
 	Size		itupsz;
+	int			indnatts = IndexRelationGetNumberOfAttributes(wstate->index);
+	int			indnkeyatts = IndexRelationGetNumberOfKeyAttributes(wstate->index);
 
 	/*
 	 * This is a handy place to check for cancel interrupts during the btree
@@ -887,17 +889,17 @@ _bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup)
 		ItemIdSetUnused(ii);	/* redundant */
 		((PageHeader) opage)->pd_lower -= sizeof(ItemIdData);
 
-		if (P_ISLEAF(opageop))
+		if (indnkeyatts != indnatts && P_ISLEAF(opageop))
 		{
-			OffsetNumber	lastleftoffnum = OffsetNumberPrev(last_off);
-			IndexTuple		truncated;
-			Size			truncsz;
+			IndexTuple	truncated;
+			Size		truncsz;
 
 			/*
-			 * Truncate away any unneeded attributes from high key on leaf
-			 * level.  This is only done at the leaf level because downlinks in
-			 * internal pages are either negative infinity items, or get their
-			 * contents from copying from one level down.  See also:
+			 * Truncate any non-key attributes from high key on leaf level
+			 * (i.e. truncate on leaf level if we're building an INCLUDE
+			 * index).  This is only done at the leaf level because downlinks
+			 * in internal pages are either negative infinity items, or get
+			 * their contents from copying from one level down.  See also:
 			 * _bt_split().
 			 *
 			 * Since the truncated tuple is probably smaller than the
@@ -911,12 +913,8 @@ _bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup)
 			 * only shift the line pointer array back and forth, and overwrite
 			 * the latter portion of the space occupied by the original tuple.
 			 * This is fairly cheap.
-			 *
-			 * TODO: Give a little weight to how large the final downlink will
-			 * be when deciding on a split point.
 			 */
-			truncated = _bt_suffix_truncate(wstate->index, opage,
-											lastleftoffnum, oitup);
+			truncated = _bt_nonkey_truncate(wstate->index, oitup);
 			truncsz = IndexTupleSize(truncated);
 			PageIndexTupleDelete(opage, P_HIKEY);
 			_bt_sortaddtup(opage, truncsz, truncated, P_HIKEY);
@@ -935,9 +933,8 @@ _bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup)
 		if (state->btps_next == NULL)
 			state->btps_next = _bt_pagestate(wstate, state->btps_level + 1);
 
-		Assert((BTreeTupleGetNAtts(state->btps_minkey, wstate->index) <=
-				IndexRelationGetNumberOfKeyAttributes(wstate->index) &&
-				BTreeTupleGetNAtts(state->btps_minkey, wstate->index) > 0) ||
+		Assert(BTreeTupleGetNAtts(state->btps_minkey, wstate->index) ==
+			   IndexRelationGetNumberOfKeyAttributes(wstate->index) ||
 			   P_LEFTMOST(opageop));
 		Assert(BTreeTupleGetNAtts(state->btps_minkey, wstate->index) == 0 ||
 			   !P_LEFTMOST(opageop));
@@ -982,7 +979,7 @@ _bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup)
 	 * the first item for a page is copied from the prior page in the code
 	 * above.  Since the minimum key for an entire level is only used as a
 	 * minus infinity downlink, and never as a high key, there is no need to
-	 * truncate away suffix attributes at this point.
+	 * truncate away non-key attributes at this point.
 	 */
 	if (last_off == P_HIKEY)
 	{
@@ -1041,9 +1038,8 @@ _bt_uppershutdown(BTWriteState *wstate, BTPageState *state)
 		}
 		else
 		{
-			Assert((BTreeTupleGetNAtts(s->btps_minkey, wstate->index) <=
-					IndexRelationGetNumberOfKeyAttributes(wstate->index) &&
-					BTreeTupleGetNAtts(s->btps_minkey, wstate->index) > 0) ||
+			Assert(BTreeTupleGetNAtts(s->btps_minkey, wstate->index) ==
+				   IndexRelationGetNumberOfKeyAttributes(wstate->index) ||
 				   P_LEFTMOST(opaque));
 			Assert(BTreeTupleGetNAtts(s->btps_minkey, wstate->index) == 0 ||
 				   !P_LEFTMOST(opaque));
@@ -1140,8 +1136,6 @@ _bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 			}
 			else if (itup != NULL)
 			{
-				int32		compare = 0;
-
 				for (i = 1; i <= keysz; i++)
 				{
 					SortSupport entry;
@@ -1149,6 +1143,7 @@ _bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 								attrDatum2;
 					bool		isNull1,
 								isNull2;
+					int32		compare;
 
 					entry = sortKeys + i - 1;
 					attrDatum1 = index_getattr(itup, i, tupdes, &isNull1);
@@ -1164,22 +1159,6 @@ _bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 					}
 					else if (compare < 0)
 						break;
-				}
-
-				/*
-				 * If key values are equal, we sort on ItemPointer.  This is
-				 * required for btree indexes, since heap TID is treated as an
-				 * implicit last key attribute in order to ensure that all keys
-				 * in the index are physically unique.
-				 *
-				 * Deliberately invert the order, since TIDs "sort DESC".
-				 */
-				if (compare == 0)
-				{
-					compare = ItemPointerCompare(&itup2->t_tid, &itup->t_tid);
-					Assert(compare != 0);
-					if (compare > 0)
-						load1 = false;
 				}
 			}
 			else
