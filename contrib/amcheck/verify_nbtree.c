@@ -154,6 +154,8 @@ static inline bool invariant_l_nontarget_offset(BtreeCheckState *state,
 							   Page other, int tupnkeyatts, ScanKey key,
 							   ItemPointer scantid, OffsetNumber upperbound);
 static Page palloc_btree_page(BtreeCheckState *state, BlockNumber blocknum);
+static inline ItemPointer BTreeTupleGetHeapTIDCareful(BtreeCheckState *state,
+								  IndexTuple itup, bool isleaf);
 
 /*
  * bt_index_check(index regclass, heapallindexed boolean)
@@ -923,7 +925,7 @@ bt_target_page_check(BtreeCheckState *state)
 		 */
 		tupnkeyatts = BTreeTupleGetNKeyAtts(itup, state->rel);
 		skey = _bt_mkscankey(state->rel, itup);
-		scantid = BTreeTupleGetHeapTID(itup);
+		scantid = BTreeTupleGetHeapTIDCareful(state, itup, P_ISLEAF(topaque));
 
 		/* Fingerprint leaf page tuples (those that point to the heap) */
 		if (state->heapallindexed && P_ISLEAF(topaque) && !ItemIdIsDead(itemid))
@@ -1050,7 +1052,8 @@ bt_target_page_check(BtreeCheckState *state)
 			{
 				righttupnkeyatts = BTreeTupleGetNKeyAtts(righttup, state->rel);
 				rightkey = _bt_mkscankey(state->rel, righttup);
-				rightscantid = BTreeTupleGetHeapTID(righttup);
+				rightscantid = BTreeTupleGetHeapTIDCareful(state, righttup,
+														   P_ISLEAF(topaque));
 			}
 
 			if (righttup &&
@@ -1806,6 +1809,7 @@ invariant_l_offset(BtreeCheckState *state, int tupnkeyatts, ScanKey key,
 	 */
 	if (cmp == 0)
 	{
+		BTPageOpaque topaque;
 		ItemId		itemid;
 		IndexTuple	ritup;
 		int			uppnkeyatts;
@@ -1816,7 +1820,9 @@ invariant_l_offset(BtreeCheckState *state, int tupnkeyatts, ScanKey key,
 		uppnkeyatts = BTreeTupleGetNKeyAtts(ritup, state->rel);
 
 		/* Get heap TID for item to the right */
-		rheaptid = BTreeTupleGetHeapTID(ritup);
+		topaque = (BTPageOpaque) PageGetSpecialPointer(state->target);
+		rheaptid = BTreeTupleGetHeapTIDCareful(state, ritup,
+											   P_ISLEAF(topaque));
 
 		if (uppnkeyatts == tupnkeyatts)
 			return scantid == NULL && rheaptid != NULL;
@@ -1904,13 +1910,16 @@ invariant_l_nontarget_offset(BtreeCheckState *state, Page nontarget,
 		IndexTuple	child;
 		int			uppnkeyatts;
 		ItemPointer childheaptid;
+		BTPageOpaque copaque;
 
+		copaque = (BTPageOpaque) PageGetSpecialPointer(nontarget);
 		itemid = PageGetItemId(nontarget, upperbound);
 		child = (IndexTuple) PageGetItem(nontarget, itemid);
 		uppnkeyatts = BTreeTupleGetNKeyAtts(child, state->rel);
 
 		/* Get heap TID for item from child/non-target */
-		childheaptid = BTreeTupleGetHeapTID(child);
+		childheaptid = BTreeTupleGetHeapTIDCareful(state, child,
+												   P_ISLEAF(copaque));
 
 		if (uppnkeyatts == tupnkeyatts)
 			return scantid == NULL && childheaptid != NULL;
@@ -2073,4 +2082,32 @@ palloc_btree_page(BtreeCheckState *state, BlockNumber blocknum)
 						blocknum, RelationGetRelationName(state->rel))));
 
 	return page;
+}
+
+/*
+ * BTreeTupleGetHeapTID() wrapper that lets caller enforce that a heap TID must
+ * be present in cases where that is mandatory.
+ *
+ * This doesn't add much as of BTREE_VERSION 4, since the INDEX_ALT_TID_MASK
+ * bit is effectively a proxy for whether or not the tuple is a pivot tuple.
+ * It may become more useful in the future, when non-pivot tuples support their
+ * own alternative INDEX_ALT_TID_MASK representation.
+ *
+ * Note that it is incorrect to specify the tuple as a non-pivot when passing a
+ * leaf tuple that came from the high key offset, since that is actually a
+ * pivot tuple.
+ */
+static inline ItemPointer
+BTreeTupleGetHeapTIDCareful(BtreeCheckState *state, IndexTuple itup,
+							bool nonpivot)
+{
+	ItemPointer result = BTreeTupleGetHeapTID(itup);
+
+	if (result == NULL && nonpivot)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("block %u or its right sibling block or child block in index \"%s\" contains non-pivot tuple that lacks a heap TID",
+						state->targetblock, RelationGetRelationName(state->rel))));
+
+	return result;
 }

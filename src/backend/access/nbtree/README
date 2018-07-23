@@ -34,27 +34,47 @@ Differences to the Lehman & Yao algorithm
 We have made the following changes in order to incorporate the L&Y algorithm
 into Postgres:
 
-The requirement that all btree keys be unique is too onerous,
-but the algorithm won't work correctly without it.  Fortunately, it is
-only necessary that keys be unique on a single tree level, because L&Y
-only use the assumption of key uniqueness when re-finding a key in a
-parent page (to determine where to insert the key for a split page).
-Therefore, we can use the link field to disambiguate multiple
-occurrences of the same user key: only one entry in the parent level
-will be pointing at the page we had split.  (Indeed we need not look at
-the real "key" at all, just at the link field.)  We can distinguish
-items at the leaf level in the same way, by examining their links to
-heap tuples; we'd never have two items for the same heap tuple.
+The requirement that all btree keys be unique is satisfied by treating
+heap TID as a tie-breaker attribute.  Logical duplicates are sorted in
+descending item pointer order.  We don't use btree keys to
+disambiguate downlinks from the internal pages during a page split,
+though: only one entry in the parent level will be pointing at the
+page we just split, so the link fields can be used to re-find
+downlinks in the parent via a linear search.
 
 Lehman and Yao require that the key range for a subtree S is described
-by Ki < v <= Ki+1 where Ki and Ki+1 are the adjacent keys in the parent
-page.  A search that finds exact equality to a bounding key in an upper
-tree level must descend to the left of that key to ensure it finds any
-equal keys.  An insertion that sees the high key of its target page is
-equal to the key to be inserted cannot move right, since the downlink
-for the right sibling in the parent must always be strictly less than
+by Ki < v <= Ki+1 where Ki and Ki+1 are the adjacent keys in the
+parent page, but do not account for the need to search the tree based
+only on leading index attributes in a composite index.  Since heap TID
+is always used to make btree keys unique (even in unique indexes),
+every btree index is treated as a composite index internally.  A
+search that finds exact equality to a pivot tuple in an upper tree
+level must descend to the left of that key to ensure it finds any
+equal keys, even when scan values were provided for all attributes.
+An insertion that sees that the high key of its target page is equal
+to the key to be inserted cannot move right, since the downlink for
+the right sibling in the parent must always be strictly less than
 right sibling keys (this is always possible because the leftmost
-downlink on any non-leaf level is always a negative infinity downlink).
+downlink on any non-leaf level is always a negative infinity
+downlink).
+
+We might be able to avoid moving left in the event of a full match on
+all attributes up to and including the heap TID attribute, but that
+would be a very narrow win, since it's rather unlikely that heap TID
+will be an exact match.  We can avoid moving left unnecessarily when
+all user-visible keys are equal by avoiding exact equality;  a
+sentinel value that's less than any possible heap TID is used by most
+index scans.  This is effective because of suffix truncation.  An
+"extra" heap TID attribute in pivot tuples is almost always avoided.
+All truncated attributes compare as minus infinity, even against a
+sentinel value, and the sentinel value is less than any real TID
+value, so an unnecessary move to the left is avoided regardless of
+whether or not a heap TID is present in the otherwise-equal pivot
+tuple.  Consistently moving left on full equality is also needed by
+page deletion, which re-finds a leaf page by descending the tree while
+searching on the leaf page's high key.  If we wanted to avoid moving
+left without breaking page deletion, we'd have to avoid suffix
+truncation, which could never be worth it.
 
 Lehman and Yao don't require read locks, but assume that in-memory
 copies of tree pages are unshared.  Postgres shares in-memory buffers

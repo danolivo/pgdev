@@ -327,8 +327,8 @@ heap_page_prune(Relation relation, Buffer buffer, TransactionId OldestXmin,
 	/* I am not under vacuum */
 	if ((MyPgXact->vacuumFlags == 0) && (prstate.ndead > 0))
 	{
-		if (relation->rd_node.dbNode != 0)
-			HeapCleanerSend(relation, BufferGetBlockNumber(buffer));
+//		if (relation->rd_node.dbNode != 0)
+//			HeapCleanerSend(relation, BufferGetBlockNumber(buffer));
 	}
 	return ndeleted;
 }

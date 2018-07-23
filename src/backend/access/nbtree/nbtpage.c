@@ -1421,7 +1421,7 @@ _bt_pagedel(Relation rel, Buffer buf)
 
 				/* we need an insertion scan key for the search, so build one */
 				itup_scankey = _bt_mkscankey(rel, targetkey);
-				/* find the leftmost leaf page containing this key */
+				/* get stack to leaf page by searching index */
 				stack = _bt_search(rel,
 								   BTreeTupleGetNAtts(targetkey, rel),
 								   itup_scankey,

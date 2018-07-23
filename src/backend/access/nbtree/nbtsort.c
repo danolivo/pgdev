@@ -880,7 +880,7 @@ _bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup)
 
 		if (P_ISLEAF(opageop))
 		{
-			OffsetNumber	lastleftoffnum = OffsetNumberPrev(last_off);
+			IndexTuple		lastleft;
 			IndexTuple		truncated;
 			Size			truncsz;
 
@@ -890,6 +890,15 @@ _bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup)
 			 * internal pages are either negative infinity items, or get their
 			 * contents from copying from one level down.  See also:
 			 * _bt_split().
+			 *
+			 * We don't try to bias our choice of split point to make it more
+			 * likely that _bt_suffix_truncate() can truncate away more
+			 * attributes, whereas the split point passed to _bt_split() is
+			 * chosen much more delicately.  Suffix truncation is mostly useful
+			 * because it can greatly improve space utilization for workloads
+			 * with random insertions.  It doesn't seem worthwhile to add
+			 * complex logic for choosing a split point here for a benefit that
+			 * is bound to be much smaller.
 			 *
 			 * Since the truncated tuple is probably smaller than the
 			 * original, it cannot just be copied in place (besides, we want
@@ -902,12 +911,11 @@ _bt_buildadd(BTWriteState *wstate, BTPageState *state, IndexTuple itup)
 			 * only shift the line pointer array back and forth, and overwrite
 			 * the latter portion of the space occupied by the original tuple.
 			 * This is fairly cheap.
-			 *
-			 * TODO: Give a little weight to how large the final downlink will
-			 * be when deciding on a split point.
 			 */
-			truncated = _bt_suffix_truncate(wstate->index, opage,
-											lastleftoffnum, oitup);
+			ii = PageGetItemId(opage, OffsetNumberPrev(last_off));
+			lastleft = (IndexTuple) PageGetItem(opage, ii);
+
+			truncated = _bt_suffix_truncate(wstate->index, lastleft, oitup);
 			truncsz = IndexTupleSize(truncated);
 			PageIndexTupleDelete(opage, P_HIKEY);
 			_bt_sortaddtup(opage, truncsz, truncated, P_HIKEY);

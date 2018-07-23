@@ -177,7 +177,7 @@ static pid_t hcworker_forkexec(void);
 NON_EXEC_STATIC void HeapCleanerLauncherMain(int argc, char *argv[]) pg_attribute_noreturn();
 NON_EXEC_STATIC void HeapCleanerWorkerMain(int argc, char *argv[]) pg_attribute_noreturn();
 
-static DirtyBlocks *index_cleanup(PrivateRefCountEntry *res, DirtyBlocks *AuxiliaryList);
+static DirtyBlocks *cleanup_relations(PrivateRefCountEntry *res, DirtyBlocks *AuxiliaryList);
 static void launch_worker(Oid dbNode);
 static WorkerInfo look_for_worker(Oid dbNode);
 static void main_launcher_loop(void);
@@ -911,7 +911,7 @@ HeapCleanerWorkerMain(int argc, char *argv[])
  * Main logic of HEAP and index relations cleaning
  */
 static DirtyBlocks*
-index_cleanup(PrivateRefCountEntry *res, DirtyBlocks *AuxiliaryList)
+cleanup_relations(PrivateRefCountEntry *res, DirtyBlocks *AuxiliaryList)
 {
 	Relation		heapRelation;
 	Relation   		*IndexRelations;
@@ -923,7 +923,7 @@ index_cleanup(PrivateRefCountEntry *res, DirtyBlocks *AuxiliaryList)
 	//	int			save_sec_context;
 	//	int			save_nestlevel;
 	int i;
-
+return AuxiliaryList;
 	if (RecoveryInProgress())
 		return AuxiliaryList;
 
@@ -1425,7 +1425,7 @@ main_worker_loop(void)
 			MyWorkerInfo->nitems = 0;
 		}
 		LWLockRelease(&MyWorkerInfo->WorkItemLock);
-//elog(LOG, "-> Worker got %d nitems!", nitems);
+
 		if (nitems > 0)
 		{
 			int i;
@@ -1466,7 +1466,7 @@ main_worker_loop(void)
 				/* Pass along each relation and try to clean it */
 				for (relcounter = 0; relcounter < nrelations; relcounter++)
 				{
-					CurrentTempList = index_cleanup(relations[relcounter], CurrentTempList);
+					CurrentTempList = cleanup_relations(relations[relcounter], CurrentTempList);
 					if (relations[relcounter] > 0)
 						has_work = true;
 				}

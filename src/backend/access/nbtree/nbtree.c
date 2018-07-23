@@ -934,13 +934,10 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 
 	/* To prepare tuple entries search across index pages */
 	Assert(BufferIsValid(buf));
-//	_bt_relbuf(irel, buf);
-//	LockBufferForCleanup(buf);
-//	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-	offnum = _bt_binsrch(irel, buf, keysCount, skey, &info->dead_tuples[pos], false);
 	page = BufferGetPage(buf);
 	_bt_checkpage(irel, buf);
 	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	offnum = _bt_binsrch(irel, buf, keysCount, skey, &info->dead_tuples[pos], P_FIRSTDATAKEY(opaque), false);
 
 	for (;;)
 	{
@@ -984,7 +981,7 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 			opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 			Assert(!P_IGNORE(opaque));
 			/* Set offnum to first potentially interesting item */
-			offnum = _bt_binsrch(irel, buf, keysCount, skey, &info->dead_tuples[pos], false);
+			offnum = _bt_binsrch(irel, buf, keysCount, skey, &info->dead_tuples[pos], P_FIRSTDATAKEY(opaque), false);
 
 			if (offnum > PageGetMaxOffsetNumber(page))
 				break;
