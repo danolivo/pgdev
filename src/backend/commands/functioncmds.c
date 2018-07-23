@@ -51,6 +51,7 @@
 #include "commands/proclang.h"
 #include "executor/execdesc.h"
 #include "executor/executor.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "optimizer/clauses.h"
 #include "optimizer/var.h"
@@ -2245,6 +2246,15 @@ ExecuteCallStmt(CallStmt *stmt, ParamListInfo params, bool atomic, DestReceiver 
 		callcontext->atomic = true;
 
 	/*
+	 * In security definer procedures, we can't allow transaction commands.
+	 * StartTransaction() insists that the security context stack is empty,
+	 * and AbortTransaction() resets the security context.  This could be
+	 * reorganized, but right now it doesn't work.
+	 */
+	if (((Form_pg_proc )GETSTRUCT(tp))->prosecdef)
+		callcontext->atomic = true;
+
+	/*
 	 * Expand named arguments, defaults, etc.
 	 */
 	fexpr->args = expand_function_arguments(fexpr->args, fexpr->funcresulttype, tp);
@@ -2264,6 +2274,7 @@ ExecuteCallStmt(CallStmt *stmt, ParamListInfo params, bool atomic, DestReceiver 
 	/* Initialize function call structure */
 	InvokeFunctionExecuteHook(fexpr->funcid);
 	fmgr_info(fexpr->funcid, &flinfo);
+	fmgr_info_set_expr((Node *) fexpr, &flinfo);
 	InitFunctionCallInfoData(fcinfo, &flinfo, nargs, fexpr->inputcollid, (Node *) callcontext, NULL);
 
 	/*
@@ -2338,4 +2349,27 @@ ExecuteCallStmt(CallStmt *stmt, ParamListInfo params, bool atomic, DestReceiver 
 			 fexpr->funcresulttype);
 
 	FreeExecutorState(estate);
+}
+
+/*
+ * Construct the tuple descriptor for a CALL statement return
+ */
+TupleDesc
+CallStmtResultDesc(CallStmt *stmt)
+{
+	FuncExpr   *fexpr;
+	HeapTuple   tuple;
+	TupleDesc   tupdesc;
+
+	fexpr = stmt->funcexpr;
+
+	tuple = SearchSysCache1(PROCOID, ObjectIdGetDatum(fexpr->funcid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for procedure %u", fexpr->funcid);
+
+	tupdesc = build_function_result_tupdesc_t(tuple);
+
+	ReleaseSysCache(tuple);
+
+	return tupdesc;
 }

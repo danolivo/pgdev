@@ -684,11 +684,8 @@ ProcArrayApplyRecoveryInfo(RunningTransactions running)
 
 	/*
 	 * Remove stale locks, if any.
-	 *
-	 * Locks are always assigned to the toplevel xid so we don't need to care
-	 * about subxcnt/subxids (and by extension not about ->suboverflowed).
 	 */
-	StandbyReleaseOldLocks(running->xcnt, running->xids);
+	StandbyReleaseOldLocks(running->oldestRunningXid);
 
 	/*
 	 * If our snapshot is already valid, nothing else to do...
@@ -2017,8 +2014,8 @@ GetRunningTransactionData(void)
 		/*
 		 * If we wished to exclude xids this would be the right place for it.
 		 * Procs with the PROC_IN_VACUUM flag set don't usually assign xids,
-		 * but they do during truncation at the end when they get the lock
-		 * and truncate, so it is not much of a problem to include them if they
+		 * but they do during truncation at the end when they get the lock and
+		 * truncate, so it is not much of a problem to include them if they
 		 * are seen and it is cleaner to include them.
 		 */
 

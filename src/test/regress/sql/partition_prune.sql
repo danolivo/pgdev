@@ -137,6 +137,13 @@ explain (costs off) select * from mc2p where a = 2 and b < 1;
 explain (costs off) select * from mc2p where a > 1;
 explain (costs off) select * from mc2p where a = 1 and b > 1;
 
+-- all partitions but the default one should be pruned
+explain (costs off) select * from mc2p where a = 1 and b is null;
+explain (costs off) select * from mc2p where a is null and b is null;
+explain (costs off) select * from mc2p where a is null and b = 1;
+explain (costs off) select * from mc2p where a is null;
+explain (costs off) select * from mc2p where b is null;
+
 -- boolean partitioning
 create table boolpart (a bool) partition by list (a);
 create table boolpart_default partition of boolpart default;
@@ -707,6 +714,47 @@ select * from boolp where a = (select value from boolvalues where not value);
 
 drop table boolp;
 
+--
+-- Test run-time pruning of MergeAppend subnodes
+--
+set enable_seqscan = off;
+set enable_sort = off;
+create table ma_test (a int) partition by range (a);
+create table ma_test_p1 partition of ma_test for values from (0) to (10);
+create table ma_test_p2 partition of ma_test for values from (10) to (20);
+create table ma_test_p3 partition of ma_test for values from (20) to (30);
+insert into ma_test select x from generate_series(0,29) t(x);
+create index on ma_test (a);
+
+analyze ma_test;
+prepare mt_q1 (int) as select * from ma_test where a >= $1 and a % 10 = 5 order by a;
+
+-- Execute query 5 times to allow choose_custom_plan
+-- to start considering a generic plan.
+execute mt_q1(0);
+execute mt_q1(0);
+execute mt_q1(0);
+execute mt_q1(0);
+execute mt_q1(0);
+
+explain (analyze, costs off, summary off, timing off) execute mt_q1(15);
+execute mt_q1(15);
+explain (analyze, costs off, summary off, timing off) execute mt_q1(25);
+execute mt_q1(25);
+-- Ensure MergeAppend behaves correctly when no subplans match
+explain (analyze, costs off, summary off, timing off) execute mt_q1(35);
+execute mt_q1(35);
+
+deallocate mt_q1;
+
+-- ensure initplan params properly prune partitions
+explain (analyze, costs off, summary off, timing off) select * from ma_test where a >= (select min(a) from ma_test_p2) order by a;
+
+reset enable_seqscan;
+reset enable_sort;
+
+drop table ma_test;
+
 reset enable_indexonlyscan;
 
 --
@@ -721,6 +769,8 @@ create table pp_arrpart2 partition of pp_arrpart for values in ('{2, 3}', '{4, 5
 explain (costs off) select * from pp_arrpart where a = '{1}';
 explain (costs off) select * from pp_arrpart where a = '{1, 2}';
 explain (costs off) select * from pp_arrpart where a in ('{4, 5}', '{1}');
+explain (costs off) update pp_arrpart set a = a where a = '{1}';
+explain (costs off) delete from pp_arrpart where a = '{1}';
 drop table pp_arrpart;
 
 -- array type hash partition key
@@ -813,3 +863,11 @@ drop table inh_lp cascade;
 
 reset enable_partition_pruning;
 reset constraint_exclusion;
+
+-- Check pruning for a partition tree containing only temporary relations
+create temp table pp_temp_parent (a int) partition by list (a);
+create temp table pp_temp_part_1 partition of pp_temp_parent for values in (1);
+create temp table pp_temp_part_def partition of pp_temp_parent default;
+explain (costs off) select * from pp_temp_parent where true;
+explain (costs off) select * from pp_temp_parent where a = 2;
+drop table pp_temp_parent;

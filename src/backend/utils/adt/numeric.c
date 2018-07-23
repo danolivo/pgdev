@@ -4218,8 +4218,8 @@ numeric_poly_combine(PG_FUNCTION_ARGS)
 		state1->sumX = state2->sumX;
 		state1->sumX2 = state2->sumX2;
 #else
-		accum_sum_copy(&state2->sumX, &state1->sumX);
-		accum_sum_copy(&state2->sumX2, &state1->sumX2);
+		accum_sum_copy(&state1->sumX, &state2->sumX);
+		accum_sum_copy(&state1->sumX2, &state2->sumX2);
 #endif
 
 		MemoryContextSwitchTo(old_context);
@@ -8353,7 +8353,7 @@ power_var_int(const NumericVar *base, int exp, NumericVar *result, int rscale)
 			 * While 0 ^ 0 can be either 1 or indeterminate (error), we treat
 			 * it as 1 because most programming languages do this. SQL:2003
 			 * also requires a return value of 1.
-			 * http://en.wikipedia.org/wiki/Exponentiation#Zero_to_the_zero_power
+			 * https://en.wikipedia.org/wiki/Exponentiation#Zero_to_the_zero_power
 			 */
 			set_var_from_var(&const_one, result);
 			result->dscale = rscale;	/* no need to round */

@@ -1219,6 +1219,7 @@ ReadTwoPhaseFile(TransactionId xid, bool give_warnings)
 	uint32		crc_offset;
 	pg_crc32c	calc_crc,
 				file_crc;
+	int			r;
 
 	TwoPhaseFilePath(path, xid);
 
@@ -1228,8 +1229,7 @@ ReadTwoPhaseFile(TransactionId xid, bool give_warnings)
 		if (give_warnings)
 			ereport(WARNING,
 					(errcode_for_file_access(),
-					 errmsg("could not open two-phase state file \"%s\": %m",
-							path)));
+					 errmsg("could not open file \"%s\": %m", path)));
 		return NULL;
 	}
 
@@ -1241,12 +1241,16 @@ ReadTwoPhaseFile(TransactionId xid, bool give_warnings)
 	 */
 	if (fstat(fd, &stat))
 	{
+		int			save_errno = errno;
+
 		CloseTransientFile(fd);
 		if (give_warnings)
+		{
+			errno = save_errno;
 			ereport(WARNING,
 					(errcode_for_file_access(),
-					 errmsg("could not stat two-phase state file \"%s\": %m",
-							path)));
+					 errmsg("could not stat file \"%s\": %m", path)));
+		}
 		return NULL;
 	}
 
@@ -1272,15 +1276,27 @@ ReadTwoPhaseFile(TransactionId xid, bool give_warnings)
 	buf = (char *) palloc(stat.st_size);
 
 	pgstat_report_wait_start(WAIT_EVENT_TWOPHASE_FILE_READ);
-	if (read(fd, buf, stat.st_size) != stat.st_size)
+	r = read(fd, buf, stat.st_size);
+	if (r != stat.st_size)
 	{
+		int			save_errno = errno;
+
 		pgstat_report_wait_end();
 		CloseTransientFile(fd);
 		if (give_warnings)
-			ereport(WARNING,
-					(errcode_for_file_access(),
-					 errmsg("could not read two-phase state file \"%s\": %m",
-							path)));
+		{
+			if (r < 0)
+			{
+				errno = save_errno;
+				ereport(WARNING,
+						(errcode_for_file_access(),
+						 errmsg("could not read file \"%s\": %m", path)));
+			}
+			else
+				ereport(WARNING,
+						(errmsg("could not read file \"%s\": read %d of %zu",
+								path, r, (Size) stat.st_size)));
+		}
 		pfree(buf);
 		return NULL;
 	}
@@ -1446,7 +1462,6 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 	RelFileNode *delrels;
 	int			ndelrels;
 	SharedInvalidationMessage *invalmsgs;
-	int			i;
 
 	/*
 	 * Validate the GID, and lock the GXACT to ensure that two backends do not
@@ -1539,13 +1554,9 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 		delrels = abortrels;
 		ndelrels = hdr->nabortrels;
 	}
-	for (i = 0; i < ndelrels; i++)
-	{
-		SMgrRelation srel = smgropen(delrels[i], InvalidBackendId);
 
-		smgrdounlink(srel, false);
-		smgrclose(srel);
-	}
+	/* Make sure files supposed to be dropped are dropped */
+	DropRelationFiles(delrels, ndelrels, false);
 
 	/*
 	 * Handle cache invalidation messages.
@@ -1627,8 +1638,7 @@ RemoveTwoPhaseFile(TransactionId xid, bool giveWarning)
 		if (errno != ENOENT || giveWarning)
 			ereport(WARNING,
 					(errcode_for_file_access(),
-					 errmsg("could not remove two-phase state file \"%s\": %m",
-							path)));
+					 errmsg("could not remove file \"%s\": %m", path)));
 }
 
 /*
@@ -1656,26 +1666,35 @@ RecreateTwoPhaseFile(TransactionId xid, void *content, int len)
 	if (fd < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not recreate two-phase state file \"%s\": %m",
-						path)));
+				 errmsg("could not recreate file \"%s\": %m", path)));
 
 	/* Write content and CRC */
 	pgstat_report_wait_start(WAIT_EVENT_TWOPHASE_FILE_WRITE);
 	if (write(fd, content, len) != len)
 	{
+		int			save_errno = errno;
+
 		pgstat_report_wait_end();
 		CloseTransientFile(fd);
+
+		/* if write didn't set errno, assume problem is no disk space */
+		errno = save_errno ? save_errno : ENOSPC;
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not write two-phase state file: %m")));
+				 errmsg("could not write file \"%s\": %m", path)));
 	}
 	if (write(fd, &statefile_crc, sizeof(pg_crc32c)) != sizeof(pg_crc32c))
 	{
+		int			save_errno = errno;
+
 		pgstat_report_wait_end();
 		CloseTransientFile(fd);
+
+		/* if write didn't set errno, assume problem is no disk space */
+		errno = save_errno ? save_errno : ENOSPC;
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not write two-phase state file: %m")));
+				 errmsg("could not write file \"%s\": %m", path)));
 	}
 	pgstat_report_wait_end();
 
@@ -1686,17 +1705,20 @@ RecreateTwoPhaseFile(TransactionId xid, void *content, int len)
 	pgstat_report_wait_start(WAIT_EVENT_TWOPHASE_FILE_SYNC);
 	if (pg_fsync(fd) != 0)
 	{
+		int			save_errno = errno;
+
 		CloseTransientFile(fd);
+		errno = save_errno;
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not fsync two-phase state file: %m")));
+				 errmsg("could not fsync file \"%s\": %m", path)));
 	}
 	pgstat_report_wait_end();
 
 	if (CloseTransientFile(fd) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not close two-phase state file: %m")));
+				 errmsg("could not close file \"%s\": %m", path)));
 }
 
 /*

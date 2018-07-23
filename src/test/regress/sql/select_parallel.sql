@@ -55,6 +55,15 @@ $$ select 'foo'::varchar union all select 'bar'::varchar $$
 language sql stable;
 select sp_test_func() order by 1;
 
+-- Parallel Append is not to be used when the subpath depends on the outer param
+create table part_pa_test(a int, b int) partition by range(a);
+create table part_pa_test_p1 partition of part_pa_test for values from (minvalue) to (0);
+create table part_pa_test_p2 partition of part_pa_test for values from (0) to (maxvalue);
+explain (costs off)
+	select (select max((select pa1.b from part_pa_test pa1 where pa1.a = pa2.a)))
+	from part_pa_test pa2;
+drop table part_pa_test;
+
 -- test with leader participation disabled
 set parallel_leader_participation = off;
 explain (costs off)
@@ -251,6 +260,13 @@ explain (costs off, verbose)
     select ten, sp_simple_func(ten) from tenk1 where ten < 100 order by ten;
 
 drop function sp_simple_func(integer);
+
+-- test handling of SRFs in targetlist (bug in 10.0)
+
+explain (costs off)
+   select count(*), generate_series(1,2) from tenk1 group by twenty;
+
+select count(*), generate_series(1,2) from tenk1 group by twenty;
 
 -- test gather merge with parallel leader participation disabled
 set parallel_leader_participation = off;

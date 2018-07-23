@@ -92,17 +92,10 @@
 
     <listitem>
      <para>
-      Window functions now support all options shown in the SQL:2011
+      Window functions now support all framing options shown in the SQL:2011
       standard, including <literal>RANGE <replaceable>distance</replaceable>
       PRECEDING/FOLLOWING</literal>, <literal>GROUPS</literal> mode, and
       frame exclusion options
-     </para>
-    </listitem>
-
-    <listitem>
-     <para>
-      Channel binding for SCRAM authentication, to prevent potential
-      man-in-the-middle attacks on database connections
      </para>
     </listitem>
 
@@ -629,7 +622,7 @@ Branch: master [6bdf1303b] Avoid wrong results for power() with NaN
        </para>
 
        <para>
-        This features is disabled by default
+        This feature is disabled by default
         but can be enabled by changing <link
         linkend="guc-enable-partitionwise-join"><varname>enable_partitionwise_join</varname></link>.
        </para>
@@ -647,7 +640,7 @@ Branch: master [6bdf1303b] Avoid wrong results for power() with NaN
        </para>
 
        <para>
-        This features is disabled by default
+        This feature is disabled by default
         but can be enabled by changing <link
         linkend="guc-enable-partitionwise-aggregate"><varname>enable_partitionwise_aggregate</varname></link>.
        </para>
@@ -933,7 +926,7 @@ same commits as above
 -->
 
        <para>
-        Allow SP-GiST indexes to optionally use compression (Teodor Sigaev,
+        Allow SP-GiST to use lossy representation of leaf keys (Teodor Sigaev,
         Heikki Linnakangas, Alexander Korotkov, Nikita Glukhov)
        </para>
 
@@ -1083,7 +1076,7 @@ same commits as above
 -->
 
        <para>
-        Allow vacuum to avoid unnecesary index scans (Masahiko Sawada,
+        Allow vacuum to avoid unnecessary index scans (Masahiko Sawada,
         Alexander Korotkov)
        </para>
       </listitem>
@@ -1230,29 +1223,6 @@ same commits as above
 
       <listitem>
 <!--
-2017-11-18 [9288d62bb] Support channel binding 'tls-unique' in SCRAM
-2017-12-19 [4bbf110d2] Add libpq connection parameter "scram_channel_binding"
-2018-01-04 [d3fb72ea6] Implement channel binding tls-server-end-point for SCRAM
--->
-
-       <para>
-        Add libpq option to support channel binding when using <link
-        linkend="auth-password"><acronym>SCRAM</acronym></link>
-        authentication (Michael Paquier)
-       </para>
-
-       <para>
-        While <acronym>SCRAM</acronym> always prevents the
-        replay of transmitted hashed passwords in a later
-        session, <acronym>SCRAM</acronym> with channel binding
-        also prevents man-in-the-middle attacks.  The options are <link
-        linkend="libpq-scram-channel-binding"><option>scram_channel_binding=tls-unique</option></link>
-        and <option>scram_channel_binding=tls-server-end-point</option>.
-       </para>
-      </listitem>
-
-      <listitem>
-<!--
 2017-09-12 [83aaac41c] Allow custom search filters to be configured for LDAP au
 -->
 
@@ -1263,7 +1233,7 @@ same commits as above
        </para>
 
        <para>
-        Specifically, "ldapsearchfilter" allows pattern matching using
+        Specifically, <literal>ldapsearchfilter</literal> allows pattern matching using
         combinations of <acronym>LDAP</acronym> attributes.
        </para>
       </listitem>
@@ -1315,7 +1285,7 @@ same commits as above
 -->
 
        <para>
-        Add default roles which controls file system access (Stephen Frost)
+        Add default roles which control file system access (Stephen Frost)
        </para>
 
        <para>
@@ -1325,7 +1295,7 @@ same commits as above
         <literal>pg_execute_server_program</literal>.  These roles now also
         control who can use <command>COPY</command> and extension <link
         linkend="file-fdw"><application>file_fdw</application></link>.
-        Previously only super-users could use these functions, and that
+        Previously only superusers could use these functions, and that
         is still the default behavior.
        </para>
       </listitem>
@@ -1338,7 +1308,7 @@ same commits as above
        <para>
         Allow access to file system functions to be controlled by
         <command>GRANT</command>/<command>REVOKE</command> permissions,
-        rather than super-user checks (Stephen Frost)
+        rather than superuser checks (Stephen Frost)
        </para>
 
        <para>
@@ -1364,7 +1334,7 @@ same commits as above
        </para>
 
        <para>
-        Previously super users were exclusively granted to access these
+        Previously, superusers were exclusively granted access to these
         functions.
        </para>
 
@@ -1387,10 +1357,10 @@ same commits as above
        </para>
 
        <para>
-        <productname>PostgreSQL</productname> only allows super-users to
+        <productname>PostgreSQL</productname> only allows superusers to
         access <application>postgres_fdw</application> tables without
         passwords, e.g. via <literal>peer</literal>.  Previously the
-        session owner had to be a super-user to allow such access;  now
+        session owner had to be a superuser to allow such access;  now
         the view owner is checked instead.
        </para>
       </listitem>
@@ -1424,7 +1394,7 @@ same commits as above
        <para>
         Add server setting <link
         linkend="guc-ssl-passphrase-command"><varname>ssl_passphrase_command</varname></link>
-        to allow supplying of the the passphrase for <acronym>SSL</acronym>
+        to allow supplying of the passphrase for <acronym>SSL</acronym>
         key files (Peter Eisentraut)
        </para>
 
@@ -1467,7 +1437,7 @@ same commits as above
 
        <para>
         The new unit is "B".  This is in addition to "kB", "MB", "GB"
-        and "TB", which were accepted previously.
+        and "TB".
        </para>
 
       </listitem>
@@ -1567,7 +1537,7 @@ same commits as above
 -->
 
        <para>
-        Exclude unlogged, temporary tables, and
+        Exclude unlogged tables, temporary tables, and
         <filename>pg_internal.init</filename> files from streaming base
         backups (David Steele)
        </para>
@@ -1594,7 +1564,7 @@ same commits as above
 -->
 
        <para>
-        Allow replication slots to be advanced programatically, rather
+        Allow replication slots to be advanced programmatically, rather
         than be consumed by subscribers (Petr Jelinek)
        </para>
 
@@ -1704,7 +1674,7 @@ same commits as above
 
        <para>
         Allow <command>ALTER INDEX</command> to set statistics-gathering
-        targets for expression indexes (Alexander Korotkov, Adrien nayrat)
+        targets for expression indexes (Alexander Korotkov, Adrien Nayrat)
        </para>
 
        <para>
@@ -1726,8 +1696,8 @@ same commits as above
 
        <para>
         Also, if any table mentioned in <command>VACUUM</command> uses
-        a column list, then <command>ANALYZE</command> keyword must be
-        supplied;  previously <command>ANALYZE</command> was implied in
+        a column list, then the <command>ANALYZE</command> keyword must be
+        supplied; previously, <command>ANALYZE</command> was implied in
         such cases.
        </para>
       </listitem>
@@ -1760,7 +1730,7 @@ same commits as above
        </para>
 
        <para>
-        This is useful for allowing aggregate functions be optimized and
+        This is useful for allowing aggregate functions to be optimized and
         to work as window functions.
        </para>
 
@@ -1803,7 +1773,7 @@ same commits as above
        </para>
 
        <para>
-        Also allow PL/PL/Perl, PL/Python, and PL/Tcl to handle
+        Also allow PL/Perl, PL/Python, and PL/Tcl to handle
         composite-domain function arguments and results.  Also improve
         PL/Python domain handling.
        </para>
@@ -1896,7 +1866,7 @@ same commits as above
        <para>
         Add text search function <link
         linkend="textsearch-functions-table"><function>websearch_to_tsquery()</function></link>
-        that supports a queries syntax similar to that used by web search
+        that supports a query syntax similar to that used by web search
         engines (Victor Drobny, Dmitry Ivanov)
        </para>
       </listitem>
@@ -1909,7 +1879,7 @@ same commits as above
        <para>
         Add function <link
         linkend="textsearch-functions-table"><function>json(b)_to_tsvector()</function></link>
-        to create text search query for matching
+        to create a text search query for matching
         <type>JSON</type>/<type>JSONB </type>values (Dmitry Dolgov)
        </para>
 
@@ -2309,7 +2279,7 @@ same commits as above
 -->
 
        <para>
-        Add approximated Zipfian-distributed random generator to
+        Add an approximated Zipfian-distributed random generator to
         <application>pgbench</application> (Alik Khilazhev)
        </para>
       </listitem>
@@ -2379,16 +2349,16 @@ same commits as above
 -->
 
        <para>
-        Add <link
+        Add an option to <link
         linkend="app-pgbasebackup"><application>pg_basebackup</application></link>
-        option to create a named replication slot (Michael Banck)
+        that creates a named replication slot (Michael Banck)
        </para>
 
        <para>
         The option <option>--create-slot</option> creates
         the named replication slot (<option>--slot</option>)
         when the <acronym>WAL</acronym> streaming method
-        (<option>-wal-method=stream</option>) is used.
+        (<option>--wal-method=stream</option>) is used.
        </para>
 
        <para>
@@ -2560,7 +2530,7 @@ same commits as above
        </para>
 
        <para>
-        This is useful if the system to be loaded has a different collation
+        This is useful if the system to be loaded has different collation
         definitions or endianness, requiring the rows to be stored in
         different partitions.
        </para>
@@ -2572,7 +2542,7 @@ same commits as above
 -->
 
        <para>
-        Add ability to suppress dumping and restoring of comments
+        Add an option to suppress dumping and restoring comments
         (Robins Tharakan)
        </para>
 
@@ -2646,6 +2616,35 @@ same commits as above
 
       <listitem>
 <!--
+2017-11-18 [9288d62bb] Support channel binding 'tls-unique' in SCRAM
+2017-12-19 [4bbf110d2] Add libpq connection parameter "scram_channel_binding"
+2018-01-04 [d3fb72ea6] Implement channel binding tls-server-end-point for SCRAM
+-->
+
+       <para>
+        Add ability to use channel binding when using <link
+        linkend="auth-password"><acronym>SCRAM</acronym></link>
+        authentication (Michael Paquier)
+       </para>
+
+       <para>
+        While <acronym>SCRAM</acronym> always prevents the
+        replay of transmitted hashed passwords in a later session,
+        <acronym>SCRAM</acronym> with channel binding can also prevent
+        man-in-the-middle attacks.  However, since there is no way
+        to <emphasis>force</emphasis> channel binding in libpq,
+        the feature currently does not prevent man-in-the-middle
+        attacks when using libpq and interfaces built using it.  It is
+        expected that future versions of libpq and interfaces not built
+        using libpq, e.g. JDBC, will allow this capability.  The libpq
+        options to control the optional channel binding type are <link
+        linkend="libpq-scram-channel-binding"><option>scram_channel_binding=tls-unique</option></link>
+        and <option>scram_channel_binding=tls-server-end-point</option>.
+       </para>
+      </listitem>
+
+      <listitem>
+<!--
 2018-03-03 [a351679c8] Trivial adjustments in preparation for bootstrap data co
 2018-04-08 [372728b0d] Replace our traditional initial-catalog-data format with
 2018-04-26 [a0854f107] Avoid parsing catalog data twice during BKI file constru
@@ -2674,7 +2673,7 @@ same commits as above
 -->
 
        <para>
-        Speed up lookups of builtin function names matching oids (Andres
+        Speed up lookups of built-in function names matching OIDs (Andres
         Freund)
        </para>
 
@@ -2884,7 +2883,7 @@ same commits as above
        </para>
 
        <para>
-        Previously only super-users could call adminpack functions;
+        Previously only superusers could call adminpack functions;
         now role permissions are checked.
        </para>
       </listitem>

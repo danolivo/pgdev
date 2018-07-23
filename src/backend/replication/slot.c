@@ -351,20 +351,28 @@ retry:
 		if (s->in_use && strcmp(name, NameStr(s->data.name)) == 0)
 		{
 			/*
-			 * This is the slot we want.  We don't know yet if it's active, so
-			 * get ready to sleep on it in case it is.  (We may end up not
-			 * sleeping, but we don't want to do this while holding the
-			 * spinlock.)
+			 * This is the slot we want; check if it's active under some other
+			 * process.  In single user mode, we don't need this check.
 			 */
-			ConditionVariablePrepareToSleep(&s->active_cv);
+			if (IsUnderPostmaster)
+			{
+				/*
+				 * Get ready to sleep on it in case it is active.  (We may end
+				 * up not sleeping, but we don't want to do this while holding
+				 * the spinlock.)
+				 */
+				ConditionVariablePrepareToSleep(&s->active_cv);
 
-			SpinLockAcquire(&s->mutex);
+				SpinLockAcquire(&s->mutex);
 
-			active_pid = s->active_pid;
-			if (active_pid == 0)
-				active_pid = s->active_pid = MyProcPid;
+				active_pid = s->active_pid;
+				if (active_pid == 0)
+					active_pid = s->active_pid = MyProcPid;
 
-			SpinLockRelease(&s->mutex);
+				SpinLockRelease(&s->mutex);
+			}
+			else
+				active_pid = MyProcPid;
 			slot = s;
 
 			break;
@@ -1274,7 +1282,9 @@ SaveSlotToPath(ReplicationSlot *slot, const char *dir, int elevel)
 
 		pgstat_report_wait_end();
 		CloseTransientFile(fd);
-		errno = save_errno;
+
+		/* if write didn't set errno, assume problem is no disk space */
+		errno = save_errno ? save_errno : ENOSPC;
 		ereport(elevel,
 				(errcode_for_file_access(),
 				 errmsg("could not write to file \"%s\": %m",
@@ -1378,7 +1388,10 @@ RestoreSlotFromDisk(const char *name)
 	pgstat_report_wait_start(WAIT_EVENT_REPLICATION_SLOT_RESTORE_SYNC);
 	if (pg_fsync(fd) != 0)
 	{
+		int			save_errno = errno;
+
 		CloseTransientFile(fd);
+		errno = save_errno;
 		ereport(PANIC,
 				(errcode_for_file_access(),
 				 errmsg("could not fsync file \"%s\": %m",
@@ -1401,11 +1414,16 @@ RestoreSlotFromDisk(const char *name)
 
 		CloseTransientFile(fd);
 		errno = saved_errno;
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not read file \"%s\", read %d of %u: %m",
-						path, readBytes,
-						(uint32) ReplicationSlotOnDiskConstantSize)));
+		if (readBytes < 0)
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("could not read file \"%s\": %m", path)));
+		else
+			ereport(PANIC,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("could not read file \"%s\": read %d of %zu",
+							path, readBytes,
+							(Size) ReplicationSlotOnDiskConstantSize)));
 	}
 
 	/* verify magic */
@@ -1441,10 +1459,15 @@ RestoreSlotFromDisk(const char *name)
 
 		CloseTransientFile(fd);
 		errno = saved_errno;
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not read file \"%s\", read %d of %u: %m",
-						path, readBytes, cp.length)));
+		if (readBytes < 0)
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("could not read file \"%s\": %m", path)));
+		else
+			ereport(PANIC,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("could not read file \"%s\": read %d of %zu",
+							path, readBytes, (Size) cp.length)));
 	}
 
 	CloseTransientFile(fd);

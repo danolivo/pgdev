@@ -821,8 +821,14 @@ static XLogSource XLogReceiptSource = 0;	/* XLOG_FROM_* code */
 static XLogRecPtr ReadRecPtr;	/* start of last record read */
 static XLogRecPtr EndRecPtr;	/* end+1 of last record read */
 
-static XLogRecPtr minRecoveryPoint; /* local copy of
-									 * ControlFile->minRecoveryPoint */
+/*
+ * Local copies of equivalent fields in the control file.  When running
+ * crash recovery, minRecoveryPoint is set to InvalidXLogRecPtr as we
+ * expect to replay all the WAL available, and updateMinRecoveryPoint is
+ * switched to false to prevent any updates while replaying records.
+ * Those values are kept consistent as long as crash recovery runs.
+ */
+static XLogRecPtr minRecoveryPoint;
 static TimeLineID minRecoveryPointTLI;
 static bool updateMinRecoveryPoint = true;
 
@@ -881,6 +887,7 @@ static bool WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 static int	emode_for_corrupt_record(int emode, XLogRecPtr RecPtr);
 static void XLogFileClose(void);
 static void PreallocXlogFiles(XLogRecPtr endptr);
+static void RemoveTempXlogFiles(void);
 static void RemoveOldXlogFiles(XLogSegNo segno, XLogRecPtr PriorRedoPtr, XLogRecPtr endptr);
 static void RemoveXlogFile(const char *segname, XLogRecPtr PriorRedoPtr, XLogRecPtr endptr);
 static void UpdateLastRemovedPtr(char *filename);
@@ -1965,7 +1972,7 @@ XLogBytePosToRecPtr(uint64 bytepos)
 		seg_offset += fullpages * XLOG_BLCKSZ + bytesleft + SizeOfXLogShortPHD;
 	}
 
-	XLogSegNoOffsetToRecPtr(fullsegs, seg_offset, result, wal_segment_size);
+	XLogSegNoOffsetToRecPtr(fullsegs, seg_offset, wal_segment_size, result);
 
 	return result;
 }
@@ -2011,7 +2018,7 @@ XLogBytePosToEndRecPtr(uint64 bytepos)
 			seg_offset += fullpages * XLOG_BLCKSZ + bytesleft + SizeOfXLogShortPHD;
 	}
 
-	XLogSegNoOffsetToRecPtr(fullsegs, seg_offset, result, wal_segment_size);
+	XLogSegNoOffsetToRecPtr(fullsegs, seg_offset, wal_segment_size, result);
 
 	return result;
 }
@@ -2711,20 +2718,26 @@ UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force)
 	if (!updateMinRecoveryPoint || (!force && lsn <= minRecoveryPoint))
 		return;
 
+	/*
+	 * An invalid minRecoveryPoint means that we need to recover all the WAL,
+	 * i.e., we're doing crash recovery.  We never modify the control file's
+	 * value in that case, so we can short-circuit future checks here too. The
+	 * local values of minRecoveryPoint and minRecoveryPointTLI should not be
+	 * updated until crash recovery finishes.
+	 */
+	if (XLogRecPtrIsInvalid(minRecoveryPoint))
+	{
+		updateMinRecoveryPoint = false;
+		return;
+	}
+
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 
 	/* update local copy */
 	minRecoveryPoint = ControlFile->minRecoveryPoint;
 	minRecoveryPointTLI = ControlFile->minRecoveryPointTLI;
 
-	/*
-	 * An invalid minRecoveryPoint means that we need to recover all the WAL,
-	 * i.e., we're doing crash recovery.  We never modify the control file's
-	 * value in that case, so we can short-circuit future checks here too.
-	 */
-	if (minRecoveryPoint == 0)
-		updateMinRecoveryPoint = false;
-	else if (force || minRecoveryPoint < lsn)
+	if (force || minRecoveryPoint < lsn)
 	{
 		XLogRecPtr	newMinRecoveryPoint;
 		TimeLineID	newMinRecoveryPointTLI;
@@ -3110,7 +3123,16 @@ XLogNeedsFlush(XLogRecPtr record)
 	 */
 	if (RecoveryInProgress())
 	{
-		/* Quick exit if already known updated */
+		/*
+		 * An invalid minRecoveryPoint means that we need to recover all the
+		 * WAL, i.e., we're doing crash recovery.  We never modify the control
+		 * file's value in that case, so we can short-circuit future checks
+		 * here too.
+		 */
+		if (XLogRecPtrIsInvalid(minRecoveryPoint))
+			updateMinRecoveryPoint = false;
+
+		/* Quick exit if already known to be updated or cannot be updated */
 		if (record <= minRecoveryPoint || !updateMinRecoveryPoint)
 			return false;
 
@@ -3124,20 +3146,8 @@ XLogNeedsFlush(XLogRecPtr record)
 		minRecoveryPointTLI = ControlFile->minRecoveryPointTLI;
 		LWLockRelease(ControlFileLock);
 
-		/*
-		 * An invalid minRecoveryPoint means that we need to recover all the
-		 * WAL, i.e., we're doing crash recovery.  We never modify the control
-		 * file's value in that case, so we can short-circuit future checks
-		 * here too.
-		 */
-		if (minRecoveryPoint == 0)
-			updateMinRecoveryPoint = false;
-
 		/* check again */
-		if (record <= minRecoveryPoint || !updateMinRecoveryPoint)
-			return false;
-		else
-			return true;
+		return record > minRecoveryPoint;
 	}
 
 	/* Quick exit if already known flushed */
@@ -3268,7 +3278,10 @@ XLogFileInit(XLogSegNo logsegno, bool *use_existent, bool use_lock)
 	pgstat_report_wait_start(WAIT_EVENT_WAL_INIT_SYNC);
 	if (pg_fsync(fd) != 0)
 	{
+		int			save_errno = errno;
+
 		close(fd);
+		errno = save_errno;
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not fsync file \"%s\": %m", tmppath)));
@@ -3395,21 +3408,24 @@ XLogFileCopy(XLogSegNo destsegno, TimeLineID srcTLI, XLogSegNo srcsegno,
 
 		if (nread > 0)
 		{
+			int			r;
+
 			if (nread > sizeof(buffer))
 				nread = sizeof(buffer);
-			errno = 0;
 			pgstat_report_wait_start(WAIT_EVENT_WAL_COPY_READ);
-			if (read(srcfd, buffer, nread) != nread)
+			r = read(srcfd, buffer, nread);
+			if (r != nread)
 			{
-				if (errno != 0)
+				if (r < 0)
 					ereport(ERROR,
 							(errcode_for_file_access(),
 							 errmsg("could not read file \"%s\": %m",
 									path)));
 				else
 					ereport(ERROR,
-							(errmsg("not enough data in file \"%s\"",
-									path)));
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("could not read file \"%s\": read %d of %zu",
+									path, r, (Size) nread)));
 			}
 			pgstat_report_wait_end();
 		}
@@ -3553,7 +3569,7 @@ XLogFileOpen(XLogSegNo segno)
 	if (fd < 0)
 		ereport(PANIC,
 				(errcode_for_file_access(),
-				 errmsg("could not open write-ahead log file \"%s\": %m", path)));
+				 errmsg("could not open file \"%s\": %m", path)));
 
 	return fd;
 }
@@ -3742,7 +3758,7 @@ XLogFileClose(void)
 	if (close(openLogFile))
 		ereport(PANIC,
 				(errcode_for_file_access(),
-				 errmsg("could not close log file %s: %m",
+				 errmsg("could not close file \"%s\": %m",
 						XLogFileNameP(ThisTimeLineID, openLogSegNo))));
 	openLogFile = -1;
 }
@@ -3849,6 +3865,35 @@ UpdateLastRemovedPtr(char *filename)
 	if (segno > XLogCtl->lastRemovedSegNo)
 		XLogCtl->lastRemovedSegNo = segno;
 	SpinLockRelease(&XLogCtl->info_lck);
+}
+
+/*
+ * Remove all temporary log files in pg_wal
+ *
+ * This is called at the beginning of recovery after a previous crash,
+ * at a point where no other processes write fresh WAL data.
+ */
+static void
+RemoveTempXlogFiles(void)
+{
+	DIR		   *xldir;
+	struct dirent *xlde;
+
+	elog(DEBUG2, "removing all temporary WAL segments");
+
+	xldir = AllocateDir(XLOGDIR);
+	while ((xlde = ReadDir(xldir, XLOGDIR)) != NULL)
+	{
+		char		path[MAXPGPATH];
+
+		if (strncmp(xlde->d_name, "xlogtemp.", 9) != 0)
+			continue;
+
+		snprintf(path, MAXPGPATH, XLOGDIR "/%s", xlde->d_name);
+		unlink(path);
+		elog(DEBUG2, "removed temporary WAL segment \"%s\"", path);
+	}
+	FreeDir(xldir);
 }
 
 /*
@@ -4047,7 +4092,7 @@ RemoveXlogFile(const char *segname, XLogRecPtr PriorRedoPtr, XLogRecPtr endptr)
 		{
 			ereport(LOG,
 					(errcode_for_file_access(),
-					 errmsg("could not rename old write-ahead log file \"%s\": %m",
+					 errmsg("could not rename file \"%s\": %m",
 							path)));
 			return;
 		}
@@ -4266,6 +4311,12 @@ ReadRecord(XLogReaderState *xlogreader, XLogRecPtr RecPtr, int emode,
 				minRecoveryPoint = ControlFile->minRecoveryPoint;
 				minRecoveryPointTLI = ControlFile->minRecoveryPointTLI;
 
+				/*
+				 * The startup process can update its local copy of
+				 * minRecoveryPoint from this point.
+				 */
+				updateMinRecoveryPoint = true;
+
 				UpdateControlFile();
 				LWLockRelease(ControlFileLock);
 
@@ -4451,7 +4502,7 @@ WriteControlFile(void)
 	if (fd < 0)
 		ereport(PANIC,
 				(errcode_for_file_access(),
-				 errmsg("could not create control file \"%s\": %m",
+				 errmsg("could not create file \"%s\": %m",
 						XLOG_CONTROL_FILE)));
 
 	errno = 0;
@@ -4463,7 +4514,8 @@ WriteControlFile(void)
 			errno = ENOSPC;
 		ereport(PANIC,
 				(errcode_for_file_access(),
-				 errmsg("could not write to control file: %m")));
+				 errmsg("could not write to file \"%s\": %m",
+						XLOG_CONTROL_FILE)));
 	}
 	pgstat_report_wait_end();
 
@@ -4471,13 +4523,15 @@ WriteControlFile(void)
 	if (pg_fsync(fd) != 0)
 		ereport(PANIC,
 				(errcode_for_file_access(),
-				 errmsg("could not fsync control file: %m")));
+				 errmsg("could not fsync file \"%s\": %m",
+						XLOG_CONTROL_FILE)));
 	pgstat_report_wait_end();
 
 	if (close(fd))
 		ereport(PANIC,
 				(errcode_for_file_access(),
-				 errmsg("could not close control file: %m")));
+				 errmsg("could not close file \"%s\": %m",
+						XLOG_CONTROL_FILE)));
 }
 
 static void
@@ -4496,7 +4550,7 @@ ReadControlFile(void)
 	if (fd < 0)
 		ereport(PANIC,
 				(errcode_for_file_access(),
-				 errmsg("could not open control file \"%s\": %m",
+				 errmsg("could not open file \"%s\": %m",
 						XLOG_CONTROL_FILE)));
 
 	pgstat_report_wait_start(WAIT_EVENT_CONTROL_FILE_READ);
@@ -4506,10 +4560,13 @@ ReadControlFile(void)
 		if (r < 0)
 			ereport(PANIC,
 					(errcode_for_file_access(),
-					 errmsg("could not read from control file: %m")));
+					 errmsg("could not read file \"%s\": %m",
+							XLOG_CONTROL_FILE)));
 		else
 			ereport(PANIC,
-					 (errmsg("could not read from control file: read %d bytes, expected %d", r, (int) sizeof(ControlFileData))));
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("could not read file \"%s\": read %d of %zu",
+							XLOG_CONTROL_FILE, r, sizeof(ControlFileData))));
 	}
 	pgstat_report_wait_end();
 
@@ -4705,8 +4762,7 @@ UpdateControlFile(void)
 	if (fd < 0)
 		ereport(PANIC,
 				(errcode_for_file_access(),
-				 errmsg("could not open control file \"%s\": %m",
-						XLOG_CONTROL_FILE)));
+				 errmsg("could not open file \"%s\": %m", XLOG_CONTROL_FILE)));
 
 	errno = 0;
 	pgstat_report_wait_start(WAIT_EVENT_CONTROL_FILE_WRITE_UPDATE);
@@ -4717,7 +4773,8 @@ UpdateControlFile(void)
 			errno = ENOSPC;
 		ereport(PANIC,
 				(errcode_for_file_access(),
-				 errmsg("could not write to control file: %m")));
+				 errmsg("could not write to file \"%s\": %m",
+						XLOG_CONTROL_FILE)));
 	}
 	pgstat_report_wait_end();
 
@@ -4725,13 +4782,15 @@ UpdateControlFile(void)
 	if (pg_fsync(fd) != 0)
 		ereport(PANIC,
 				(errcode_for_file_access(),
-				 errmsg("could not fsync control file: %m")));
+				 errmsg("could not fsync file \"%s\": %m",
+						XLOG_CONTROL_FILE)));
 	pgstat_report_wait_end();
 
 	if (close(fd))
 		ereport(PANIC,
 				(errcode_for_file_access(),
-				 errmsg("could not close control file: %m")));
+				 errmsg("could not close file \"%s\": %m",
+						XLOG_CONTROL_FILE)));
 }
 
 /*
@@ -5631,7 +5690,7 @@ exitArchiveRecovery(TimeLineID endTLI, XLogRecPtr endOfLog)
 		if (close(fd))
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not close log file %s: %m",
+					 errmsg("could not close file \"%s\": %m",
 							XLogFileNameP(ThisTimeLineID, startLogSegNo))));
 	}
 
@@ -6308,6 +6367,15 @@ StartupXLOG(void)
 	struct stat st;
 
 	/*
+	 * We should have an aux process resource owner to use, and we should not
+	 * be in a transaction that's installed some other resowner.
+	 */
+	Assert(AuxProcessResourceOwner != NULL);
+	Assert(CurrentResourceOwner == NULL ||
+		   CurrentResourceOwner == AuxProcessResourceOwner);
+	CurrentResourceOwner = AuxProcessResourceOwner;
+
+	/*
 	 * Verify XLOG status looks valid.
 	 */
 	if (ControlFile->state < DB_SHUTDOWNED ||
@@ -6361,17 +6429,25 @@ StartupXLOG(void)
 	 */
 	ValidateXLOGDirectoryStructure();
 
-	/*
-	 * If we previously crashed, there might be data which we had written,
-	 * intending to fsync it, but which we had not actually fsync'd yet.
-	 * Therefore, a power failure in the near future might cause earlier
-	 * unflushed writes to be lost, even though more recent data written to
-	 * disk from here on would be persisted.  To avoid that, fsync the entire
-	 * data directory.
+	/*----------
+	 * If we previously crashed, perform a couple of actions:
+	 *	- The pg_wal directory may still include some temporary WAL segments
+	 * used when creating a new segment, so perform some clean up to not
+	 * bloat this path.  This is done first as there is no point to sync this
+	 * temporary data.
+	 *	- There might be data which we had written, intending to fsync it,
+	 * but which we had not actually fsync'd yet. Therefore, a power failure
+	 * in the near future might cause earlier unflushed writes to be lost,
+	 * even though more recent data written to disk from here on would be
+	 * persisted.  To avoid that, fsync the entire data directory.
+	 *---------
 	 */
 	if (ControlFile->state != DB_SHUTDOWNED &&
 		ControlFile->state != DB_SHUTDOWNED_IN_RECOVERY)
+	{
+		RemoveTempXlogFiles();
 		SyncDataDirectory();
+	}
 
 	/*
 	 * Initialize on the assumption we want to recover to the latest timeline
@@ -6889,9 +6965,26 @@ StartupXLOG(void)
 		/* No need to hold ControlFileLock yet, we aren't up far enough */
 		UpdateControlFile();
 
-		/* initialize our local copy of minRecoveryPoint */
-		minRecoveryPoint = ControlFile->minRecoveryPoint;
-		minRecoveryPointTLI = ControlFile->minRecoveryPointTLI;
+		/*
+		 * Initialize our local copy of minRecoveryPoint.  When doing crash
+		 * recovery we want to replay up to the end of WAL.  Particularly, in
+		 * the case of a promoted standby minRecoveryPoint value in the
+		 * control file is only updated after the first checkpoint.  However,
+		 * if the instance crashes before the first post-recovery checkpoint
+		 * is completed then recovery will use a stale location causing the
+		 * startup process to think that there are still invalid page
+		 * references when checking for data consistency.
+		 */
+		if (InArchiveRecovery)
+		{
+			minRecoveryPoint = ControlFile->minRecoveryPoint;
+			minRecoveryPointTLI = ControlFile->minRecoveryPointTLI;
+		}
+		else
+		{
+			minRecoveryPoint = InvalidXLogRecPtr;
+			minRecoveryPointTLI = 0;
+		}
 
 		/*
 		 * Reset pgstat data, because it may be invalid after recovery.
@@ -7460,6 +7553,13 @@ StartupXLOG(void)
 	}
 
 	/*
+	 * Pre-scan prepared transactions to find out the range of XIDs present.
+	 * This information is not quite needed yet, but it is positioned here so
+	 * as potential problems are detected before any on-disk change is done.
+	 */
+	oldestActiveXID = PrescanPreparedTransactions(NULL, NULL);
+
+	/*
 	 * Consider whether we need to assign a new timeline ID.
 	 *
 	 * If we are doing an archive recovery, we always assign a new ID.  This
@@ -7513,6 +7613,24 @@ StartupXLOG(void)
 		else
 			snprintf(reason, sizeof(reason), "no recovery target specified");
 
+		/*
+		 * We are now done reading the old WAL.  Turn off archive fetching if
+		 * it was active, and make a writable copy of the last WAL segment.
+		 * (Note that we also have a copy of the last block of the old WAL in
+		 * readBuf; we will use that below.)
+		 */
+		exitArchiveRecovery(EndOfLogTLI, EndOfLog);
+
+		/*
+		 * Write the timeline history file, and have it archived. After this
+		 * point (or rather, as soon as the file is archived), the timeline
+		 * will appear as "taken" in the WAL archive and to any standby
+		 * servers.  If we crash before actually switching to the new
+		 * timeline, standby servers will nevertheless think that we switched
+		 * to the new timeline, and will try to connect to the new timeline.
+		 * To minimize the window for that, try to do as little as possible
+		 * between here and writing the end-of-recovery record.
+		 */
 		writeTimeLineHistory(ThisTimeLineID, recoveryTargetTLI,
 							 EndRecPtr, reason);
 	}
@@ -7520,15 +7638,6 @@ StartupXLOG(void)
 	/* Save the selected TimeLineID in shared memory, too */
 	XLogCtl->ThisTimeLineID = ThisTimeLineID;
 	XLogCtl->PrevTimeLineID = PrevTimeLineID;
-
-	/*
-	 * We are now done reading the old WAL.  Turn off archive fetching if it
-	 * was active, and make a writable copy of the last WAL segment. (Note
-	 * that we also have a copy of the last block of the old WAL in readBuf;
-	 * we will use that below.)
-	 */
-	if (ArchiveRecoveryRequested)
-		exitArchiveRecovery(EndOfLogTLI, EndOfLog);
 
 	/*
 	 * Prepare to write WAL starting at EndOfLog location, and init xlog
@@ -7581,9 +7690,6 @@ StartupXLOG(void)
 
 	XLogCtl->LogwrtRqst.Write = EndOfLog;
 	XLogCtl->LogwrtRqst.Flush = EndOfLog;
-
-	/* Pre-scan prepared transactions to find out the range of XIDs present */
-	oldestActiveXID = PrescanPreparedTransactions(NULL, NULL);
 
 	/*
 	 * Update full_page_writes in shared memory and write an XLOG_FPW_CHANGE
@@ -7857,6 +7963,8 @@ CheckRecoveryConsistency(void)
 	 */
 	if (XLogRecPtrIsInvalid(minRecoveryPoint))
 		return;
+
+	Assert(InArchiveRecovery);
 
 	/*
 	 * assume that we are called in the startup process, and hence don't need
@@ -8379,6 +8487,15 @@ GetNextXidAndEpoch(TransactionId *xid, uint32 *epoch)
 void
 ShutdownXLOG(int code, Datum arg)
 {
+	/*
+	 * We should have an aux process resource owner to use, and we should not
+	 * be in a transaction that's installed some other resowner.
+	 */
+	Assert(AuxProcessResourceOwner != NULL);
+	Assert(CurrentResourceOwner == NULL ||
+		   CurrentResourceOwner == AuxProcessResourceOwner);
+	CurrentResourceOwner = AuxProcessResourceOwner;
+
 	/* Don't be chatty in standalone mode */
 	ereport(IsPostmasterEnvironment ? LOG : NOTICE,
 			(errmsg("shutting down")));
@@ -9946,11 +10063,16 @@ xlog_redo(XLogReaderState *record)
 		 * Update minRecoveryPoint to ensure that if recovery is aborted, we
 		 * recover back up to this point before allowing hot standby again.
 		 * This is important if the max_* settings are decreased, to ensure
-		 * you don't run queries against the WAL preceding the change.
+		 * you don't run queries against the WAL preceding the change. The
+		 * local copies cannot be updated as long as crash recovery is
+		 * happening and we expect all the WAL to be replayed.
 		 */
-		minRecoveryPoint = ControlFile->minRecoveryPoint;
-		minRecoveryPointTLI = ControlFile->minRecoveryPointTLI;
-		if (minRecoveryPoint != 0 && minRecoveryPoint < lsn)
+		if (InArchiveRecovery)
+		{
+			minRecoveryPoint = ControlFile->minRecoveryPoint;
+			minRecoveryPointTLI = ControlFile->minRecoveryPointTLI;
+		}
+		if (minRecoveryPoint != InvalidXLogRecPtr && minRecoveryPoint < lsn)
 		{
 			ControlFile->minRecoveryPoint = lsn;
 			ControlFile->minRecoveryPointTLI = ThisTimeLineID;
@@ -10134,7 +10256,7 @@ assign_xlog_sync_method(int new_sync_method, void *extra)
 			if (pg_fsync(openLogFile) != 0)
 				ereport(PANIC,
 						(errcode_for_file_access(),
-						 errmsg("could not fsync log segment %s: %m",
+						 errmsg("could not fsync file \"%s\": %m",
 								XLogFileNameP(ThisTimeLineID, openLogSegNo))));
 			pgstat_report_wait_end();
 			if (get_sync_bit(sync_method) != get_sync_bit(new_sync_method))
@@ -10153,13 +10275,14 @@ assign_xlog_sync_method(int new_sync_method, void *extra)
 void
 issue_xlog_fsync(int fd, XLogSegNo segno)
 {
+	pgstat_report_wait_start(WAIT_EVENT_WAL_SYNC);
 	switch (sync_method)
 	{
 		case SYNC_METHOD_FSYNC:
 			if (pg_fsync_no_writethrough(fd) != 0)
 				ereport(PANIC,
 						(errcode_for_file_access(),
-						 errmsg("could not fsync log file %s: %m",
+						 errmsg("could not fsync file \"%s\": %m",
 								XLogFileNameP(ThisTimeLineID, segno))));
 			break;
 #ifdef HAVE_FSYNC_WRITETHROUGH
@@ -10167,7 +10290,7 @@ issue_xlog_fsync(int fd, XLogSegNo segno)
 			if (pg_fsync_writethrough(fd) != 0)
 				ereport(PANIC,
 						(errcode_for_file_access(),
-						 errmsg("could not fsync write-through log file %s: %m",
+						 errmsg("could not fsync write-through file \"%s\": %m",
 								XLogFileNameP(ThisTimeLineID, segno))));
 			break;
 #endif
@@ -10176,7 +10299,7 @@ issue_xlog_fsync(int fd, XLogSegNo segno)
 			if (pg_fdatasync(fd) != 0)
 				ereport(PANIC,
 						(errcode_for_file_access(),
-						 errmsg("could not fdatasync log file %s: %m",
+						 errmsg("could not fdatasync file \"%s\": %m",
 								XLogFileNameP(ThisTimeLineID, segno))));
 			break;
 #endif
@@ -10188,6 +10311,7 @@ issue_xlog_fsync(int fd, XLogSegNo segno)
 			elog(PANIC, "unrecognized wal_sync_method: %d", sync_method);
 			break;
 	}
+	pgstat_report_wait_end();
 }
 
 /*
@@ -11594,6 +11718,7 @@ XLogPageRead(XLogReaderState *xlogreader, XLogRecPtr targetPagePtr, int reqLen,
 	int			emode = private->emode;
 	uint32		targetPageOff;
 	XLogSegNo	targetSegNo PG_USED_FOR_ASSERTS_ONLY;
+	int			r;
 
 	XLByteToSeg(targetPagePtr, targetSegNo, wal_segment_size);
 	targetPageOff = XLogSegmentOffset(targetPagePtr, wal_segment_size);
@@ -11675,8 +11800,10 @@ retry:
 	if (lseek(readFile, (off_t) readOff, SEEK_SET) < 0)
 	{
 		char		fname[MAXFNAMELEN];
+		int			save_errno = errno;
 
 		XLogFileName(fname, curFileTLI, readSegNo, wal_segment_size);
+		errno = save_errno;
 		ereport(emode_for_corrupt_record(emode, targetPagePtr + reqLen),
 				(errcode_for_file_access(),
 				 errmsg("could not seek in log segment %s to offset %u: %m",
@@ -11685,16 +11812,27 @@ retry:
 	}
 
 	pgstat_report_wait_start(WAIT_EVENT_WAL_READ);
-	if (read(readFile, readBuf, XLOG_BLCKSZ) != XLOG_BLCKSZ)
+	r = read(readFile, readBuf, XLOG_BLCKSZ);
+	if (r != XLOG_BLCKSZ)
 	{
 		char		fname[MAXFNAMELEN];
+		int			save_errno = errno;
 
 		pgstat_report_wait_end();
 		XLogFileName(fname, curFileTLI, readSegNo, wal_segment_size);
-		ereport(emode_for_corrupt_record(emode, targetPagePtr + reqLen),
-				(errcode_for_file_access(),
-				 errmsg("could not read from log segment %s, offset %u: %m",
-						fname, readOff)));
+		if (r < 0)
+		{
+			errno = save_errno;
+			ereport(emode_for_corrupt_record(emode, targetPagePtr + reqLen),
+					(errcode_for_file_access(),
+					 errmsg("could not read from log segment %s, offset %u: %m",
+							fname, readOff)));
+		}
+		else
+			ereport(emode_for_corrupt_record(emode, targetPagePtr + reqLen),
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("could not read from log segment %s, offset %u: read %d of %zu",
+							fname, readOff, r, (Size) XLOG_BLCKSZ)));
 		goto next_record_is_invalid;
 	}
 	pgstat_report_wait_end();

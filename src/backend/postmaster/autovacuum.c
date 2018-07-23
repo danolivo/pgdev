@@ -522,13 +522,9 @@ AutoVacLauncherMain(int argc, char *argv[])
 		pgstat_report_wait_end();
 		AbortBufferIO();
 		UnlockBuffers();
-		if (CurrentResourceOwner)
-		{
-			ResourceOwnerRelease(CurrentResourceOwner,
-								 RESOURCE_RELEASE_BEFORE_LOCKS,
-								 false, true);
-			/* we needn't bother with the other ResourceOwnerRelease phases */
-		}
+		/* this is probably dead code, but let's be safe: */
+		if (AuxProcessResourceOwner)
+			ReleaseAuxProcessResources(false);
 		AtEOXact_Buffers(false);
 		AtEOXact_SMgr();
 		AtEOXact_Files(false);
@@ -2904,7 +2900,7 @@ table_recheck_autovac(Oid relid, HTAB *table_toast_map,
 		tab->at_vacoptions = VACOPT_SKIPTOAST |
 			(dovacuum ? VACOPT_VACUUM : 0) |
 			(doanalyze ? VACOPT_ANALYZE : 0) |
-			(!wraparound ? VACOPT_NOWAIT : 0);
+			(!wraparound ? VACOPT_SKIP_LOCKED : 0);
 		tab->at_params.freeze_min_age = freeze_min_age;
 		tab->at_params.freeze_table_age = freeze_table_age;
 		tab->at_params.multixact_freeze_min_age = multixact_freeze_min_age;

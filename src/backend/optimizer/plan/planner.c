@@ -335,7 +335,6 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	 */
 	if ((cursorOptions & CURSOR_OPT_PARALLEL_OK) != 0 &&
 		IsUnderPostmaster &&
-		dynamic_shared_memory_type != DSM_IMPL_NONE &&
 		parse->commandType == CMD_SELECT &&
 		!parse->hasModifyingCTE &&
 		max_parallel_workers_per_gather > 0 &&
@@ -1163,6 +1162,7 @@ inheritance_planner(PlannerInfo *root)
 	List	   *final_rtable = NIL;
 	int			save_rel_array_size = 0;
 	RelOptInfo **save_rel_array = NULL;
+	AppendRelInfo **save_append_rel_array = NULL;
 	List	   *subpaths = NIL;
 	List	   *subroots = NIL;
 	List	   *resultRelations = NIL;
@@ -1529,6 +1529,7 @@ inheritance_planner(PlannerInfo *root)
 		}
 		save_rel_array_size = subroot->simple_rel_array_size;
 		save_rel_array = subroot->simple_rel_array;
+		save_append_rel_array = subroot->append_rel_array;
 
 		/* Make sure any initplans from this rel get into the outer list */
 		root->init_plans = subroot->init_plans;
@@ -1579,6 +1580,8 @@ inheritance_planner(PlannerInfo *root)
 	parse->rtable = final_rtable;
 	root->simple_rel_array_size = save_rel_array_size;
 	root->simple_rel_array = save_rel_array;
+	root->append_rel_array = save_append_rel_array;
+
 	/* Must reconstruct master's simple_rte_array, too */
 	root->simple_rte_array = (RangeTblEntry **)
 		palloc0((list_length(final_rtable) + 1) * sizeof(RangeTblEntry *));
@@ -4600,8 +4603,7 @@ create_one_window_path(PlannerInfo *root,
 		path = (Path *)
 			create_windowagg_path(root, window_rel, path, window_target,
 								  wflists->windowFuncs[wc->winref],
-								  wc,
-								  window_pathkeys);
+								  wc);
 	}
 
 	add_path(window_rel, path);
@@ -5462,8 +5464,6 @@ make_window_input_target(PlannerInfo *root,
  * The required ordering is first the PARTITION keys, then the ORDER keys.
  * In the future we might try to implement windowing using hashing, in which
  * case the ordering could be relaxed, but for now we always sort.
- *
- * Caution: if you change this, see createplan.c's get_column_info_for_window!
  */
 static List *
 make_pathkeys_for_window(PlannerInfo *root, WindowClause *wc,
@@ -6046,8 +6046,7 @@ plan_create_index_workers(Oid tableOid, Oid indexOid)
 	double		allvisfrac;
 
 	/* Return immediately when parallelism disabled */
-	if (dynamic_shared_memory_type == DSM_IMPL_NONE ||
-		max_parallel_maintenance_workers == 0)
+	if (max_parallel_maintenance_workers == 0)
 		return 0;
 
 	/* Set up largely-dummy planner state */
@@ -6909,8 +6908,8 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 							  scanjoin_targets_contain_srfs);
 
 	/*
-	 * If the relation is partitioned, recurseively apply the same changes to
-	 * all partitions and generate new Append paths. Since Append is not
+	 * If the relation is partitioned, recursively apply the same changes to
+	 * all partitions and generate new Append paths.  Since Append is not
 	 * projection-capable, that might save a separate Result node, and it also
 	 * is important for partitionwise aggregate.
 	 */
@@ -7012,6 +7011,7 @@ create_partitionwise_grouping_paths(PlannerInfo *root,
 	List	   *grouped_live_children = NIL;
 	List	   *partially_grouped_live_children = NIL;
 	PathTarget *target = grouped_rel->reltarget;
+	bool		partial_grouping_valid = true;
 
 	Assert(patype != PARTITIONWISE_AGGREGATE_NONE);
 	Assert(patype != PARTITIONWISE_AGGREGATE_PARTIAL ||
@@ -7091,6 +7091,8 @@ create_partitionwise_grouping_paths(PlannerInfo *root,
 				lappend(partially_grouped_live_children,
 						child_partially_grouped_rel);
 		}
+		else
+			partial_grouping_valid = false;
 
 		if (patype == PARTITIONWISE_AGGREGATE_FULL)
 		{
@@ -7103,20 +7105,18 @@ create_partitionwise_grouping_paths(PlannerInfo *root,
 	}
 
 	/*
-	 * All children can't be dummy at this point. If they are, then the parent
-	 * too marked as dummy.
-	 */
-	Assert(grouped_live_children != NIL ||
-		   partially_grouped_live_children != NIL);
-
-	/*
 	 * Try to create append paths for partially grouped children. For full
 	 * partitionwise aggregation, we might have paths in the partial_pathlist
 	 * if parallel aggregation is possible.  For partial partitionwise
 	 * aggregation, we may have paths in both pathlist and partial_pathlist.
+	 *
+	 * NB: We must have a partially grouped path for every child in order to
+	 * generate a partially grouped path for this relation.
 	 */
-	if (partially_grouped_rel)
+	if (partially_grouped_rel && partial_grouping_valid)
 	{
+		Assert(partially_grouped_live_children != NIL);
+
 		add_paths_to_append_rel(root, partially_grouped_rel,
 								partially_grouped_live_children);
 
@@ -7130,7 +7130,11 @@ create_partitionwise_grouping_paths(PlannerInfo *root,
 
 	/* If possible, create append paths for fully grouped children. */
 	if (patype == PARTITIONWISE_AGGREGATE_FULL)
+	{
+		Assert(grouped_live_children != NIL);
+
 		add_paths_to_append_rel(root, grouped_rel, grouped_live_children);
+	}
 }
 
 /*
