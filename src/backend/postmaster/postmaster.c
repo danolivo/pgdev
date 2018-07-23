@@ -5342,7 +5342,7 @@ CountChildren(int target)
 
 		if (bp->dead_end)
 			continue;
-//elog(LOG, "in CountChildren: bp->bkend_type=%d", bp->bkend_type);
+
 		/*
 		 * Since target == BACKEND_TYPE_ALL is the most common case, we test
 		 * it first and avoid touching shared memory for every child.

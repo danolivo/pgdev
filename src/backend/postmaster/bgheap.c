@@ -1282,12 +1282,11 @@ main_launcher_loop()
 
 		if (len > 0)
 		{
-//			WorkerInfo worker;
 			CleanerMessage *mptr;
 
 			if (len%sizeof(CleanerMessage) != 0)
 				elog(ERROR, "INCORRECT Message size!");
-//elog(LOG, "Receive %lu", len/sizeof(CleanerMessage));
+
 			/* Push all data from httable to waiting list */
 			for (mptr = table; ((char *)mptr-(char *)table) < len; mptr++)
 				push_waiting_list(heapcleaner_max_workers, mptr);
@@ -1381,11 +1380,7 @@ main_launcher_loop()
 			proc_exit(1);
 		}
 	}
-	{
-		FILE *f = fopen("/home/andrey/test.log", "a+");
-		fprintf(f, "Heap Launcher exit with 0\n");
-		fclose(f);
-	}
+
 	elog(LOG, "Heap Launcher exit with 0");
 	proc_exit(0);
 }

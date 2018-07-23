@@ -2688,7 +2688,6 @@ perform_work_item(AutoVacuumWorkItem *workitem)
 	}
 	PG_CATCH();
 	{
-		elog(LOG, "---- AUTOVACUUM CATCH!");
 		/*
 		 * Abort the transaction, start a new one, and proceed with the next
 		 * table in our list.

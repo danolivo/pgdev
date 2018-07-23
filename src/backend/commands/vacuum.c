@@ -1618,7 +1618,7 @@ vac_open_indexes(Relation relation, LOCKMODE lockmode,
 	ListCell   *indexoidscan;
 	int			i;
 
-//	Assert(lockmode != NoLock);
+	Assert(lockmode != NoLock);
 
 	indexoidlist = RelationGetIndexList(relation);
 

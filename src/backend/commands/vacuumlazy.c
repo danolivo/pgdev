@@ -1755,15 +1755,17 @@ quick_vacuum_index(Relation irel, Relation hrel,
 				   int num_dead_tuples)
 {
 	int				tnum;
-	bool			found[MaxOffsetNumber];
-	IndexInfo* 		indexInfo = BuildIndexInfo(irel);
-	EState*			estate = CreateExecutorState();
-	ExprContext*	econtext = GetPerTupleExprContext(estate);
-	ExprState*		predicate = ExecPrepareQual(indexInfo->ii_Predicate, estate);
-	TupleTableSlot*	slot = MakeSingleTupleTableSlot(RelationGetDescr(hrel));
+	bool			*found = palloc(num_dead_tuples*sizeof(bool));
+	IndexInfo 		*indexInfo = BuildIndexInfo(irel);
+	EState			*estate = CreateExecutorState();
+	ExprContext		*econtext = GetPerTupleExprContext(estate);
+	ExprState		*predicate = ExecPrepareQual(indexInfo->ii_Predicate, estate);
+	TupleTableSlot	*slot = MakeSingleTupleTableSlot(RelationGetDescr(hrel));
 
 	IndexTargetDeleteResult	stats;
 	IndexTargetDeleteInfo	ivinfo;
+
+	Assert(found != NULL);
 
 	stats.tuples_removed = 0;
 	ivinfo.indexRelation = irel;
@@ -1771,7 +1773,7 @@ quick_vacuum_index(Relation irel, Relation hrel,
 
 	econtext->ecxt_scantuple = slot;
 
-	memset(found, 0, MaxOffsetNumber*sizeof(bool));
+	memset(found, 0, num_dead_tuples*sizeof(bool));
 	/* Get tuple from heap */
 	for (tnum = num_dead_tuples-1; tnum >= 0; tnum--)
 	{
@@ -1790,7 +1792,6 @@ quick_vacuum_index(Relation irel, Relation hrel,
 			 * Tuple has 'not used' status.
 			 */
 			found[tnum] = true;
-			elog(LOG, "---> get_tuple_by_tid == NULL");
 			continue;
 		}
 
@@ -1809,7 +1810,6 @@ quick_vacuum_index(Relation irel, Relation hrel,
 		if ((predicate != NULL) && (!ExecQual(predicate, econtext)))
 		{
 			found[tnum] = true;
-			elog(LOG, "---> PREDICATE");
 			continue;
 		}
 
@@ -1833,6 +1833,7 @@ quick_vacuum_index(Relation irel, Relation hrel,
 //	elog(LOG, "del: %d (%d) -> %s", stats.tuples_removed, num_dead_tuples, RelationGetRelationName(irel));
 	ExecDropSingleTupleTableSlot(slot);
 	FreeExecutorState(estate);
+	pfree(found);
 }
 
 /*
