@@ -1730,7 +1730,7 @@ get_tuple_by_tid(Relation rel, ItemPointer tid)
 	{
 		offnum = ItemIdGetRedirect(lp);
 		lp = PageGetItemId(page, offnum);
-//		Assert(ItemIdIsUsed(lp));
+
 		if (!ItemIdIsUsed(lp))
 		{
 			UnlockReleaseBuffer(buffer);
@@ -1830,12 +1830,7 @@ quick_vacuum_index(Relation irel, Relation hrel,
 
 		index_target_delete(&ivinfo, &stats, values, isnull);
 	}
-	{
-//		FILE *f=fopen("/home/andrey/test.log", "a+");
-//		fprintf(f, "index del: %d (%d) -> %s\n", stats.tuples_removed, num_dead_tuples, RelationGetRelationName(irel));
-//		fclose(f);
-	}
-//	elog(LOG, "del: %d (%d) -> %s", stats.tuples_removed, num_dead_tuples, RelationGetRelationName(irel));
+
 	ExecDropSingleTupleTableSlot(slot);
 	FreeExecutorState(estate);
 	pfree(found);

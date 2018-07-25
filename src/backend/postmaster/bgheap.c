@@ -386,9 +386,8 @@ cleanup_relations(DirtyRelation *res, BlockNumber *AuxiliaryList)
 			}
 
 			quick_vacuum_index(IndexRelations[irnum], heapRelation,
-							    dead_tuples,
-								num_dead_tuples);
-
+							   dead_tuples,
+							   num_dead_tuples);
 		}
 
 		if (!found_non_nbtree)
@@ -414,12 +413,6 @@ cleanup_relations(DirtyRelation *res, BlockNumber *AuxiliaryList)
 				Assert(ItemIdIsDead(lp));
 				ItemIdSetUnused(lp);
 				unusable[nunusable++] = offnum;
-			}
-
-			{
-				FILE *f=fopen("/home/andrey/test.log", "a+");
-				fprintf(f, "[%d] heap del: %d (%d) -> %s\n", res->items[i], nunusable, num_dead_tuples, RelationGetRelationName(heapRelation));
-				fclose(f);
 			}
 
 			if (nunusable > 0)
@@ -1269,7 +1262,6 @@ main_launcher_loop()
 
 					} else if (!startWorker)
 					{
-//						elog(LOG, "Launcher: Launch worker. blk=%d", msg.blkno);
 						/* Start new worker */
 						launch_worker(msg.dbNode);
 						startWorker = true;

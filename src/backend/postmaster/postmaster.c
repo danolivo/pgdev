@@ -360,8 +360,6 @@ bool		redirection_done = false;	/* stderr redirected for syslogger? */
 static volatile sig_atomic_t start_autovac_launcher = false;
 static volatile sig_atomic_t start_heapclnr_launcher = false;
 
-//static volatile sig_atomic_t start_bgheap_cleaner = false;
-
 /* the launcher needs to be signalled to communicate some condition */
 static volatile bool avlauncher_needs_signal = false;
 
@@ -668,14 +666,7 @@ PostmasterMain(int argc, char *argv[])
 #ifdef SIGXFSZ
 	pqsignal(SIGXFSZ, SIG_IGN); /* ignored */
 #endif
-	{
-		FILE *f = fopen("/home/andrey/test.log", "at");
-		fprintf(f, "Begin Test\n");
-		fclose(f);
-		f = fopen("/home/andrey/test1.log", "at");
-		fprintf(f, "Begin Test\n");
-		fclose(f);
-	}
+
 	/*
 	 * Options setup
 	 */
