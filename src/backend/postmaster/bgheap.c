@@ -18,7 +18,6 @@
 #include "postgres.h"
 
 #include <unistd.h>
-//#include "fmgr.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -29,7 +28,6 @@
 #include "access/nbtree.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"
-//#include "access/xlog.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
@@ -40,35 +38,27 @@
 #include "executor/executor.h"
 #include "libpq/pqsignal.h"
 #include "postmaster/bgheap.h"
-//#include "postmaster/bgworker.h"
 #include "postmaster/fork_process.h"
 #include "postmaster/postmaster.h"
-//#include "storage/bufmgr.h"
 #include "storage/condition_variable.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
-//#include "storage/latch.h"
 #include "storage/lmgr.h"
 #include "storage/pmsignal.h"
-//#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "tcop/tcopprot.h"
-//#include "utils/guc.h"
 #include "utils/ps_status.h"
 #include "utils/lsyscache.h"
-//#include "utils/memutils.h"
-//#include "utils/rel.h"
 #include "utils/resowner.h"
 #include "utils/syscache.h"
 #include "utils/timeout.h"
-//#include "utils/tqual.h"
 
 /*
  * Maximum number of storage at a backend side before shipping to a
  * background heap cleaner
  */
-#define DBLOCKS_STORAGE_ITEMS_MAX	(1)
+#define DBLOCKS_STORAGE_ITEMS_MAX	(50)
 
 /*
  * Maximum number of dirty blocks which can keep a worker for each relation
@@ -76,10 +66,15 @@
 #define WORKER_DIRTYBLOCKS_MAX_NUM	(1024)
 
 /* Maximum number of slots for dirty relations */
-#define WORKER_RELATIONS_MAX_NUM	(2)
+#define WORKER_RELATIONS_MAX_NUM	(100)
 
 /* Number of work items in a launcher/worker shared buffer */
 #define WORKER_TASK_ITEMS_MAX		(256)
+
+/*
+ * Maximum time interval which worker can idle without a task (ms)
+ */
+#define WORKER_IDLE_TIME_DURATION_MAX	(5000)
 
 /* Minimal info for cleanup a block of heap relation and its index relations */
 typedef struct CleanerMessage
@@ -88,7 +83,6 @@ typedef struct CleanerMessage
 	Oid	dbNode;		/* Database ID */
 	Oid	spcNode;	/* Tablespace ID*/
 	int	blkno;		/* Block number */
-	TransactionId	xid;
 } CleanerMessage;
 
 /*
@@ -958,7 +952,9 @@ backend_store_dirty_block(CleanerMessage *msg)
 }
 
 /*
- * Send a package of dirty blocks from a Backend to a Heap Cleaner Launcher
+ * Send a package of dirty blocks from a Backend to the Cleaner.
+ * Form the package by passing across the table. During this pass table is
+ * cleaned. Sign of clean row is (dbNode == 0) condition.
  */
 static void
 backend_send_dirty_blocks(void)
@@ -992,7 +988,9 @@ backend_send_dirty_blocks(void)
 }
 
 /*
- * Send a dirty block of relation to Heap cleaner launcher
+ * Send a dirty block of relation to the Cleaner.
+ * Before shipping to the Cleaner dirty blocks collects in a simple hash
+ * table. Duplicates are discarded.
  */
 void
 HeapCleanerSend(Relation relation, BlockNumber blkno)
@@ -1008,7 +1006,10 @@ HeapCleanerSend(Relation relation, BlockNumber blkno)
 	if (IsSystemRelation(relation))
 		return;
 
-
+	/*
+	 * Check the relation type.
+	 * Not all relations can be cleaned now (similarly vacuum).
+	 */
 	if (relation->rd_rel->relkind != RELKIND_RELATION &&
 		relation->rd_rel->relkind != RELKIND_MATVIEW &&
 		relation->rd_rel->relkind != RELKIND_TOASTVALUE &&
@@ -1030,7 +1031,6 @@ HeapCleanerSend(Relation relation, BlockNumber blkno)
 	msg.dbNode = relation->rd_node.dbNode;
 	msg.spcNode = relation->rd_node.spcNode;
 	msg.blkno = blkno;
-	msg.xid = GetCurrentTransactionIdIfAny();
 
 	if (backend_store_dirty_block(&msg))
 		backend_send_dirty_blocks();
@@ -1197,11 +1197,6 @@ look_for_worker(Oid dbNode)
 
 	return worker;
 }
-
-/*
- * Maximum time interval which worker can idle (ms)
- */
-#define WORKER_IDLE_TIME_DURATION_MAX	(5000)
 
 /*
  * Entry point of a launcher behavior logic
