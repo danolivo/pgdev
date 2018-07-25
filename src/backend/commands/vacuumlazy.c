@@ -1730,7 +1730,12 @@ get_tuple_by_tid(Relation rel, ItemPointer tid)
 	{
 		offnum = ItemIdGetRedirect(lp);
 		lp = PageGetItemId(page, offnum);
-		Assert(ItemIdIsUsed(lp));
+//		Assert(ItemIdIsUsed(lp));
+		if (!ItemIdIsUsed(lp))
+		{
+			UnlockReleaseBuffer(buffer);
+			return NULL;
+		}
 	}
 
 	/* Form a tuple */

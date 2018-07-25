@@ -17,9 +17,8 @@
 
 #include "postgres.h"
 
-
 #include <unistd.h>
-#include "fmgr.h"
+//#include "fmgr.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -30,7 +29,7 @@
 #include "access/nbtree.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"
-#include "access/xlog.h"
+//#include "access/xlog.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_namespace.h"
@@ -41,34 +40,48 @@
 #include "executor/executor.h"
 #include "libpq/pqsignal.h"
 #include "postmaster/bgheap.h"
-#include "postmaster/bgworker.h"
+//#include "postmaster/bgworker.h"
 #include "postmaster/fork_process.h"
 #include "postmaster/postmaster.h"
-#include "storage/bufmgr.h"
+//#include "storage/bufmgr.h"
 #include "storage/condition_variable.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
-#include "storage/latch.h"
+//#include "storage/latch.h"
 #include "storage/lmgr.h"
 #include "storage/pmsignal.h"
-#include "storage/proc.h"
+//#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/smgr.h"
 #include "tcop/tcopprot.h"
-#include "utils/guc.h"
+//#include "utils/guc.h"
 #include "utils/ps_status.h"
 #include "utils/lsyscache.h"
-#include "utils/memutils.h"
-#include "utils/rel.h"
+//#include "utils/memutils.h"
+//#include "utils/rel.h"
 #include "utils/resowner.h"
 #include "utils/syscache.h"
 #include "utils/timeout.h"
+//#include "utils/tqual.h"
 
-#define RELATIONS_MAX_NUM	(100)
+/*
+ * Maximum number of storage at a backend side before shipping to a
+ * background heap cleaner
+ */
+#define DBLOCKS_STORAGE_ITEMS_MAX	(1)
+
+/*
+ * Maximum number of dirty blocks which can keep a worker for each relation
+ */
+#define WORKER_DIRTYBLOCKS_MAX_NUM	(1024)
+
+/* Maximum number of slots for dirty relations */
+#define WORKER_RELATIONS_MAX_NUM	(2)
+
 /* Number of work items in a launcher/worker shared buffer */
-#define WORK_ITEMS_MAX	(256)
+#define WORKER_TASK_ITEMS_MAX		(256)
 
-/* Minimal data for cleanup a block of heap relation and its index relations */
+/* Minimal info for cleanup a block of heap relation and its index relations */
 typedef struct CleanerMessage
 {
 	Oid	relid;		/* Relation ID */
@@ -87,7 +100,7 @@ typedef struct WorkerInfoData
 	Oid				dbOid;					/* Database ID of the worker */
 	TimestampTz 	launchtime;				/* To define a time of last worker activity */
 	int				pid;					/* Used for system signals passing */
-	CleanerMessage	buffer[WORK_ITEMS_MAX];	/* Array of work items */
+	CleanerMessage	buffer[WORKER_TASK_ITEMS_MAX];	/* Array of work items */
 	int				nitems;					/* Number of work items in buffer */
 	LWLock			WorkItemLock;			/* Locker for safe buffer access */
 	int				id;						/* Used for Internal launcher buffers management */
@@ -117,20 +130,13 @@ typedef struct WorkWaitingList
 	CleanerMessage	msg;
 } WorkWaitingList;
 
-#define DIRTYBLOCKS_MAX_NUM		(1024)
-typedef struct DirtyBlocks
-{
-	BlockNumber	blkno;
-	uint8		stage;
-} DirtyBlocks;
-
-typedef struct PrivateRefCountEntry
+typedef struct DirtyRelation
 {
 	Oid			relid;
 	Oid			spcNode;
 	int			nitems;
-	DirtyBlocks	*items;
-} PrivateRefCountEntry;
+	BlockNumber	*items;
+} DirtyRelation;
 
 /*
  * Table of database relations.
@@ -149,6 +155,9 @@ static HeapCleanerShmemStruct *HeapCleanerShmem;
 
 static dlist_head DatabaseList = DLIST_STATIC_INIT(DatabaseList);
 static MemoryContext DatabaseListCxt = NULL;
+
+static CleanerMessage	dblocks[DBLOCKS_STORAGE_ITEMS_MAX];
+static int				dblocks_records_num = -1;
 
 /* Signal handling */
 static volatile sig_atomic_t got_SIGHUP = false;
@@ -177,7 +186,7 @@ static pid_t hcworker_forkexec(void);
 NON_EXEC_STATIC void HeapCleanerLauncherMain(int argc, char *argv[]) pg_attribute_noreturn();
 NON_EXEC_STATIC void HeapCleanerWorkerMain(int argc, char *argv[]) pg_attribute_noreturn();
 
-static DirtyBlocks *cleanup_relations(PrivateRefCountEntry *res, DirtyBlocks *AuxiliaryList);
+static BlockNumber *cleanup_relations(DirtyRelation *res, BlockNumber *AuxiliaryList);
 static void launch_worker(Oid dbNode);
 static WorkerInfo look_for_worker(Oid dbNode);
 static void main_launcher_loop(void);
@@ -189,7 +198,7 @@ static void push_waiting_list(int listId, CleanerMessage *msg);
 static void SIGHUP_Handler(SIGNAL_ARGS);
 static void SIGTERM_Handler(SIGNAL_ARGS);
 static void SIGUSR2_Handler(SIGNAL_ARGS);
-static void send_dirty_blocks(void);
+static void backend_send_dirty_blocks(void);
 static bool try_send_message(WorkerInfo worker, CleanerMessage *msg);
 
 #ifdef EXEC_BACKEND
@@ -249,11 +258,220 @@ HeapCleanerWorkerIAm(void)
 }
 #endif
 
+/*
+ * Send dirty blocks from a collector's table to launcher at the end of transaction
+ */
 void
 AtEOXact_BGHeap_tables(bool isCommit)
 {
-	send_dirty_blocks();
+	backend_send_dirty_blocks();
 }
+
+/*
+ * Main logic of HEAP and index relations cleaning
+ */
+static BlockNumber*
+cleanup_relations(DirtyRelation *res, BlockNumber *AuxiliaryList)
+{
+	Relation		heapRelation;
+	Relation   		*IndexRelations;
+	int				nindexes;
+	int				AuxiliaryCounter = 0;
+	LOCKMODE		lockmode = AccessShareLock;
+	int				i;
+
+	if (RecoveryInProgress())
+		return AuxiliaryList;
+
+	CHECK_FOR_INTERRUPTS();
+
+	StartTransactionCommand();
+
+	/*
+	 * At this point relation availability is not guaranteed.
+	 * Make safe test to check this.
+	 */
+	heapRelation = try_relation_open(res->relid, lockmode);
+
+	if (!heapRelation)
+	{
+		elog(LOG, "[%d] Cleanup: UnSuccessful opening. Relation deleted?", res->relid);
+		CommitTransactionCommand();
+		return AuxiliaryList;
+	}
+
+	/*
+	 * Check relation type similarly vacuum
+	 */
+	if (!(pg_class_ownercheck(RelationGetRelid(heapRelation), GetUserId()) ||
+		  (pg_database_ownercheck(MyDatabaseId, GetUserId()) && !heapRelation->rd_rel->relisshared)))
+	{
+		if (heapRelation->rd_rel->relisshared)
+			ereport(WARNING,
+					(errmsg("skipping \"%s\" --- only superuser can vacuum it",
+							RelationGetRelationName(heapRelation))));
+		else if (heapRelation->rd_rel->relnamespace == PG_CATALOG_NAMESPACE)
+			ereport(WARNING,
+					(errmsg("skipping \"%s\" --- only superuser or database owner can vacuum it",
+							RelationGetRelationName(heapRelation))));
+		else
+			ereport(WARNING,
+					(errmsg("skipping \"%s\" --- only table or database owner can vacuum it",
+							RelationGetRelationName(heapRelation))));
+		relation_close(heapRelation, lockmode);
+		CommitTransactionCommand();
+		return AuxiliaryList;
+	}
+
+	/* Open and lock index relations correspond to the heap relation */
+	vac_open_indexes(heapRelation, RowExclusiveLock, &nindexes, &IndexRelations);
+
+	/* Main cleanup cycle */
+	for (i = 0; i < res->nitems; i++)
+	{
+		BlockNumber		nblocks;
+		bool			needLock;
+		Buffer			buffer;
+		ItemPointerData	dead_tuples[MaxOffsetNumber];
+		int				num_dead_tuples = 0;
+		OffsetNumber	offnum;
+		int				irnum;
+		Page 			page;
+		ItemId 			lp;
+		int				tnum;
+		bool			found_non_nbtree = false;
+
+		needLock = !RELATION_IS_LOCAL(heapRelation);
+		if (needLock)
+			LockRelationForExtension(heapRelation, ExclusiveLock);
+		nblocks = RelationGetNumberOfBlocks(heapRelation);
+		if (needLock)
+			UnlockRelationForExtension(heapRelation, ExclusiveLock);
+
+		if (res->items[i] >= nblocks)
+			/* Block was deleted early */
+			continue;
+
+		/* Create TID list */
+		buffer = ReadBuffer(heapRelation, res->items[i]);
+		page = BufferGetPage(buffer);
+
+		if (!ConditionalLockBuffer(buffer))
+		{
+			AuxiliaryList[AuxiliaryCounter++] = res->items[i];
+			ReleaseBuffer(buffer);
+			continue;
+		}
+
+		/* Collect dead tuples TID's */
+		for (offnum = FirstOffsetNumber; offnum < PageGetMaxOffsetNumber(page); offnum = OffsetNumberNext(offnum))
+		{
+			lp = PageGetItemId(page, offnum);
+			if (ItemIdIsDead(lp) && ItemIdHasStorage(lp))
+			{
+				ItemPointerSet(&(dead_tuples[num_dead_tuples]), res->items[i], offnum);
+				num_dead_tuples++;
+			}
+		}
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+
+		if (num_dead_tuples == 0)
+		{
+			/* Block is clear */
+			ReleaseBuffer(buffer);
+			continue;
+		}
+
+		/* Iterate across all index relations */
+		for (irnum = 0; irnum < nindexes; irnum++)
+		{
+			if (IndexRelations[irnum]->rd_amroutine->amtargetdelete == NULL)
+			{
+				found_non_nbtree = true;
+				continue;
+			}
+
+			quick_vacuum_index(IndexRelations[irnum], heapRelation,
+							    dead_tuples,
+								num_dead_tuples);
+
+		}
+
+		if (!found_non_nbtree)
+		{
+			OffsetNumber	unusable[MaxOffsetNumber];
+			int				nunusable = 0;
+
+			if (!ConditionalLockBufferForCleanup(buffer))
+			{
+				AuxiliaryList[AuxiliaryCounter++] = res->items[i];
+				ReleaseBuffer(buffer);
+				continue;
+			}
+
+			START_CRIT_SECTION();
+
+			/* Release DEAD heap tuples storage */
+			for (tnum = 0; tnum < num_dead_tuples; tnum++)
+			{
+				OffsetNumber	offnum = ItemPointerGetOffsetNumber(&dead_tuples[tnum]);
+				ItemId			lp = PageGetItemId(page, offnum);
+
+				Assert(ItemIdIsDead(lp));
+				ItemIdSetUnused(lp);
+				unusable[nunusable++] = offnum;
+			}
+
+			{
+				FILE *f=fopen("/home/andrey/test.log", "a+");
+				fprintf(f, "[%d] heap del: %d (%d) -> %s\n", res->items[i], nunusable, num_dead_tuples, RelationGetRelationName(heapRelation));
+				fclose(f);
+			}
+
+			if (nunusable > 0)
+			{
+				XLogRecPtr	recptr;
+
+				((PageHeader) page)->pd_prune_xid = InvalidTransactionId;
+				PageRepairFragmentation(page);
+				PageClearFull(page);
+				MarkBufferDirty(buffer);
+				if (RelationNeedsWAL(heapRelation))
+				{
+					recptr = log_heap_clean(heapRelation, buffer,
+									NULL, 0,
+									NULL, 0,
+									unusable, nunusable,
+									InvalidTransactionId);
+
+					PageSetLSN(BufferGetPage(buffer), recptr);
+				}
+			}
+
+			END_CRIT_SECTION();
+			UnlockReleaseBuffer(buffer);
+		}
+		/*
+		 * ToDo: that we can do with TOAST relation?
+		 */
+
+	}
+
+	vac_close_indexes(nindexes, IndexRelations, NoLock);
+	relation_close(heapRelation, lockmode);
+	CommitTransactionCommand();
+
+	if (AuxiliaryCounter > 0)
+	{
+		BlockNumber	*tmp = res->items;
+
+		res->nitems = AuxiliaryCounter;
+		res->items = AuxiliaryList;
+		return tmp;
+	} else
+		return AuxiliaryList;
+}
+
 /*
  * Free any launcher resources before close process
  */
@@ -683,22 +901,9 @@ HeapCleanerShmemSize(void)
 	return size;
 }
 
-#define BLOCKS_TABLE_ITEMS_MAX	(50)
-
-typedef struct CleanerMessagesHashTable
-{
-	int order;
-	CleanerMessage msg;
-} CleanerMessagesHashTable;
-static CleanerMessagesHashTable	htblocks[BLOCKS_TABLE_ITEMS_MAX];
-static int records_num = -1;
-
-static void clean_blocks_table(void)
-{
-	memset(htblocks, 0, BLOCKS_TABLE_ITEMS_MAX*sizeof(CleanerMessagesHashTable));
-	records_num = 0;
-}
-
+/*
+ * Compare messages
+ */
 static bool
 isEqualMsgs(CleanerMessage *msg1, CleanerMessage *msg2)
 {
@@ -715,66 +920,65 @@ isEqualMsgs(CleanerMessage *msg1, CleanerMessage *msg2)
 }
 
 static bool
-hash_blocks(CleanerMessage *msg)
+backend_store_dirty_block(CleanerMessage *msg)
 {
-	int position = msg->blkno%BLOCKS_TABLE_ITEMS_MAX;
+	int position = msg->blkno%DBLOCKS_STORAGE_ITEMS_MAX;
 
-	if (records_num < 0)
-		clean_blocks_table();
+	/* Initial storage cleanup */
+	if (dblocks_records_num < 0)
+	{
+		memset(dblocks, 0, DBLOCKS_STORAGE_ITEMS_MAX*sizeof(CleanerMessage));
+		dblocks_records_num = 0;
+	}
 
-	Assert(records_num < BLOCKS_TABLE_ITEMS_MAX);
+	Assert(dblocks_records_num < DBLOCKS_STORAGE_ITEMS_MAX);
 
 	/* Search for new position of msg or duplicate */
 	for (;;)
 	{
-		if (htblocks[position].order == 0)
+		if (dblocks[position].dbNode == 0)
 		{
 			/* Position found */
-			htblocks[position].msg = *msg;
-			htblocks[position].order = ++records_num;
-/*			{
-				FILE *f = fopen("/home/andrey/test.log", "a+");
-				fprintf(f, "position: %d %d %d %d\n", htblocks[position].msg.blkno, htblocks[position].msg.dbNode,  htblocks[position].msg.relid, htblocks[position].msg.spcNode);
-				fprintf(f, "p--> %d %d %d %d\n", msg->blkno, msg->dbNode, msg->relid, msg->spcNode);
-				fclose(f);
-			} */
-			if ((double)(BLOCKS_TABLE_ITEMS_MAX-records_num)/BLOCKS_TABLE_ITEMS_MAX < 0.25)
-			{
+			dblocks[position] = *msg;
+			++dblocks_records_num;
+
+			if ((double)(DBLOCKS_STORAGE_ITEMS_MAX-dblocks_records_num)/DBLOCKS_STORAGE_ITEMS_MAX < 0.25)
+				/* Storage needs to be packaging and shipping to the Cleaner */
 				return true;
-			}
 		}
 
-		if (isEqualMsgs(&htblocks[position].msg, msg))
-		{
+		if (isEqualMsgs(&dblocks[position], msg))
 			/* found full duplicate */
 			return false;
-		}
-		position = (position+1)%BLOCKS_TABLE_ITEMS_MAX;
+
+		position = (position+1)%DBLOCKS_STORAGE_ITEMS_MAX;
 	}
 
 	return false;
 }
 
+/*
+ * Send a package of dirty blocks from a Backend to a Heap Cleaner Launcher
+ */
 static void
-send_dirty_blocks(void)
+backend_send_dirty_blocks(void)
 {
-	int							rc;
-	CleanerMessagesHashTable	*htptr;
-	CleanerMessage				data[BLOCKS_TABLE_ITEMS_MAX];
-	int							nitems = records_num;
+	int				rc;
+	CleanerMessage	*htptr;
+	CleanerMessage	data[DBLOCKS_STORAGE_ITEMS_MAX];
+	int				nitems = dblocks_records_num;
 
-	Assert(nitems <= BLOCKS_TABLE_ITEMS_MAX);
+	Assert(nitems <= DBLOCKS_STORAGE_ITEMS_MAX);
 
-	if (records_num == 0)
+	if (dblocks_records_num == 0)
 		return;
 
-	for (htptr = htblocks; records_num > 0; htptr++)
+	for (htptr = dblocks; dblocks_records_num > 0; htptr++)
 	{
-		if (htptr->order != 0)
+		if (htptr->dbNode != 0)
 		{
-			data[htptr->order-1] = htptr->msg;
-			htptr->order = 0;
-			records_num--;
+			data[--dblocks_records_num] = *htptr;
+			htptr->dbNode = 0;
 		}
 	}
 
@@ -786,6 +990,7 @@ send_dirty_blocks(void)
 		rc = send(HeapCleanerSock, data, nitems*sizeof(CleanerMessage), 0);
 	} while (rc < 0 && errno == EINTR);
 }
+
 /*
  * Send a dirty block of relation to Heap cleaner launcher
  */
@@ -803,14 +1008,32 @@ HeapCleanerSend(Relation relation, BlockNumber blkno)
 	if (IsSystemRelation(relation))
 		return;
 
+
+	if (relation->rd_rel->relkind != RELKIND_RELATION &&
+		relation->rd_rel->relkind != RELKIND_MATVIEW &&
+		relation->rd_rel->relkind != RELKIND_TOASTVALUE &&
+		relation->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+	{
+		ereport(WARNING,
+				(errmsg("skipping \"%s\" --- cannot clean non-tables or special system tables",
+						RelationGetRelationName(relation))));
+		return;
+	}
+
+	if (RELATION_IS_OTHER_TEMP(relation))
+		return;
+
+	if (relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		return;
+
 	msg.relid = RelationGetRelid(relation);
 	msg.dbNode = relation->rd_node.dbNode;
 	msg.spcNode = relation->rd_node.spcNode;
 	msg.blkno = blkno;
 	msg.xid = GetCurrentTransactionIdIfAny();
 
-	if (hash_blocks(&msg))
-		send_dirty_blocks();
+	if (backend_store_dirty_block(&msg))
+		backend_send_dirty_blocks();
 	else
 		return;
 
@@ -888,15 +1111,16 @@ HeapCleanerWorkerMain(int argc, char *argv[])
 		char		dbname[NAMEDATALEN];
 		HASHCTL		hash_ctl;
 
+		pgstat_report_heapcleaner(MyWorkerInfo->dbOid);
 		InitPostgres(NULL, MyWorkerInfo->dbOid, NULL, InvalidOid, dbname, false);
 		SetProcessingMode(NormalProcessing);
 		set_ps_display(dbname, false);
 
 		MemSet(&hash_ctl, 0, sizeof(hash_ctl));
 		hash_ctl.keysize = sizeof(int32);
-		hash_ctl.entrysize = sizeof(PrivateRefCountEntry);
+		hash_ctl.entrysize = sizeof(DirtyRelation);
 
-		PrivateRelationsTable = hash_create("PrivateRelationsTable", RELATIONS_MAX_NUM, &hash_ctl,
+		PrivateRelationsTable = hash_create("PrivateRelationsTable", WORKER_RELATIONS_MAX_NUM, &hash_ctl,
 											  HASH_ELEM | HASH_BLOBS);
 		main_worker_loop();
 	}
@@ -905,276 +1129,6 @@ HeapCleanerWorkerMain(int argc, char *argv[])
 
 	proc_exit(0);
 }
-
-#include "utils/tqual.h"
-/*
- * Main logic of HEAP and index relations cleaning
- */
-static DirtyBlocks*
-cleanup_relations(PrivateRefCountEntry *res, DirtyBlocks *AuxiliaryList)
-{
-	Relation		heapRelation;
-	Relation   		*IndexRelations;
-	int				nindexes;
-	int				AuxiliaryCounter = 0;
-	LOCKMODE		lockmode = AccessShareLock;
-//	Oid				toast_relid;
-	//	Oid			save_userid;
-	//	int			save_sec_context;
-	//	int			save_nestlevel;
-	int i;
-return AuxiliaryList;
-	if (RecoveryInProgress())
-		return AuxiliaryList;
-
-	CHECK_FOR_INTERRUPTS();
-
-	StartTransactionCommand();
-
-//	elog(LOG, "-> Worker cleanup: spcNode=%d relid=%d nitems=%d", res->spcNode, res->relid, res->nitems);
-
-	/*
-	 * At this point relation availability is not guaranteed.
-	 * Make safe test to check this.
-	 */
-	heapRelation = try_relation_open(res->relid, lockmode);
-
-	if (!heapRelation)
-	{
-		elog(LOG, "[%d] Cleanup: UnSuccessful opening. Relation deleted?", res->relid);
-		CommitTransactionCommand();
-		return AuxiliaryList;
-	}// else
-//		elog(LOG, "[%d] Cleanup: Successful opening!", res->relid);
-
-	/*
-	 * Check relation type similarly vacuum
-	 */
-	if (!(pg_class_ownercheck(RelationGetRelid(heapRelation), GetUserId()) ||
-		  (pg_database_ownercheck(MyDatabaseId, GetUserId()) && !heapRelation->rd_rel->relisshared)))
-	{
-		if (heapRelation->rd_rel->relisshared)
-			ereport(WARNING,
-					(errmsg("skipping \"%s\" --- only superuser can vacuum it",
-							RelationGetRelationName(heapRelation))));
-		else if (heapRelation->rd_rel->relnamespace == PG_CATALOG_NAMESPACE)
-			ereport(WARNING,
-					(errmsg("skipping \"%s\" --- only superuser or database owner can vacuum it",
-							RelationGetRelationName(heapRelation))));
-		else
-			ereport(WARNING,
-					(errmsg("skipping \"%s\" --- only table or database owner can vacuum it",
-							RelationGetRelationName(heapRelation))));
-		relation_close(heapRelation, lockmode);
-		CommitTransactionCommand();
-		return AuxiliaryList;
-	}
-
-	if (heapRelation->rd_rel->relkind != RELKIND_RELATION &&
-			heapRelation->rd_rel->relkind != RELKIND_MATVIEW &&
-			heapRelation->rd_rel->relkind != RELKIND_TOASTVALUE &&
-			heapRelation->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
-	{
-		ereport(WARNING,
-				(errmsg("skipping \"%s\" --- cannot vacuum non-tables or special system tables",
-						RelationGetRelationName(heapRelation))));
-		relation_close(heapRelation, lockmode);
-		CommitTransactionCommand();
-		return AuxiliaryList;
-	}
-
-	if (RELATION_IS_OTHER_TEMP(heapRelation))
-	{
-		relation_close(heapRelation, lockmode);
-		CommitTransactionCommand();
-		return AuxiliaryList;
-	}
-
-	if (heapRelation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
-	{
-		relation_close(heapRelation, lockmode);
-		CommitTransactionCommand();
-		return AuxiliaryList;
-	}
-
-//	toast_relid = heapRelation->rd_rel->reltoastrelid;
-
-	/* Open and lock index relations correspond to the heap relation */
-	vac_open_indexes(heapRelation, RowExclusiveLock, &nindexes, &IndexRelations);
-
-	/* Main cleanup cycle */
-	for (i = 0; i < res->nitems; i++)
-	{
-		BlockNumber		nblocks;
-		bool			needLock;
-		Buffer			buffer;
-//		Buffer			vmbuffer;
-		ItemPointerData	dead_tuples[MaxOffsetNumber];
-		int				num_dead_tuples = 0;
-		OffsetNumber	offnum;
-		int				irnum;
-		Page 			page;
-		ItemId 			lp;
-		int				tnum;
-		bool			found_non_nbtree = false;
-
-		needLock = !RELATION_IS_LOCAL(heapRelation);
-		if (needLock)
-			LockRelationForExtension(heapRelation, ExclusiveLock);
-		nblocks = RelationGetNumberOfBlocks(heapRelation);
-		if (needLock)
-			UnlockRelationForExtension(heapRelation, ExclusiveLock);
-
-//		elog(LOG, "[%d] Cleanup: Pass checks. nblocks=%d.", res->items[i].blkno, nblocks);
-
-		if (res->items[i].blkno >= nblocks)
-			/* Block was deleted early */
-			continue;
-
-		/* Create TID list */
-		buffer = ReadBuffer(heapRelation, res->items[i].blkno);
-		page = BufferGetPage(buffer);
-
-		if (!ConditionalLockBuffer(buffer))
-		{
-			AuxiliaryList[AuxiliaryCounter++] = res->items[i];
-			ReleaseBuffer(buffer);
-			continue;
-		}
-
-		/* Collect dead tuples TID's*/
-		for (offnum = FirstOffsetNumber; offnum < PageGetMaxOffsetNumber(page); offnum = OffsetNumberNext(offnum))
-		{
-			lp = PageGetItemId(page, offnum);
-			if (ItemIdIsDead(lp) && ItemIdHasStorage(lp))
-			{
-				ItemPointerSet(&(dead_tuples[num_dead_tuples]), res->items[i].blkno, offnum);
-				num_dead_tuples++;
-			}
-		}
-		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-
-		if (num_dead_tuples == 0)
-		{
-			/* Block is clear */
-//			elog(LOG, "[%d] Cleanup: Do nothing.", res->items[i].blkno);
-			ReleaseBuffer(buffer);
-			continue;
-		}
-
-		/* Iterate across all index relations */
-		for (irnum = 0; irnum < nindexes; irnum++)
-		{
-			if (IndexRelations[irnum]->rd_amroutine->amtargetdelete == NULL)
-			{
-				found_non_nbtree = true;
-				continue;
-			}
-
-			quick_vacuum_index(IndexRelations[irnum], heapRelation,
-							    dead_tuples,
-								num_dead_tuples);
-
-		}
-
-		if (!found_non_nbtree)
-		{
-			OffsetNumber	unusable[MaxOffsetNumber];
-			int				nunusable = 0;
-
-			if (!ConditionalLockBufferForCleanup(buffer))
-			{
-				AuxiliaryList[AuxiliaryCounter++] = res->items[i];
-				ReleaseBuffer(buffer);
-				continue;
-			}
-
-			START_CRIT_SECTION();
-
-			/* Release DEAD heap tuples storage */
-			for (tnum = 0; tnum < num_dead_tuples; tnum++)
-			{
-				OffsetNumber	offnum = ItemPointerGetOffsetNumber(&dead_tuples[tnum]);
-				ItemId			lp = PageGetItemId(page, offnum);
-
-				Assert(ItemIdIsDead(lp));
-				ItemIdSetUnused(lp);
-				unusable[nunusable++] = offnum;
-			}
-
-			{
-	//			FILE *f=fopen("/home/andrey/test.log", "a+");
-	//			fprintf(f, "[%d] heap del: %d (%d) -> %s\n", res->items[i].blkno, nunusable, num_dead_tuples, RelationGetRelationName(heapRelation));
-//				fclose(f);
-			}
-
-			if (nunusable > 0)
-			{
-				XLogRecPtr	recptr;
-
-				((PageHeader) page)->pd_prune_xid = InvalidTransactionId;
-				PageRepairFragmentation(page);
-				PageClearFull(page);
-				MarkBufferDirty(buffer);
-				if (RelationNeedsWAL(heapRelation))
-				{
-					recptr = log_heap_clean(heapRelation, buffer,
-									NULL, 0,
-									NULL, 0,
-									unusable, nunusable,
-									InvalidTransactionId);
-
-					PageSetLSN(BufferGetPage(buffer), recptr);
-				}
-			}
-
-			END_CRIT_SECTION();
-			UnlockReleaseBuffer(buffer);
-		}
-		/* Clean next TOAST relation */
-	//	if (toast_relid != InvalidOid)
-	//		index_cleanup(res->spcNode, toast_relid, blkno);
-	}
-
-	vac_close_indexes(nindexes, IndexRelations, NoLock);
-	relation_close(heapRelation, lockmode);
-	CommitTransactionCommand();
-
-	if (AuxiliaryCounter > 0)
-	{
-		DirtyBlocks	*tmp = res->items;
-
-		res->nitems = AuxiliaryCounter;
-		res->items = AuxiliaryList;
-		return tmp;
-	} else
-		return AuxiliaryList;
-}
-
-//	GetUserIdAndSecContext(&save_userid, &save_sec_context);
-//	SetUserIdAndSecContext(heapRelation->rd_rel->relowner,
-//						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
-//	save_nestlevel = NewGUCNestLevel();
-	//		if (PageIsAllVisible(page))
-	//			visibilitymap_pin(heapRelation, res->items[i].blkno, &vmbuffer);
-	//		if (vmbuffer == InvalidBuffer && PageIsAllVisible(page))
-	//		{
-	//			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-	//			visibilitymap_pin(heapRelation, res->items[i].blkno, &vmbuffer);
-	//			LockBuffer(buffer, BUFFER_LOCK_SHARE);
-	//		}
-//	buffer = ReadBufferWithoutRelcache(heapRelation->rd_node,
-	//											   MAIN_FORKNUM,
-		//										   blkno,
-			//									   RBM_NORMAL,
-				//								   NULL);
-
-	/* Roll back any GUC changes executed by index functions */
-//	AtEOXact_GUC(false, save_nestlevel);
-
-	/* Restore userid and security context */
-//	SetUserIdAndSecContext(save_userid, save_sec_context);
-
 /*
  * IsHeapCleaner functions
  *		Return whether this is either a launcher heap cleaner process or
@@ -1245,6 +1199,11 @@ look_for_worker(Oid dbNode)
 }
 
 /*
+ * Maximum time interval which worker can idle (ms)
+ */
+#define WORKER_IDLE_TIME_DURATION_MAX	(5000)
+
+/*
  * Entry point of a launcher behavior logic
  */
 static void
@@ -1258,9 +1217,9 @@ main_launcher_loop()
 		int				rc;
 		int				len;
 		CleanerMessage	msg;
-		CleanerMessage	table[BLOCKS_TABLE_ITEMS_MAX];
+		CleanerMessage	table[DBLOCKS_STORAGE_ITEMS_MAX];
 		WorkerInfo		startingWorker;
-		long			timeout;
+		long			timeout = 10L;
 		dlist_node		*node;
 		WorkerInfo		worker;
 		bool			haveWork = false;
@@ -1275,7 +1234,7 @@ main_launcher_loop()
 		ResetLatch(MyLatch);
 
 		/* At First, receive a message from backend */
-		len = recv(HeapCleanerSock, table, BLOCKS_TABLE_ITEMS_MAX*sizeof(CleanerMessage), 0);
+		len = recv(HeapCleanerSock, table, DBLOCKS_STORAGE_ITEMS_MAX*sizeof(CleanerMessage), 0);
 
 		LWLockAcquire(HeapCleanerLock, LW_EXCLUSIVE);
 		startingWorker = HeapCleanerShmem->startingWorker;
@@ -1315,6 +1274,7 @@ main_launcher_loop()
 
 					} else if (!startWorker)
 					{
+//						elog(LOG, "Launcher: Launch worker. blk=%d", msg.blkno);
 						/* Start new worker */
 						launch_worker(msg.dbNode);
 						startWorker = true;
@@ -1326,10 +1286,14 @@ main_launcher_loop()
 		}
 
 		if (!dlist_is_empty(&WaitingList[heapcleaner_max_workers]))
+		{
 			haveWork = true;
+			timeout = 1L;
+		}
 
 		/* See waiting lists of active workers and try to send messages */
 		if (!dlist_is_empty(&HeapCleanerShmem->runningWorkers))
+		{
 			for (node = dlist_head_node(&HeapCleanerShmem->runningWorkers);
 				 ;
 				 node = dlist_next_node(&HeapCleanerShmem->runningWorkers, node))
@@ -1338,29 +1302,72 @@ main_launcher_loop()
 
 				if (dlist_is_empty(&WaitingList[worker->id]))
 				{
-					if (!dlist_has_next(&HeapCleanerShmem->runningWorkers, node))
+					/* Check worker idle time */
+					if (TimestampDifferenceExceeds(worker->launchtime, GetCurrentTimestamp(), WORKER_IDLE_TIME_DURATION_MAX))
+					{
+						LWLockAcquire(&worker->WorkItemLock, LW_EXCLUSIVE);
+
+						/*
+						 * Check: may be worker has tasks but is too lazy
+						 */
+						if (worker->nitems == 0)
+						{
+							/* Shutdown the idle worker */
+							kill(worker->pid, SIGTERM);
+							dlist_delete(&worker->links);
+							dlist_push_head(&HeapCleanerShmem->freeWorkers, &worker->links);
+
+							if (!dlist_is_empty(&HeapCleanerShmem->runningWorkers))
+								node = dlist_head_node(&HeapCleanerShmem->runningWorkers);
+							else
+							{
+								LWLockRelease(&worker->WorkItemLock);
+								break;
+							}
+						}
+						LWLockRelease(&worker->WorkItemLock);
+					}
+					else if (!dlist_has_next(&HeapCleanerShmem->runningWorkers, node))
 						break;
 					else
 						continue;
 				}
 
+				/* Put list of potentially dirty blocks to the worker shared buffer */
 				LWLockAcquire(&worker->WorkItemLock, LW_EXCLUSIVE);
-
-				while ((worker->nitems < WORK_ITEMS_MAX) && !dlist_is_empty(&WaitingList[worker->id]))
+				while ((worker->nitems < WORKER_TASK_ITEMS_MAX) && !dlist_is_empty(&WaitingList[worker->id]))
 					worker->buffer[worker->nitems++] = pop_waiting_list(worker->id);
-
+				worker->launchtime = GetCurrentTimestamp();
 				LWLockRelease(&worker->WorkItemLock);
 
-				if (!dlist_is_empty(&WaitingList[worker->id]))
-					haveWork = true;
-
-				/* You have a work! */
+				/* Worker, you have a task! */
 				kill(worker->pid, SIGUSR2);
+
+				/*
+				 * If launcher has any tasks, It check signals quickly
+				 * and to work on further.
+				 */
+				if (!dlist_is_empty(&WaitingList[worker->id]))
+				{
+					haveWork = true;
+					timeout = 1L;
+				}
 
 				if (!dlist_has_next(&HeapCleanerShmem->runningWorkers, node))
 					break;
 			}
 
+			/*
+			 * Launcher have'nt any immediate tasks and
+			 * need to terminate idle workers only
+			 */
+			if (!haveWork)
+			{
+				/* We only need to wait idle workers */
+				haveWork = true;
+				timeout = 1000L;
+			}
+		}
 		LWLockRelease(HeapCleanerLock);
 
 		if (!haveWork)
@@ -1371,7 +1378,11 @@ main_launcher_loop()
 							WL_LATCH_SET | WL_POSTMASTER_DEATH | WL_SOCKET_READABLE,
 							HeapCleanerSock, timeout,
 							WAIT_EVENT_BGHEAP_MAIN);
-		}
+		} else
+			rc = WaitLatchOrSocket(MyLatch,
+							WL_LATCH_SET | WL_POSTMASTER_DEATH | WL_TIMEOUT | WL_SOCKET_READABLE,
+							HeapCleanerSock, timeout,
+							WAIT_EVENT_BGHEAP_MAIN);
 
 		/* Emergency bailout if postmaster has died */
 		if (rc & WL_POSTMASTER_DEATH)
@@ -1391,12 +1402,12 @@ main_launcher_loop()
 static void
 main_worker_loop(void)
 {
-	CleanerMessage			lbuf[WORK_ITEMS_MAX];
-	int						nitems;
-	DirtyBlocks				*CurrentTempList = palloc(DIRTYBLOCKS_MAX_NUM);
+	CleanerMessage			task_item[WORKER_TASK_ITEMS_MAX];
+	int						task_items_num = 0;
+	BlockNumber				*FreeDirtyBlocksList = palloc(WORKER_DIRTYBLOCKS_MAX_NUM);
 	bool					has_work = false;
-	PrivateRefCountEntry	*relations[RELATIONS_MAX_NUM];
-	int						nrelations = 0;
+	DirtyRelation			*dirty_relation[WORKER_RELATIONS_MAX_NUM];
+	int						dirty_relations_num = 0;
 
 	while (!got_SIGTERM)
 	{
@@ -1415,58 +1426,96 @@ main_worker_loop(void)
 		LWLockAcquire(&MyWorkerInfo->WorkItemLock, LW_SHARED);
 		if (MyWorkerInfo->nitems > 0)
 		{
-			nitems = MyWorkerInfo->nitems;
-			memcpy(lbuf, MyWorkerInfo->buffer, nitems*sizeof(CleanerMessage));
+			task_items_num = MyWorkerInfo->nitems;
+			memcpy(task_item, MyWorkerInfo->buffer, task_items_num*sizeof(CleanerMessage));
 			MyWorkerInfo->nitems = 0;
 		}
 		LWLockRelease(&MyWorkerInfo->WorkItemLock);
 
-		if (nitems > 0)
+		if (task_items_num > 0)
 		{
-			int i;
-			PrivateRefCountEntry *hashent;
-			bool		found;
+			int				i;
+			DirtyRelation	*hashent;
+			bool			found;
 
 			/* Pass across items and sort by relation */
-			for (i = 0; i < nitems; i++)
+			for (i = 0; i < task_items_num; i++)
 			{
 				hashent = hash_search(PrivateRelationsTable,
-								  (void *) &(lbuf[i].relid), HASH_ENTER, &found);
+								  (void *) &(task_item[i].relid), HASH_FIND, NULL);
 
 				if (hashent == NULL)
-					elog(ERROR, "-> hashent == NULL");
-
-				if (!found)
 				{
+					elog(LOG, "Add new relation: %d", task_item[i].relid);
+					if (dirty_relations_num == WORKER_RELATIONS_MAX_NUM)
+					{
+						int	j;
+						int min = dirty_relation[0]->nitems;
+						int pos = 0;
+						Oid relOid;
+						/*
+						 * All slots for dirty relations are busy.
+						 * Search for slot with small number of dirty blocks
+						 * and clean it.
+						 */
+						elog(LOG, "All dirty relation slots are busy at worker process. Start min=%d", min);
+						for (j = 1; j < dirty_relations_num; j++)
+						{
+							if (dirty_relation[j]->nitems < min)
+							{
+								min = dirty_relation[j]->nitems;
+								pos = j;
+							}
+						}
+
+						elog(LOG, "Remove slot %d with id=%d nitems=%d. Set new relation id=%d",pos, dirty_relation[pos]->relid, dirty_relation[pos]->nitems, task_item[i].relid);
+						relOid = dirty_relation[pos]->relid;
+						hashent = hash_search(PrivateRelationsTable,
+														  (void *) &relOid, HASH_REMOVE, &found);
+
+						pfree(hashent->items);
+						Assert(found);
+						dirty_relations_num--;
+					}
+
+					hashent = hash_search(PrivateRelationsTable, (void *) &(task_item[i].relid), HASH_ENTER, &found);
+					Assert(!found);
+					Assert(hashent != NULL);
 					/*
 					 * At a new entry we create list of potentially 'dirty' blocks
 					 */
-					hashent->items = palloc(DIRTYBLOCKS_MAX_NUM*sizeof(DirtyBlocks));
 					hashent->nitems = 0;
-					hashent->spcNode = lbuf[i].spcNode;
-					relations[nrelations++] = hashent;
+					hashent->items = palloc(WORKER_DIRTYBLOCKS_MAX_NUM*sizeof(BlockNumber));
+					hashent->spcNode = task_item[i].spcNode;
+					dirty_relation[dirty_relations_num++] = hashent;
 				}
 
-				hashent->items[hashent->nitems].stage = 0;
-				if (hashent->nitems == DIRTYBLOCKS_MAX_NUM)
+				/* If buffer with dirty blocks is full, cleanup it now */
+				if (hashent->nitems == WORKER_DIRTYBLOCKS_MAX_NUM)
 					hashent->nitems = 0;
-				hashent->items[hashent->nitems++].blkno = lbuf[i].blkno;
+
+				hashent->items[hashent->nitems++] = task_item[i].blkno;
 			}
+			task_items_num = 0;
 
 			PG_TRY();
 			{
 				int relcounter;
 				has_work = false;
 
-				/* Pass along each relation and try to clean it */
-				for (relcounter = 0; relcounter < nrelations; relcounter++)
+				/* Pass along dirty relations and try to clean it */
+				for (relcounter = 0; relcounter < dirty_relations_num; relcounter++)
 				{
-					CurrentTempList = cleanup_relations(relations[relcounter], CurrentTempList);
-					if (relations[relcounter] > 0)
+					FreeDirtyBlocksList = cleanup_relations(dirty_relation[relcounter], FreeDirtyBlocksList);
+
+					/*
+					 * Some blocks from the list may was blocked by a backend.
+					 * Deferred its for next cleanup attempt.
+					 */
+					if (dirty_relation[relcounter]->nitems > 0)
 						has_work = true;
 				}
 
-				nitems = 0;
 				QueryCancelPending = false;
 			}
 			PG_CATCH();
@@ -1556,7 +1605,7 @@ static void
 SIGTERM_Handler(SIGNAL_ARGS)
 {
 	int save_errno = errno;
-
+elog(LOG, "I got SIGTERM!");
 	got_SIGTERM = true;
 
 	SetLatch(MyLatch);
@@ -1667,7 +1716,7 @@ try_send_message(WorkerInfo worker, CleanerMessage *msg)
 	bool result = false;
 
 	LWLockAcquire(&worker->WorkItemLock, LW_EXCLUSIVE);
-	if (worker->nitems < WORK_ITEMS_MAX)
+	if (worker->nitems < WORKER_TASK_ITEMS_MAX)
 	{
 		memcpy(&worker->buffer[worker->nitems], msg, sizeof(CleanerMessage));
 		worker->nitems++;

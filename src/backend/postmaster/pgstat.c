@@ -1395,6 +1395,20 @@ pgstat_report_autovac(Oid dboid)
 	pgstat_send(&msg, sizeof(msg));
 }
 
+void
+pgstat_report_heapcleaner(Oid dboid)
+{
+	PgStat_MsgAutovacStart msg;
+
+	if (pgStatSock == PGINVALID_SOCKET)
+		return;
+
+	pgstat_setheader(&msg.m_hdr, PGSTAT_MTYPE_BGHEAP_START);
+	msg.m_databaseid = dboid;
+	msg.m_start_time = GetCurrentTimestamp();
+
+	pgstat_send(&msg, sizeof(msg));
+}
 
 /* ---------
  * pgstat_report_vacuum() -
@@ -4124,10 +4138,10 @@ pgstat_get_backend_desc(BackendType backendType)
 			backendDesc = "autovacuum worker";
 			break;
 		case B_BG_HEAPCLNR_LAUNCHER:
-			backendDesc = "background heap cleaner launcher";
+			backendDesc = "heap cleaner launcher";
 			break;
 		case B_BG_HEAPCLNR_WORKER:
-			backendDesc = "background heap cleaner worker";
+			backendDesc = "heap cleaner worker";
 			break;
 		case B_BACKEND:
 			backendDesc = "client backend";
@@ -4438,6 +4452,10 @@ PgstatCollectorMain(int argc, char *argv[])
 
 				case PGSTAT_MTYPE_AUTOVAC_START:
 					pgstat_recv_autovac((PgStat_MsgAutovacStart *) &msg, len);
+					break;
+
+				case PGSTAT_MTYPE_BGHEAP_START:
+//					pgstat_recv_autovac((PgStat_MsgHeapCleanerStart *) &msg, len);
 					break;
 
 				case PGSTAT_MTYPE_VACUUM:
