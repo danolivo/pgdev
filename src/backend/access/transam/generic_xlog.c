@@ -545,37 +545,3 @@ generic_mask(char *page, BlockNumber blkno)
 
 	mask_unused_space(page);
 }
-
-/*
- * Function to write generic xlog for every existing block of a relation.
- * Caller is responsible for locking the relation exclusively.
- */
-void
-generate_xlog_for_rel(Relation rel)
-{
-	BlockNumber blkno;
-	BlockNumber nblocks;
-
-	nblocks = RelationGetNumberOfBlocks(rel);
-
-	elog(DEBUG2, "generate_xlog_for_rel '%s', nblocks %u BEGIN.",
-		 RelationGetRelationName(rel), nblocks);
-
-	for (blkno = 0; blkno < nblocks; blkno++)
-	{
-		Buffer	buffer;
-		GenericXLogState *state;
-
-		CHECK_FOR_INTERRUPTS();
-
-		buffer = ReadBuffer(rel, blkno);
-		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-
-		state = GenericXLogStart(rel);
-		GenericXLogRegisterBuffer(state, buffer, GENERIC_XLOG_FULL_IMAGE);
-		GenericXLogFinish(state);
-
-		UnlockReleaseBuffer(buffer);
-	}
-	elog(DEBUG2, "generate_xlog_for_rel '%s' END.", RelationGetRelationName(rel));
-}

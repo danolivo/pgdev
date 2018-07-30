@@ -172,7 +172,7 @@ gistinsert(Relation r, Datum *values, bool *isnull,
 						 values, isnull, true /* size is currently bogus */ );
 	itup->t_tid = *ht_ctid;
 
-	gistdoinsert(r, itup, 0, giststate, false);
+	gistdoinsert(r, itup, 0, giststate);
 
 	/* cleanup */
 	MemoryContextSwitchTo(oldCxt);
@@ -218,8 +218,7 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 				BlockNumber *newblkno,
 				Buffer leftchildbuf,
 				List **splitinfo,
-				bool markfollowright,
-				bool is_build)
+				bool markfollowright)
 {
 	BlockNumber blkno = BufferGetBlockNumber(buffer);
 	Page		page = BufferGetPage(buffer);
@@ -458,7 +457,7 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 		 * insertion for that. NB: The number of pages and data segments
 		 * specified here must match the calculations in gistXLogSplit()!
 		 */
-		if (RelationNeedsWAL(rel) && !is_build)
+		if (RelationNeedsWAL(rel))
 			XLogEnsureRecordSpace(npage, 1 + npage * 2);
 
 		START_CRIT_SECTION();
@@ -479,20 +478,18 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 		PageRestoreTempPage(dist->page, BufferGetPage(dist->buffer));
 		dist->page = BufferGetPage(dist->buffer);
 
-		/*
-		 * Write the WAL record.
-		 * Do not write XLog entry if the insertion is caused by
-		 * index build process.
-		 */
-		if (RelationNeedsWAL(rel) && !is_build)
+		/* Write the WAL record */
+		if (RelationNeedsWAL(rel))
 			recptr = gistXLogSplit(is_leaf,
-								dist, oldrlink, oldnsn, leftchildbuf,
-								markfollowright);
+								   dist, oldrlink, oldnsn, leftchildbuf,
+								   markfollowright);
 		else
 			recptr = gistGetFakeLSN(rel);
 
 		for (ptr = dist; ptr; ptr = ptr->next)
+		{
 			PageSetLSN(ptr->page, recptr);
+		}
 
 		/*
 		 * Return the new child buffers to the caller.
@@ -546,8 +543,7 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 		if (BufferIsValid(leftchildbuf))
 			MarkBufferDirty(leftchildbuf);
 
-
-		if (RelationNeedsWAL(rel) && !is_build)
+		if (RelationNeedsWAL(rel))
 		{
 			OffsetNumber ndeloffs = 0,
 						deloffs[1];
@@ -570,7 +566,6 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 			PageSetLSN(page, recptr);
 		}
 
-
 		if (newblkno)
 			*newblkno = blkno;
 	}
@@ -587,27 +582,16 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 	 * the full page image. There's a chicken-and-egg problem: if we updated
 	 * the child pages first, we wouldn't know the recptr of the WAL record
 	 * we're about to write.
-	 *
-	 * We use fakeLSNs for inserions caused by index build. And when it is
-	 * finished, we write generic_xlog entry for each index page and update
-	 * all LSNs. In order to keep NSNs less then LSNs after this update, we
-	 * set NSN to InvalidXLogRecPtr, which is the smallest possible NSN.
 	 */
-
 	if (BufferIsValid(leftchildbuf))
 	{
 		Page		leftpg = BufferGetPage(leftchildbuf);
-		XLogRecPtr	fakerecptr = InvalidXLogRecPtr;
 
-		if (!is_build)
-			GistPageSetNSN(leftpg, recptr);
-		else
-			GistPageSetNSN(leftpg, fakerecptr);
-
+		GistPageSetNSN(leftpg, recptr);
 		GistClearFollowRight(leftpg);
+
 		PageSetLSN(leftpg, recptr);
 	}
-
 
 	END_CRIT_SECTION();
 
@@ -620,8 +604,7 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
  * so it does not bother releasing palloc'd allocations.
  */
 void
-gistdoinsert(Relation r, IndexTuple itup, Size freespace,
-			 GISTSTATE *giststate, bool is_build)
+gistdoinsert(Relation r, IndexTuple itup, Size freespace, GISTSTATE *giststate)
 {
 	ItemId		iid;
 	IndexTuple	idxtuple;
@@ -633,7 +616,6 @@ gistdoinsert(Relation r, IndexTuple itup, Size freespace,
 	memset(&state, 0, sizeof(GISTInsertState));
 	state.freespace = freespace;
 	state.r = r;
-	state.is_build = is_build;
 
 	/* Start from the root */
 	firststack.blkno = GIST_ROOT_BLKNO;
@@ -1250,7 +1232,7 @@ gistinserttuples(GISTInsertState *state, GISTInsertStack *stack,
 							   oldoffnum, NULL,
 							   leftchild,
 							   &splitinfo,
-							   true, state->is_build);
+							   true);
 
 	/*
 	 * Before recursing up in case the page was split, release locks on the

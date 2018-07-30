@@ -17,7 +17,6 @@
 #include "access/gin_private.h"
 #include "access/ginxlog.h"
 #include "access/xloginsert.h"
-#include "access/generic_xlog.h"
 #include "catalog/index.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -195,7 +194,6 @@ ginEntryInsert(GinState *ginstate,
 		buildStats->nEntries++;
 
 	ginPrepareEntryScan(&btree, attnum, key, category, ginstate);
-	btree.isBuild = (buildStats != NULL);
 
 	stack = ginFindLeafPage(&btree, false, NULL);
 	page = BufferGetPage(stack->buffer);
@@ -348,6 +346,23 @@ ginbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	GinInitBuffer(RootBuffer, GIN_LEAF);
 	MarkBufferDirty(RootBuffer);
 
+	if (RelationNeedsWAL(index))
+	{
+		XLogRecPtr	recptr;
+		Page		page;
+
+		XLogBeginInsert();
+		XLogRegisterBuffer(0, MetaBuffer, REGBUF_WILL_INIT | REGBUF_STANDARD);
+		XLogRegisterBuffer(1, RootBuffer, REGBUF_WILL_INIT);
+
+		recptr = XLogInsert(RM_GIN_ID, XLOG_GIN_CREATE_INDEX);
+
+		page = BufferGetPage(RootBuffer);
+		PageSetLSN(page, recptr);
+
+		page = BufferGetPage(MetaBuffer);
+		PageSetLSN(page, recptr);
+	}
 
 	UnlockReleaseBuffer(MetaBuffer);
 	UnlockReleaseBuffer(RootBuffer);
@@ -402,16 +417,7 @@ ginbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 * Update metapage stats
 	 */
 	buildstate.buildStats.nTotalPages = RelationGetNumberOfBlocks(index);
-	ginUpdateStats(index, &buildstate.buildStats, true);
-
-	/*
-	 * Create generic wal records for all pages of relation, if necessary.
-	 * It seems reasonable not to generate WAL, if we recieved interrupt
-	 * signal.
-	 */
-	CHECK_FOR_INTERRUPTS();
-	if (RelationNeedsWAL(index))
-		generate_xlog_for_rel(index);
+	ginUpdateStats(index, &buildstate.buildStats);
 
 	/*
 	 * Return statistics

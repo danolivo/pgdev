@@ -71,7 +71,6 @@ extern int	gin_pending_list_limit;
 
 /* ginutil.c */
 extern void ginGetStats(Relation index, GinStatsData *stats);
-extern void ginUpdateStats(Relation index,
-						   const GinStatsData *stats, bool is_build);
+extern void ginUpdateStats(Relation index, const GinStatsData *stats);
 
 #endif							/* GIN_H */
