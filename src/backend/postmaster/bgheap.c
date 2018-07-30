@@ -60,7 +60,7 @@
  * Maximum number of task items in storage at a backend side before shipping to a
  * background heap cleaner
  */
-#define BACKEND_DIRTY_ITEMS_MAX		(1)//(20)
+#define BACKEND_DIRTY_ITEMS_MAX		(20)
 
 /*
  * Maximum number of task items in waiting list at a Launcher side.
@@ -68,18 +68,18 @@
  * messages exceed this, we ignore the remains and increase counter of missed
  * items.
  */
-#define WAITING_MESSAGES_MAX_NUM	(1)//(10000)
+#define WAITING_MESSAGES_MAX_NUM	(10000)
 
 /*
  * Maximum number of dirty blocks which can keep a worker for each relation
  */
-#define WORKER_DIRTYBLOCKS_MAX_NUM	(1)//(1000)
+#define WORKER_DIRTYBLOCKS_MAX_NUM	(1000)
 
 /* Maximum number of slots for dirty relations */
-#define WORKER_RELATIONS_MAX_NUM	(1)//(100)
+#define WORKER_RELATIONS_MAX_NUM	(100)
 
 /* Maximum number of task items in a launcher/worker shared buffer */
-#define WORKER_TASK_ITEMS_MAX		(1)//(100)
+#define WORKER_TASK_ITEMS_MAX		(100)
 
 /*
  * Maximum time interval which worker can idle without a task (ms)
@@ -1006,7 +1006,7 @@ backend_send_dirty_blocks(void)
 	CleanerMessage	*htptr;
 	CleanerMessage	data[BACKEND_DIRTY_ITEMS_MAX];
 	int				nitems = 0;
-//return;
+
 	Assert(dblocks_records_num <= BACKEND_DIRTY_ITEMS_MAX);
 
 	if (dblocks_records_num <= 0)
@@ -1045,7 +1045,7 @@ void
 HeapCleanerSend(Relation relation, BlockNumber blkno)
 {
 	CleanerMessage msg;
-//return;
+
 	if (RecoveryInProgress())
 			return;
 
@@ -1305,9 +1305,9 @@ main_launcher_loop()
 					MissedBlocksNum += (len - ((char *)mptr - (char *)table))/sizeof(CleanerMessage);
 					break;
 				}
-			WLIST_Print(heapcleaner_max_workers, "A0");
+//			WLIST_Print(heapcleaner_max_workers, "A0");
 		}
-		WLIST_Print(heapcleaner_max_workers, "A1");
+//		WLIST_Print(heapcleaner_max_workers, "A1");
 		if (!WLIST_IsEmpty(heapcleaner_max_workers))
 		{
 			bool startWorker = (startingWorker != NULL);
@@ -1337,10 +1337,10 @@ main_launcher_loop()
 					startWorker = true;
 				}
 				WLIST_Push(heapcleaner_max_workers, &msg);
-				WLIST_Print(heapcleaner_max_workers, "A2");
+//				WLIST_Print(heapcleaner_max_workers, "A2");
 			} while (wList[heapcleaner_max_workers].first != EOList);
 		}
-		WLIST_Print(heapcleaner_max_workers, "A3");
+//		WLIST_Print(heapcleaner_max_workers, "A3");
 
 		if (!WLIST_IsEmpty(heapcleaner_max_workers))
 		{
@@ -1426,7 +1426,7 @@ main_launcher_loop()
 			}
 		}
 		LWLockRelease(HeapCleanerLock);
-elog(LOG, "LAUNCHER Before sleeping: haveWork=%d timeout=%u", haveWork, timeout);
+
 		if (!haveWork)
 		{
 			timeout = -1L;
