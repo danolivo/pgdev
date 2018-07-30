@@ -590,10 +590,11 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 		 */
 		for (i = 1; (i < nchain) && (chainitems[i - 1] != latestdead); i++)
 		{
-			ndeleted++;
+//			ndeleted++;
 			if (chainitems[i] == latestdead)
 				continue;
 			heap_prune_record_unused(prstate, chainitems[i]);
+			ndeleted++;
 		}
 
 		/*

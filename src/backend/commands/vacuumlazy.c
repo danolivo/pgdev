@@ -739,7 +739,7 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 			/* Remove index entries */
 			for (i = 0; i < nindexes; i++)
 			{
-				bool use_quick_strategy = true; // (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
+				bool use_quick_strategy = false;//true; // (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
 
 				if (use_quick_strategy && (Irel[i]->rd_amroutine->amtargetdelete != NULL))
 					quick_vacuum_index(Irel[i], onerel, vacrelstats->dead_tuples, vacrelstats->num_dead_tuples);
@@ -1391,7 +1391,7 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 		/* Remove index entries */
 		for (i = 0; i < nindexes; i++)
 		{
-			bool use_quick_strategy = true; // (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
+			bool use_quick_strategy = false;//true; // (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
 
 			if (use_quick_strategy && (Irel[i]->rd_amroutine->amtargetdelete != NULL))
 				quick_vacuum_index(Irel[i], onerel, vacrelstats->dead_tuples, vacrelstats->num_dead_tuples);
