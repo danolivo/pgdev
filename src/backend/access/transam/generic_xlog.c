@@ -576,3 +576,6 @@ generate_xlog_for_rel(Relation rel)
 		GenericXLogFinish(state);
 
 		UnlockReleaseBuffer(buffer);
+	}
+	elog(DEBUG2, "generate_xlog_for_rel '%s' END.", RelationGetRelationName(rel));
+}
