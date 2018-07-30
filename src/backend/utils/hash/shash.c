@@ -1,3 +1,18 @@
+/*
+ * shash.c
+ *
+ * Lightweight hash tables without dynamic expansion
+ *
+ *
+ * Copyright (c) 1996-2018, PostgreSQL Global Development Group
+ *
+ *
+ * IDENTIFICATION
+ *	  src/backend/utils/hash/shash.c
+ *
+ *-------------------------------------------------------------------------
+ */
+
 #include "postgres.h"
 
 #include "utils/shash.h"
