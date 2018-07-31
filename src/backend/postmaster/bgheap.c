@@ -1052,7 +1052,10 @@ HeapCleanerSend(Relation relation, BlockNumber blkno)
 	if (HeapCleanerSock == PGINVALID_SOCKET)
 		return;
 
-	if (IsSystemRelation(relation))
+	if (IsSystemRelation(relation) ||
+		IsCatalogRelation(relation) ||
+		IsSharedRelation(relation) ||
+		IsSystemNamespace(RelationGetNamespace(relation)))
 		return;
 
 	/*
