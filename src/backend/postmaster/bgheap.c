@@ -79,7 +79,7 @@
 #define WORKER_RELATIONS_MAX_NUM	(100)
 
 /* Maximum number of task items in a launcher/worker shared buffer */
-#define WORKER_TASK_ITEMS_MAX		(100)
+#define WORKER_TASK_ITEMS_MAX		(1000)
 
 /*
  * Maximum time interval which worker can idle without a task (ms)
@@ -1054,7 +1054,6 @@ HeapCleanerSend(Relation relation, BlockNumber blkno)
 
 	if (IsSystemRelation(relation) ||
 		IsCatalogRelation(relation) ||
-		IsSharedRelation(relation) ||
 		IsSystemNamespace(RelationGetNamespace(relation)))
 		return;
 
