@@ -2055,3 +2055,151 @@ _bt_initialize_more_data(BTScanOpaque so, ScanDirection dir)
 	so->numKilled = 0;			/* just paranoia */
 	so->markItemIndex = -1;		/* ditto */
 }
+
+void
+tree_traversal(Relation index)
+{
+	BTPageOpaque	opaque;
+	BlockNumber		blkno,
+					nblocks;
+	OffsetNumber	offnum = InvalidOffsetNumber;
+	ItemPointer		ltid;
+	ScanKey			skey;
+	BTStack			stack;
+	Buffer			buf;
+	ItemId			itemid;
+	IndexTuple		itup;
+	Page			page;
+	int				indnkeyatts = IndexRelationGetNumberOfKeyAttributes(index);
+	int i=0;
+
+	if (RecoveryInProgress())
+		return;
+
+	if (!IsNormalProcessingMode())
+		return;
+
+	nblocks = RelationGetNumberOfBlocks(index);
+
+	/* Search for a leaf page */
+	for (blkno = 1; blkno < nblocks; blkno++)
+	{
+		buf = ReadBuffer(index, blkno);
+		LockBuffer(buf, BT_READ);
+		page = BufferGetPage(buf);
+		if (!P_ISDELETED(opaque) && !PageIsNew(page))
+		{
+			opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+			if (P_ISLEAF(opaque))
+				break;
+		}
+		_bt_relbuf(index, buf);
+	}
+
+	if (blkno == nblocks)
+	{
+//		elog(LOG, "index can't have any leafs");
+		return;
+	}// else
+//		elog(LOG, "index have leaf!");
+
+	/* Search for most left leaf of b-tree */
+	for (;;)
+	{
+		Buffer new_buf = _bt_walk_left(index, buf, NULL);
+
+		if (new_buf == InvalidBuffer)
+			break;
+		buf = new_buf;
+	}
+//	elog(LOG, "Got left leaf!");
+	/* Start point initialization */
+	page = BufferGetPage(buf);
+ 	_bt_checkpage(index, buf);
+ 	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	offnum = P_FIRSTDATAKEY(opaque);
+	itemid = PageGetItemId(page, offnum);
+	itup = (IndexTuple) PageGetItem(page, itemid);
+	ltid = BTreeTupleGetHeapTID(itup);
+	skey = _bt_mkscankey(index, itup);
+	stack = _bt_search(index, indnkeyatts, skey, ltid, false, &buf, BT_READ, NULL);
+//	elog(LOG, "S1!");
+	for (;;)
+	{
+		offnum = OffsetNumberNext(offnum);
+
+		if (offnum > PageGetMaxOffsetNumber(page))
+		{
+			Assert(i<100000);
+			/* Switch to next page */
+//			buf = _bt_moveright(index, buf, indnkeyatts, skey, NULL, false, true, stack, BT_READ, NULL);
+			buf = _bt_relandgetbuf(index, buf, opaque->btpo_next, BT_READ);
+			for (;;)
+			{
+				page = BufferGetPage(buf);
+				opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+
+				if (P_RIGHTMOST(opaque))
+					break;
+
+				/*
+				 * Finish any incomplete splits we encounter along the way.
+				 */
+				if (P_INCOMPLETE_SPLIT(opaque))
+				{
+					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+					LockBuffer(buf, BT_WRITE);
+
+					if (P_INCOMPLETE_SPLIT(opaque))
+						_bt_finish_split(index, buf, stack);
+					else
+						_bt_relbuf(index, buf);
+
+					/* re-acquire the lock in the right mode, and re-check */
+					buf = _bt_getbuf(index, BufferGetBlockNumber(buf), BT_READ);
+					continue;
+				}
+
+				if (P_IGNORE(opaque))
+				{
+					/* step right one page */
+					buf = _bt_relandgetbuf(index, buf, opaque->btpo_next, BT_READ);
+					continue;
+				}
+				else
+					break;
+			}
+
+			if (P_RIGHTMOST(opaque))
+				/* it is rightmost leaf */
+				break;
+
+//			elog(LOG, "S1.1.1! %d %d, offnum=%d maxoff=%d, %d, nblocks=%d blkno=%d", i++, buf, offnum, PageGetMaxOffsetNumber(page),
+//								P_RIGHTMOST(opaque), nblocks, BufferGetBlockNumber(buf));
+			page = BufferGetPage(buf);
+ 			_bt_checkpage(index, buf);
+ 			opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+			offnum = P_FIRSTDATAKEY(opaque);
+		}
+//		elog(LOG, "S1.2!");
+		if (_bt_compare(index, indnkeyatts, skey, NULL, page, offnum) != 0)
+		{
+			itemid = PageGetItemId(page, offnum);
+			itup = (IndexTuple) PageGetItem(page, itemid);
+			skey = _bt_mkscankey(index, itup);
+			ltid = BTreeTupleGetHeapTID(itup);
+			Assert(ltid);
+		}
+		else
+		{
+			ItemPointer tid = BTreeTupleGetHeapTID(itup);
+			Assert(tid);
+			if (ItemPointerCompare(tid, ltid) < 0)
+				elog(LOG, "Rule not performed: ");
+		}
+//		elog(LOG, "S1.3!");
+	}
+//	elog(LOG, "Sn!");
+	_bt_freeskey(skey);
+ 	_bt_relbuf(index, buf);
+}

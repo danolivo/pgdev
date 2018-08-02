@@ -1314,7 +1314,7 @@ vacuum_rel(Oid relid, RangeVar *relation, int options, VacuumParams *params)
 	int			save_sec_context;
 	int			save_nestlevel;
 	bool		rel_lock = true;
-
+//elog(LOG, "DO VACUUM!");
 	Assert(params != NULL);
 
 	/* Begin a transaction for vacuuming this relation */

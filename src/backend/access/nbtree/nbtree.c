@@ -479,6 +479,9 @@ btendscan(IndexScanDesc scan)
 		pfree(so->currTuples);
 	/* so->markTuples should not be pfree'd, see btrescan */
 	pfree(so);
+//	LockRelation(scan->indexRelation, AccessShareLock);
+//	tree_traversal(scan->indexRelation);
+//	UnlockRelation(scan->indexRelation, AccessShareLock);
 }
 
 /*
