@@ -29,7 +29,6 @@ typedef enum
 typedef uint64 (*SHashValueFunc) (void *key, uint64 size, uint64 base);
 typedef bool (*CompareFunc) (void* bucket1, void* bucket2);
 
-
 typedef struct SHTABCTL
 {
 	uint64			ElementSize;
@@ -50,13 +49,15 @@ typedef struct SHTAB
 	uint64			HTableSize;
 } SHTAB;
 
-extern SHTAB* SHASH_Create(SHTABCTL shctl);
-extern void SHASH_Clean(SHTAB* shtab);
-extern void SHASH_Destroy(SHTAB* shtab);
-extern uint64 SHASH_Entries(SHTAB* shtab);
-extern void SHASH_SeqReset(SHTAB* shtab);
-extern void* SHASH_SeqNext(SHTAB* shtab);
-extern void* SHASH_Search(SHTAB* shtab, void *keyPtr, SHASHACTION action, bool *foundPtr);
+typedef struct SHTAB*	PSHTAB;
+
+extern PSHTAB SHASH_Create(SHTABCTL shctl);
+extern void SHASH_Clean(PSHTAB shtab);
+extern void SHASH_Destroy(PSHTAB shtab);
+extern uint64 SHASH_Entries(PSHTAB shtab);
+extern void SHASH_SeqReset(PSHTAB shtab);
+extern void* SHASH_SeqNext(PSHTAB shtab);
+extern void* SHASH_Search(PSHTAB shtab, void *keyPtr, SHASHACTION action, bool *foundPtr);
 extern uint64 DefaultHashValueFunc(void *key, uint64 size, uint64 base);
 
 #endif /* SHASH_H_ */

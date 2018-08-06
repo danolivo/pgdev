@@ -419,7 +419,7 @@ delete from trigtest where i=1;
 select * from trigtest2;
 -- ensure we still insert, even when all triggers are disabled
 insert into trigtest default values;
-select *  from trigtest;
+select *  from trigtest ORDER BY i;
 drop table trigtest2;
 drop table trigtest;
 

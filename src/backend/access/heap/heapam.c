@@ -60,6 +60,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "port/atomics.h"
+#include "postmaster/bgheap.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
@@ -3437,6 +3438,8 @@ l1:
 
 	pgstat_count_heap_delete(relation);
 
+//	HeapCleanerSend(relation, ItemPointerGetBlockNumber(&tp.t_self));
+
 	if (old_key_tuple != NULL && old_key_copied)
 		heap_freetuple(old_key_tuple);
 
@@ -4397,6 +4400,7 @@ l2:
 	bms_free(modified_attrs);
 	bms_free(interesting_attrs);
 
+//	HeapCleanerSend(relation, ItemPointerGetBlockNumber(otid));
 	return HeapTupleMayBeUpdated;
 }
 

@@ -167,7 +167,7 @@ select * from rtest_v1;
 
 insert into rtest_v1 values (2, 12);
 insert into rtest_v1 values (2, 13);
-select * from rtest_v1;
+select * from rtest_v1 ORDER BY a, b;
  a | b  
 ---+----
  1 | 11

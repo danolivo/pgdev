@@ -447,6 +447,8 @@ vacuum_log_cleanup_info(Relation rel, LVRelStats *vacrelstats)
 		(void) log_heap_cleanup_info(rel->rd_node, vacrelstats->latestRemovedXid);
 }
 
+static int tupgone_dead_counter = 0;
+
 /*
  *	lazy_scan_heap() -- scan an open heap relation
  *
@@ -1146,6 +1148,7 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 				HeapTupleHeaderAdvanceLatestRemovedXid(tuple.t_data,
 													   &vacrelstats->latestRemovedXid);
 				tups_vacuumed += 1;
+				tupgone_dead_counter++;
 				has_dead_tuples = true;
 			}
 			else
@@ -1460,10 +1463,10 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 	appendStringInfo(&buf, _("%s."), pg_rusage_show(&ru0));
 
 	ereport(elevel,
-			(errmsg("\"%s\": found %.0f removable, %.0f nonremovable row versions in %u out of %u pages",
+			(errmsg("\"%s\": found %.0f removable, %.0f nonremovable row versions in %u out of %u pages. tupgone_dead_counter=%d",
 					RelationGetRelationName(onerel),
 					tups_vacuumed, num_tuples,
-					vacrelstats->scanned_pages, nblocks),
+					vacrelstats->scanned_pages, nblocks, tupgone_dead_counter),
 			 errdetail_internal("%s", buf.data)));
 	pfree(buf.data);
 }

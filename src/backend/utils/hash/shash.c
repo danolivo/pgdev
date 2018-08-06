@@ -15,10 +15,16 @@
 
 #include "postgres.h"
 
+#include "limits.h"
 #include "utils/shash.h"
+
+#define ELEM(index) (&shtab->Elements[index*shtab->Header.ElementSize])
 
 static void check(SHTAB* shtab);
 
+/*
+ * Check data allocation of hash table variables
+ */
 static void
 check(SHTAB* shtab)
 {
@@ -27,27 +33,35 @@ check(SHTAB* shtab)
 	Assert(shtab->state != NULL);
 }
 
+/*
+ * Create and initialize hash table with shctl options
+ */
 SHTAB*
 SHASH_Create(SHTABCTL shctl)
 {
 	SHTAB*	shtab = (SHTAB *) palloc(sizeof(SHTAB));
-//elog(LOG, "Start create");
+
 	Assert(shctl.ElementSize != 0);
 	Assert(shctl.ElementSize >= shctl.KeySize);
 
 	shtab->Header = shctl;
-	shtab->HTableSize = shtab->Header.ElementsMaxNum*(2. - shtab->Header.FillFactor) + 1;
+	shtab->HTableSize = shtab->Header.ElementsMaxNum * (2. - shtab->Header.FillFactor) + 1;
 	Assert(shtab->HTableSize > shtab->Header.ElementsMaxNum);
 
 	/* Add one element as sign of empty value */
-	shtab->Elements = (char *) palloc(shtab->HTableSize*shctl.ElementSize);
-	shtab->state = (HESTATE *) palloc(shtab->HTableSize*sizeof(HESTATE));
+	shtab->Elements = (char *) palloc(shtab->HTableSize * shctl.ElementSize);
+	shtab->state = (HESTATE *) palloc(shtab->HTableSize * sizeof(HESTATE));
 	shtab->nElements = 0;
 	shtab->SeqScanCurElem = 0;
-//	elog(LOG, "End create");
+
 	return shtab;
 }
 
+/*
+ * Fast cleaning of hash table.
+ * After call of this function hash table contains 0 elements
+ * and can be used again.
+ */
 void
 SHASH_Clean(SHTAB* shtab)
 {
@@ -64,6 +78,9 @@ SHASH_Clean(SHTAB* shtab)
 	shtab->SeqScanCurElem = 0;
 }
 
+/*
+ * Free all hash table memory resources.
+ */
 void
 SHASH_Destroy(SHTAB* shtab)
 {
@@ -74,6 +91,9 @@ SHASH_Destroy(SHTAB* shtab)
 	pfree(shtab);
 }
 
+/*
+ * Get number of elements in the hash table.
+ */
 uint64
 SHASH_Entries(SHTAB* shtab)
 {
@@ -83,40 +103,10 @@ SHASH_Entries(SHTAB* shtab)
 	return shtab->nElements;
 }
 
-#define ELEM(index) (&shtab->Elements[index*shtab->Header.ElementSize])
-
-void
-SHASH_SeqReset(SHTAB* shtab)
-{
-	check(shtab);
-
-	shtab->SeqScanCurElem = 0;
-}
-
-void*
-SHASH_SeqNext(SHTAB* shtab)
-{
-	check(shtab);
-
-	if (shtab->SeqScanCurElem == shtab->HTableSize)
-		return NULL;
-
-	Assert(shtab->SeqScanCurElem < shtab->HTableSize);
-
-	do
-	{
-		if (shtab->state[shtab->SeqScanCurElem] == SHASH_USED)
-			return ELEM(shtab->SeqScanCurElem++);
-		else
-		 shtab->SeqScanCurElem++;
-	}
-	while (shtab->SeqScanCurElem < shtab->HTableSize);
-
-	return NULL;
-}
-
-#include "limits.h"
-
+/*
+ * Find, enter or delete element.
+ * return NULL, if element not found.
+ */
 void*
 SHASH_Search(SHTAB* shtab, void *keyPtr, SHASHACTION action, bool *foundPtr)
 {
@@ -140,8 +130,6 @@ SHASH_Search(SHTAB* shtab, void *keyPtr, SHASHACTION action, bool *foundPtr)
 	 */
 	for(;;)
 	{
-//		uint64	pos = index*shtab->Header.ElementSize;
-
 		if (shtab->state[index] == SHASH_NUSED)
 		{
 			/* Empty position found */
@@ -153,7 +141,7 @@ SHASH_Search(SHTAB* shtab, void *keyPtr, SHASHACTION action, bool *foundPtr)
 					if (first_removed_index != ULONG_MAX)
 						index= first_removed_index;
 
-					memset(ELEM(index), 0, shtab->Header.ElementSize);
+//					memset(ELEM(index), 0, shtab->Header.ElementSize);
 					memcpy(ELEM(index), keyPtr, shtab->Header.KeySize);
 					shtab->state[index] = SHASH_USED;
 					shtab->nElements++;
@@ -161,7 +149,9 @@ SHASH_Search(SHTAB* shtab, void *keyPtr, SHASHACTION action, bool *foundPtr)
 				}
 				break;
 			case SHASH_FIND:
+				/* Hash table not contains record with such key */
 			case SHASH_REMOVE:
+				/* may be potential problem */
 				break;
 			default:
 				Assert(0);
@@ -180,6 +170,7 @@ SHASH_Search(SHTAB* shtab, void *keyPtr, SHASHACTION action, bool *foundPtr)
 
 			if (action == SHASH_REMOVE)
 			{
+				Assert(shtab->nElements > 0);
 				/* Data will be cleaned by ENTER operation */
 				shtab->state[index] = SHASH_REMOVED;
 				shtab->nElements--;
@@ -204,7 +195,7 @@ SHASH_Search(SHTAB* shtab, void *keyPtr, SHASHACTION action, bool *foundPtr)
 			if ((action == SHASH_ENTER) && (first_removed_index != ULONG_MAX) && (shtab->nElements < shtab->Header.ElementsMaxNum))
 			{
 				index = first_removed_index;
-				memset(ELEM(index), 0, shtab->Header.ElementSize);
+//				memset(ELEM(index), 0, shtab->Header.ElementSize);
 				memcpy(ELEM(index), keyPtr, shtab->Header.KeySize);
 				shtab->state[index] = SHASH_USED;
 				shtab->nElements++;
@@ -220,6 +211,46 @@ SHASH_Search(SHTAB* shtab, void *keyPtr, SHASHACTION action, bool *foundPtr)
 	return NULL;
 }
 
+/*
+ * Begin new sequental scan of the hash table.
+ */
+void
+SHASH_SeqReset(SHTAB* shtab)
+{
+	check(shtab);
+
+	shtab->SeqScanCurElem = 0;
+}
+
+/*
+ * Get next hash table value during sequental scan.
+ * Call after last element returned returns NULL.
+ */
+void*
+SHASH_SeqNext(SHTAB* shtab)
+{
+	check(shtab);
+
+	if (shtab->SeqScanCurElem == shtab->HTableSize)
+		return NULL;
+
+	Assert(shtab->SeqScanCurElem < shtab->HTableSize);
+
+	do
+	{
+		if (shtab->state[shtab->SeqScanCurElem] == SHASH_USED)
+			return ELEM(shtab->SeqScanCurElem++);
+		else
+		 shtab->SeqScanCurElem++;
+	}
+	while (shtab->SeqScanCurElem < shtab->HTableSize);
+
+	return NULL;
+}
+
+/*
+ * Simple hash function.
+ */
 uint64
 DefaultHashValueFunc(void *key, uint64 size, uint64 base)
 {
