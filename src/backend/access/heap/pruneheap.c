@@ -157,6 +157,7 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 
 			/* OK to prune */
 			(void) heap_page_prune(relation, buffer, OldestXmin, true, &ignore);
+			HeapCleanerSend(relation, BufferGetBlockNumber(buffer));
 		}
 
 		/* And release buffer lock */
@@ -324,12 +325,6 @@ heap_page_prune(Relation relation, Buffer buffer, TransactionId OldestXmin,
 	 * and update FSM with the remaining space.
 	 */
 
-	/* I am not under vacuum */
-	if ((MyPgXact->vacuumFlags == 0) && (prstate.ndead > 0))
-	{
-		if (relation->rd_node.dbNode != 0)
-			HeapCleanerSend(relation, BufferGetBlockNumber(buffer));
-	}
 	return ndeleted;
 }
 
@@ -590,11 +585,10 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 		 */
 		for (i = 1; (i < nchain) && (chainitems[i - 1] != latestdead); i++)
 		{
-//			ndeleted++;
+			ndeleted++;
 			if (chainitems[i] == latestdead)
 				continue;
 			heap_prune_record_unused(prstate, chainitems[i]);
-			ndeleted++;
 		}
 
 		/*

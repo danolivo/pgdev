@@ -217,7 +217,7 @@ static pid_t hcworker_forkexec(void);
 #endif
 
 static uint64 CleanerMessageHashFunc(void *key, uint64 size, uint64 base);
-static SHTAB *cleanup_relations(DirtyRelation *res, SHTAB *AuxiliaryList);
+static PSHTAB cleanup_relations(DirtyRelation *res, SHTAB *AuxiliaryList, bool got_SIGTERM);
 static bool DefaultCompareFunc(void* bucket1, void* bucket2);
 NON_EXEC_STATIC void HeapCleanerLauncherMain(int argc, char *argv[]) pg_attribute_noreturn();
 NON_EXEC_STATIC void HeapCleanerWorkerMain(int argc, char *argv[]) pg_attribute_noreturn();
@@ -307,8 +307,8 @@ static int SatisfiesVacuum = 0;
 /*
  * Main logic of HEAP and index relations cleaning
  */
-static SHTAB*
-cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList)
+static PSHTAB
+cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 {
 	Relation		heapRelation;
 	Relation   		*IndexRelations;
@@ -319,12 +319,16 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList)
 	Assert(res != NULL);
 	Assert(res->items != NULL);
 	Assert(AuxiliaryList != NULL);
+	Assert(SHASH_Entries(AuxiliaryList) == 0);
 
 	if (SHASH_Entries(res->items) == 0)
 		return AuxiliaryList;
 
 	if (RecoveryInProgress())
+	{
+		SHASH_Clean(res->items);
 		return AuxiliaryList;
+	}
 
 	CHECK_FOR_INTERRUPTS();
 
@@ -340,6 +344,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList)
 	{
 		elog(LOG, "[%d] Cleanup: UnSuccessful opening. Relation deleted? dbOid=%d", res->relid, MyWorkerInfo->dbOid);
 		CommitTransactionCommand();
+		SHASH_Clean(res->items);
 		return AuxiliaryList;
 	}
 
@@ -363,6 +368,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList)
 							RelationGetRelationName(heapRelation))));
 		relation_close(heapRelation, lockmode);
 		CommitTransactionCommand();
+		SHASH_Clean(res->items);
 		return AuxiliaryList;
 	}
 
@@ -388,7 +394,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList)
 
 		Assert(item->hits > 0);
 
-		if ((item->lastXid > GetOldestXmin(NULL, PROCARRAY_FLAGS_VACUUM)) && (item->hits < 10))
+		if (!got_SIGTERM && (item->lastXid > GetOldestXmin(NULL, PROCARRAY_FLAGS_VACUUM)) && (item->hits < 10))
 		{
 			/*
 			 * Skip block cleaning and return it to a waiting list
@@ -552,7 +558,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList)
 			pgstat_update_heap_dead_tuples(heapRelation, nunusable);
 		}
 		/*
-		 * ToDo: that we can do with TOAST relation?
+		 * ToDo: that we will do with TOAST relation?
 		 */
 	}
 
@@ -1590,6 +1596,10 @@ main_worker_loop(void)
 
 	FreeDirtyBlocksList = SHASH_Create(shctl);
 
+	/*
+	 * TODO: If we wait while !has_work, then on rep_changes test worker has
+	 * one block which not cleaned and worker will have gone to infinity loop.
+	 */
 	while (!got_SIGTERM || has_work)
 	{
 		int	rc;
@@ -1738,7 +1748,7 @@ main_worker_loop(void)
 				if (SHASH_Entries(FreeDirtyBlocksList) > 0)
 					SHASH_Clean(FreeDirtyBlocksList);
 
-				FreeDirtyBlocksList = cleanup_relations(dirty_relation[relcounter], FreeDirtyBlocksList);
+				FreeDirtyBlocksList = cleanup_relations(dirty_relation[relcounter], FreeDirtyBlocksList, got_SIGTERM);
 
 				/*
 				 * Some blocks from the list may blocked by a backend.
@@ -1766,7 +1776,7 @@ main_worker_loop(void)
 							WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
 							1L,
 							WAIT_EVENT_BGHEAP_MAIN);
-		else
+		else if (!got_SIGTERM)
 			/* Wait data or signals */
 			rc = WaitLatch(MyLatch,
 					WL_LATCH_SET | WL_POSTMASTER_DEATH,
