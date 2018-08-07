@@ -158,8 +158,6 @@ static void lazy_scan_heap(Relation onerel, int options,
 			   bool aggressive);
 static void lazy_vacuum_heap(Relation onerel, LVRelStats *vacrelstats);
 static bool lazy_check_needs_freeze(Buffer buf, bool *hastup);
-/*static void quick_vacuum_index(Relation irel, Relation hrel,
-					LVRelStats *vacrelstats);*/
 static void lazy_vacuum_index(Relation indrel,
 				  IndexBulkDeleteResult **stats,
 				  LVRelStats *vacrelstats);
@@ -739,7 +737,7 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 			/* Remove index entries */
 			for (i = 0; i < nindexes; i++)
 			{
-				bool use_quick_strategy = false;//true; // (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
+				bool use_quick_strategy = (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
 
 				if (use_quick_strategy && (Irel[i]->rd_amroutine->amtargetdelete != NULL))
 					quick_vacuum_index(Irel[i], onerel, vacrelstats->dead_tuples, vacrelstats->num_dead_tuples);
@@ -1391,7 +1389,7 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 		/* Remove index entries */
 		for (i = 0; i < nindexes; i++)
 		{
-			bool use_quick_strategy = false;//true; // (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
+			bool use_quick_strategy = (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
 
 			if (use_quick_strategy && (Irel[i]->rd_amroutine->amtargetdelete != NULL))
 				quick_vacuum_index(Irel[i], onerel, vacrelstats->dead_tuples, vacrelstats->num_dead_tuples);

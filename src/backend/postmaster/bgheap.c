@@ -5,6 +5,11 @@
  *
  * Made in autovacuum analogy. Uses 'Target' strategy for clean relations,
  * without full scan.
+ * The cleaner to consist of one Launcher and Workers.
+ * One worker corresponds to one database.
+ * Launcher receives message from a backend {dbOid; relOid; blkno} by
+ * socket and translate it to a worker by shared memory buffer. Worker receive
+ * message and cleanup block of heap relation and its index relations.
  *
  * Copyright (c) 1996-2018, PostgreSQL Global Development Group
  *
@@ -60,7 +65,7 @@
  * Maximum number of task items in storage at a backend side before shipping to a
  * background heap cleaner
  */
-#define BACKEND_DIRTY_ITEMS_MAX		(20)
+#define BACKEND_DIRTY_ITEMS_MAX		1//(20)
 
 /*
  * Maximum number of task items in waiting list at a Launcher side.
@@ -68,23 +73,23 @@
  * messages exceed this, we ignore the remains and increase counter of missed
  * items.
  */
-#define WAITING_MESSAGES_MAX_NUM	(100)
+#define WAITING_MESSAGES_MAX_NUM		(100)
 
 /*
  * Maximum number of dirty blocks which can keep a worker for each relation
  */
-#define WORKER_DIRTYBLOCKS_MAX_NUM	(1000)
+#define WORKER_DIRTYBLOCKS_MAX_NUM		(1000)
 
 /* Maximum number of slots for dirty relations */
-#define WORKER_RELATIONS_MAX_NUM	(100)
+#define WORKER_RELATIONS_MAX_NUM		(100)
 
 /* Maximum number of task items in a launcher/worker shared buffer */
-#define WORKER_TASK_ITEMS_MAX		(1000)
+#define WORKER_TASK_ITEMS_MAX			(1000)
 
 /*
  * Maximum time interval which worker can idle without a task (ms)
  */
-#define WORKER_IDLE_TIME_DURATION_MAX	(50000)
+#define WORKER_IDLE_TIME_DURATION_MAX	(5000)
 
 /* Minimal info for cleanup a block of heap relation and its index relations */
 typedef struct CleanerMessage
@@ -169,6 +174,8 @@ static uint32	MissedBlocksNum = 0;
 
 static void launcher_stat_print(void);
 
+static MemoryContext BGHeapMemCxt = NULL;
+
 /*
  * Table of database relations.
  * For each relation we support a waiting list of dirty blocks.
@@ -184,8 +191,11 @@ static HeapCleanerShmemStruct *HeapCleanerShmem;
 static dlist_head DatabaseList = DLIST_STATIC_INIT(DatabaseList);
 static MemoryContext DatabaseListCxt = NULL;
 
-static CleanerMessage	dblocks[BACKEND_DIRTY_ITEMS_MAX];
-static int				dblocks_records_num = -1;
+/*
+ * Hash table for collection of dirty blocks after heap_page_prune() action
+ * at a Backend side.
+ */
+PSHTAB	dblocks = NULL;
 
 /* Signal handling */
 static volatile sig_atomic_t got_SIGHUP = false;
@@ -300,10 +310,18 @@ HeapCleanerWorkerIAm(void)
 void
 AtEOXact_BGHeap_tables(bool isCommit)
 {
+	MemoryContext oldMemCxt;
+//	elog(LOG, "XACT END");
+	if (BGHeapMemCxt == NULL)
+		BGHeapMemCxt = AllocSetContextCreate(BGHeapMemCxt, "bgheap",
+											 ALLOCSET_DEFAULT_SIZES);
+	oldMemCxt = MemoryContextSwitchTo(BGHeapMemCxt);
+
 	backend_send_dirty_blocks();
+
+	MemoryContextSwitchTo(oldMemCxt);
 }
 
-static int SatisfiesVacuum = 0;
 /*
  * Main logic of HEAP and index relations cleaning
  */
@@ -970,43 +988,36 @@ elog(LOG, "-> Launcher Started!");
 static bool
 backend_store_dirty_block(CleanerMessage *msg)
 {
-	int position = msg->blkno%BACKEND_DIRTY_ITEMS_MAX;
+	bool			found;
+	CleanerMessage	*rec;
 
-	/* Initial storage cleanup */
-	if (dblocks_records_num < 0)
+	/* Initialize collector's hash table */
+	if (dblocks == NULL)
 	{
-		memset(dblocks, 0, BACKEND_DIRTY_ITEMS_MAX*sizeof(CleanerMessage));
-		dblocks_records_num = 0;
+		SHTABCTL	ctl;
+
+		ctl.ElementsMaxNum = BACKEND_DIRTY_ITEMS_MAX;
+		ctl.FillFactor = 0.75;
+		ctl.ElementSize = sizeof(CleanerMessage);
+		ctl.KeySize = 2 * sizeof(Oid) + sizeof(BlockNumber);
+		ctl.HashFunc = CleanerMessageHashFunc;
+		ctl.CompFunc = isEqualMsgs;
+		dblocks = SHASH_Create(ctl);
+		elog(LOG, "SHASH_Create: %lu", SHASH_Entries(dblocks));
 	}
 
-	Assert(dblocks_records_num < BACKEND_DIRTY_ITEMS_MAX);
+	/* Search for new position or for duplicates */
+	rec = (CleanerMessage *) SHASH_Search(dblocks, (void *) msg, SHASH_ENTER, &found);
+	elog(LOG, "SHASH_Add: %lu sz=%lu st=%d", SHASH_Entries(dblocks), dblocks->HTableSize, dblocks->state[0]);
 
-	/* Search for new position of msg or duplicate */
-	for (;;)
-	{
-		if (dblocks[position].dbNode == 0)
-		{
-			/* Position found */
-			dblocks[position] = *msg;
-			++dblocks_records_num;
-			dblocks[position].hits = 1;
+	if (!rec)
+		return true;
 
-			if ((double)(BACKEND_DIRTY_ITEMS_MAX-dblocks_records_num)/BACKEND_DIRTY_ITEMS_MAX < 0.25)
-				/* Storage needs to be packaging and shipping to the Cleaner */
-				return true;
-			else
-				return false;
-		}
-		else if (isEqualMsgs(&dblocks[position], msg))
-		{
-			/* found full duplicate */
-			dblocks[position].hits++;
-			return false;
-		}
-		else
-			position = (position+1)%BACKEND_DIRTY_ITEMS_MAX;
-	}
+	if (!found)
+		rec->hits = 0;
 
+	rec->xid = msg->xid;
+	rec->hits++;
 	return false;
 }
 
@@ -1019,28 +1030,28 @@ static void
 backend_send_dirty_blocks(void)
 {
 	int				rc;
-	CleanerMessage	*htptr;
+	CleanerMessage	*rec;
 	CleanerMessage	data[BACKEND_DIRTY_ITEMS_MAX];
 	int				nitems = 0;
 
-	Assert(dblocks_records_num <= BACKEND_DIRTY_ITEMS_MAX);
-
-	if (dblocks_records_num <= 0)
+	if (dblocks == NULL)
 		return;
 
-	for (htptr = dblocks; nitems < dblocks_records_num; htptr++)
-	{
-//		elog(LOG, "size=%lu nitems=%d dblocks_records_num=%d", (long unsigned int)(htptr-dblocks), nitems, dblocks_records_num);
-		Assert((htptr-dblocks) < BACKEND_DIRTY_ITEMS_MAX);
+	if (SHASH_Entries(dblocks) == 0)
+		return;
 
-		if (htptr->dbNode != 0)
-		{
-			data[nitems++] = *htptr;
-//			elog(LOG, "ADD to the package: %d %d %d", htptr->blkno, htptr->dbNode, htptr->relid);
-			htptr->dbNode = 0;
-			dblocks_records_num--;
-		}
+//	if (SHASH_Entries(dblocks) > BACKEND_DIRTY_ITEMS_MAX)
+//		elog(ERROR, "SHASH_Entries(dblocks)=%lu BACKEND_DIRTY_ITEMS_MAX=%lu\n", SHASH_Entries(dblocks), BACKEND_DIRTY_ITEMS_MAX);
+	Assert(SHASH_Entries(dblocks) <= BACKEND_DIRTY_ITEMS_MAX);
+
+	for (SHASH_SeqReset(dblocks);
+		(rec = SHASH_SeqNext(dblocks)) != NULL; )
+	{
+		Assert(rec->hits > 0);
+		Assert(nitems < BACKEND_DIRTY_ITEMS_MAX);
+		data[nitems++] = *rec;
 	}
+	SHASH_Clean(dblocks);
 
 	/* Send data to launcher.
 	 * We'll retry after EINTR, but ignore all other failures
@@ -1049,7 +1060,6 @@ backend_send_dirty_blocks(void)
 	{
 		rc = send(HeapCleanerSock, data, nitems*sizeof(CleanerMessage), 0);
 	} while (rc < 0 && errno == EINTR);
-//	elog(LOG, "Package with size %d was shipped", nitems);
 }
 
 /*
@@ -1061,6 +1071,11 @@ void
 HeapCleanerSend(Relation relation, BlockNumber blkno)
 {
 	CleanerMessage msg;
+	MemoryContext	oldMemCxt;
+
+	if (BGHeapMemCxt == NULL)
+		BGHeapMemCxt = AllocSetContextCreate(BGHeapMemCxt, "bgheap",
+											 ALLOCSET_DEFAULT_SIZES);
 
 	if (RecoveryInProgress())
 			return;
@@ -1096,16 +1111,17 @@ HeapCleanerSend(Relation relation, BlockNumber blkno)
 	if (relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 		return;
 
-	msg.relid = RelationGetRelid(relation);
+	oldMemCxt = MemoryContextSwitchTo(BGHeapMemCxt);
+
 	msg.dbNode = relation->rd_node.dbNode;
+	msg.relid = RelationGetRelid(relation);
 	msg.blkno = blkno;
 	msg.xid = GetCurrentTransactionIdIfAny();
 
 	if (backend_store_dirty_block(&msg))
 		backend_send_dirty_blocks();
-	else
-		return;
 
+	MemoryContextSwitchTo(oldMemCxt);
 }
 
 /*
@@ -1316,22 +1332,29 @@ look_for_worker(Oid dbNode)
 static void
 main_launcher_loop()
 {
-	uint32			TmpMissedBlocksNumber = MissedBlocksNum;
-	bool			found;
+	uint32	TmpMissedBlocksNumber = MissedBlocksNum;
+	bool	found;
+	long	timeout = -1L;
 
 	Assert(HeapCleanerSock != PGINVALID_SOCKET);
 
-	while (!got_SIGTERM)
+	/*
+	 * Do work until not catch a SIGTERM signal and all blocks
+	 * not shipped to workers.
+	 * timeout <= 0 tells us that the launcher does not have any work right now,
+	 * and it will sleep until the socket message or the system signal.
+	 */
+	while (!got_SIGTERM || (timeout > 0))
 	{
 		int				rc;
 		int				len;
 		CleanerMessage	*msg;
 		CleanerMessage	table[BACKEND_DIRTY_ITEMS_MAX];
 		WorkerInfo		startingWorker;
-		long			timeout = 10L;
-		dlist_node		*node;
 		WorkerInfo		worker;
-		bool			haveWork = false;
+		dlist_node		*node;
+
+		timeout = -1L;
 
 		if (TmpMissedBlocksNumber != MissedBlocksNum)
 		{
@@ -1353,6 +1376,9 @@ main_launcher_loop()
 		LWLockAcquire(HeapCleanerLock, LW_EXCLUSIVE);
 		startingWorker = HeapCleanerShmem->startingWorker;
 
+		/*
+		 * Message was received from socket.
+		 */
 		if (len > 0)
 		{
 			CleanerMessage *mptr;
@@ -1382,23 +1408,25 @@ main_launcher_loop()
 				{
 					msg->hits++;
 					msg->xid = (msg->xid > mptr->xid) ? msg->xid : mptr->xid;
-				} else
+				}
+				else
 					memcpy(msg, mptr, sizeof(CleanerMessage));
-
-				Assert(msg->hits >= 0);
 			}
 		}
 
+		/*
+		 * Main waiting list parsing.
+		 */
 		if (SHASH_Entries(wTab[heapcleaner_max_workers]) > 0)
 		{
 			bool startWorker = (startingWorker != NULL);
 
 			/*
 			 * Pass across general waiting list.
-			 * Try to send messages to an active worker.
+			 * Try to send tasks to active workers.
 			 */
-			SHASH_SeqReset(wTab[heapcleaner_max_workers]);
-			while ((msg = (CleanerMessage *) SHASH_SeqNext(wTab[heapcleaner_max_workers])) != NULL)
+			for (SHASH_SeqReset(wTab[heapcleaner_max_workers]);
+				(msg = (CleanerMessage *) SHASH_SeqNext(wTab[heapcleaner_max_workers])) != NULL; )
 			{
 				worker = look_for_worker(msg->dbNode);
 
@@ -1415,8 +1443,6 @@ main_launcher_loop()
 							memcpy(temp_msg, msg, sizeof(CleanerMessage));
 					else
 						MissedBlocksNum++;
-
-					Assert(temp_msg->hits > 0);
 
 					/*
 					 * Message gone to worker. delete from main waiting list.
@@ -1439,11 +1465,8 @@ main_launcher_loop()
 		 * Check: if we can't process all incoming messages, we need too small
 		 * timeout, check latches and go to next iteration.
 		 */
-		if (SHASH_Entries(wTab[heapcleaner_max_workers]) != 0)
-		{
-			haveWork = true;
+		if (SHASH_Entries(wTab[heapcleaner_max_workers]) > 0)
 			timeout = 1L;
-		}
 
 		/*
 		 * See waiting lists of active workers and try to send messages.
@@ -1514,11 +1537,8 @@ main_launcher_loop()
 				 * If launcher has any tasks, It check signals quickly
 				 * and to work on further.
 				 */
-				if (SHASH_Entries(wTab[worker->id]) != 0)
-				{
-					haveWork = true;
+				if (SHASH_Entries(wTab[worker->id]) > 0)
 					timeout = 1L;
-				}
 
 				if (!dlist_has_next(&HeapCleanerShmem->runningWorkers, node))
 					break;
@@ -1526,30 +1546,26 @@ main_launcher_loop()
 
 			/*
 			 * Launcher have'nt any immediate tasks and
-			 * need to terminate idle workers only
+			 * need to manage idle workers only
 			 */
-			if (!haveWork)
-			{
+			if (timeout < 0)
 				/* We only need to wait idle workers */
-				haveWork = true;
-				timeout = 1000L;
-			}
+				timeout = 100L;
 		}
 		LWLockRelease(HeapCleanerLock);
 
-		if (!haveWork)
+		if (!got_SIGTERM)
 		{
-			timeout = -1L;
+			int wakeEvents = WL_LATCH_SET | WL_POSTMASTER_DEATH | WL_SOCKET_READABLE;
+
+			if (timeout > 0)
+				wakeEvents |=  WL_TIMEOUT;
 			/* Wait data or signals */
 			rc = WaitLatchOrSocket(MyLatch,
-							WL_LATCH_SET | WL_POSTMASTER_DEATH | WL_SOCKET_READABLE,
-							HeapCleanerSock, timeout,
-							WAIT_EVENT_BGHEAP_MAIN);
-		} else
-			rc = WaitLatchOrSocket(MyLatch,
-							WL_LATCH_SET | WL_POSTMASTER_DEATH | WL_TIMEOUT | WL_SOCKET_READABLE,
-							HeapCleanerSock, timeout,
-							WAIT_EVENT_BGHEAP_MAIN);
+								   wakeEvents,
+								   HeapCleanerSock, timeout,
+								   WAIT_EVENT_BGHEAP_MAIN);
+		}
 
 		/* Emergency bailout if postmaster has died */
 		if (rc & WL_POSTMASTER_DEATH)
@@ -1582,7 +1598,7 @@ main_worker_loop(void)
 	DirtyRelation	*dirty_relation[WORKER_RELATIONS_MAX_NUM];
 	PSHTAB			FreeDirtyBlocksList;
 	uint32			TmpMissedBlocksNumber = 0;
-	bool			has_work = false;
+	long			timeout = -1L;
 	int				dirty_relations_num = 0;
 	int				task_items_num = 0;
 	SHTABCTL		shctl;
@@ -1596,19 +1612,11 @@ main_worker_loop(void)
 
 	FreeDirtyBlocksList = SHASH_Create(shctl);
 
-	/*
-	 * TODO: If we wait while !has_work, then on rep_changes test worker has
-	 * one block which not cleaned and worker will have gone to infinity loop.
-	 */
-	while (!got_SIGTERM || has_work)
+	while (!got_SIGTERM || (timeout > 0))
 	{
 		int	rc;
 
-		/*
-		 * Initial value at each iteration. Will be changed to true, if one of
-		 * wait lists contains blocks.
-		 */
-		has_work = false;
+		timeout = -1L;
 
 		if (got_SIGHUP)
 		{
@@ -1651,12 +1659,11 @@ main_worker_loop(void)
 			bool			found;
 			int				i;
 
-			has_work = true;
-
 			/* Pass across items and sort by relation */
 			for (i = 0; i < task_items_num; i++)
 			{
-				WorkerTask *item;
+				WorkerTask	*item;
+
 				worker_total_hits_received += task_item[i].hits;
 				hashent = SHASH_Search(PrivateRelationsTable,
 								  (void *) &(task_item[i].relid), HASH_FIND, NULL);
@@ -1755,7 +1762,7 @@ main_worker_loop(void)
 				 * Deferred its for next cleanup attempt.
 				 */
 				if (SHASH_Entries(dirty_relation[relcounter]->items) > 0)
-					has_work = true;
+					timeout = 1L;
 			}
 
 			QueryCancelPending = false;
@@ -1771,17 +1778,13 @@ main_worker_loop(void)
 		}
 		PG_END_TRY();
 
-		if (has_work)
-			rc = WaitLatch(MyLatch,
-							WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-							1L,
-							WAIT_EVENT_BGHEAP_MAIN);
-		else if (!got_SIGTERM)
-			/* Wait data or signals */
-			rc = WaitLatch(MyLatch,
-					WL_LATCH_SET | WL_POSTMASTER_DEATH,
-					-1L,
-					WAIT_EVENT_BGHEAP_MAIN);
+		if (!got_SIGTERM)
+		{
+			int	wakeEvents = WL_LATCH_SET | WL_POSTMASTER_DEATH;
+			if (timeout > 0)
+				wakeEvents |= WL_TIMEOUT;
+			rc = WaitLatch(MyLatch, wakeEvents, timeout, WAIT_EVENT_BGHEAP_MAIN);
+		}
 
 		ResetLatch(MyLatch);
 
@@ -2055,7 +2058,7 @@ stat_collector_print(void)
 	fprintf(f, "TOTAL BLOCKS Cleaned: %lu (%d with cycles)\n", SHASH_Entries(worker_stat), total_blocks_cleaned);
 	fprintf(f, "TOTAL HITS/REMOVED => %d/%d (%6.2f percent)\n", total_hits, total_removed_tuples, 100.*(float)total_removed_tuples/(float)total_hits);
 	fprintf(f, "vainly cleaned blocks: %d (%d hits)\n", worker_zero_cleaned_blocks_num, worker_zero_cleaned_hits_num);
-	fprintf(f, "worker_tuple_dead_but_HOT=%d, worker_tuple_recently_dead=%d SatisfiesVacuum=%d\n", worker_tuple_dead_but_HOT, worker_tuple_recently_dead, SatisfiesVacuum);
+	fprintf(f, "worker_tuple_dead_but_HOT=%d, worker_tuple_recently_dead=%d\n", worker_tuple_dead_but_HOT, worker_tuple_recently_dead);
 	fprintf(f, "BLOCKS NOT FOUND: %d (%d hits)\n", worker_not_found_blocks_num, worker_not_found_blocks_hits);
 
 	fprintf(f, "IN-Memory waiting list: %lu relations\n", SHASH_Entries(PrivateRelationsTable));
