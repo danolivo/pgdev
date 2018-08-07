@@ -141,7 +141,6 @@ SHASH_Search(SHTAB* shtab, void *keyPtr, SHASHACTION action, bool *foundPtr)
 					if (first_removed_index != ULONG_MAX)
 						index= first_removed_index;
 
-//					memset(ELEM(index), 0, shtab->Header.ElementSize);
 					memcpy(ELEM(index), keyPtr, shtab->Header.KeySize);
 					shtab->state[index] = SHASH_USED;
 					shtab->nElements++;
@@ -195,7 +194,6 @@ SHASH_Search(SHTAB* shtab, void *keyPtr, SHASHACTION action, bool *foundPtr)
 			if ((action == SHASH_ENTER) && (first_removed_index != ULONG_MAX) && (shtab->nElements < shtab->Header.ElementsMaxNum))
 			{
 				index = first_removed_index;
-//				memset(ELEM(index), 0, shtab->Header.ElementSize);
 				memcpy(ELEM(index), keyPtr, shtab->Header.KeySize);
 				shtab->state[index] = SHASH_USED;
 				shtab->nElements++;

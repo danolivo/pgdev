@@ -65,7 +65,7 @@
  * Maximum number of task items in storage at a backend side before shipping to a
  * background heap cleaner
  */
-#define BACKEND_DIRTY_ITEMS_MAX		1//(20)
+#define BACKEND_DIRTY_ITEMS_MAX			(20)
 
 /*
  * Maximum number of task items in waiting list at a Launcher side.
@@ -311,7 +311,7 @@ void
 AtEOXact_BGHeap_tables(bool isCommit)
 {
 	MemoryContext oldMemCxt;
-//	elog(LOG, "XACT END");
+
 	if (BGHeapMemCxt == NULL)
 		BGHeapMemCxt = AllocSetContextCreate(BGHeapMemCxt, "bgheap",
 											 ALLOCSET_DEFAULT_SIZES);
@@ -1040,8 +1040,6 @@ backend_send_dirty_blocks(void)
 	if (SHASH_Entries(dblocks) == 0)
 		return;
 
-//	if (SHASH_Entries(dblocks) > BACKEND_DIRTY_ITEMS_MAX)
-//		elog(ERROR, "SHASH_Entries(dblocks)=%lu BACKEND_DIRTY_ITEMS_MAX=%lu\n", SHASH_Entries(dblocks), BACKEND_DIRTY_ITEMS_MAX);
 	Assert(SHASH_Entries(dblocks) <= BACKEND_DIRTY_ITEMS_MAX);
 
 	for (SHASH_SeqReset(dblocks);
@@ -1194,7 +1192,6 @@ HeapCleanerWorkerMain(int argc, char *argv[])
 	if (OidIsValid(MyWorkerInfo->dbOid))
 	{
 		char		dbname[NAMEDATALEN];
-//		HASHCTL		hash_ctl;
 		SHTABCTL	pr_ctl;
 
 		pgstat_report_heapcleaner(MyWorkerInfo->dbOid);
@@ -1208,10 +1205,6 @@ HeapCleanerWorkerMain(int argc, char *argv[])
 		pr_ctl.CompFunc = DefaultCompareFunc;
 		pr_ctl.ElementSize = sizeof(DirtyRelation);
 		pr_ctl.KeySize = sizeof(int32);
-
-//		MemSet(&hash_ctl, 0, sizeof(hash_ctl));
-//		hash_ctl.keysize = sizeof(int32);
-//		hash_ctl.entrysize = sizeof(DirtyRelation);
 
 		PrivateRelationsTable = SHASH_Create(pr_ctl);
 

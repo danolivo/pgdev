@@ -1,10 +1,3 @@
-/*
- * shash.h
- *
- *  Created on: 27 июл. 2018 г.
- *      Author: andrey
- */
-
 #ifndef SHASH_H_
 #define SHASH_H_
 
@@ -24,8 +17,6 @@ typedef enum
 	SHASH_REMOVED
 } HESTATE;
 
-//typedef	unsigned long int uint64;
-//typedef	unsigned char uint8;
 typedef uint64 (*SHashValueFunc) (void *key, uint64 size, uint64 base);
 typedef bool (*CompareFunc) (void* bucket1, void* bucket2);
 
