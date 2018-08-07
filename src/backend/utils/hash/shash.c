@@ -50,7 +50,7 @@ SHASH_Create(SHTABCTL shctl)
 
 	/* Add one element as sign of empty value */
 	shtab->Elements = (char *) palloc(shtab->HTableSize * shctl.ElementSize);
-	shtab->state = (HESTATE *) palloc(shtab->HTableSize * sizeof(HESTATE));
+	shtab->state = (HESTATE *) palloc0(shtab->HTableSize * sizeof(HESTATE));
 	shtab->nElements = 0;
 	shtab->SeqScanCurElem = 0;
 
