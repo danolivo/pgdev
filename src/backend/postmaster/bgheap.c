@@ -38,6 +38,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
+#include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "common/ip.h"
 #include "executor/executor.h"
@@ -322,6 +323,128 @@ AtEOXact_BGHeap_tables(bool isCommit)
 	MemoryContextSwitchTo(oldMemCxt);
 }
 
+static void
+save_to_list(PSHTAB AuxiliaryList, WorkerTask *item)
+{
+	bool found;
+
+	WorkerTask *new_item = (WorkerTask *)
+							SHASH_Search(AuxiliaryList,
+							(void *) &(item->blkno),
+							HASH_ENTER, &found);
+
+	Assert((new_item != NULL) && (!found));
+	new_item->hits = item->hits;
+	new_item->lastXid = item->lastXid;
+}
+
+static bool
+heap_page_is_all_visible(Relation rel, Buffer buf,
+						 TransactionId *visibility_cutoff_xid,
+						 bool *all_frozen)
+{
+	Page		page = BufferGetPage(buf);
+	BlockNumber blockno = BufferGetBlockNumber(buf);
+	OffsetNumber offnum,
+				maxoff;
+	bool		all_visible = true;
+	TransactionId	OldestXmin = GetOldestXmin(rel, PROCARRAY_FLAGS_VACUUM);
+
+	*visibility_cutoff_xid = InvalidTransactionId;
+	*all_frozen = true;
+
+	/*
+	 * This is a stripped down version of the line pointer scan in
+	 * lazy_scan_heap(). So if you change anything here, also check that code.
+	 */
+	maxoff = PageGetMaxOffsetNumber(page);
+	for (offnum = FirstOffsetNumber;
+		 offnum <= maxoff && all_visible;
+		 offnum = OffsetNumberNext(offnum))
+	{
+		ItemId		itemid;
+		HeapTupleData tuple;
+
+		itemid = PageGetItemId(page, offnum);
+
+		/* Unused or redirect line pointers are of no interest */
+		if (!ItemIdIsUsed(itemid) || ItemIdIsRedirected(itemid))
+			continue;
+
+		ItemPointerSet(&(tuple.t_self), blockno, offnum);
+
+		/*
+		 * Dead line pointers can have index pointers pointing to them. So
+		 * they can't be treated as visible
+		 */
+		if (ItemIdIsDead(itemid))
+		{
+			all_visible = false;
+			*all_frozen = false;
+			break;
+		}
+
+		Assert(ItemIdIsNormal(itemid));
+
+		tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemid);
+		tuple.t_len = ItemIdGetLength(itemid);
+		tuple.t_tableOid = RelationGetRelid(rel);
+
+		switch (HeapTupleSatisfiesVacuum(&tuple, OldestXmin, buf))
+		{
+			case HEAPTUPLE_LIVE:
+				{
+					TransactionId xmin;
+
+					/* Check comments in lazy_scan_heap. */
+					if (!HeapTupleHeaderXminCommitted(tuple.t_data))
+					{
+						all_visible = false;
+						*all_frozen = false;
+						break;
+					}
+
+					/*
+					 * The inserter definitely committed. But is it old enough
+					 * that everyone sees it as committed?
+					 */
+					xmin = HeapTupleHeaderGetXmin(tuple.t_data);
+					if (!TransactionIdPrecedes(xmin, OldestXmin))
+					{
+						all_visible = false;
+						*all_frozen = false;
+						break;
+					}
+
+					/* Track newest xmin on page. */
+					if (TransactionIdFollows(xmin, *visibility_cutoff_xid))
+						*visibility_cutoff_xid = xmin;
+
+					/* Check whether this tuple is already frozen or not */
+					if (all_visible && *all_frozen &&
+						heap_tuple_needs_eventual_freeze(tuple.t_data))
+						*all_frozen = false;
+				}
+				break;
+
+			case HEAPTUPLE_DEAD:
+			case HEAPTUPLE_RECENTLY_DEAD:
+			case HEAPTUPLE_INSERT_IN_PROGRESS:
+			case HEAPTUPLE_DELETE_IN_PROGRESS:
+				{
+					all_visible = false;
+					*all_frozen = false;
+					break;
+				}
+			default:
+				elog(ERROR, "unexpected HeapTupleSatisfiesVacuum result");
+				break;
+		}
+	}							/* scan along page */
+
+	return all_visible;
+}
+
 /*
  * Main logic of HEAP and index relations cleaning
  */
@@ -408,24 +531,19 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		ItemId 			lp;
 		int				tnum;
 		bool			found_non_nbtree = false;
-		bool 			found;
 
 		Assert(item->hits > 0);
 
-		if (!got_SIGTERM && (item->lastXid > GetOldestXmin(NULL, PROCARRAY_FLAGS_VACUUM)) && (item->hits < 10))
+		if (!got_SIGTERM &&
+			(res->items->Header.ElementsMaxNum/SHASH_Entries(res->items) > 3) &&
+			(item->lastXid > GetOldestXmin(NULL, PROCARRAY_FLAGS_VACUUM)) &&
+			(item->hits < 10))
 		{
 			/*
-			 * Skip block cleaning and return it to a waiting list
+			 * Skip block cleaning and save it to a waiting list
 			 * for the next iteration.
 			 */
-			WorkerTask *new_item = (WorkerTask *)
-									SHASH_Search(AuxiliaryList,
-									(void *) &(item->blkno),
-									HASH_ENTER, &found);
-
-			Assert((new_item != NULL) && (!found));
-			new_item->hits = item->hits;
-			new_item->lastXid = item->lastXid;
+			save_to_list(AuxiliaryList, item);
 			continue;
 		}
 
@@ -449,24 +567,34 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		}
 
 		/* Create TID list */
-		buffer = ReadBuffer(heapRelation, item->blkno);
+		if (!got_SIGTERM)
+			buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, item->blkno, RBM_NORMAL_NO_READ, NULL);
+		else
+			buffer = ReadBuffer(heapRelation, item->blkno);
+
+		if (BufferIsInvalid(buffer))
+		{
+			/*
+			 * Buffer was already evicted from shared buffers
+			 */
+			Assert(!got_SIGTERM);
+			save_to_list(AuxiliaryList, item);
+			continue;
+		}
+
 		page = BufferGetPage(buffer);
 		if (!ConditionalLockBuffer(buffer))
 		{
-			/*
-			 * Can't lock buffer.
-			 * Skip block cleaning and return it to a waiting list
-			 * for the next iteration.
-			 */
-			WorkerTask *new_item = (WorkerTask *)
-									SHASH_Search(AuxiliaryList,
-									(void *) &(item->blkno),
-									HASH_ENTER, &found);
-
-			Assert((new_item != NULL) && !found);
-			new_item->hits = item->hits;
-			new_item->lastXid = item->lastXid;
+			/* Can't lock buffer. */
 			ReleaseBuffer(buffer);
+			save_to_list(AuxiliaryList, item);
+			continue;
+		}
+//		heap_page_prune_opt(heapRelation, buffer);
+		if (!IsBufferDirty(buffer))
+		{
+			/* Skip block if it is not dirty */
+			UnlockReleaseBuffer(buffer);
 			continue;
 		}
 
@@ -520,17 +648,16 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			OffsetNumber	unusable[MaxOffsetNumber];
 			int				nunusable = 0;
 			Size			freespace;
+			TransactionId	visibility_cutoff_xid;
+			bool			all_frozen;
+//			Buffer			vmbuffer = InvalidBuffer;
+
+//			visibilitymap_pin(heapRelation, item->blkno, &vmbuffer);
 
 			if (!ConditionalLockBufferForCleanup(buffer))
 			{
-				WorkerTask *new_item = (WorkerTask *)
-										SHASH_Search(AuxiliaryList,
-										(void *) &(item->blkno),
-										HASH_ENTER, &found);
-				Assert((new_item != NULL) && !found);
-				new_item->hits = item->hits;
-				new_item->lastXid = item->lastXid;
 				ReleaseBuffer(buffer);
+				save_to_list(AuxiliaryList, item);
 				continue;
 			}
 
@@ -549,19 +676,17 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 
 			if (nunusable > 0)
 			{
-				XLogRecPtr	recptr;
-
 				PageRepairFragmentation(page);
 				PageClearFull(page);
 				MarkBufferDirty(buffer);
 
 				if (RelationNeedsWAL(heapRelation))
 				{
-					recptr = log_heap_clean(heapRelation, buffer,
-									NULL, 0,
-									NULL, 0,
-									unusable, nunusable,
-									InvalidTransactionId);
+					XLogRecPtr	recptr = log_heap_clean(heapRelation, buffer,
+														NULL, 0,
+														NULL, 0,
+														unusable, nunusable,
+														InvalidTransactionId);
 
 					PageSetLSN(BufferGetPage(buffer), recptr);
 				}
@@ -571,6 +696,27 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 
 			END_CRIT_SECTION();
 			freespace = PageGetHeapFreeSpace(page);
+			if (heap_page_is_all_visible(heapRelation, buffer, &visibility_cutoff_xid, &all_frozen))
+				PageSetAllVisible(page);
+			/*
+			if (PageIsAllVisible(page))
+			{
+				uint8		vm_status = visibilitymap_get_status(heapRelation, item->blkno, &vmbuffer);
+				uint8		flags = 0;
+
+				if ((vm_status & VISIBILITYMAP_ALL_VISIBLE) == 0)
+					flags |= VISIBILITYMAP_ALL_VISIBLE;
+				if ((vm_status & VISIBILITYMAP_ALL_FROZEN) == 0 && all_frozen)
+					flags |= VISIBILITYMAP_ALL_FROZEN;
+
+				Assert(BufferIsValid(vmbuffer));
+				if (flags != 0)
+					visibilitymap_set(heapRelation, item->blkno, buffer, InvalidXLogRecPtr,
+									  vmbuffer, visibility_cutoff_xid, flags);
+
+				ReleaseBuffer(vmbuffer);
+			}
+*/
 			UnlockReleaseBuffer(buffer);
 			RecordPageWithFreeSpace(heapRelation, item->blkno, freespace);
 			pgstat_update_heap_dead_tuples(heapRelation, nunusable);
@@ -1003,12 +1149,10 @@ backend_store_dirty_block(CleanerMessage *msg)
 		ctl.HashFunc = CleanerMessageHashFunc;
 		ctl.CompFunc = isEqualMsgs;
 		dblocks = SHASH_Create(ctl);
-		elog(LOG, "SHASH_Create: %lu", SHASH_Entries(dblocks));
 	}
 
 	/* Search for new position or for duplicates */
 	rec = (CleanerMessage *) SHASH_Search(dblocks, (void *) msg, SHASH_ENTER, &found);
-	elog(LOG, "SHASH_Add: %lu sz=%lu st=%d", SHASH_Entries(dblocks), dblocks->HTableSize, dblocks->state[0]);
 
 	if (!rec)
 		return true;
@@ -1221,6 +1365,10 @@ HeapCleanerWorkerMain(int argc, char *argv[])
 
 			worker_stat = SHASH_Create(ctl);
 		}
+
+		/* Add tracking info to pgstat */
+		pgstat_progress_start_command(PROGRESS_COMMAND_CLEANER, MyWorkerInfo->dbOid);
+
 		main_worker_loop();
 	}
 	else
@@ -1531,7 +1679,7 @@ main_launcher_loop()
 				 * and to work on further.
 				 */
 				if (SHASH_Entries(wTab[worker->id]) > 0)
-					timeout = 1L;
+					timeout = 5L;
 
 				if (!dlist_has_next(&HeapCleanerShmem->runningWorkers, node))
 					break;
@@ -1713,6 +1861,7 @@ main_worker_loop(void)
 					 */
 					hashent->items = SHASH_Create(shctl);
 					dirty_relation[dirty_relations_num++] = hashent;
+					pgstat_progress_update_param(PROGRESS_CLEANER_RELATIONS, SHASH_Entries(PrivateRelationsTable));
 				}
 
 				/*
@@ -1741,6 +1890,7 @@ main_worker_loop(void)
 		PG_TRY();
 		{
 			int relcounter;
+			int64 stat_tot_item = 0;
 
 			/* Pass along dirty relations and try to clean it */
 			for (relcounter = 0; relcounter < dirty_relations_num; relcounter++)
@@ -1754,10 +1904,11 @@ main_worker_loop(void)
 				 * Some blocks from the list may blocked by a backend.
 				 * Deferred its for next cleanup attempt.
 				 */
-				if (SHASH_Entries(dirty_relation[relcounter]->items) > 0)
-					timeout = 1L;
+				if ((stat_tot_item += SHASH_Entries(dirty_relation[relcounter]->items)) > 0)
+					timeout = 10L;
 			}
 
+			pgstat_progress_update_param(PROGRESS_CLEANER_TOTAL_ITEMS, stat_tot_item);
 			QueryCancelPending = false;
 		}
 		PG_CATCH();
@@ -1786,6 +1937,7 @@ main_worker_loop(void)
 			proc_exit(1);
 	}
 
+	pgstat_progress_end_command();
 	stat_collector_print();
 	proc_exit(0);
 }

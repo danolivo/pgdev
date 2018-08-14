@@ -333,6 +333,7 @@ extern void LocalPrefetchBuffer(SMgrRelation smgr, ForkNumber forkNum,
 extern BufferDesc *LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum,
 				 BlockNumber blockNum, bool *foundPtr);
 extern void MarkLocalBufferDirty(Buffer buffer);
+extern bool IsLocalBufferDirty(Buffer buffer);
 extern void DropRelFileNodeLocalBuffers(RelFileNode rnode, ForkNumber forkNum,
 							BlockNumber firstDelBlock);
 extern void DropRelFileNodeAllLocalBuffers(RelFileNode rnode);

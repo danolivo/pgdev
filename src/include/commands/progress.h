@@ -34,4 +34,8 @@
 #define PROGRESS_VACUUM_PHASE_TRUNCATE			5
 #define PROGRESS_VACUUM_PHASE_FINAL_CLEANUP		6
 
+/* Progress parameters for cleaner */
+#define PROGRESS_CLEANER_RELATIONS				0
+#define	PROGRESS_CLEANER_TOTAL_ITEMS			1
+
 #endif
