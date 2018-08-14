@@ -245,7 +245,6 @@ static void SIGUSR2_Handler(SIGNAL_ARGS);
 static void backend_send_dirty_blocks(void);
 
 /* Functions for debug purposes */
-static void worker_stat_add_block(Oid reloid, BlockNumber blkno, uint16 hits, int dead_tuples_num);
 static void stat_collector_print(void);
 
 #ifdef EXEC_BACKEND
@@ -336,113 +335,6 @@ save_to_list(PSHTAB AuxiliaryList, WorkerTask *item)
 	Assert((new_item != NULL) && (!found));
 	new_item->hits = item->hits;
 	new_item->lastXid = item->lastXid;
-}
-
-static bool
-heap_page_is_all_visible(Relation rel, Buffer buf,
-						 TransactionId *visibility_cutoff_xid,
-						 bool *all_frozen)
-{
-	Page		page = BufferGetPage(buf);
-	BlockNumber blockno = BufferGetBlockNumber(buf);
-	OffsetNumber offnum,
-				maxoff;
-	bool		all_visible = true;
-	TransactionId	OldestXmin = GetOldestXmin(rel, PROCARRAY_FLAGS_VACUUM);
-
-	*visibility_cutoff_xid = InvalidTransactionId;
-	*all_frozen = true;
-
-	/*
-	 * This is a stripped down version of the line pointer scan in
-	 * lazy_scan_heap(). So if you change anything here, also check that code.
-	 */
-	maxoff = PageGetMaxOffsetNumber(page);
-	for (offnum = FirstOffsetNumber;
-		 offnum <= maxoff && all_visible;
-		 offnum = OffsetNumberNext(offnum))
-	{
-		ItemId		itemid;
-		HeapTupleData tuple;
-
-		itemid = PageGetItemId(page, offnum);
-
-		/* Unused or redirect line pointers are of no interest */
-		if (!ItemIdIsUsed(itemid) || ItemIdIsRedirected(itemid))
-			continue;
-
-		ItemPointerSet(&(tuple.t_self), blockno, offnum);
-
-		/*
-		 * Dead line pointers can have index pointers pointing to them. So
-		 * they can't be treated as visible
-		 */
-		if (ItemIdIsDead(itemid))
-		{
-			all_visible = false;
-			*all_frozen = false;
-			break;
-		}
-
-		Assert(ItemIdIsNormal(itemid));
-
-		tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemid);
-		tuple.t_len = ItemIdGetLength(itemid);
-		tuple.t_tableOid = RelationGetRelid(rel);
-
-		switch (HeapTupleSatisfiesVacuum(&tuple, OldestXmin, buf))
-		{
-			case HEAPTUPLE_LIVE:
-				{
-					TransactionId xmin;
-
-					/* Check comments in lazy_scan_heap. */
-					if (!HeapTupleHeaderXminCommitted(tuple.t_data))
-					{
-						all_visible = false;
-						*all_frozen = false;
-						break;
-					}
-
-					/*
-					 * The inserter definitely committed. But is it old enough
-					 * that everyone sees it as committed?
-					 */
-					xmin = HeapTupleHeaderGetXmin(tuple.t_data);
-					if (!TransactionIdPrecedes(xmin, OldestXmin))
-					{
-						all_visible = false;
-						*all_frozen = false;
-						break;
-					}
-
-					/* Track newest xmin on page. */
-					if (TransactionIdFollows(xmin, *visibility_cutoff_xid))
-						*visibility_cutoff_xid = xmin;
-
-					/* Check whether this tuple is already frozen or not */
-					if (all_visible && *all_frozen &&
-						heap_tuple_needs_eventual_freeze(tuple.t_data))
-						*all_frozen = false;
-				}
-				break;
-
-			case HEAPTUPLE_DEAD:
-			case HEAPTUPLE_RECENTLY_DEAD:
-			case HEAPTUPLE_INSERT_IN_PROGRESS:
-			case HEAPTUPLE_DELETE_IN_PROGRESS:
-				{
-					all_visible = false;
-					*all_frozen = false;
-					break;
-				}
-			default:
-				elog(ERROR, "unexpected HeapTupleSatisfiesVacuum result");
-				break;
-		}
-	}							/* scan along page */
-
-	return all_visible;
 }
 
 /*
@@ -590,7 +482,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			save_to_list(AuxiliaryList, item);
 			continue;
 		}
-//		heap_page_prune_opt(heapRelation, buffer);
+
 		if (!IsBufferDirty(buffer))
 		{
 			/* Skip block if it is not dirty */
@@ -648,11 +540,6 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			OffsetNumber	unusable[MaxOffsetNumber];
 			int				nunusable = 0;
 			Size			freespace;
-			TransactionId	visibility_cutoff_xid;
-			bool			all_frozen;
-//			Buffer			vmbuffer = InvalidBuffer;
-
-//			visibilitymap_pin(heapRelation, item->blkno, &vmbuffer);
 
 			if (!ConditionalLockBufferForCleanup(buffer))
 			{
@@ -690,33 +577,11 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 
 					PageSetLSN(BufferGetPage(buffer), recptr);
 				}
-
-				worker_stat_add_block(res->relid, item->blkno, item->hits, nunusable);
 			}
 
 			END_CRIT_SECTION();
 			freespace = PageGetHeapFreeSpace(page);
-			if (heap_page_is_all_visible(heapRelation, buffer, &visibility_cutoff_xid, &all_frozen))
-				PageSetAllVisible(page);
-			/*
-			if (PageIsAllVisible(page))
-			{
-				uint8		vm_status = visibilitymap_get_status(heapRelation, item->blkno, &vmbuffer);
-				uint8		flags = 0;
 
-				if ((vm_status & VISIBILITYMAP_ALL_VISIBLE) == 0)
-					flags |= VISIBILITYMAP_ALL_VISIBLE;
-				if ((vm_status & VISIBILITYMAP_ALL_FROZEN) == 0 && all_frozen)
-					flags |= VISIBILITYMAP_ALL_FROZEN;
-
-				Assert(BufferIsValid(vmbuffer));
-				if (flags != 0)
-					visibilitymap_set(heapRelation, item->blkno, buffer, InvalidXLogRecPtr,
-									  vmbuffer, visibility_cutoff_xid, flags);
-
-				ReleaseBuffer(vmbuffer);
-			}
-*/
 			UnlockReleaseBuffer(buffer);
 			RecordPageWithFreeSpace(heapRelation, item->blkno, freespace);
 			pgstat_update_heap_dead_tuples(heapRelation, nunusable);
@@ -2143,38 +2008,6 @@ CleanerMessageHashFunc(void *key, uint64 size, uint64 base)
 	sum += DefaultHashValueFunc(&msg->blkno, sizeof(BlockNumber), base);
 
 	return sum%base;
-}
-
-static void
-worker_stat_add_block(Oid reloid, BlockNumber blkno, uint16 hits, int dead_tuples_num)
-{
-	stat_struct	bucket;
-	stat_struct	*rec;
-	bool		found;
-
-	Assert(MyWorkerInfo != NULL);
-
-	bucket.dbOid = MyWorkerInfo->dbOid;
-	bucket.reloid = reloid;
-	bucket.blkno = blkno;
-
-	rec = (stat_struct *) SHASH_Search(worker_stat, &bucket, SHASH_ENTER, &found);
-	if (rec == NULL)
-	{
-		elog(LOG, "BGHEAP worker_stat structure is full.");
-		return;
-	}
-
-	if (!found)
-	{
-		rec->hits = 0;
-		rec->tuples_removed = 0;
-		rec->cleaning_cycles = 0;
-	}
-
-	rec->hits += hits;
-	rec->tuples_removed += dead_tuples_num;
-	rec->cleaning_cycles++;
 }
 
 static void
