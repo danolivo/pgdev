@@ -908,7 +908,8 @@ CREATE VIEW pg_stat_progress_cleaner AS
 		S.pid AS pid, S.datid AS datid, D.datname AS datname,
 		S.relid AS relid,
 		S.param1 AS relations, S.param2 AS queue_len, S.param3 AS false_hits,
-		S.param4 AS cleaned_tuples, S.param5 AS vainly_cleaned_tuples
+		S.param4 AS cleaned_tuples, S.param5 AS vainly_cleaned_tuples,
+		S.param6 AS missed_tuples
     FROM pg_stat_get_progress_info('CLEANER') AS S
 		LEFT JOIN pg_database D ON S.datid = D.oid;
 

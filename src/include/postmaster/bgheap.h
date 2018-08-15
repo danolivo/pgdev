@@ -9,8 +9,6 @@
 #define SRC_INCLUDE_ACCESS_BGHEAP_H_
 
 #include "storage/block.h"
-#include "storage/off.h"
-//#include "storage/relfilenode.h"
 
 #ifdef EXEC_BACKEND
 extern void HeapCleanerLauncherIAm(void);

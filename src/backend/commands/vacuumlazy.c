@@ -1776,7 +1776,6 @@ quick_vacuum_index(Relation irel, Relation hrel,
 
 	econtext->ecxt_scantuple = slot;
 
-//	memset(found, 0, num_dead_tuples*sizeof(bool));
 	/* Get tuple from heap */
 	for (tnum = num_dead_tuples-1; tnum >= 0; tnum--)
 	{
@@ -1829,24 +1828,8 @@ quick_vacuum_index(Relation irel, Relation hrel,
 		ivinfo.found_dead_tuples = found;
 
 		index_target_delete(&ivinfo, &stats, values, isnull);
-//		if (!found[tnum])
-//			elog(LOG, "NOT FOUND");
 	}
-//	{
-//		int c = 0, tc;
-//		for (tnum = num_dead_tuples-1; tnum >= 0; tnum--)
-//		{
-//			if (!found[tnum])
-//			{
-//				c++;
-//				tc = tnum;
-//			}
-//		}
-///		if (c > 0)
-//			elog(LOG, "NOT FOUND: %d/%d (%d)",c, num_dead_tuples, tc);
-//		else if (num_dead_tuples > 1)
-//			elog(LOG, "FOUND: %d/%d (%d)",c, num_dead_tuples, tc);
-//	}
+
 	ExecDropSingleTupleTableSlot(slot);
 	FreeExecutorState(estate);
 	pfree(found);

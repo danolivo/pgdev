@@ -145,32 +145,10 @@ typedef struct DirtyRelation
 	SHTAB		*items;
 } DirtyRelation;
 
-/*
- * Structure for debug purposes only
- */
-typedef struct stat_struct
-{
-	/* - hash key - */
-	Oid			dbOid;
-	Oid			reloid;
-	BlockNumber	blkno;
-
-	/* --- DATA --- */
-	int		hits;
-	int 	tuples_removed;
-	int		cleaning_cycles;
-} stat_struct;
-
-static PSHTAB	worker_stat = NULL;
-static int		vainly_cleaned_tuples = 0;
+static int		stat_vainly_cleaned_tuples = 0;
 static uint64	stat_total_deletions = 0;
 static int		stat_false_block_hits = 0;
-static int		worker_total_hits_received = 0;
-static int		worker_waiting_lists_hits = 0;
-static int		launcher_total_received_hits = 0;
-static uint32	MissedBlocksNum = 0;
-
-static void launcher_stat_print(void);
+static uint32	stat_missed_blocks = 0;
 
 static MemoryContext BGHeapMemCxt = NULL;
 
@@ -186,8 +164,6 @@ static bool am_heapcleaner_worker = false;
 int heapcleaner_max_workers = 10;
 static WorkerInfo MyWorkerInfo = NULL;
 static HeapCleanerShmemStruct *HeapCleanerShmem;
-static dlist_head DatabaseList = DLIST_STATIC_INIT(DatabaseList);
-static MemoryContext DatabaseListCxt = NULL;
 
 /*
  * Hash table for collection of dirty blocks after heap_page_prune() action
@@ -504,8 +480,8 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			/*
 			 * Block is clear. Accumulate some stats and continue.
 			 */
-			vainly_cleaned_tuples += item->hits;
-			pgstat_progress_update_param(PROGRESS_CLEANER_VAINLY_CLEANED_TUPLES, vainly_cleaned_tuples);
+			stat_vainly_cleaned_tuples += item->hits;
+			pgstat_progress_update_param(PROGRESS_CLEANER_VAINLY_CLEANED_TUPLES, stat_vainly_cleaned_tuples);
 			ReleaseBuffer(buffer);
 			continue;
 		}
@@ -945,10 +921,6 @@ HeapCleanerLauncherMain(int argc, char *argv[])
 		/* Flush any leaked data in the top-level context */
 		MemoryContextResetAndDeleteChildren(bgheap_context);
 
-		/* don't leave dangling pointers to freed memory */
-		DatabaseListCxt = NULL;
-		dlist_init(&DatabaseList);
-
 		/*
 		 * Make sure pgstat also considers our stat data as gone.  Note: we
 		 * mustn't use autovac_refresh_stats here.
@@ -1215,20 +1187,6 @@ HeapCleanerWorkerMain(int argc, char *argv[])
 
 		PrivateRelationsTable = SHASH_Create(pr_ctl);
 
-		if (worker_stat == NULL)
-		{
-			SHTABCTL ctl;
-
-			ctl.ElementsMaxNum = 100000;
-			ctl.FillFactor = 0.5;
-			ctl.HashFunc = CleanerMessageHashFunc;
-			ctl.CompFunc = DefaultCompareFunc;
-			ctl.ElementSize = sizeof(stat_struct);
-			ctl.KeySize = 2 * sizeof(Oid) + sizeof(BlockNumber);
-
-			worker_stat = SHASH_Create(ctl);
-		}
-
 		/* Add tracking info to pgstat */
 		pgstat_progress_start_command(PROGRESS_COMMAND_CLEANER, MyWorkerInfo->dbOid);
 
@@ -1336,7 +1294,6 @@ look_for_worker(Oid dbNode)
 static void
 main_launcher_loop()
 {
-	uint32	TmpMissedBlocksNumber = MissedBlocksNum;
 	bool	found;
 	long	timeout = -1L;
 
@@ -1360,11 +1317,6 @@ main_launcher_loop()
 
 		timeout = -1L;
 
-		if (TmpMissedBlocksNumber != MissedBlocksNum)
-		{
-//			elog(LOG, "Missed blocks: cur=%d delta=%d", MissedBlocksNum, MissedBlocksNum-TmpMissedBlocksNumber);
-			TmpMissedBlocksNumber = MissedBlocksNum;
-		}
 		/* Process system signals */
 		if (got_SIGHUP)
 		{
@@ -1396,7 +1348,6 @@ main_launcher_loop()
 			 */
 			for (mptr = table; ((char *)mptr-(char *)table) < len; mptr++)
 			{
-				launcher_total_received_hits += mptr->hits;
 				worker = look_for_worker(mptr->dbNode);
 				if (worker)
 					msg = (CleanerMessage *) SHASH_Search(wTab[worker->id], mptr, SHASH_ENTER, &found);
@@ -1407,7 +1358,7 @@ main_launcher_loop()
 					/*
 					 * Hash table is FULL and we can't insert a message
 					 */
-					MissedBlocksNum++;
+					stat_missed_blocks++;
 				else if (found)
 				{
 					msg->hits++;
@@ -1446,7 +1397,7 @@ main_launcher_loop()
 						else
 							memcpy(temp_msg, msg, sizeof(CleanerMessage));
 					else
-						MissedBlocksNum++;
+						stat_missed_blocks++;
 
 					/*
 					 * Message gone to worker. delete from main waiting list.
@@ -1579,17 +1530,8 @@ main_launcher_loop()
 		}
 	}
 
-	launcher_stat_print();
 	elog(LOG, "Heap Launcher exit with 0");
 	proc_exit(0);
-}
-
-static void
-launcher_stat_print(void)
-{
-	FILE *f = fopen("/home/andrey/stat.txt", "a+");
-	fprintf(f, "TOTAL hits received: %d\n", launcher_total_received_hits);
-	fclose(f);
 }
 
 /*
@@ -1601,7 +1543,6 @@ main_worker_loop(void)
 	CleanerMessage	task_item[WORKER_TASK_ITEMS_MAX];
 	DirtyRelation	*dirty_relation[WORKER_RELATIONS_MAX_NUM];
 	PSHTAB			FreeDirtyBlocksList;
-	uint32			TmpMissedBlocksNumber = 0;
 	long			timeout = -1L;
 	int				dirty_relations_num = 0;
 	int				task_items_num = 0;
@@ -1632,12 +1573,6 @@ main_worker_loop(void)
 			/* It is needed only for wakeup worker */
 			got_SIGUSR2 = false;
 
-		if (TmpMissedBlocksNumber != MissedBlocksNum)
-		{
-//			elog(LOG, "WORKER Missed blocks: cur=%d delta=%d", MissedBlocksNum, MissedBlocksNum-TmpMissedBlocksNumber);
-			TmpMissedBlocksNumber = MissedBlocksNum;
-		}
-
 		/*
 		 * Move task items from shared buffer to local and release it for
 		 * new data.
@@ -1663,12 +1598,13 @@ main_worker_loop(void)
 			bool			found;
 			int				i;
 
+			pgstat_progress_update_param(PROGRESS_CLEANER_MISSED_BLOCKS, stat_missed_blocks);
+
 			/* Pass across items and sort by relation */
 			for (i = 0; i < task_items_num; i++)
 			{
 				WorkerTask	*item;
 
-				worker_total_hits_received += task_item[i].hits;
 				hashent = SHASH_Search(PrivateRelationsTable,
 								  (void *) &(task_item[i].relid), HASH_FIND, NULL);
 
@@ -1698,7 +1634,7 @@ main_worker_loop(void)
 						}
 
 						/* Save stats about not cleaned blocks */
-						MissedBlocksNum += SHASH_Entries(dirty_relation[pos]->items);
+						stat_missed_blocks += SHASH_Entries(dirty_relation[pos]->items);
 
 						elog(LOG, "Remove slot %d with id=%d nitems=%lu. Set new relation id=%d",pos, dirty_relation[pos]->relid, SHASH_Entries(dirty_relation[pos]->items), task_item[i].relid);
 						hashent = SHASH_Search(PrivateRelationsTable,
@@ -1733,7 +1669,7 @@ main_worker_loop(void)
 				 */
 				item = (WorkerTask *) SHASH_Search(hashent->items, (void *) &(task_item[i].blkno), HASH_ENTER, &found);
 				if (item == NULL)
-					MissedBlocksNum++;
+					stat_missed_blocks++;
 				else
 				{
 					if (!found)
@@ -1741,7 +1677,7 @@ main_worker_loop(void)
 						item->hits = 0;
 						item->lastXid = InvalidTransactionId;
 					}
-					worker_waiting_lists_hits += task_item[i].hits;
+
 					item->hits += task_item[i].hits;
 					Assert(item->hits > 0);
 					item->lastXid = (item->lastXid > task_item[i].xid) ? item->lastXid : task_item[i].xid;

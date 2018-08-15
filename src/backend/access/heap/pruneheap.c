@@ -413,7 +413,6 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 				heap_prune_record_dead(prstate, rootoffnum);
 				HeapTupleHeaderAdvanceLatestRemovedXid(htup,
 													   &prstate->latestRemovedXid);
-//				ndeleted++;
 			}
 
 			/* Nothing more to do */
