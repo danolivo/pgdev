@@ -162,14 +162,11 @@ typedef struct stat_struct
 } stat_struct;
 
 static PSHTAB	worker_stat = NULL;
-static int		worker_zero_cleaned_blocks_num = 0;
-static int		worker_zero_cleaned_hits_num = 0;
-static int		worker_not_found_blocks_num = 0;
-static int		worker_not_found_blocks_hits = 0;
+static int		vainly_cleaned_tuples = 0;
+static uint64	stat_total_deletions = 0;
+static int		stat_false_block_hits = 0;
 static int		worker_total_hits_received = 0;
 static int		worker_waiting_lists_hits = 0;
-static int		worker_tuple_dead_but_HOT = 0;
-static int		worker_tuple_recently_dead = 0;
 static int		launcher_total_received_hits = 0;
 static uint32	MissedBlocksNum = 0;
 
@@ -243,9 +240,6 @@ static void SIGHUP_Handler(SIGNAL_ARGS);
 static void SIGTERM_Handler(SIGNAL_ARGS);
 static void SIGUSR2_Handler(SIGNAL_ARGS);
 static void backend_send_dirty_blocks(void);
-
-/* Functions for debug purposes */
-static void stat_collector_print(void);
 
 #ifdef EXEC_BACKEND
 /*
@@ -346,7 +340,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	Relation		heapRelation;
 	Relation   		*IndexRelations;
 	int				nindexes;
-	LOCKMODE		lockmode = AccessShareLock;
+	LOCKMODE		lockmode = ExclusiveLock/*AccessShareLock*/;
 	WorkerTask		*item;
 
 	Assert(res != NULL);
@@ -453,8 +447,8 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			 * Skip cleaning and drop block from waiting list.
 			 * Accumulate some stats before continue.
 			 */
-			worker_not_found_blocks_num++;
-			worker_not_found_blocks_hits += item->hits;
+			stat_false_block_hits += item->hits;
+			pgstat_progress_update_param(PROGRESS_CLEANER_FALSE_HITS, stat_false_block_hits);
 			continue;
 		}
 
@@ -474,7 +468,6 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			continue;
 		}
 
-		page = BufferGetPage(buffer);
 		if (!ConditionalLockBuffer(buffer))
 		{
 			/* Can't lock buffer. */
@@ -490,13 +483,15 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			continue;
 		}
 
+		page = BufferGetPage(buffer);
+
 		/* Collect dead tuples TID's */
 		for (offnum = FirstOffsetNumber;
 			 offnum < PageGetMaxOffsetNumber(page);
 			 offnum = OffsetNumberNext(offnum))
 		{
 			lp = PageGetItemId(page, offnum);
-			if (ItemIdIsDead(lp) /*&& ItemIdHasStorage(lp)*/)
+			if (ItemIdIsDead(lp)/* && ItemIdHasStorage(lp)*/)
 			{
 				ItemPointerSet(&(dead_tuples[num_dead_tuples]), item->blkno, offnum);
 				num_dead_tuples++;
@@ -509,8 +504,8 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			/*
 			 * Block is clear. Accumulate some stats and continue.
 			 */
-			worker_zero_cleaned_blocks_num++;
-			worker_zero_cleaned_hits_num += item->hits;
+			vainly_cleaned_tuples += item->hits;
+			pgstat_progress_update_param(PROGRESS_CLEANER_VAINLY_CLEANED_TUPLES, vainly_cleaned_tuples);
 			ReleaseBuffer(buffer);
 			continue;
 		}
@@ -527,7 +522,8 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 				continue;
 			}
 
-			quick_vacuum_index(IndexRelations[irnum], heapRelation,
+			quick_vacuum_index(IndexRelations[irnum],
+							   heapRelation,
 							   dead_tuples,
 							   num_dead_tuples);
 		}
@@ -577,6 +573,8 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 
 					PageSetLSN(BufferGetPage(buffer), recptr);
 				}
+				stat_total_deletions += nunusable;
+				pgstat_progress_update_param(PROGRESS_CLEANER_TOTAL_DELETIONS, stat_total_deletions);
 			}
 
 			END_CRIT_SECTION();
@@ -591,7 +589,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		 */
 	}
 
-	vac_close_indexes(nindexes, IndexRelations, NoLock);
+	vac_close_indexes(nindexes, IndexRelations, RowExclusiveLock/*NoLock*/);
 	relation_close(heapRelation, lockmode);
 	CommitTransactionCommand();
 
@@ -1364,7 +1362,7 @@ main_launcher_loop()
 
 		if (TmpMissedBlocksNumber != MissedBlocksNum)
 		{
-			elog(LOG, "Missed blocks: cur=%d delta=%d", MissedBlocksNum, MissedBlocksNum-TmpMissedBlocksNumber);
+//			elog(LOG, "Missed blocks: cur=%d delta=%d", MissedBlocksNum, MissedBlocksNum-TmpMissedBlocksNumber);
 			TmpMissedBlocksNumber = MissedBlocksNum;
 		}
 		/* Process system signals */
@@ -1636,7 +1634,7 @@ main_worker_loop(void)
 
 		if (TmpMissedBlocksNumber != MissedBlocksNum)
 		{
-			elog(LOG, "WORKER Missed blocks: cur=%d delta=%d", MissedBlocksNum, MissedBlocksNum-TmpMissedBlocksNumber);
+//			elog(LOG, "WORKER Missed blocks: cur=%d delta=%d", MissedBlocksNum, MissedBlocksNum-TmpMissedBlocksNumber);
 			TmpMissedBlocksNumber = MissedBlocksNum;
 		}
 
@@ -1755,7 +1753,7 @@ main_worker_loop(void)
 		PG_TRY();
 		{
 			int relcounter;
-			int64 stat_tot_item = 0;
+			int64 stat_tot_wait_queue_len = 0;
 
 			/* Pass along dirty relations and try to clean it */
 			for (relcounter = 0; relcounter < dirty_relations_num; relcounter++)
@@ -1769,11 +1767,11 @@ main_worker_loop(void)
 				 * Some blocks from the list may blocked by a backend.
 				 * Deferred its for next cleanup attempt.
 				 */
-				if ((stat_tot_item += SHASH_Entries(dirty_relation[relcounter]->items)) > 0)
+				if ((stat_tot_wait_queue_len += SHASH_Entries(dirty_relation[relcounter]->items)) > 0)
 					timeout = 10L;
 			}
 
-			pgstat_progress_update_param(PROGRESS_CLEANER_TOTAL_ITEMS, stat_tot_item);
+			pgstat_progress_update_param(PROGRESS_CLEANER_TOTAL_QUEUE_LENGTH, stat_tot_wait_queue_len);
 			QueryCancelPending = false;
 		}
 		PG_CATCH();
@@ -1803,7 +1801,6 @@ main_worker_loop(void)
 	}
 
 	pgstat_progress_end_command();
-	stat_collector_print();
 	proc_exit(0);
 }
 
@@ -2008,61 +2005,4 @@ CleanerMessageHashFunc(void *key, uint64 size, uint64 base)
 	sum += DefaultHashValueFunc(&msg->blkno, sizeof(BlockNumber), base);
 
 	return sum%base;
-}
-
-static void
-stat_collector_print(void)
-{
-	stat_struct	*rec;
-	FILE *f = fopen("/home/andrey/stat.txt", "a+");
-	int	total_removed_tuples = 0;
-	int	total_hits = 0;
-	int total_blocks_cleaned = 0;
-
-	fprintf(f, "\n\n--------- WORKER ----------------\n");
-
-	for (SHASH_SeqReset(worker_stat);
-		(rec = SHASH_SeqNext(worker_stat)) != NULL; )
-	{
-		Assert(rec->hits > 0);
-
-		total_hits += rec->hits;
-		total_blocks_cleaned += rec->cleaning_cycles;
-		total_removed_tuples += rec->tuples_removed;
-	}
-
-	fprintf(f, "worker_total_hits_received: %d\n", worker_total_hits_received);
-	fprintf(f, "WORKER total waiting_lists_hits: %d\n", worker_waiting_lists_hits);
-	fprintf(f, "TOTAL BLOCKS Cleaned: %lu (%d with cycles)\n", SHASH_Entries(worker_stat), total_blocks_cleaned);
-	fprintf(f, "TOTAL HITS/REMOVED => %d/%d (%6.2f percent)\n", total_hits, total_removed_tuples, 100.*(float)total_removed_tuples/(float)total_hits);
-	fprintf(f, "vainly cleaned blocks: %d (%d hits)\n", worker_zero_cleaned_blocks_num, worker_zero_cleaned_hits_num);
-	fprintf(f, "worker_tuple_dead_but_HOT=%d, worker_tuple_recently_dead=%d\n", worker_tuple_dead_but_HOT, worker_tuple_recently_dead);
-	fprintf(f, "BLOCKS NOT FOUND: %d (%d hits)\n", worker_not_found_blocks_num, worker_not_found_blocks_hits);
-
-	fprintf(f, "IN-Memory waiting list: %lu relations\n", SHASH_Entries(PrivateRelationsTable));
-
-	if (SHASH_Entries(PrivateRelationsTable) > 0)
-	{
-		DirtyRelation	*list;
-
-		/* Get stat about blocks in waiting lists */
-		for (SHASH_SeqReset(PrivateRelationsTable);
-			(list = SHASH_SeqNext(PrivateRelationsTable)) != NULL; )
-		{
-			WorkerTask	*item;
-			int			total_inmem_blocks = 0;
-			int			total_inmem_hints = 0;
-
-			fprintf(f, "WORKER: Relation: %d, pos: %lu\n", list->relid, PrivateRelationsTable->SeqScanCurElem);
-			for (SHASH_SeqReset(list->items);
-				(item = SHASH_SeqNext(list->items)) != NULL; )
-			{
-				total_inmem_blocks++;
-				total_inmem_hints += item->hits;
-			}
-			fprintf(f, "WORKER: total_inmem_blocks=%d, total_inmem_hints=%d, MissedBlocksNum: %d\n",
-					total_inmem_blocks, total_inmem_hints, MissedBlocksNum);
-		}
-	}
-	fclose(f);
 }

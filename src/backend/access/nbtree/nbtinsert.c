@@ -493,6 +493,11 @@ _bt_check_unique(Relation rel, IndexTuple itup, Relation heapRel,
 					if (heap_hot_search(&htid, heapRel, SnapshotSelf, NULL))
 					{
 						/* Normal case --- it's still live */
+						elog(LOG, "It's still alive. off=%d BLK:(%d, %d)",
+								offset,
+								ItemPointerGetBlockNumber(&(itup->t_tid)),
+								ItemPointerGetOffsetNumber(&(itup->t_tid))
+						);
 					}
 					else
 					{
@@ -2522,7 +2527,21 @@ _bt_vacuum_one_page(Relation rel, Buffer buffer, Relation heapRel)
 		ItemId		itemId = PageGetItemId(page, offnum);
 
 		if (ItemIdIsDead(itemId))
+		{
 			deletable[ndeletable++] = offnum;
+/*			elog(LOG, "BACKEND remove (%d, %d) from index relation.",
+					BufferGetBlockNumber(buffer),
+					offnum
+					);
+			if (ItemIdHasStorage(itemId))
+			{
+				IndexTuple itup1 = (IndexTuple) PageGetItem(page, itemId);
+				elog(LOG, "-> HEAP tid: (%d, %d)",
+									ItemPointerGetBlockNumber(&(itup1->t_tid)),
+									ItemPointerGetOffsetNumber(&(itup1->t_tid))
+									);
+			}*/
+		}
 	}
 
 	if (ndeletable > 0)
