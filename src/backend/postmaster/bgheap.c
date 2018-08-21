@@ -146,7 +146,10 @@ typedef struct DirtyRelation
 } DirtyRelation;
 
 static int		stat_vainly_cleaned_tuples = 0;
+static int		stat_vainly_cleaned_blocks = 0;
 static uint64	stat_total_deletions = 0;
+static uint64	stat_total_cleaned_blocks = 0;
+static uint64	stat_not_acquired_locks = 0;
 static int		stat_false_block_hits = 0;
 static uint32	stat_missed_blocks = 0;
 
@@ -316,7 +319,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	Relation		heapRelation;
 	Relation   		*IndexRelations;
 	int				nindexes;
-	LOCKMODE		lockmode = ExclusiveLock/*AccessShareLock*/;
+	LOCKMODE		lockmode = /* ExclusiveLock */AccessShareLock;
 	WorkerTask		*item;
 
 	Assert(res != NULL);
@@ -375,9 +378,6 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		return AuxiliaryList;
 	}
 
-	/* Open and lock index relations correspond to the heap relation */
-	vac_open_indexes(heapRelation, RowExclusiveLock, &nindexes, &IndexRelations);
-
 	/* Main cleanup cycle */
 	for (SHASH_SeqReset(res->items);
 		 (item = (WorkerTask *) SHASH_SeqNext(res->items)) != NULL; )
@@ -397,8 +397,8 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		Assert(item->hits > 0);
 
 		if (!got_SIGTERM &&
-			(res->items->Header.ElementsMaxNum/SHASH_Entries(res->items) > 3) &&
-			(item->lastXid > GetOldestXmin(NULL, PROCARRAY_FLAGS_VACUUM)) &&
+			(res->items->Header.ElementsMaxNum/SHASH_Entries(res->items) > 2) /*&&
+			(item->lastXid > GetOldestXmin(NULL, PROCARRAY_FLAGS_VACUUM))*/ &&
 			(item->hits < 10))
 		{
 			/*
@@ -446,6 +446,9 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 
 		if (!ConditionalLockBuffer(buffer))
 		{
+			stat_not_acquired_locks++;
+			pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
+
 			/* Can't lock buffer. */
 			ReleaseBuffer(buffer);
 			save_to_list(AuxiliaryList, item);
@@ -482,9 +485,14 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			 */
 			stat_vainly_cleaned_tuples += item->hits;
 			pgstat_progress_update_param(PROGRESS_CLEANER_VAINLY_CLEANED_TUPLES, stat_vainly_cleaned_tuples);
+			stat_vainly_cleaned_blocks++;
+			pgstat_progress_update_param(PROGRESS_CLEANER_VAINLY_CLEANED_BLOCKS, stat_vainly_cleaned_blocks);
 			ReleaseBuffer(buffer);
 			continue;
 		}
+
+		/* Open and lock index relations correspond to the heap relation */
+		vac_open_indexes(heapRelation, /*RowExclusiveLock*/ExclusiveLock, &nindexes, &IndexRelations);
 
 		/* Iterate across all index relations */
 		for (irnum = 0; irnum < nindexes; irnum++)
@@ -503,6 +511,8 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 							   dead_tuples,
 							   num_dead_tuples);
 		}
+
+		vac_close_indexes(nindexes, IndexRelations, ExclusiveLock/*RowExclusiveLock*//*NoLock*/);
 
 		/*
 		 * If heap relation has not only b-tree indexes, can't clean heap block.
@@ -550,7 +560,9 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 					PageSetLSN(BufferGetPage(buffer), recptr);
 				}
 				stat_total_deletions += nunusable;
+				stat_total_cleaned_blocks++;
 				pgstat_progress_update_param(PROGRESS_CLEANER_TOTAL_DELETIONS, stat_total_deletions);
+				pgstat_progress_update_param(PROGRESS_CLEANER_CLEANED_BLOCKS, stat_total_cleaned_blocks);
 			}
 
 			END_CRIT_SECTION();
@@ -565,7 +577,6 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		 */
 	}
 
-	vac_close_indexes(nindexes, IndexRelations, RowExclusiveLock/*NoLock*/);
 	relation_close(heapRelation, lockmode);
 	CommitTransactionCommand();
 
