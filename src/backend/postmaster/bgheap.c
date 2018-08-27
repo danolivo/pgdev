@@ -66,7 +66,7 @@
  * Maximum number of task items in storage at a backend side before shipping to a
  * background heap cleaner
  */
-#define BACKEND_DIRTY_ITEMS_MAX			(50)
+#define BACKEND_DIRTY_ITEMS_MAX			(10)
 
 /*
  * Maximum number of task items in waiting list at a Launcher side.
@@ -1421,7 +1421,7 @@ main_launcher_loop()
 		 * timeout, check latches and go to next iteration.
 		 */
 		if (SHASH_Entries(wTab[heapcleaner_max_workers]) > 0)
-			timeout = 10L;
+			timeout = 1L;
 
 		/*
 		 * See waiting lists of active workers and try to send messages.
@@ -1493,7 +1493,7 @@ main_launcher_loop()
 				 * and to work on further.
 				 */
 				if (SHASH_Entries(wTab[worker->id]) > 0)
-					timeout = 10L;
+					timeout = 1L;
 
 				if (!dlist_has_next(&HeapCleanerShmem->runningWorkers, node))
 					break;
@@ -1505,7 +1505,7 @@ main_launcher_loop()
 			 */
 			if (timeout < 0)
 				/* We only need to wait idle workers */
-				timeout = 1000L;
+				timeout = 100L;
 		}
 		LWLockRelease(HeapCleanerLock);
 
@@ -1704,7 +1704,7 @@ main_worker_loop(void)
 				 * Deferred its for next cleanup attempt.
 				 */
 				if ((stat_tot_wait_queue_len += SHASH_Entries(dirty_relation[relcounter]->items)) > 0)
-					timeout = 100L;
+					timeout = 10L;
 			}
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_TOTAL_QUEUE_LENGTH, stat_tot_wait_queue_len);
