@@ -66,7 +66,7 @@
  * Maximum number of task items in storage at a backend side before shipping to a
  * background heap cleaner
  */
-#define BACKEND_DIRTY_ITEMS_MAX			(20)
+#define BACKEND_DIRTY_ITEMS_MAX			(50)
 
 /*
  * Maximum number of task items in waiting list at a Launcher side.
@@ -74,12 +74,12 @@
  * messages exceed this, we ignore the remains and increase counter of missed
  * items.
  */
-#define WAITING_MESSAGES_MAX_NUM		(100)
+#define WAITING_MESSAGES_MAX_NUM		(100000)
 
 /*
  * Maximum number of dirty blocks which can keep a worker for each relation
  */
-#define WORKER_DIRTYBLOCKS_MAX_NUM		(1000)
+#define WORKER_DIRTYBLOCKS_MAX_NUM		(100000)
 
 /* Maximum number of slots for dirty relations */
 #define WORKER_RELATIONS_MAX_NUM		(100)
@@ -127,7 +127,7 @@ typedef struct WorkerInfoData
 typedef struct WorkerInfoData *WorkerInfo;
 
 /*
- * Shared memory lists.
+ * Shared memory info about workers pool.
  * Launcher get an element from freeWorkers list and init startingWorker value.
  * Worker set startingWorker to NULL value after startup and add himself
  * to runningWorkers list.
@@ -319,7 +319,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	Relation		heapRelation;
 	Relation   		*IndexRelations;
 	int				nindexes;
-	LOCKMODE		lockmode = /* ExclusiveLock */AccessShareLock;
+	LOCKMODE		lockmode = /* ExclusiveLock */ /*AccessShareLock*/NoLock;
 	WorkerTask		*item;
 
 	Assert(res != NULL);
@@ -395,19 +395,6 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		bool			found_non_nbtree = false;
 
 		Assert(item->hits > 0);
-
-		if (!got_SIGTERM &&
-			(res->items->Header.ElementsMaxNum/SHASH_Entries(res->items) > 2) /*&&
-			(item->lastXid > GetOldestXmin(NULL, PROCARRAY_FLAGS_VACUUM))*/ &&
-			(item->hits < 10))
-		{
-			/*
-			 * Skip block cleaning and save it to a waiting list
-			 * for the next iteration.
-			 */
-			save_to_list(AuxiliaryList, item);
-			continue;
-		}
 
 		needLock = !RELATION_IS_LOCAL(heapRelation);
 		if (needLock)
@@ -527,6 +514,8 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			{
 				ReleaseBuffer(buffer);
 				save_to_list(AuxiliaryList, item);
+				stat_not_acquired_locks++;
+				pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
 				continue;
 			}
 
@@ -1432,7 +1421,7 @@ main_launcher_loop()
 		 * timeout, check latches and go to next iteration.
 		 */
 		if (SHASH_Entries(wTab[heapcleaner_max_workers]) > 0)
-			timeout = 1L;
+			timeout = 10L;
 
 		/*
 		 * See waiting lists of active workers and try to send messages.
@@ -1504,7 +1493,7 @@ main_launcher_loop()
 				 * and to work on further.
 				 */
 				if (SHASH_Entries(wTab[worker->id]) > 0)
-					timeout = 5L;
+					timeout = 10L;
 
 				if (!dlist_has_next(&HeapCleanerShmem->runningWorkers, node))
 					break;
@@ -1516,7 +1505,7 @@ main_launcher_loop()
 			 */
 			if (timeout < 0)
 				/* We only need to wait idle workers */
-				timeout = 100L;
+				timeout = 1000L;
 		}
 		LWLockRelease(HeapCleanerLock);
 
@@ -1715,7 +1704,7 @@ main_worker_loop(void)
 				 * Deferred its for next cleanup attempt.
 				 */
 				if ((stat_tot_wait_queue_len += SHASH_Entries(dirty_relation[relcounter]->items)) > 0)
-					timeout = 10L;
+					timeout = 100L;
 			}
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_TOTAL_QUEUE_LENGTH, stat_tot_wait_queue_len);

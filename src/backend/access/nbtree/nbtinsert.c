@@ -493,8 +493,10 @@ _bt_check_unique(Relation rel, IndexTuple itup, Relation heapRel,
 					if (heap_hot_search(&htid, heapRel, SnapshotSelf, NULL))
 					{
 						/* Normal case --- it's still live */
-						elog(LOG, "It's still alive. off=%d BLK:(%d, %d)",
+						elog(LOG, "It's still alive. off=%d cur: (%d, %d) next: (%d, %d)",
 								offset,
+								ItemPointerGetBlockNumber(&(curitup->t_tid)),
+								ItemPointerGetOffsetNumber(&(curitup->t_tid)),
 								ItemPointerGetBlockNumber(&(itup->t_tid)),
 								ItemPointerGetOffsetNumber(&(itup->t_tid))
 						);
