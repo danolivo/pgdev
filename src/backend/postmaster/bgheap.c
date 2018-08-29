@@ -150,7 +150,7 @@ static int		stat_vainly_cleaned_blocks = 0;
 static uint64	stat_total_deletions = 0;
 static uint64	stat_total_cleaned_blocks = 0;
 static uint64	stat_not_acquired_locks = 0;
-static int		stat_false_block_hits = 0;
+static int		stat_buf_ninmem = 0;
 static uint32	stat_missed_blocks = 0;
 
 static MemoryContext BGHeapMemCxt = NULL;
@@ -404,16 +404,11 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			UnlockRelationForExtension(heapRelation, ExclusiveLock);
 
 		if (item->blkno >= nblocks)
-		{
 			/*
 			 * Block was deleted early.
 			 * Skip cleaning and drop block from waiting list.
-			 * Accumulate some stats before continue.
 			 */
-			stat_false_block_hits += item->hits;
-			pgstat_progress_update_param(PROGRESS_CLEANER_FALSE_HITS, stat_false_block_hits);
 			continue;
-		}
 
 		/* Create TID list */
 		if (!got_SIGTERM)
@@ -427,6 +422,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			 * Buffer was already evicted from shared buffers
 			 */
 			Assert(!got_SIGTERM);
+			stat_buf_ninmem++;
 			save_to_list(AuxiliaryList, item);
 			continue;
 		}
@@ -1691,6 +1687,8 @@ main_worker_loop(void)
 			int relcounter;
 			int64 stat_tot_wait_queue_len = 0;
 
+			stat_buf_ninmem = 0;
+
 			/* Pass along dirty relations and try to clean it */
 			for (relcounter = 0; relcounter < dirty_relations_num; relcounter++)
 			{
@@ -1707,6 +1705,7 @@ main_worker_loop(void)
 					timeout = 5L;
 			}
 
+			pgstat_progress_update_param(PROGRESS_CLEANER_BUF_NINMEM, stat_buf_ninmem);
 			pgstat_progress_update_param(PROGRESS_CLEANER_TOTAL_QUEUE_LENGTH, stat_tot_wait_queue_len);
 			QueryCancelPending = false;
 		}
