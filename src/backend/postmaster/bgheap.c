@@ -479,7 +479,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		}
 
 		/* Open and lock index relations correspond to the heap relation */
-		vac_open_indexes(heapRelation, /*RowExclusiveLock*/ExclusiveLock, &nindexes, &IndexRelations);
+		vac_open_indexes(heapRelation, /*RowExclusiveLock*//*ExclusiveLock*/ShareLock, &nindexes, &IndexRelations);
 
 		/* Iterate across all index relations */
 		for (irnum = 0; irnum < nindexes; irnum++)
@@ -499,7 +499,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 							   num_dead_tuples);
 		}
 
-		vac_close_indexes(nindexes, IndexRelations, ExclusiveLock/*RowExclusiveLock*//*NoLock*/);
+		vac_close_indexes(nindexes, IndexRelations, ShareLock/*ExclusiveLock*//*RowExclusiveLock*//*NoLock*/);
 
 		/*
 		 * If heap relation has not only b-tree indexes, can't clean heap block.
