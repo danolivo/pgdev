@@ -411,9 +411,9 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			continue;
 
 		/* Create TID list */
-		if (!got_SIGTERM)
-			buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, item->blkno, RBM_NORMAL_NO_READ, NULL);
-		else
+//		if (!got_SIGTERM)
+//			buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, item->blkno, RBM_NORMAL_NO_READ, NULL);
+//		else
 			buffer = ReadBuffer(heapRelation, item->blkno);
 
 		if (BufferIsInvalid(buffer))
@@ -1702,7 +1702,7 @@ main_worker_loop(void)
 				 * Deferred its for next cleanup attempt.
 				 */
 				if ((stat_tot_wait_queue_len += SHASH_Entries(dirty_relation[relcounter]->items)) > 0)
-					timeout = 5L;
+					timeout = 20L;
 			}
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_BUF_NINMEM, stat_buf_ninmem);
