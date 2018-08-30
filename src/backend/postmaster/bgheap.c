@@ -1557,7 +1557,7 @@ main_worker_loop(void)
 	{
 		int	rc;
 
-//		timeout = -1L;
+		timeout = -1L;
 
 		if (got_SIGHUP)
 		{
@@ -1593,6 +1593,9 @@ main_worker_loop(void)
 			DirtyRelation	*hashent;
 			bool			found;
 			int				i;
+
+			/* */
+			timeout = 1L;
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_MISSED_BLOCKS, stat_missed_blocks);
 
@@ -1701,15 +1704,9 @@ main_worker_loop(void)
 				 * Some blocks from the list may blocked by a backend.
 				 * Deferred its for next cleanup attempt.
 				 */
-				if ((stat_tot_wait_queue_len += SHASH_Entries(dirty_relation[relcounter]->items)) > 0)
-					timeout /= 2;
-			}
-			if (stat_tot_wait_queue_len == 0)
-			{
-				if (timeout > 1L)
-					timeout *= 2;
-				else
-					timeout = -1L;
+				if (((stat_tot_wait_queue_len += SHASH_Entries(dirty_relation[relcounter]->items)) > 0) &&
+					(timeout < 0))
+					timeout = 20L;
 			}
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_TIMEOUT, timeout);
