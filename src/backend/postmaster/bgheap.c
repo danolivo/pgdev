@@ -445,8 +445,9 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
 
 			/* Can't lock buffer. */
-			ReleaseBuffer(buffer);
+			UnlockReleaseBuffer(buffer);
 			save_to_list(AuxiliaryList, item);
+			continue;
 		}
 //		heap_page_prune_opt(heapRelation, buffer);
 //		OldestXmin = TransactionIdLimitedForOldSnapshots(RecentGlobalDataXmin, heapRelation);
