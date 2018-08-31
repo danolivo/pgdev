@@ -411,9 +411,9 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			continue;
 
 		/* Create TID list */
-		if (!got_SIGTERM)
-			buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, item->blkno, RBM_NORMAL_NO_READ, NULL);
-		else
+//		if (!got_SIGTERM)
+//			buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, item->blkno, RBM_NORMAL_NO_READ, NULL);
+//		else
 			buffer = ReadBuffer(heapRelation, item->blkno);
 
 		if (BufferIsInvalid(buffer))
@@ -1541,7 +1541,6 @@ main_worker_loop(void)
 	PSHTAB			FreeDirtyBlocksList;
 	long			timeout = -1L;
 	int				dirty_relations_num = 0;
-	int				task_items_num = 0;
 	SHTABCTL		shctl;
 
 	shctl.FillFactor = 0.75;
@@ -1556,6 +1555,7 @@ main_worker_loop(void)
 	while (!got_SIGTERM || (timeout > 0))
 	{
 		int	rc;
+		int	incoming_items_num = 0;
 
 		timeout = -1L;
 
@@ -1578,8 +1578,8 @@ main_worker_loop(void)
 		LWLockAcquire(&MyWorkerInfo->WorkItemLock, LW_SHARED);
 		if (MyWorkerInfo->nitems > 0)
 		{
-			task_items_num = MyWorkerInfo->nitems;
-			memcpy(task_item, MyWorkerInfo->buffer, task_items_num*sizeof(CleanerMessage));
+			incoming_items_num = MyWorkerInfo->nitems;
+			memcpy(task_item, MyWorkerInfo->buffer, incoming_items_num*sizeof(CleanerMessage));
 			MyWorkerInfo->nitems = 0;
 		}
 		LWLockRelease(&MyWorkerInfo->WorkItemLock);
@@ -1588,19 +1588,19 @@ main_worker_loop(void)
 		 * If launcher receive some task items it need to distribute between
 		 * workers and waiting lists.
 		 */
-		if (task_items_num > 0)
+		if (incoming_items_num > 0)
 		{
 			DirtyRelation	*hashent;
 			bool			found;
 			int				i;
 
 			/* */
-			timeout = 1L;
+			timeout = 2L;
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_MISSED_BLOCKS, stat_missed_blocks);
 
 			/* Pass across items and sort by relation */
-			for (i = 0; i < task_items_num; i++)
+			for (i = 0; i < incoming_items_num; i++)
 			{
 				WorkerTask	*item;
 
@@ -1682,7 +1682,7 @@ main_worker_loop(void)
 					item->lastXid = (item->lastXid > task_item[i].xid) ? item->lastXid : task_item[i].xid;
 				}
 			}
-			task_items_num = 0;
+			incoming_items_num = 0;
 		}
 
 		PG_TRY();
