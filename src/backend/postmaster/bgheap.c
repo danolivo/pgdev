@@ -321,7 +321,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	int				nindexes;
 	LOCKMODE		lockmode = /* ExclusiveLock */ /*AccessShareLock*/NoLock;
 	WorkerTask		*item;
-	TransactionId	OldestXmin;// = TransactionIdLimitedForOldSnapshots(RecentGlobalDataXmin, relation);//GetOldestXmin(NULL, PROCARRAY_FLAGS_VACUUM);
+	TransactionId	OldestXmin = GetOldestXmin(NULL, PROCARRAY_FLAGS_VACUUM);
 
 	Assert(res != NULL);
 	Assert(res->items != NULL);
@@ -439,9 +439,17 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			save_to_list(AuxiliaryList, item);
 			continue;
 		}
+		if (!TransactionIdPrecedesOrEquals(item->lastXid, OldestXmin))
+		{
+			stat_not_acquired_locks++;
+			pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
 
+			/* Can't lock buffer. */
+			ReleaseBuffer(buffer);
+			save_to_list(AuxiliaryList, item);
+		}
 //		heap_page_prune_opt(heapRelation, buffer);
-		OldestXmin = TransactionIdLimitedForOldSnapshots(RecentGlobalDataXmin, heapRelation);
+//		OldestXmin = TransactionIdLimitedForOldSnapshots(RecentGlobalDataXmin, heapRelation);
 		heap_page_prune(heapRelation, buffer, OldestXmin,
 						false, &latestRemovedXid);
 //		if (!IsBufferDirty(buffer))
