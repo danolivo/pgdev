@@ -321,6 +321,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	int				nindexes;
 	LOCKMODE		lockmode = /* ExclusiveLock */ /*AccessShareLock*/NoLock;
 	WorkerTask		*item;
+	TransactionId	OldestXmin = GetOldestXmin(NULL, PROCARRAY_FLAGS_VACUUM);
 
 	Assert(res != NULL);
 	Assert(res->items != NULL);
@@ -393,6 +394,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		ItemId 			lp;
 		int				tnum;
 		bool			found_non_nbtree = false;
+		TransactionId	latestRemovedXid;
 
 		Assert(item->hits > 0);
 
@@ -438,7 +440,9 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			continue;
 		}
 
-		heap_page_prune_opt(heapRelation, buffer);
+//		heap_page_prune_opt(heapRelation, buffer);
+		heap_page_prune(heapRelation, buffer, OldestXmin,
+						false, &latestRemovedXid);
 //		if (!IsBufferDirty(buffer))
 //		{
 //			stat_not_acquired_locks++;
