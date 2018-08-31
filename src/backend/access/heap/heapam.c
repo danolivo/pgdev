@@ -60,6 +60,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "port/atomics.h"
+#include "postmaster/bgheap.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
@@ -3401,6 +3402,8 @@ l1:
 
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
+	HeapCleanerSend(relation, block);
+
 	if (vmbuffer != InvalidBuffer)
 		ReleaseBuffer(vmbuffer);
 
@@ -4119,6 +4122,7 @@ l2:
 
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
+		HeapCleanerSend(relation, block);
 		/*
 		 * Let the toaster do its thing, if needed.
 		 *

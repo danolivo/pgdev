@@ -438,6 +438,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			continue;
 		}
 
+		heap_page_prune_opt(heapRelation, buffer);
 //		if (!IsBufferDirty(buffer))
 //		{
 //			stat_not_acquired_locks++;
