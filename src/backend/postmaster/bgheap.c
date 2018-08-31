@@ -440,6 +440,8 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 
 		if (!IsBufferDirty(buffer))
 		{
+			stat_not_acquired_locks++;
+			pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
 			/* Skip block if it is not dirty */
 			UnlockReleaseBuffer(buffer);
 			continue;
