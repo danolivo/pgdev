@@ -1742,7 +1742,7 @@ main_worker_loop(void)
 				 */
 				if (((stat_tot_wait_queue_len += SHASH_Entries(dirty_relation[relcounter]->items)) > 0) &&
 					(timeout < 0))
-					timeout = 50L;
+					timeout = 1L;
 			}
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_TIMEOUT, timeout);
