@@ -414,7 +414,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		TransactionId	latestRemovedXid;
 
 		Assert(item->hits > 0);
-		Assert(TransactionIdIsValid(item->lastXid));
+//		Assert(TransactionIdIsValid(item->lastXid));
 
 		needLock = !RELATION_IS_LOCAL(heapRelation);
 		if (needLock)
