@@ -385,14 +385,14 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	}
 
 	OldestXmin = GetOldestXmin(heapRelation, PROCARRAY_FLAGS_VACUUM);
-
+elog(LOG, "OldestXmin: %u : %u", OldestXmin, TransactionIdLimitedForOldSnapshots(OldestXmin, heapRelation)
+		);
 	Assert(TransactionIdIsValid(OldestXmin));
 	/* Main cleanup cycle */
 	for (SHASH_SeqReset(res->items);
 		 (item = (WorkerTask *) SHASH_SeqNext(res->items)) != NULL; )
 	{
 		BlockNumber		nblocks;
-		bool			needLock;
 		Buffer			buffer;
 		ItemPointerData	dead_tuples[MaxOffsetNumber];
 		int				num_dead_tuples = 0;
@@ -407,12 +407,12 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		Assert(item->hits > 0);
 //		Assert(TransactionIdIsValid(item->lastXid));
 
-		needLock = !RELATION_IS_LOCAL(heapRelation);
-		if (needLock)
-			LockRelationForExtension(heapRelation, ExclusiveLock);
+//		needLock = !RELATION_IS_LOCAL(heapRelation);
+//		if (needLock)
+//			LockRelationForExtension(heapRelation, ExclusiveLock);
 		nblocks = RelationGetNumberOfBlocks(heapRelation);
-		if (needLock)
-			UnlockRelationForExtension(heapRelation, ExclusiveLock);
+//		if (needLock)
+//			UnlockRelationForExtension(heapRelation, ExclusiveLock);
 
 		if (item->blkno >= nblocks)
 			/*
@@ -461,7 +461,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			continue;
 		}
 
-		(void) heap_page_prune(heapRelation, buffer, OldestXmin, false, &latestRemovedXid);
+//		(void) heap_page_prune(heapRelation, buffer, OldestXmin, false, &latestRemovedXid);
 
 //		if (!IsBufferDirty(buffer))
 //		{
