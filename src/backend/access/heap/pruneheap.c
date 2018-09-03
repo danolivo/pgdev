@@ -157,7 +157,7 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 
 			/* OK to prune */
 			(void) heap_page_prune(relation, buffer, OldestXmin, true, &ignore);
-//			if (IsBufferDirty(buffer))
+			if (IsBufferDirty(buffer))
 			HeapCleanerSend(relation, BufferGetBlockNumber(buffer));
 		}
 

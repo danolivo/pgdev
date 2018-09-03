@@ -383,18 +383,9 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		SHASH_Clean(res->items);
 		return AuxiliaryList;
 	}
-//	OldestXmin = TransactionIdLimitedForOldSnapshots(GetOldestXmin(heapRelation, PROCARRAY_FLAGS_VACUUM), heapRelation);
+
 	OldestXmin = GetOldestXmin(heapRelation, PROCARRAY_FLAGS_VACUUM);
-//	OldestXmin = TransactionIdLimitedForOldSnapshots(RecentGlobalDataXmin, heapRelation);
-//	OldestXmin = RecentGlobalXmin;
-/*	if (IsCatalogRelation(heapRelation) ||
-		RelationIsAccessibleInLogicalDecoding(heapRelation))
-		OldestXmin = RecentGlobalXmin;
-	else
-		OldestXmin =
-			TransactionIdLimitedForOldSnapshots(RecentGlobalDataXmin,
-					heapRelation);
-*/
+
 	Assert(TransactionIdIsValid(OldestXmin));
 	/* Main cleanup cycle */
 	for (SHASH_SeqReset(res->items);
@@ -430,17 +421,6 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			 */
 			continue;
 
-		/*
-		 * stop cleaning if page was changed by transaction after OldestXmin. In
-		 * this case there is high probability that we can't do anything usefull
-		 * with it. Let we return to clean later.
-		 */
-		if ((!got_SIGTERM) && (!TransactionIdPrecedesOrEquals(item->lastXid, OldestXmin)))
-		{
-			save_to_list(AuxiliaryList, item);
-			continue;
-		}
-
 		/* Create TID list */
 		if (!got_SIGTERM)
 			buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, item->blkno, RBM_NORMAL_NO_READ, NULL);
@@ -458,6 +438,18 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			continue;
 		}
 
+		/*
+		 * stop cleaning if page was changed by transaction after OldestXmin. In
+		 * this case there is high probability that we can't do anything usefull
+		 * with it. Let we return to clean later.
+		 */
+		if (!got_SIGTERM && !IsBufferDirty(buffer) && (!TransactionIdPrecedesOrEquals(item->lastXid, OldestXmin)))
+		{
+			ReleaseBuffer(buffer);
+			save_to_list(AuxiliaryList, item);
+			continue;
+		}
+
 		if (!ConditionalLockBufferForCleanup(buffer))
 		{
 			stat_not_acquired_locks++;
@@ -471,14 +463,14 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 
 		(void) heap_page_prune(heapRelation, buffer, OldestXmin, false, &latestRemovedXid);
 
-		if (!IsBufferDirty(buffer))
-		{
+//		if (!IsBufferDirty(buffer))
+//		{
 //			stat_not_acquired_locks++;
 //			pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
 			/* Skip block if it is not dirty */
-			UnlockReleaseBuffer(buffer);
-			continue;
-		}
+//			UnlockReleaseBuffer(buffer);
+//			continue;
+//		}
 
 		page = BufferGetPage(buffer);
 
