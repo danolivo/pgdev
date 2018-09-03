@@ -1740,8 +1740,7 @@ main_worker_loop(void)
 				 * Some blocks from the list may blocked by a backend.
 				 * Deferred its for next cleanup attempt.
 				 */
-				if (((stat_tot_wait_queue_len += SHASH_Entries(dirty_relation[relcounter]->items)) > 0) &&
-					(timeout < 0))
+				if ((stat_tot_wait_queue_len += SHASH_Entries(dirty_relation[relcounter]->items)) > 0)
 					timeout = 1L;
 			}
 
