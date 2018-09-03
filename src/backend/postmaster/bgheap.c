@@ -319,9 +319,9 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	Relation		heapRelation;
 	Relation   		*IndexRelations;
 	int				nindexes;
-	LOCKMODE		lockmode = ExclusiveLock /* AccessShareLock;//NoLock */;
+	LOCKMODE		lockmode = /*ExclusiveLock*/ /* AccessShareLock;*/NoLock;
 	WorkerTask		*item;
-	TransactionId	OldestXmin;
+//	TransactionId	OldestXmin;
 
 	Assert(res != NULL);
 	Assert(res->items != NULL);
@@ -382,7 +382,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		return AuxiliaryList;
 	}
 //	OldestXmin = TransactionIdLimitedForOldSnapshots(GetOldestXmin(heapRelation, PROCARRAY_FLAGS_VACUUM), heapRelation);
-	OldestXmin = TransactionIdLimitedForOldSnapshots(RecentGlobalDataXmin, heapRelation);
+//	OldestXmin = TransactionIdLimitedForOldSnapshots(RecentGlobalDataXmin, heapRelation);
 
 	/* Main cleanup cycle */
 	for (SHASH_SeqReset(res->items);
@@ -417,12 +417,12 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			 */
 			continue;
 
-		if (!got_SIGTERM && !TransactionIdPrecedesOrEquals(item->lastXid, OldestXmin))
-		{
+//		if (!got_SIGTERM && !TransactionIdPrecedesOrEquals(item->lastXid, OldestXmin))
+//		{
 //			ReleaseBuffer(buffer);
-			save_to_list(AuxiliaryList, item);
-			continue;
-		}
+//			save_to_list(AuxiliaryList, item);
+//			continue;
+//		}
 
 		/* Create TID list */
 		if (!got_SIGTERM)
@@ -441,6 +441,15 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			continue;
 		}
 
+		if (!IsBufferDirty(buffer))
+		{
+//			stat_not_acquired_locks++;
+//			pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
+			/* Skip block if it is not dirty */
+			ReleaseBuffer(buffer);
+			continue;
+		}
+
 		if (!ConditionalLockBuffer(buffer))
 		{
 			stat_not_acquired_locks++;
@@ -452,20 +461,10 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			continue;
 		}
 
-
 //		heap_page_prune_opt(heapRelation, buffer);
 //		elog(LOG, "OldestXmin: %u, item->lastXid: %u, O1: %u", OldestXmin, item->lastXid, TransactionIdLimitedForOldSnapshots(RecentGlobalDataXmin, heapRelation));
-		heap_page_prune(heapRelation, buffer, OldestXmin,
-						true, &latestRemovedXid);
-
-		if (!IsBufferDirty(buffer))
-		{
-//			stat_not_acquired_locks++;
-//			pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
-			/* Skip block if it is not dirty */
-			UnlockReleaseBuffer(buffer);
-			continue;
-		}
+//		heap_page_prune(heapRelation, buffer, OldestXmin,
+//						true, &latestRemovedXid);
 
 		page = BufferGetPage(buffer);
 
