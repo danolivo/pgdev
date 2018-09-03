@@ -334,6 +334,62 @@ analyze_rel(Oid relid, RangeVar *relation, int options,
 	LWLockRelease(ProcArrayLock);
 }
 
+static void
+deep_analyze_rel(Relation rel)
+{
+	int nblocks = RelationGetNumberOfBlocks(rel);
+	int i;
+	int	TotalDeadTuples = 0;
+	int	CleanBlocks = 0;
+
+	ereport(LOG,
+				(errmsg("Deep analyze of table \"%s",
+						RelationGetRelationName(rel))));
+
+	for (i = 1; i < nblocks; i++)
+	{
+		Buffer			buffer = ReadBuffer(rel, i);
+		Page			page = BufferGetPage(buffer);
+		OffsetNumber	offnum;
+		int				DeadTuples = 0;
+		int				HasStorage = 0;
+
+		for (offnum = FirstOffsetNumber;
+			 offnum < PageGetMaxOffsetNumber(page);
+			 offnum = OffsetNumberNext(offnum))
+		{
+			ItemId	lp = PageGetItemId(page, offnum);
+
+			if (ItemIdIsDead(lp))
+			{
+				DeadTuples++;
+				if (ItemIdHasStorage(lp))
+					HasStorage++;
+			}
+		}
+
+		TotalDeadTuples += DeadTuples;
+
+		if (DeadTuples > 0)
+		{
+			FILE *f = fopen("/home/andrey/log.log", "a+");
+			fprintf(f, "[%d/%d] DeadTuples: %d HasStorage=%d\n", i, nblocks, DeadTuples, HasStorage);
+			fclose(f);
+		} else
+		{
+			CleanBlocks++;
+		}
+
+		ReleaseBuffer(buffer);
+	}
+	{
+		FILE *f = fopen("/home/andrey/log.log", "a+");
+		fprintf(f, "TotalDeadTuples: %d. CleanBlocks: %d\n", TotalDeadTuples, CleanBlocks);
+		fprintf(f, "OldestXmin: %u. curxid=%u\n", GetOldestXmin(rel, PROCARRAY_FLAGS_VACUUM), GetCurrentTransactionIdIfAny());
+		fclose(f);
+	}
+
+}
 /*
  *	do_analyze_rel() -- analyze one relation, recursively or not
  *
@@ -732,6 +788,8 @@ do_analyze_rel(Relation onerel, int options, VacuumParams *params,
 	MemoryContextSwitchTo(caller_context);
 	MemoryContextDelete(anl_context);
 	anl_context = NULL;
+
+	deep_analyze_rel(onerel);
 }
 
 /*
