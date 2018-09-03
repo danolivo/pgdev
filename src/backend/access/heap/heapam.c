@@ -3402,7 +3402,7 @@ l1:
 
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
-	HeapCleanerSend(relation, block);
+//	HeapCleanerSend(relation, block);
 
 	if (vmbuffer != InvalidBuffer)
 		ReleaseBuffer(vmbuffer);
@@ -4122,7 +4122,6 @@ l2:
 
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
-		HeapCleanerSend(relation, block);
 		/*
 		 * Let the toaster do its thing, if needed.
 		 *
@@ -4400,6 +4399,8 @@ l2:
 	bms_free(id_attrs);
 	bms_free(modified_attrs);
 	bms_free(interesting_attrs);
+
+	HeapCleanerSend(relation, block);
 
 	return HeapTupleMayBeUpdated;
 }

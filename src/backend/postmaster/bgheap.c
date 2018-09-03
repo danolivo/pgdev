@@ -319,9 +319,9 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	Relation		heapRelation;
 	Relation   		*IndexRelations;
 	int				nindexes;
-	LOCKMODE		lockmode = /* ExclusiveLock */ /*AccessShareLock*/NoLock;
+	LOCKMODE		lockmode = ExclusiveLock /* AccessShareLock;//NoLock */;
 	WorkerTask		*item;
-	TransactionId	OldestXmin = GetOldestXmin(NULL, PROCARRAY_FLAGS_VACUUM);
+	TransactionId	OldestXmin;
 
 	Assert(res != NULL);
 	Assert(res->items != NULL);
@@ -340,6 +340,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	CHECK_FOR_INTERRUPTS();
 
 	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
 
 	/*
 	 * At this point relation availability is not guaranteed.
@@ -350,6 +351,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	if (!heapRelation)
 	{
 		elog(LOG, "[%d] Cleanup: UnSuccessful opening. Relation deleted? dbOid=%d", res->relid, MyWorkerInfo->dbOid);
+		PopActiveSnapshot();
 		CommitTransactionCommand();
 		SHASH_Clean(res->items);
 		return AuxiliaryList;
@@ -374,10 +376,13 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 					(errmsg("skipping \"%s\" --- only table or database owner can vacuum it",
 							RelationGetRelationName(heapRelation))));
 		relation_close(heapRelation, lockmode);
+		PopActiveSnapshot();
 		CommitTransactionCommand();
 		SHASH_Clean(res->items);
 		return AuxiliaryList;
 	}
+//	OldestXmin = TransactionIdLimitedForOldSnapshots(GetOldestXmin(heapRelation, PROCARRAY_FLAGS_VACUUM), heapRelation);
+	OldestXmin = TransactionIdLimitedForOldSnapshots(RecentGlobalDataXmin, heapRelation);
 
 	/* Main cleanup cycle */
 	for (SHASH_SeqReset(res->items);
@@ -412,10 +417,17 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			 */
 			continue;
 
+		if (!got_SIGTERM && !TransactionIdPrecedesOrEquals(item->lastXid, OldestXmin))
+		{
+//			ReleaseBuffer(buffer);
+			save_to_list(AuxiliaryList, item);
+			continue;
+		}
+
 		/* Create TID list */
-//		if (!got_SIGTERM)
-//			buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, item->blkno, RBM_NORMAL_NO_READ, NULL);
-//		else
+		if (!got_SIGTERM)
+			buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, item->blkno, RBM_NORMAL_NO_READ, NULL);
+		else
 			buffer = ReadBuffer(heapRelation, item->blkno);
 
 		if (BufferIsInvalid(buffer))
@@ -439,28 +451,21 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			save_to_list(AuxiliaryList, item);
 			continue;
 		}
-		if (!TransactionIdPrecedesOrEquals(item->lastXid, OldestXmin))
-		{
-			stat_not_acquired_locks++;
-			pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
 
-			/* Can't lock buffer. */
-			UnlockReleaseBuffer(buffer);
-			save_to_list(AuxiliaryList, item);
-			continue;
-		}
+
 //		heap_page_prune_opt(heapRelation, buffer);
-//		OldestXmin = TransactionIdLimitedForOldSnapshots(RecentGlobalDataXmin, heapRelation);
+//		elog(LOG, "OldestXmin: %u, item->lastXid: %u, O1: %u", OldestXmin, item->lastXid, TransactionIdLimitedForOldSnapshots(RecentGlobalDataXmin, heapRelation));
 		heap_page_prune(heapRelation, buffer, OldestXmin,
-						false, &latestRemovedXid);
-//		if (!IsBufferDirty(buffer))
-//		{
+						true, &latestRemovedXid);
+
+		if (!IsBufferDirty(buffer))
+		{
 //			stat_not_acquired_locks++;
 //			pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
 			/* Skip block if it is not dirty */
-//			UnlockReleaseBuffer(buffer);
-//			continue;
-//		}
+			UnlockReleaseBuffer(buffer);
+			continue;
+		}
 
 		page = BufferGetPage(buffer);
 
@@ -580,6 +585,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	}
 
 	relation_close(heapRelation, lockmode);
+	PopActiveSnapshot();
 	CommitTransactionCommand();
 
 	{
@@ -1106,7 +1112,7 @@ HeapCleanerSend(Relation relation, BlockNumber blkno)
 	msg.dbNode = relation->rd_node.dbNode;
 	msg.relid = RelationGetRelid(relation);
 	msg.blkno = blkno;
-	msg.xid = GetCurrentTransactionIdIfAny();
+	msg.xid = /*ReadNewTransactionId();*/ GetCurrentTransactionIdIfAny();
 
 	if (backend_store_dirty_block(&msg))
 		backend_send_dirty_blocks();
@@ -1612,7 +1618,7 @@ main_worker_loop(void)
 			int				i;
 
 			/* */
-			timeout = 2L;
+			timeout = 10L;
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_MISSED_BLOCKS, stat_missed_blocks);
 
@@ -1723,7 +1729,7 @@ main_worker_loop(void)
 				 */
 				if (((stat_tot_wait_queue_len += SHASH_Entries(dirty_relation[relcounter]->items)) > 0) &&
 					(timeout < 0))
-					timeout = 20L;
+					timeout = 50L;
 			}
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_TIMEOUT, timeout);
