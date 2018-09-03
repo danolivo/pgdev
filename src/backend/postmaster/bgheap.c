@@ -434,7 +434,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			 */
 			Assert(!got_SIGTERM);
 			stat_buf_ninmem++;
-			save_to_list(AuxiliaryList, item);
+//			save_to_list(AuxiliaryList, item);
 			continue;
 		}
 
