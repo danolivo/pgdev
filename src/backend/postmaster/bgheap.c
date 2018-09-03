@@ -443,12 +443,12 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		 * this case there is high probability that we can't do anything usefull
 		 * with it. Let we return to clean later.
 		 */
-		if (!got_SIGTERM && !IsBufferDirty(buffer) && (!TransactionIdPrecedesOrEquals(item->lastXid, OldestXmin)))
-		{
-			ReleaseBuffer(buffer);
-			save_to_list(AuxiliaryList, item);
-			continue;
-		}
+//		if (!got_SIGTERM && !IsBufferDirty(buffer) && (!TransactionIdPrecedesOrEquals(item->lastXid, OldestXmin)))
+//		{
+//			ReleaseBuffer(buffer);
+//			save_to_list(AuxiliaryList, item);
+//			continue;
+//		}
 
 		if (!ConditionalLockBufferForCleanup(buffer))
 		{
@@ -553,6 +553,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 				Assert(ItemIdIsDead(lp));
 				ItemIdSetUnused(lp);
 				unusable[nunusable++] = offnum;
+				elog(LOG, "AAA");
 			}
 
 			if (nunusable > 0)
