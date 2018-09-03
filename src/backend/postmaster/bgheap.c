@@ -310,6 +310,11 @@ save_to_list(PSHTAB AuxiliaryList, WorkerTask *item)
 	new_item->lastXid = item->lastXid;
 }
 
+#define STRATEGY_GENTLY			(0)
+#define STRATEGY_AGGRESSIVE		(1)
+
+static int strategy = STRATEGY_AGGRESSIVE;
+
 /*
  * Main logic of HEAP and index relations cleaning
  */
@@ -385,8 +390,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	}
 
 	OldestXmin = GetOldestXmin(heapRelation, PROCARRAY_FLAGS_VACUUM);
-elog(LOG, "OldestXmin: %u : %u", OldestXmin, TransactionIdLimitedForOldSnapshots(OldestXmin, heapRelation)
-		);
+
 	Assert(TransactionIdIsValid(OldestXmin));
 	/* Main cleanup cycle */
 	for (SHASH_SeqReset(res->items);
@@ -405,14 +409,8 @@ elog(LOG, "OldestXmin: %u : %u", OldestXmin, TransactionIdLimitedForOldSnapshots
 		TransactionId	latestRemovedXid;
 
 		Assert(item->hits > 0);
-//		Assert(TransactionIdIsValid(item->lastXid));
 
-//		needLock = !RELATION_IS_LOCAL(heapRelation);
-//		if (needLock)
-//			LockRelationForExtension(heapRelation, ExclusiveLock);
 		nblocks = RelationGetNumberOfBlocks(heapRelation);
-//		if (needLock)
-//			UnlockRelationForExtension(heapRelation, ExclusiveLock);
 
 		if (item->blkno >= nblocks)
 			/*
@@ -434,7 +432,7 @@ elog(LOG, "OldestXmin: %u : %u", OldestXmin, TransactionIdLimitedForOldSnapshots
 			 */
 			Assert(!got_SIGTERM);
 			stat_buf_ninmem++;
-//			save_to_list(AuxiliaryList, item);
+			save_to_list(AuxiliaryList, item);
 			continue;
 		}
 
@@ -443,34 +441,37 @@ elog(LOG, "OldestXmin: %u : %u", OldestXmin, TransactionIdLimitedForOldSnapshots
 		 * this case there is high probability that we can't do anything usefull
 		 * with it. Let we return to clean later.
 		 */
-//		if (!got_SIGTERM && !IsBufferDirty(buffer) && (!TransactionIdPrecedesOrEquals(item->lastXid, OldestXmin)))
-//		{
-//			ReleaseBuffer(buffer);
-//			save_to_list(AuxiliaryList, item);
-//			continue;
-//		}
-
-		if (!ConditionalLockBufferForCleanup(buffer))
+		if (!got_SIGTERM && !IsBufferDirty(buffer) && (!TransactionIdPrecedesOrEquals(item->lastXid, OldestXmin)))
 		{
-			stat_not_acquired_locks++;
-			pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
-
-			/* Can't lock buffer. */
 			ReleaseBuffer(buffer);
 			save_to_list(AuxiliaryList, item);
 			continue;
 		}
 
-//		(void) heap_page_prune(heapRelation, buffer, OldestXmin, false, &latestRemovedXid);
+		if (strategy == STRATEGY_GENTLY)
+		{
+			if (!ConditionalLockBufferForCleanup(buffer))
+			{
+				stat_not_acquired_locks++;
+				pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
 
-//		if (!IsBufferDirty(buffer))
-//		{
-//			stat_not_acquired_locks++;
-//			pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
+				/* Can't lock buffer. */
+				ReleaseBuffer(buffer);
+				save_to_list(AuxiliaryList, item);
+				continue;
+			}
+		}
+		else if (strategy == STRATEGY_AGGRESSIVE)
+			LockBufferForCleanup(buffer);
+
+		(void) heap_page_prune(heapRelation, buffer, OldestXmin, false, &latestRemovedXid);
+
+		if (!IsBufferDirty(buffer))
+		{
 			/* Skip block if it is not dirty */
-//			UnlockReleaseBuffer(buffer);
-//			continue;
-//		}
+			UnlockReleaseBuffer(buffer);
+			continue;
+		}
 
 		page = BufferGetPage(buffer);
 
@@ -533,14 +534,19 @@ elog(LOG, "OldestXmin: %u : %u", OldestXmin, TransactionIdLimitedForOldSnapshots
 			int				nunusable = 0;
 			Size			freespace;
 
-			if (!ConditionalLockBufferForCleanup(buffer))
+			if (strategy == STRATEGY_GENTLY)
 			{
-				ReleaseBuffer(buffer);
-				save_to_list(AuxiliaryList, item);
-				stat_not_acquired_locks++;
-				pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
-				continue;
+				if (!ConditionalLockBufferForCleanup(buffer))
+				{
+					ReleaseBuffer(buffer);
+					save_to_list(AuxiliaryList, item);
+					stat_not_acquired_locks++;
+					pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
+					continue;
+				}
 			}
+			else if (strategy == STRATEGY_AGGRESSIVE)
+				LockBufferForCleanup(buffer);
 
 			START_CRIT_SECTION();
 

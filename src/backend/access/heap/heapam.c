@@ -4400,7 +4400,7 @@ l2:
 	bms_free(modified_attrs);
 	bms_free(interesting_attrs);
 
-//	HeapCleanerSend(relation, block);
+	HeapCleanerSend(relation, block);
 
 	return HeapTupleMayBeUpdated;
 }
