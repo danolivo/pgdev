@@ -341,6 +341,7 @@ deep_analyze_rel(Relation rel)
 	int i;
 	int	TotalDeadTuples = 0;
 	int	CleanBlocks = 0;
+	int	DirtyBlocks = 0;
 
 	ereport(LOG,
 				(errmsg("Deep analyze of table \"%s",
@@ -353,6 +354,7 @@ deep_analyze_rel(Relation rel)
 		OffsetNumber	offnum;
 		int				DeadTuples = 0;
 		int				HasStorage = 0;
+		bool			DirtyBlock = false;
 
 		for (offnum = FirstOffsetNumber;
 			 offnum < PageGetMaxOffsetNumber(page);
@@ -362,18 +364,22 @@ deep_analyze_rel(Relation rel)
 
 			if (ItemIdIsDead(lp))
 			{
+				DirtyBlock = true;
 				DeadTuples++;
 				if (ItemIdHasStorage(lp))
 					HasStorage++;
 			}
 		}
 
+		if (DirtyBlock)
+			DirtyBlocks++;
+
 		TotalDeadTuples += DeadTuples;
 
 		if (DeadTuples > 0)
 		{
 			FILE *f = fopen("log.log", "a+");
-			fprintf(f, "[%d/%d] DeadTuples: %d HasStorage=%d\n", i, nblocks, DeadTuples, HasStorage);
+			fprintf(f, "[%d/%d] DeadTuples: %d from %d. HasStorage=%d\n", i, nblocks, DeadTuples, PageGetMaxOffsetNumber(page), HasStorage);
 			fclose(f);
 		} else
 		{
@@ -384,7 +390,7 @@ deep_analyze_rel(Relation rel)
 	}
 	{
 		FILE *f = fopen("log.log", "a+");
-		fprintf(f, "TotalDeadTuples: %d. CleanBlocks: %d\n", TotalDeadTuples, CleanBlocks);
+		fprintf(f, "TotalDeadTuples: %d. CleanBlocks: %d DirtyBlocks: %d\n", TotalDeadTuples, CleanBlocks, DirtyBlocks);
 		fprintf(f, "OldestXmin: %u. curxid=%u\n", GetOldestXmin(rel, PROCARRAY_FLAGS_VACUUM), GetCurrentTransactionIdIfAny());
 		fclose(f);
 	}
