@@ -553,7 +553,6 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 				Assert(ItemIdIsDead(lp));
 				ItemIdSetUnused(lp);
 				unusable[nunusable++] = offnum;
-				elog(LOG, "AAA");
 			}
 
 			if (nunusable > 0)
