@@ -372,7 +372,7 @@ deep_analyze_rel(Relation rel)
 
 		if (DeadTuples > 0)
 		{
-			FILE *f = fopen("/home/andrey/log.log", "a+");
+			FILE *f = fopen("log.log", "a+");
 			fprintf(f, "[%d/%d] DeadTuples: %d HasStorage=%d\n", i, nblocks, DeadTuples, HasStorage);
 			fclose(f);
 		} else
@@ -383,7 +383,7 @@ deep_analyze_rel(Relation rel)
 		ReleaseBuffer(buffer);
 	}
 	{
-		FILE *f = fopen("/home/andrey/log.log", "a+");
+		FILE *f = fopen("log.log", "a+");
 		fprintf(f, "TotalDeadTuples: %d. CleanBlocks: %d\n", TotalDeadTuples, CleanBlocks);
 		fprintf(f, "OldestXmin: %u. curxid=%u\n", GetOldestXmin(rel, PROCARRAY_FLAGS_VACUUM), GetCurrentTransactionIdIfAny());
 		fclose(f);
