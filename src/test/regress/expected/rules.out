@@ -1827,13 +1827,14 @@ pg_stat_progress_cleaner| SELECT s.pid,
     s.relid,
     s.param1 AS relations,
     s.param2 AS queue_len,
-    s.param3 AS false_hits,
+    s.param3 AS ninmem,
     s.param4 AS cleaned_tuples,
     s.param5 AS vain_tuples,
-    s.param6 AS missed_tuples,
+    s.param6 AS missed_blocks,
     s.param7 AS cleaned_blocks,
     s.param8 AS vain_blocks,
-    s.param9 AS nlocks
+    s.param9 AS nlocks,
+    s.param10 AS timeout
    FROM (pg_stat_get_progress_info('CLEANER'::text) s(pid, datid, relid, param1, param2, param3, param4, param5, param6, param7, param8, param9, param10)
      LEFT JOIN pg_database d ON ((s.datid = d.oid)));
 pg_stat_progress_vacuum| SELECT s.pid,

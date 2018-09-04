@@ -468,27 +468,21 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid,
 	if (!HeapTupleHeaderXminCommitted(tuple))
 	{
 		if (HeapTupleHeaderXminInvalid(tuple))
-		{
-			elog(LOG,"HeapTupleHeaderXminInvalid");
 			return HeapTupleInvisible;
-		}
+
 		/* Used by pre-9.0 binary upgrades */
 		if (tuple->t_infomask & HEAP_MOVED_OFF)
 		{
 			TransactionId xvac = HeapTupleHeaderGetXvac(tuple);
 
 			if (TransactionIdIsCurrentTransactionId(xvac))
-			{
-				elog(LOG,"TransactionIdIsCurrentTransactionId");
 				return HeapTupleInvisible;
-			}
 			if (!TransactionIdIsInProgress(xvac))
 			{
 				if (TransactionIdDidCommit(xvac))
 				{
 					SetHintBits(tuple, buffer, HEAP_XMIN_INVALID,
 								InvalidTransactionId);
-					elog(LOG,"TransactionIdDidCommit");
 					return HeapTupleInvisible;
 				}
 				SetHintBits(tuple, buffer, HEAP_XMIN_COMMITTED,
@@ -503,10 +497,7 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid,
 			if (!TransactionIdIsCurrentTransactionId(xvac))
 			{
 				if (TransactionIdIsInProgress(xvac))
-				{
-					elog(LOG,"TransactionIdIsInProgress");
 					return HeapTupleInvisible;
-				}
 				if (TransactionIdDidCommit(xvac))
 					SetHintBits(tuple, buffer, HEAP_XMIN_COMMITTED,
 								InvalidTransactionId);
@@ -514,7 +505,6 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid,
 				{
 					SetHintBits(tuple, buffer, HEAP_XMIN_INVALID,
 								InvalidTransactionId);
-
 					return HeapTupleInvisible;
 				}
 			}
@@ -522,10 +512,7 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid,
 		else if (TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmin(tuple)))
 		{
 			if (HeapTupleHeaderGetCmin(tuple) >= curcid)
-			{
-				elog(LOG,"TransactionIdIsInProgress curcid");
 				return HeapTupleInvisible;	/* inserted after scan started */
-			}
 
 			if (tuple->t_infomask & HEAP_XMAX_INVALID)	/* xid invalid */
 				return HeapTupleMayBeUpdated;
@@ -584,11 +571,8 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid,
 						return HeapTupleSelfUpdated;	/* updated after scan
 														 * started */
 					else
-					{
-						elog(LOG,"TransactionIdIsInProgress E5");
 						return HeapTupleInvisible;	/* updated before scan
 													 * started */
-					}
 				}
 			}
 
@@ -603,16 +587,10 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid,
 			if (HeapTupleHeaderGetCmax(tuple) >= curcid)
 				return HeapTupleSelfUpdated;	/* updated after scan started */
 			else
-			{
-				elog(LOG,"TransactionIdIsInProgress E4");
 				return HeapTupleInvisible;	/* updated before scan started */
-			}
-			}
-		else if (TransactionIdIsInProgress(HeapTupleHeaderGetRawXmin(tuple)))
-		{
-			elog(LOG,"TransactionIdIsInProgress E3 xid: %u", HeapTupleHeaderGetRawXmin(tuple));
-			return HeapTupleInvisible;
 		}
+		else if (TransactionIdIsInProgress(HeapTupleHeaderGetRawXmin(tuple)))
+			return HeapTupleInvisible;
 		else if (TransactionIdDidCommit(HeapTupleHeaderGetRawXmin(tuple)))
 			SetHintBits(tuple, buffer, HEAP_XMIN_COMMITTED,
 						HeapTupleHeaderGetRawXmin(tuple));
@@ -621,7 +599,6 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid,
 			/* it must have aborted or crashed */
 			SetHintBits(tuple, buffer, HEAP_XMIN_INVALID,
 						InvalidTransactionId);
-			elog(LOG,"TransactionIdIsInProgress E2");
 			return HeapTupleInvisible;
 		}
 	}

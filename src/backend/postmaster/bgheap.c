@@ -198,6 +198,14 @@ PSHTAB	*wTab;
  */
 SHTABCTL wTabCtl;
 
+#define CLEANUP_GENTLY			(0)
+#define CLEANUP_AGGRESSIVE		(1)
+
+/*
+ * Cleanup strategy
+ */
+static int strategy = CLEANUP_AGGRESSIVE;
+
 #ifdef EXEC_BACKEND
 static pid_t hclauncher_forkexec(void);
 static pid_t hcworker_forkexec(void);
@@ -310,11 +318,6 @@ save_to_list(PSHTAB AuxiliaryList, WorkerTask *item)
 	new_item->lastXid = item->lastXid;
 }
 
-#define STRATEGY_GENTLY			(0)
-#define STRATEGY_AGGRESSIVE		(1)
-
-static int strategy = STRATEGY_AGGRESSIVE;
-
 /*
  * Main logic of HEAP and index relations cleaning
  */
@@ -324,7 +327,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	Relation		heapRelation;
 	Relation   		*IndexRelations;
 	int				nindexes;
-	LOCKMODE		lockmode = /*ExclusiveLock*/ /* AccessShareLock;*/NoLock /*ShareUpdateExclusiveLock*/;
+	LOCKMODE		lockmode = AccessShareLock;
 	WorkerTask		*item;
 	TransactionId	OldestXmin;
 
@@ -389,6 +392,10 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		return AuxiliaryList;
 	}
 
+	/*
+	 * Get xid for following prune process. Function here is rather
+	 * expensive, so call them only one per round.
+	 */
 	OldestXmin = GetOldestXmin(heapRelation, PROCARRAY_FLAGS_VACUUM);
 
 	Assert(TransactionIdIsValid(OldestXmin));
@@ -419,7 +426,10 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			 */
 			continue;
 
-		/* Create TID list */
+		/*
+		 * Get and pin the buffer.
+		 * If Postgres not in termination state when we get in-memory buffer only
+		 */
 		if (!got_SIGTERM)
 			buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, item->blkno, RBM_NORMAL_NO_READ, NULL);
 		else
@@ -428,7 +438,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		if (BufferIsInvalid(buffer))
 		{
 			/*
-			 * Buffer was already evicted from shared buffers
+			 * Buffer was evicted from shared buffers already.
 			 */
 			Assert(!got_SIGTERM);
 			stat_buf_ninmem++;
@@ -448,7 +458,10 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			continue;
 		}
 
-		if (strategy == STRATEGY_GENTLY)
+		/*
+		 * Lock the buffer for pruning
+		 */
+		if (strategy == CLEANUP_GENTLY)
 		{
 			if (!ConditionalLockBufferForCleanup(buffer))
 			{
@@ -461,17 +474,13 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 				continue;
 			}
 		}
-		else if (strategy == STRATEGY_AGGRESSIVE)
+		else if (strategy == CLEANUP_AGGRESSIVE)
 			LockBufferForCleanup(buffer);
 
+		/*
+		 * Increase our chances for cleaning more tuples.
+		 */
 		(void) heap_page_prune(heapRelation, buffer, OldestXmin, false, &latestRemovedXid);
-
-		if (!IsBufferDirty(buffer))
-		{
-			/* Skip block if it is not dirty */
-			UnlockReleaseBuffer(buffer);
-			continue;
-		}
 
 		page = BufferGetPage(buffer);
 
@@ -481,7 +490,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			 offnum = OffsetNumberNext(offnum))
 		{
 			lp = PageGetItemId(page, offnum);
-			if (ItemIdIsDead(lp)/* && ItemIdHasStorage(lp)*/)
+			if (ItemIdIsDead(lp))
 			{
 				ItemPointerSet(&(dead_tuples[num_dead_tuples]), item->blkno, offnum);
 				num_dead_tuples++;
@@ -503,7 +512,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		}
 
 		/* Open and lock index relations correspond to the heap relation */
-		vac_open_indexes(heapRelation, /*RowExclusiveLock*//*ExclusiveLock*/ShareLock, &nindexes, &IndexRelations);
+		vac_open_indexes(heapRelation, ShareLock, &nindexes, &IndexRelations);
 
 		/* Iterate across all index relations */
 		for (irnum = 0; irnum < nindexes; irnum++)
@@ -523,7 +532,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 							   num_dead_tuples);
 		}
 
-		vac_close_indexes(nindexes, IndexRelations, ShareLock/*ExclusiveLock*//*RowExclusiveLock*//*NoLock*/);
+		vac_close_indexes(nindexes, IndexRelations, ShareLock);
 
 		/*
 		 * If heap relation has not only b-tree indexes, can't clean heap block.
@@ -534,7 +543,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			int				nunusable = 0;
 			Size			freespace;
 
-			if (strategy == STRATEGY_GENTLY)
+			if (strategy == CLEANUP_GENTLY)
 			{
 				if (!ConditionalLockBufferForCleanup(buffer))
 				{
@@ -545,7 +554,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 					continue;
 				}
 			}
-			else if (strategy == STRATEGY_AGGRESSIVE)
+			else if (strategy == CLEANUP_AGGRESSIVE)
 				LockBufferForCleanup(buffer);
 
 			START_CRIT_SECTION();
@@ -1629,7 +1638,7 @@ main_worker_loop(void)
 			int				i;
 
 			/* */
-			timeout = 10L;
+			timeout = 20L;
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_MISSED_BLOCKS, stat_missed_blocks);
 
@@ -1739,7 +1748,7 @@ main_worker_loop(void)
 				 * Deferred its for next cleanup attempt.
 				 */
 				if ((stat_tot_wait_queue_len += SHASH_Entries(dirty_relation[relcounter]->items)) > 0)
-					timeout = 1L;
+					timeout = 5L;
 			}
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_TIMEOUT, timeout);
