@@ -1026,27 +1026,8 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 				info->found_dead_tuples[pos] = true;
 			}
 			else if (res > 0)
-			{
-				if (pos == info->last_dead_tuple)
-					elog(LOG, "ByBreak");
 				break;
-			}/* else
-			if (pos == info->last_dead_tuple)
-			{
-				OffsetNumber off1 = offnum-1;
-				ItemId itemid1 = PageGetItemId(page, off1);
-				IndexTuple itup1 = (IndexTuple) PageGetItem(page, itemid1);
 
-				elog(LOG, "NEQ: off=%d/%d here: (%d, %d) search for: (%d, %d) pre: (%d, %d)", offnum,
-								PageGetMaxOffsetNumber(page),
-								ItemPointerGetBlockNumber(&(itup->t_tid)),
-								ItemPointerGetOffsetNumber(&(itup->t_tid)),
-								ItemPointerGetBlockNumber(&info->dead_tuples[pos]),
-								ItemPointerGetOffsetNumber(&info->dead_tuples[pos]),
-								ItemPointerGetBlockNumber(&(itup1->t_tid)),
-								ItemPointerGetOffsetNumber(&(itup1->t_tid))
-								);
-			}*/
 			pos--;
 		}
 

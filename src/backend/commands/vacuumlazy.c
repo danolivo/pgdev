@@ -1794,7 +1794,6 @@ quick_vacuum_index(Relation irel, Relation hrel,
 			 * Tuple has 'not used' status.
 			 */
 			found[tnum] = true;
-			elog(LOG, "NULL");
 			continue;
 		}
 
@@ -1813,7 +1812,6 @@ quick_vacuum_index(Relation irel, Relation hrel,
 		if ((predicate != NULL) && (!ExecQual(predicate, econtext)))
 		{
 			found[tnum] = true;
-			elog(LOG, "Predicate");
 			continue;
 		}
 
