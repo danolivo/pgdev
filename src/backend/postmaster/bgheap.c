@@ -1414,7 +1414,7 @@ main_launcher_loop()
 		}
 
 		/*
-		 * Main waiting list parsing.
+		 * Passing across the main waiting list
 		 */
 		if (SHASH_Entries(wTab[heapcleaner_max_workers]) > 0)
 		{
@@ -1485,6 +1485,7 @@ main_launcher_loop()
 					/* Start new worker */
 					launch_worker(msg->dbNode);
 					startWorker = true;
+					elog(LOG, "IsStartingWorker: %d, list empty: %d", startingWorker != NULL, dlist_is_empty(HeapCleanerShmem->runningWorkers));
 				}
 			}
 		}
