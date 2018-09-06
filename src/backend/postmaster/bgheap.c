@@ -1485,7 +1485,7 @@ main_launcher_loop()
 					/* Start new worker */
 					launch_worker(msg->dbNode);
 					startWorker = true;
-					elog(LOG, "IsStartingWorker: %d, list empty: %d", startingWorker != NULL, dlist_is_empty(HeapCleanerShmem->runningWorkers));
+					elog(LOG, "IsStartingWorker: %d, list empty: %d", startingWorker != NULL, dlist_is_empty(&HeapCleanerShmem->runningWorkers));
 				}
 			}
 		}
