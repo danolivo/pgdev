@@ -1428,23 +1428,52 @@ main_launcher_loop()
 
 				if (worker)
 				{
-					CleanerMessage *temp_msg = (CleanerMessage *) SHASH_Search(wTab[worker->id], (void *) msg, SHASH_ENTER, &found);
+					/*
+					 * Insert task to the worker waiting list.
+					 */
+					CleanerMessage *temp_msg = (CleanerMessage *) SHASH_Search(
+												wTab[worker->id],
+												(void *) msg,
+												SHASH_ENTER, &found);
+
 					if (temp_msg != NULL)
 						if (found)
 						{
+							/*
+							 * If we have a duplicate task (same block) than
+							 * increase hits counter and last xid parameter.
+							 */
 							temp_msg->hits += msg->hits;
 							temp_msg->xid = (msg->xid > temp_msg->xid) ? msg->xid : temp_msg->xid;
 						}
 						else
+							/*
+							 * We have new task. Initialize hits, last xid etc
+							 * by values from the backend.
+							 */
 							memcpy(temp_msg, msg, sizeof(CleanerMessage));
 					else
+					{
+						/*
+						 * Waiting list is full. Miss block.
+						 */
 						stat_missed_blocks++;
+						elog(LOG, "Worker pid=%d have full waiting list, nitems=%d", worker->pid, worker->nitems);
+					}
 
 					/*
-					 * Message gone to worker. delete from main waiting list.
+					 * Message has gone to worker. delete from main waiting list.
 					 */
-					temp_msg = (CleanerMessage *) SHASH_Search(wTab[heapcleaner_max_workers], (void *) msg, SHASH_REMOVE, NULL);
+					temp_msg = (CleanerMessage *) SHASH_Search(
+												wTab[heapcleaner_max_workers],
+												(void *) msg,
+												SHASH_REMOVE, NULL);
 					Assert(temp_msg != NULL);
+
+					/*
+					 * Launcher received a message for worker. Update timestamp.
+					 */
+					worker->launchtime = GetCurrentTimestamp();
 
 					continue;
 				}
@@ -1487,7 +1516,7 @@ main_launcher_loop()
 						 */
 						if (worker->nitems == 0)
 						{
-							elog(LOG, "Shutdown the idle worker pid=%d", worker->pid);
+							elog(LOG, "Shutdown the idle worker pid=%d, id=%d. dt=%lf", worker->pid, worker->id, (worker->launchtime-GetCurrentTimestamp())/1e6);
 							/* Shutdown the idle worker */
 							kill(worker->pid, SIGTERM);
 							dlist_delete(&worker->links);
