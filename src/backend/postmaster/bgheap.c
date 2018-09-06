@@ -649,6 +649,7 @@ FreeLauncherInfo(int code, Datum arg)
 static void
 FreeWorkerInfo(int code, Datum arg)
 {
+	elog(LOG, "Free Worker Info");
 	if (MyWorkerInfo != NULL)
 	{
 		LWLockAcquire(HeapCleanerLock, LW_EXCLUSIVE);
