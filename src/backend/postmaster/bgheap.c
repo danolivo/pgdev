@@ -1231,7 +1231,7 @@ HeapCleanerWorkerMain(int argc, char *argv[])
 		/* Add tracking info to pgstat */
 		pgstat_progress_start_command(PROGRESS_COMMAND_CLEANER, MyWorkerInfo->dbOid);
 
-		elog(LOG, "Worker started");
+		elog(LOG, "Worker started: dbOid=%d", MyWorkerInfo->dbOid);
 
 		main_worker_loop();
 	}
