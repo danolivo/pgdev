@@ -1198,10 +1198,11 @@ HeapCleanerWorkerMain(int argc, char *argv[])
 	{
 		MyWorkerInfo = HeapCleanerShmem->startingWorker;
 		MyWorkerInfo->pid = getpid();
-		HeapCleanerShmem->startingWorker = NULL;
 
 		/* insert into the running list */
 		dlist_push_head(&HeapCleanerShmem->runningWorkers, &MyWorkerInfo->links);
+
+		HeapCleanerShmem->startingWorker = NULL;
 
 		on_shmem_exit(FreeWorkerInfo, 0);
 	}
