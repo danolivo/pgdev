@@ -46,7 +46,7 @@ typedef enum
 	RBM_NORMAL_NO_LOG,			/* Don't log page as invalid during WAL
 								 * replay; otherwise same as RBM_NORMAL */
 	RBM_NORMAL_NO_READ			/* Don't actually read page, returns only if it
-	 	 	 	 	 	 	 	 * presents in shared memory */
+								 * presents in shared memory */
 } ReadBufferMode;
 
 /* forward declared, to avoid having to expose buf_internals.h here */

@@ -599,6 +599,8 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			RecordPageWithFreeSpace(heapRelation, item->blkno, freespace);
 			pgstat_update_heap_dead_tuples(heapRelation, nunusable);
 		}
+		else
+			ReleaseBuffer(buffer);
 		/*
 		 * ToDo: that we will do with TOAST relation?
 		 */
@@ -1485,6 +1487,7 @@ main_launcher_loop()
 						 */
 						if (worker->nitems == 0)
 						{
+							elog(LOG, "Shutdown the idle worker pid=%d", worker->pid);
 							/* Shutdown the idle worker */
 							kill(worker->pid, SIGTERM);
 							dlist_delete(&worker->links);

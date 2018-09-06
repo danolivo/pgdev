@@ -902,7 +902,7 @@ CREATE VIEW pg_stat_progress_vacuum AS
 		S.param6 AS max_dead_tuples, S.param7 AS num_dead_tuples
     FROM pg_stat_get_progress_info('VACUUM') AS S
 		LEFT JOIN pg_database D ON S.datid = D.oid;
-		
+
 CREATE VIEW pg_stat_progress_cleaner AS
 	SELECT
 		S.pid AS pid, S.datid AS datid, D.datname AS datname,
