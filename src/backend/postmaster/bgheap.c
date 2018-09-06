@@ -1238,6 +1238,7 @@ HeapCleanerWorkerMain(int argc, char *argv[])
 	else
 		elog(ERROR, "dbid %d not valid!", MyWorkerInfo->dbOid);
 
+	elog(LOG, "Worker finished normally");
 	proc_exit(0);
 }
 
@@ -1845,7 +1846,7 @@ SIGTERM_Handler(SIGNAL_ARGS)
 	got_SIGTERM = true;
 
 	SetLatch(MyLatch);
-
+	elog(LOG, "Worker got SIGTERM.");
 	errno = save_errno;
 }
 
