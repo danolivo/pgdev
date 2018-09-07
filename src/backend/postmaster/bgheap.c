@@ -442,8 +442,8 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			 * Buffer was evicted from shared buffers already.
 			 */
 			Assert(!got_SIGTERM);
-			stat_buf_ninmem++;
-			save_to_list(AuxiliaryList, item);
+//			stat_buf_ninmem++;
+//			save_to_list(AuxiliaryList, item);
 			continue;
 		}
 
@@ -1398,7 +1398,7 @@ insert_task_into_buffer(int listId, CleanerTask* task)
  * в конечном итоге приходится отбрасывать).
  */
 static void
-main_launcher_loop()
+main_launcher_loop(void)
 {
 	long	timeout = -1L;
 
@@ -1557,10 +1557,6 @@ main_launcher_loop()
 						}
 						LWLockRelease(&worker->WorkItemLock);
 					}
-					else if (!dlist_has_next(&HeapCleanerShmem->runningWorkers, node))
-						break;
-					else
-						continue;
 				}
 
 				/* Put list of potentially dirty blocks to the worker shared buffer */
@@ -1603,8 +1599,7 @@ main_launcher_loop()
 				/* We only need to wait idle workers */
 				timeout = 100L;
 		}
-		else
-			elog(LOG, "No running workers!");
+
 		LWLockRelease(HeapCleanerLock);
 
 		if (!got_SIGTERM)
