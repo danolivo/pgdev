@@ -229,6 +229,9 @@ SHASH_SeqNext(SHTAB* shtab)
 {
 	check(shtab);
 
+	if (SHASH_Entries(shtab) == 0)
+		return NULL;
+
 	if (shtab->SeqScanCurElem == shtab->HTableSize)
 		return NULL;
 
