@@ -654,11 +654,10 @@ FreeWorkerInfo(int code, Datum arg)
 	{
 		LWLockAcquire(HeapCleanerLock, LW_EXCLUSIVE);
 
-		dlist_delete(&MyWorkerInfo->links);
 		MyWorkerInfo->dbOid = InvalidOid;
 		MyWorkerInfo->launchtime = 0;
-		dlist_push_head(&HeapCleanerShmem->freeWorkers,
-						&MyWorkerInfo->links);
+		dlist_delete(&MyWorkerInfo->links);
+		dlist_push_head(&HeapCleanerShmem->freeWorkers, &MyWorkerInfo->links);
 		/* not mine anymore */
 		MyWorkerInfo = NULL;
 
@@ -1525,8 +1524,8 @@ main_launcher_loop()
 							elog(LOG, "Shutdown the idle worker pid=%d, id=%d. dt=%lf", worker->pid, worker->id, (worker->launchtime-GetCurrentTimestamp())/1e6);
 							/* Shutdown the idle worker */
 							kill(worker->pid, SIGTERM);
-							dlist_delete(&worker->links);
-							dlist_push_head(&HeapCleanerShmem->freeWorkers, &worker->links);
+//							dlist_delete(&worker->links);
+//							dlist_push_head(&HeapCleanerShmem->freeWorkers, &worker->links);
 
 							if (!dlist_is_empty(&HeapCleanerShmem->runningWorkers))
 								node = dlist_head_node(&HeapCleanerShmem->runningWorkers);
@@ -1584,6 +1583,8 @@ main_launcher_loop()
 				/* We only need to wait idle workers */
 				timeout = 100L;
 		}
+		else
+			elog(LOG, "No running workers!");
 		LWLockRelease(HeapCleanerLock);
 
 		if (!got_SIGTERM)
