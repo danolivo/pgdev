@@ -903,6 +903,15 @@ CREATE VIEW pg_stat_progress_vacuum AS
     FROM pg_stat_get_progress_info('VACUUM') AS S
 		LEFT JOIN pg_database D ON S.datid = D.oid;
 
+CREATE VIEW pg_stat_progress_clauncher AS
+	SELECT
+		S.pid AS pid, S.datid AS datid, D.datname AS datname,
+		S.relid AS relid,
+		S.param1 AS tot_incoming_tasks, S.param2 AS wait_tasks
+    FROM pg_stat_get_progress_info('CLAUNCHER') AS S
+		LEFT JOIN pg_database D ON S.datid = D.oid;
+
+
 CREATE VIEW pg_stat_progress_cleaner AS
 	SELECT
 		S.pid AS pid, S.datid AS datid, D.datname AS datname,

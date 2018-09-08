@@ -470,6 +470,8 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
 		cmdtype = PROGRESS_COMMAND_VACUUM;
 	else if (pg_strcasecmp(cmd, "CLEANER") == 0)
 		cmdtype = PROGRESS_COMMAND_CLEANER;
+	else if (pg_strcasecmp(cmd, "CLAUNCHER") == 0)
+		cmdtype = PROGRESS_COMMAND_CLAUNCHER;
 	else
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),

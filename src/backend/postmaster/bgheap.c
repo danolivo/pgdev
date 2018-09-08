@@ -154,6 +154,9 @@ static uint64	stat_not_acquired_locks = 0;
 static int		stat_buf_ninmem = 0;
 static uint32	stat_missed_blocks = 0;
 
+static uint32	lc_stat_total_incoming_tasks = 0;
+static uint32	lc_stat_wait_tasks = 0;
+
 static MemoryContext BGHeapMemCxt = NULL;
 
 /*
@@ -1002,6 +1005,10 @@ HeapCleanerLauncherMain(int argc, char *argv[])
 	for (counter = 0; counter < heapcleaner_max_workers+1; counter++)
 		wTab[counter] = SHASH_Create(wTabCtl);
 	on_shmem_exit(FreeLauncherInfo, 0);
+
+	/* Add tracking info to pgstat */
+	pgstat_progress_start_command(PROGRESS_COMMAND_CLAUNCHER, 0);
+
 elog(LOG, "-> Launcher Started!");
 	main_launcher_loop();
 
@@ -1401,6 +1408,7 @@ static void
 main_launcher_loop(void)
 {
 	long	timeout = -1L;
+	int		i;
 
 	Assert(HeapCleanerSock != PGINVALID_SOCKET);
 
@@ -1456,6 +1464,9 @@ main_launcher_loop(void)
 			for (mptr = table; ((char *)mptr-(char *)table) < len; mptr++)
 			{
 				worker = look_for_worker(mptr->dbNode);
+
+				lc_stat_total_incoming_tasks++;
+				pgstat_progress_update_param(PROGRESS_CLAUNCHER_TOT_INCOMING_TASKS, lc_stat_total_incoming_tasks);
 
 				if (worker)
 					insert_task_into_buffer(worker->id, mptr);
@@ -1602,6 +1613,14 @@ main_launcher_loop(void)
 
 		LWLockRelease(HeapCleanerLock);
 
+		/*
+		 * Collect some stat
+		 */
+		lc_stat_wait_tasks = 0;
+		for (i = 0; i < heapcleaner_max_workers+1; i++)
+			lc_stat_wait_tasks += SHASH_Entries(wTab[i]);
+		pgstat_progress_update_param(PROGRESS_CLAUNCHER_WAIT_TASKS, lc_stat_wait_tasks);
+
 		if (!got_SIGTERM)
 		{
 			int wakeEvents = WL_LATCH_SET | WL_POSTMASTER_DEATH | WL_SOCKET_READABLE;
@@ -1623,6 +1642,7 @@ main_launcher_loop(void)
 		}
 	}
 
+	pgstat_progress_end_command();
 	elog(LOG, "Heap Launcher exit with 0");
 	proc_exit(0);
 }
