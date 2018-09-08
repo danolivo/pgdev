@@ -208,7 +208,7 @@ SHTABCTL wTabCtl;
 /*
  * Cleanup strategy
  */
-static int strategy = CLEANUP_AGGRESSIVE;
+static int strategy = CLEANUP_GENTLY;
 
 #ifdef EXEC_BACKEND
 static pid_t hclauncher_forkexec(void);
