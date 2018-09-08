@@ -1583,7 +1583,7 @@ main_launcher_loop(void)
 						(worker->nitems < WORKER_TASK_ITEMS_MAX))
 				{
 					void *temp_msg;
-
+elog(LOG, "a");
 					memcpy(&worker->buffer[worker->nitems++], task, sizeof(CleanerTask));
 					temp_msg = SHASH_Search(wTab[worker->id], (void *) task, SHASH_REMOVE, NULL);
 					Assert(temp_msg != NULL);
