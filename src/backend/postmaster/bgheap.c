@@ -156,6 +156,7 @@ static uint32	stat_missed_blocks = 0;
 
 static uint32	lc_stat_total_incoming_tasks = 0;
 static uint32	lc_stat_wait_tasks = 0;
+static uint32	lc_stat_shared_buf_full_counter = 0;
 
 static MemoryContext BGHeapMemCxt = NULL;
 
@@ -1573,6 +1574,9 @@ main_launcher_loop(void)
 				/* Put list of potentially dirty blocks to the worker shared buffer */
 				LWLockAcquire(&worker->WorkItemLock, LW_EXCLUSIVE);
 
+				if (worker->nitems == WORKER_TASK_ITEMS_MAX)
+					pgstat_progress_update_param(PROGRESS_CLAUNCHER_SHARED_BUF_FULL, ++lc_stat_shared_buf_full_counter);
+
 				SHASH_SeqReset(wTab[worker->id]);
 				while (((task = (CleanerTask *) SHASH_SeqNext(wTab[worker->id])) != NULL) &&
 						(worker->nitems < WORKER_TASK_ITEMS_MAX))
@@ -1620,6 +1624,7 @@ main_launcher_loop(void)
 		for (i = 0; i < heapcleaner_max_workers+1; i++)
 			lc_stat_wait_tasks += SHASH_Entries(wTab[i]);
 		pgstat_progress_update_param(PROGRESS_CLAUNCHER_WAIT_TASKS, lc_stat_wait_tasks);
+		pgstat_progress_update_param(PROGRESS_CLAUNCHER_GENLIST_WAIT_TASKS, SHASH_Entries(wTab[heapcleaner_max_workers]));
 
 		if (!got_SIGTERM)
 		{
