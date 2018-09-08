@@ -154,9 +154,9 @@ static uint64	stat_not_acquired_locks = 0;
 static int		stat_buf_ninmem = 0;
 static uint32	stat_missed_blocks = 0;
 
-static uint32	lc_stat_total_incoming_tasks = 0;
+static uint32	lc_stat_total_incoming_hits = 0;
 static uint32	lc_stat_wait_tasks = 0;
-static uint32	lc_stat_shared_buf_full_counter = 0;
+static uint32	lc_stat_total_worker_send_hits = 0;
 
 static MemoryContext BGHeapMemCxt = NULL;
 
@@ -1466,8 +1466,8 @@ main_launcher_loop(void)
 			{
 				worker = look_for_worker(mptr->dbNode);
 
-				lc_stat_total_incoming_tasks++;
-				pgstat_progress_update_param(PROGRESS_CLAUNCHER_TOT_INCOMING_TASKS, lc_stat_total_incoming_tasks);
+				lc_stat_total_incoming_hits += mptr->hits;
+				pgstat_progress_update_param(PROGRESS_CLAUNCHER_TOT_INCOMING_TASKS, lc_stat_total_incoming_hits);
 
 				if (worker)
 					insert_task_into_buffer(worker->id, mptr);
@@ -1539,8 +1539,6 @@ main_launcher_loop(void)
 				 ;
 				 node = dlist_next_node(&HeapCleanerShmem->runningWorkers, node))
 			{
-				int nitems_temp;
-
 				worker = (WorkerInfo) node;
 
 				if (SHASH_Entries(wTab[worker->id]) == 0)
@@ -1576,22 +1574,20 @@ main_launcher_loop(void)
 				/* Put list of potentially dirty blocks to the worker shared buffer */
 				LWLockAcquire(&worker->WorkItemLock, LW_EXCLUSIVE);
 
-				nitems_temp = worker->nitems;
-
 				SHASH_SeqReset(wTab[worker->id]);
 				while (((task = (CleanerTask *) SHASH_SeqNext(wTab[worker->id])) != NULL) &&
 						(worker->nitems < WORKER_TASK_ITEMS_MAX))
 				{
 					void *temp_msg;
 
+					lc_stat_total_worker_send_hits += task->hits;
 					memcpy(&worker->buffer[worker->nitems++], task, sizeof(CleanerTask));
 					temp_msg = SHASH_Search(wTab[worker->id], (void *) task, SHASH_REMOVE, NULL);
 					Assert(temp_msg != NULL);
 					Assert(worker->buffer[worker->nitems-1].hits > 0);
 				}
 
-				lc_stat_shared_buf_full_counter += worker->nitems - nitems_temp;
-				pgstat_progress_update_param(PROGRESS_CLAUNCHER_SHARED_BUF_FULL, lc_stat_shared_buf_full_counter);
+				pgstat_progress_update_param(PROGRESS_CLAUNCHER_SHARED_BUF_FULL, lc_stat_total_worker_send_hits);
 
 				worker->launchtime = GetCurrentTimestamp();
 				LWLockRelease(&worker->WorkItemLock);
