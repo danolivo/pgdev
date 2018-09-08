@@ -1539,6 +1539,8 @@ main_launcher_loop(void)
 				 ;
 				 node = dlist_next_node(&HeapCleanerShmem->runningWorkers, node))
 			{
+				int temp;
+
 				worker = (WorkerInfo) node;
 
 				if (SHASH_Entries(wTab[worker->id]) == 0)
@@ -1574,6 +1576,7 @@ main_launcher_loop(void)
 				/* Put list of potentially dirty blocks to the worker shared buffer */
 				LWLockAcquire(&worker->WorkItemLock, LW_EXCLUSIVE);
 
+				temp = worker->nitems;
 				SHASH_SeqReset(wTab[worker->id]);
 				while (((task = (CleanerTask *) SHASH_SeqNext(wTab[worker->id])) != NULL) &&
 						(worker->nitems < WORKER_TASK_ITEMS_MAX))
@@ -1588,6 +1591,7 @@ main_launcher_loop(void)
 				}
 
 				pgstat_progress_update_param(PROGRESS_CLAUNCHER_SHARED_BUF_FULL, lc_stat_total_worker_send_hits);
+				pgstat_progress_update_param(PROGRESS_CLAUNCHER_CURRENT_BUF_ITEMS, worker->nitems-temp);
 
 				worker->launchtime = GetCurrentTimestamp();
 				LWLockRelease(&worker->WorkItemLock);
