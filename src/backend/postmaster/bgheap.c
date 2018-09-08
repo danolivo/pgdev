@@ -431,9 +431,9 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		 * Get and pin the buffer.
 		 * If Postgres not in termination state when we get in-memory buffer only
 		 */
-		if (!got_SIGTERM)
-			buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, item->blkno, RBM_NORMAL_NO_READ, NULL);
-		else
+//		if (!got_SIGTERM)
+//			buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, item->blkno, RBM_NORMAL_NO_READ, NULL);
+//		else
 			buffer = ReadBuffer(heapRelation, item->blkno);
 
 		if (BufferIsInvalid(buffer))
