@@ -1591,7 +1591,7 @@ main_launcher_loop(void)
 				}
 
 				pgstat_progress_update_param(PROGRESS_CLAUNCHER_SHARED_BUF_FULL, lc_stat_total_worker_send_hits);
-				pgstat_progress_update_param(PROGRESS_CLAUNCHER_CURRENT_BUF_ITEMS, worker->nitems-temp);
+				pgstat_progress_update_param(PROGRESS_CLAUNCHER_CURRENT_BUF_ITEMS, worker->nitems);
 
 				worker->launchtime = GetCurrentTimestamp();
 				LWLockRelease(&worker->WorkItemLock);
