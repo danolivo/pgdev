@@ -203,14 +203,6 @@ PSHTAB	*wTab;
  */
 SHTABCTL wTabCtl;
 
-#define CLEANUP_GENTLY			(0)
-#define CLEANUP_AGGRESSIVE		(1)
-
-/*
- * Cleanup strategy
- */
-static int strategy = CLEANUP_GENTLY;
-
 #ifdef EXEC_BACKEND
 static pid_t hclauncher_forkexec(void);
 static pid_t hcworker_forkexec(void);
@@ -334,7 +326,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	int				nindexes;
 	LOCKMODE		lockmode = AccessShareLock;
 	WorkerTask		*item;
-	TransactionId	OldestXmin;
+//	TransactionId	OldestXmin;
 
 	Assert(res != NULL);
 	Assert(res->items != NULL);
@@ -401,9 +393,9 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	 * Get xid for following prune process. Function here is rather
 	 * expensive, so call them only one per round.
 	 */
-	OldestXmin = GetOldestXmin(heapRelation, PROCARRAY_FLAGS_VACUUM);
+//	OldestXmin = GetOldestXmin(heapRelation, PROCARRAY_FLAGS_VACUUM);
 
-	Assert(TransactionIdIsValid(OldestXmin));
+//	Assert(TransactionIdIsValid(OldestXmin));
 	/* Main cleanup cycle */
 	for (SHASH_SeqReset(res->items);
 		 (item = (WorkerTask *) SHASH_SeqNext(res->items)) != NULL; )
@@ -435,17 +427,17 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		 * Get and pin the buffer.
 		 * If Postgres not in termination state when we get in-memory buffer only
 		 */
-		if (!got_SIGTERM)
+//		if (!got_SIGTERM)
 			buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, item->blkno, RBM_NORMAL_NO_READ, NULL);
-		else
-			buffer = ReadBuffer(heapRelation, item->blkno);
+//		else
+//			buffer = ReadBuffer(heapRelation, item->blkno);
 
 		if (BufferIsInvalid(buffer))
 		{
 			/*
 			 * Buffer was evicted from shared buffers already.
 			 */
-			Assert(!got_SIGTERM);
+//			Assert(!got_SIGTERM);
 //			stat_buf_ninmem++;
 //			save_to_list(AuxiliaryList, item);
 			continue;
@@ -456,18 +448,18 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		 * this case there is high probability that we can't do anything usefull
 		 * with it. Let we return to clean later.
 		 */
-		if (!got_SIGTERM && !IsBufferDirty(buffer) && (!TransactionIdPrecedesOrEquals(item->lastXid, OldestXmin)))
-		{
-			ReleaseBuffer(buffer);
-			save_to_list(AuxiliaryList, item);
-			continue;
-		}
+//		if (!got_SIGTERM && !IsBufferDirty(buffer) && (!TransactionIdPrecedesOrEquals(item->lastXid, OldestXmin)))
+//		{
+//			ReleaseBuffer(buffer);
+//			save_to_list(AuxiliaryList, item);
+//			continue;
+//		}
 
 		/*
 		 * Lock the buffer for pruning
 		 */
-		if (strategy == CLEANUP_GENTLY)
-		{
+//		if (strategy == CLEANUP_GENTLY)
+//		{
 			if (!ConditionalLockBufferForCleanup(buffer))
 			{
 				stat_not_acquired_locks++;
@@ -475,17 +467,17 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 
 				/* Can't lock buffer. */
 				ReleaseBuffer(buffer);
-				save_to_list(AuxiliaryList, item);
+//				save_to_list(AuxiliaryList, item);
 				continue;
 			}
-		}
-		else if (strategy == CLEANUP_AGGRESSIVE)
-			LockBufferForCleanup(buffer);
+//		}
+//		else if (strategy == CLEANUP_AGGRESSIVE)
+//			LockBufferForCleanup(buffer);
 
 		/*
 		 * Increase our chances for cleaning more tuples.
 		 */
-		(void) heap_page_prune(heapRelation, buffer, OldestXmin, false, &latestRemovedXid);
+//		(void) heap_page_prune(heapRelation, buffer, OldestXmin, false, &latestRemovedXid);
 
 		page = BufferGetPage(buffer);
 
@@ -548,19 +540,19 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			int				nunusable = 0;
 			Size			freespace;
 
-			if (strategy == CLEANUP_GENTLY)
-			{
+//			if (strategy == CLEANUP_GENTLY)
+//			{
 				if (!ConditionalLockBufferForCleanup(buffer))
 				{
 					ReleaseBuffer(buffer);
-					save_to_list(AuxiliaryList, item);
+//					save_to_list(AuxiliaryList, item);
 					stat_not_acquired_locks++;
 					pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
 					continue;
 				}
-			}
-			else if (strategy == CLEANUP_AGGRESSIVE)
-				LockBufferForCleanup(buffer);
+//			}
+//			else if (strategy == CLEANUP_AGGRESSIVE)
+//				LockBufferForCleanup(buffer);
 
 			START_CRIT_SECTION();
 
@@ -1539,7 +1531,7 @@ main_launcher_loop(void)
 				 ;
 				 node = dlist_next_node(&HeapCleanerShmem->runningWorkers, node))
 			{
-				int temp;
+//				int temp;
 
 				worker = (WorkerInfo) node;
 
