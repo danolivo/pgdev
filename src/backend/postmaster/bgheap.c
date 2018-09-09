@@ -1568,7 +1568,6 @@ main_launcher_loop(void)
 				/* Put list of potentially dirty blocks to the worker shared buffer */
 				LWLockAcquire(&worker->WorkItemLock, LW_EXCLUSIVE);
 
-				temp = worker->nitems;
 				SHASH_SeqReset(wTab[worker->id]);
 				while (((task = (CleanerTask *) SHASH_SeqNext(wTab[worker->id])) != NULL) &&
 						(worker->nitems < WORKER_TASK_ITEMS_MAX))
