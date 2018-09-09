@@ -1798,7 +1798,7 @@ quick_vacuum_index(Relation irel, Relation hrel,
 		}
 
 		/*
-		 * Form values[] and isnull[] arrays from for index tuple
+		 * Form values[] and isnull[] arrays of index tuple
 		 * by heap tuple
 		 */
 		MemoryContextReset(econtext->ecxt_per_tuple_memory);

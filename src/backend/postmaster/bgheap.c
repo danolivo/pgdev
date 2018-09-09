@@ -315,6 +315,10 @@ save_to_list(PSHTAB AuxiliaryList, WorkerTask *item)
 	new_item->lastXid = item->lastXid;
 }
 
+#define DEAD_TUPLES_MAX_NUM	(10000)
+static int dead_tuples_num;
+static ItemPointerData dead_tuples[DEAD_TUPLES_MAX_NUM];
+
 /*
  * Main logic of HEAP and index relations cleaning
  */
@@ -326,7 +330,10 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	int				nindexes;
 	LOCKMODE		lockmode = AccessShareLock;
 	WorkerTask		*item;
-//	TransactionId	OldestXmin;
+	BlockNumber		nblocks;
+	int				irnum;
+	Size			freespace;
+	int				tnum;
 
 	Assert(res != NULL);
 	Assert(res->items != NULL);
@@ -367,6 +374,9 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	/*
 	 * Check relation type similarly vacuum
 	 */
+/*
+ * Ship it to heapRelation queue generation
+ *
 	if (!(pg_class_ownercheck(RelationGetRelid(heapRelation), GetUserId()) ||
 		  (pg_database_ownercheck(MyDatabaseId, GetUserId()) && !heapRelation->rd_rel->relisshared)))
 	{
@@ -388,59 +398,54 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		SHASH_Clean(res->items);
 		return AuxiliaryList;
 	}
+*/
 
-	/* Main cleanup cycle */
+	/* Open and lock index relations correspond to the heap relation */
+	vac_open_indexes(heapRelation, ShareLock, &nindexes, &IndexRelations);
+
+	for (irnum = 0; irnum < nindexes; irnum++)
+	{
+		if (IndexRelations[irnum]->rd_amroutine->amtargetdelete == NULL)
+		{
+			/* if we can't clean index relation - exit */
+			vac_close_indexes(nindexes, IndexRelations, ShareLock);
+			return AuxiliaryList;
+		}
+	}
+
+	dead_tuples_num = 0;
+
+	/* Collect DEAD tuples */
 	for (SHASH_SeqReset(res->items);
 		 (item = (WorkerTask *) SHASH_SeqNext(res->items)) != NULL; )
 	{
-		BlockNumber		nblocks;
 		Buffer			buffer;
-		ItemPointerData	dead_tuples[MaxOffsetNumber];
-		int				num_dead_tuples = 0;
-		OffsetNumber	offnum;
-		int				irnum;
 		Page 			page;
-		ItemId 			lp;
-		int				tnum;
-		bool			found_non_nbtree = false;
-		TransactionId	latestRemovedXid;
+		OffsetNumber	offnum;
 
 		Assert(item->hits > 0);
 
 		nblocks = RelationGetNumberOfBlocks(heapRelation);
 
 		if (item->blkno >= nblocks)
-			/*
-			 * Block was deleted early.
-			 * Skip cleaning and drop block from waiting list.
-			 */
+			/* Block was deleted early. */
 			continue;
 
-		/*
-		 * Get and pin the buffer.
-		 * we get in-memory buffer only
-		 */
-		buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, item->blkno, RBM_NORMAL_NO_READ, NULL);
+		/* Get and pin the buffer. We get in-memory buffer only */
+		buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, item->blkno,
+									RBM_NORMAL_NO_READ, NULL);
 
 		if (BufferIsInvalid(buffer))
-		{
-			/*
-			 * Buffer was evicted from shared buffers already.
-			 */
-//			Assert(!got_SIGTERM);
-//			stat_buf_ninmem++;
-//			save_to_list(AuxiliaryList, item);
+			/* Buffer was evicted from shared buffers already. */
 			continue;
-		}
 
-		if (!ConditionalLockBufferForCleanup(buffer))
+		if (!ConditionalLockBuffer(buffer))
 		{
 			stat_not_acquired_locks++;
 			pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
 
 			/* Can't lock buffer. */
 			ReleaseBuffer(buffer);
-//			save_to_list(AuxiliaryList, item);
 			continue;
 		}
 
@@ -448,121 +453,113 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 
 		/* Collect dead tuples TID's */
 		for (offnum = FirstOffsetNumber;
-			 offnum < PageGetMaxOffsetNumber(page);
+			 (offnum < PageGetMaxOffsetNumber(page)) &&
+					 (dead_tuples_num < DEAD_TUPLES_MAX_NUM);
 			 offnum = OffsetNumberNext(offnum))
 		{
-			lp = PageGetItemId(page, offnum);
+			ItemId	lp = PageGetItemId(page, offnum);
 			if (ItemIdIsDead(lp))
 			{
-				ItemPointerSet(&(dead_tuples[num_dead_tuples]), item->blkno, offnum);
-				num_dead_tuples++;
+				ItemPointerSet(&(dead_tuples[dead_tuples_num]), item->blkno, offnum);
+				dead_tuples_num++;
 			}
 		}
-		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
-		if (num_dead_tuples == 0)
+		UnlockReleaseBuffer(buffer);
+
+		if (offnum < PageGetMaxOffsetNumber(page))
 		{
-			/*
-			 * Block is clear. Accumulate some stats and continue.
-			 */
-			stat_vainly_cleaned_tuples += item->hits;
-			pgstat_progress_update_param(PROGRESS_CLEANER_VAINLY_CLEANED_TUPLES, stat_vainly_cleaned_tuples);
-			stat_vainly_cleaned_blocks++;
-			pgstat_progress_update_param(PROGRESS_CLEANER_VAINLY_CLEANED_BLOCKS, stat_vainly_cleaned_blocks);
+			/* Block not scanned fully. Scan at next iteration. */
+			save_to_list(AuxiliaryList, item);
+			break;
+		}
+	}
+
+	/* The rest of block list we send to Auxiliary list for next iteration */
+	for (; (item = (WorkerTask *) SHASH_SeqNext(res->items)) != NULL; )
+		save_to_list(AuxiliaryList, item);
+
+	/* Iterate across all index relations */
+	for (irnum = 0; irnum < nindexes; irnum++)
+		quick_vacuum_index(IndexRelations[irnum],
+						   heapRelation,
+						   dead_tuples,
+						   dead_tuples_num);
+
+	vac_close_indexes(nindexes, IndexRelations, ShareLock);
+
+	for (tnum = 0; tnum < dead_tuples_num;)
+	{
+		BlockNumber	blkno = ItemPointerGetBlockNumber(&dead_tuples[tnum]);
+		Buffer		buffer = ReadBuffer(heapRelation, blkno);
+		Page		page;
+		OffsetNumber	unusable[MaxOffsetNumber];
+		int				nunusable = 0;
+//elog(LOG, "blkno: %d %d %d", blkno, tnum, dead_tuples_num);
+		if (!ConditionalLockBufferForCleanup(buffer))
+		{
 			ReleaseBuffer(buffer);
+			stat_not_acquired_locks++;
+			pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
+
+			for (; (tnum < dead_tuples_num) &&
+				   (ItemPointerGetBlockNumber(&dead_tuples[tnum]) == blkno); tnum++);
+
 			continue;
 		}
 
-		/* Open and lock index relations correspond to the heap relation */
-		vac_open_indexes(heapRelation, ShareLock, &nindexes, &IndexRelations);
+		START_CRIT_SECTION();
 
-		/* Iterate across all index relations */
-		for (irnum = 0; irnum < nindexes; irnum++)
+		page = BufferGetPage(buffer);
+
+		/* Release DEAD heap tuples storage */
+		for (; (tnum < dead_tuples_num) &&
+			   (ItemPointerGetBlockNumber(&dead_tuples[tnum]) == blkno); tnum++)
 		{
-			if (IndexRelations[irnum]->rd_amroutine->amtargetdelete == NULL)
-			{
-				/*
-				 * Can clean only btree indexes now.
-				 */
-				found_non_nbtree = true;
-				continue;
-			}
+			OffsetNumber	offnum = ItemPointerGetOffsetNumber(&dead_tuples[tnum]);
+			ItemId			lp = PageGetItemId(page, offnum);
 
-			quick_vacuum_index(IndexRelations[irnum],
-							   heapRelation,
-							   dead_tuples,
-							   num_dead_tuples);
+			if (!ItemIdIsDead(lp))
+				continue;
+
+			ItemIdSetUnused(lp);
+			unusable[nunusable++] = offnum;
 		}
 
-		vac_close_indexes(nindexes, IndexRelations, ShareLock);
-
-		/*
-		 * If heap relation has not only b-tree indexes, can't clean heap block.
-		 */
-		if (!found_non_nbtree)
+		if (nunusable > 0)
 		{
-			OffsetNumber	unusable[MaxOffsetNumber];
-			int				nunusable = 0;
-			Size			freespace;
+			PageRepairFragmentation(page);
+			PageClearFull(page);
+			MarkBufferDirty(buffer);
 
-			if (!ConditionalLockBufferForCleanup(buffer))
+			if (RelationNeedsWAL(heapRelation))
 			{
-				ReleaseBuffer(buffer);
-//				save_to_list(AuxiliaryList, item);
-				stat_not_acquired_locks++;
-				pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
-				continue;
+				XLogRecPtr	recptr = log_heap_clean(heapRelation, buffer,
+													NULL, 0,
+													NULL, 0,
+													unusable, nunusable,
+													InvalidTransactionId);
+
+				PageSetLSN(BufferGetPage(buffer), recptr);
 			}
-
-			START_CRIT_SECTION();
-
-			/* Release DEAD heap tuples storage */
-			for (tnum = 0; tnum < num_dead_tuples; tnum++)
-			{
-				OffsetNumber	offnum = ItemPointerGetOffsetNumber(&dead_tuples[tnum]);
-				ItemId			lp = PageGetItemId(page, offnum);
-
-				Assert(ItemIdIsDead(lp));
-				ItemIdSetUnused(lp);
-				unusable[nunusable++] = offnum;
-			}
-
-			if (nunusable > 0)
-			{
-				PageRepairFragmentation(page);
-				PageClearFull(page);
-				MarkBufferDirty(buffer);
-
-				if (RelationNeedsWAL(heapRelation))
-				{
-					XLogRecPtr	recptr = log_heap_clean(heapRelation, buffer,
-														NULL, 0,
-														NULL, 0,
-														unusable, nunusable,
-														InvalidTransactionId);
-
-					PageSetLSN(BufferGetPage(buffer), recptr);
-				}
-				stat_total_deletions += nunusable;
-				stat_total_cleaned_blocks++;
-				pgstat_progress_update_param(PROGRESS_CLEANER_TOTAL_DELETIONS, stat_total_deletions);
-				pgstat_progress_update_param(PROGRESS_CLEANER_CLEANED_BLOCKS, stat_total_cleaned_blocks);
-			}
-
-			END_CRIT_SECTION();
-			freespace = PageGetHeapFreeSpace(page);
-
-			UnlockReleaseBuffer(buffer);
-			RecordPageWithFreeSpace(heapRelation, item->blkno, freespace);
-			pgstat_update_heap_dead_tuples(heapRelation, nunusable);
+			stat_total_deletions += nunusable;
+			stat_total_cleaned_blocks++;
+			pgstat_progress_update_param(PROGRESS_CLEANER_TOTAL_DELETIONS, stat_total_deletions);
+			pgstat_progress_update_param(PROGRESS_CLEANER_CLEANED_BLOCKS, stat_total_cleaned_blocks);
 		}
-		else
-			ReleaseBuffer(buffer);
-		/*
-		 * ToDo: that we will do with TOAST relation?
-		 */
+
+		END_CRIT_SECTION();
+		freespace = PageGetHeapFreeSpace(page);
+
+		UnlockReleaseBuffer(buffer);
+		RecordPageWithFreeSpace(heapRelation, blkno, freespace);
+		pgstat_update_heap_dead_tuples(heapRelation, nunusable);
+
 	}
 
+	/*
+	 * ToDo: that we will do with TOAST relation?
+	 */
 	relation_close(heapRelation, lockmode);
 	PopActiveSnapshot();
 	CommitTransactionCommand();
