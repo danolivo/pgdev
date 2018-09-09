@@ -389,13 +389,6 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		return AuxiliaryList;
 	}
 
-	/*
-	 * Get xid for following prune process. Function here is rather
-	 * expensive, so call them only one per round.
-	 */
-//	OldestXmin = GetOldestXmin(heapRelation, PROCARRAY_FLAGS_VACUUM);
-
-//	Assert(TransactionIdIsValid(OldestXmin));
 	/* Main cleanup cycle */
 	for (SHASH_SeqReset(res->items);
 		 (item = (WorkerTask *) SHASH_SeqNext(res->items)) != NULL; )
@@ -425,12 +418,9 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 
 		/*
 		 * Get and pin the buffer.
-		 * If Postgres not in termination state when we get in-memory buffer only
+		 * we get in-memory buffer only
 		 */
-//		if (!got_SIGTERM)
-			buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, item->blkno, RBM_NORMAL_NO_READ, NULL);
-//		else
-//			buffer = ReadBuffer(heapRelation, item->blkno);
+		buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, item->blkno, RBM_NORMAL_NO_READ, NULL);
 
 		if (BufferIsInvalid(buffer))
 		{
@@ -443,41 +433,16 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			continue;
 		}
 
-		/*
-		 * stop cleaning if page was changed by transaction after OldestXmin. In
-		 * this case there is high probability that we can't do anything usefull
-		 * with it. Let we return to clean later.
-		 */
-//		if (!got_SIGTERM && !IsBufferDirty(buffer) && (!TransactionIdPrecedesOrEquals(item->lastXid, OldestXmin)))
-//		{
-//			ReleaseBuffer(buffer);
+		if (!ConditionalLockBufferForCleanup(buffer))
+		{
+			stat_not_acquired_locks++;
+			pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
+
+			/* Can't lock buffer. */
+			ReleaseBuffer(buffer);
 //			save_to_list(AuxiliaryList, item);
-//			continue;
-//		}
-
-		/*
-		 * Lock the buffer for pruning
-		 */
-//		if (strategy == CLEANUP_GENTLY)
-//		{
-			if (!ConditionalLockBufferForCleanup(buffer))
-			{
-				stat_not_acquired_locks++;
-				pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
-
-				/* Can't lock buffer. */
-				ReleaseBuffer(buffer);
-//				save_to_list(AuxiliaryList, item);
-				continue;
-			}
-//		}
-//		else if (strategy == CLEANUP_AGGRESSIVE)
-//			LockBufferForCleanup(buffer);
-
-		/*
-		 * Increase our chances for cleaning more tuples.
-		 */
-//		(void) heap_page_prune(heapRelation, buffer, OldestXmin, false, &latestRemovedXid);
+			continue;
+		}
 
 		page = BufferGetPage(buffer);
 
@@ -540,19 +505,14 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			int				nunusable = 0;
 			Size			freespace;
 
-//			if (strategy == CLEANUP_GENTLY)
-//			{
-				if (!ConditionalLockBufferForCleanup(buffer))
-				{
-					ReleaseBuffer(buffer);
-//					save_to_list(AuxiliaryList, item);
-					stat_not_acquired_locks++;
-					pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
-					continue;
-				}
-//			}
-//			else if (strategy == CLEANUP_AGGRESSIVE)
-//				LockBufferForCleanup(buffer);
+			if (!ConditionalLockBufferForCleanup(buffer))
+			{
+				ReleaseBuffer(buffer);
+//				save_to_list(AuxiliaryList, item);
+				stat_not_acquired_locks++;
+				pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
+				continue;
+			}
 
 			START_CRIT_SECTION();
 
@@ -1531,8 +1491,6 @@ main_launcher_loop(void)
 				 ;
 				 node = dlist_next_node(&HeapCleanerShmem->runningWorkers, node))
 			{
-//				int temp;
-
 				worker = (WorkerInfo) node;
 
 				if (SHASH_Entries(wTab[worker->id]) == 0)
