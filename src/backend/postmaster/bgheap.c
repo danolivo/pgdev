@@ -1550,7 +1550,7 @@ main_launcher_loop(void)
 				 * and to work on further.
 				 */
 				if (SHASH_Entries(wTab[worker->id]) > 0)
-					timeout = 1L;
+					timeout = 5L;
 
 				if (!dlist_has_next(&HeapCleanerShmem->runningWorkers, node))
 					break;
@@ -1667,7 +1667,10 @@ main_worker_loop(void)
 			int				i;
 
 			/* */
-			timeout = 1L;
+			if (incoming_items_num == WORKER_TASK_ITEMS_MAX)
+				timeout = 1L;
+			else
+				timeout = 5L;
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_MISSED_BLOCKS, stat_missed_blocks);
 
@@ -1776,8 +1779,8 @@ main_worker_loop(void)
 				 * Some blocks from the list may blocked by a backend.
 				 * Deferred its for next cleanup attempt.
 				 */
-				if ((stat_tot_wait_queue_len += SHASH_Entries(dirty_relation[relcounter]->items)) > 0)
-					timeout = 1L;
+//				if ((stat_tot_wait_queue_len += SHASH_Entries(dirty_relation[relcounter]->items)) > 0)
+//					timeout = 5L;
 			}
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_TIMEOUT, timeout);
