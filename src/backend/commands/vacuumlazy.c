@@ -158,6 +158,9 @@ static void lazy_scan_heap(Relation onerel, int options,
 			   bool aggressive);
 static void lazy_vacuum_heap(Relation onerel, LVRelStats *vacrelstats);
 static bool lazy_check_needs_freeze(Buffer buf, bool *hastup);
+static void quick_vacuum_index(Relation irel, Relation hrel,
+		   ItemPointer dead_tuples,
+		   int num_dead_tuples);
 static void lazy_vacuum_index(Relation indrel,
 				  IndexBulkDeleteResult **stats,
 				  LVRelStats *vacrelstats);
@@ -1752,7 +1755,7 @@ get_tuple_by_tid(Relation rel, ItemPointer tid)
  *		Delete all the index entries pointing to tuples listed in
  *		dead_tuples.
  */
-void
+static void
 quick_vacuum_index(Relation irel, Relation hrel,
 				   ItemPointer dead_tuples,
 				   int num_dead_tuples)

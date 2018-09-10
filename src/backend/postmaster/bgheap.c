@@ -315,9 +315,147 @@ save_to_list(PSHTAB AuxiliaryList, WorkerTask *item)
 	new_item->lastXid = item->lastXid;
 }
 
-#define DEAD_TUPLES_MAX_NUM	(10000)
-static int dead_tuples_num;
-static ItemPointerData dead_tuples[DEAD_TUPLES_MAX_NUM];
+/*
+ * Get tuple from heap for a scan key building.
+ */
+static HeapTuple
+get_tuple_by_tid(Relation rel, ItemPointer tid)
+{
+	Buffer			buffer;
+	Page			page;
+	OffsetNumber	offnum;
+	ItemId			lp;
+	HeapTuple		tuple;
+	BlockNumber		npages;
+
+	npages = RelationGetNumberOfBlocks(rel);
+
+	if (ItemPointerGetBlockNumber(tid) > npages)
+		return NULL;
+
+	buffer = ReadBuffer(rel, ItemPointerGetBlockNumber(tid));
+
+	page = (Page) BufferGetPage(buffer);
+	offnum = ItemPointerGetOffsetNumber(tid);
+	lp = PageGetItemId(page, offnum);
+
+	/*
+	 * VACUUM Races: someone already remove the tuple from HEAP. Ignore it.
+	 */
+	if (!ItemIdIsUsed(lp))
+	{
+		ReleaseBuffer(buffer);
+		return NULL;
+	}
+	/* Walk along the chain */
+	while (!ItemIdHasStorage(lp))
+	{
+		offnum = ItemIdGetRedirect(lp);
+		lp = PageGetItemId(page, offnum);
+
+		if (!ItemIdIsUsed(lp))
+		{
+			ReleaseBuffer(buffer);
+			return NULL;
+		}
+	}
+
+	/* Form a tuple */
+	tuple = palloc(sizeof(HeapTupleData));
+	ItemPointerSet(&(tuple->t_self), BufferGetBlockNumber(buffer), offnum);
+	tuple->t_tableOid = RelationGetRelid(rel);
+	tuple->t_data = (HeapTupleHeader) PageGetItem(page, lp);
+	tuple->t_len = ItemIdGetLength(lp);
+	ReleaseBuffer(buffer);
+	return tuple;
+}
+
+/*
+ *	quick_vacuum_index() -- quick vacuum one index relation.
+ *
+ *		Delete all the index entries pointing to tuples listed in
+ *		dead_tuples.
+ */
+static void
+quick_vacuum_index1(Relation irel, Relation hrel,
+				   ItemPointer dead_tuples,
+				   int num_dead_tuples)
+{
+	int				tnum;
+	bool			*found = palloc0(num_dead_tuples*sizeof(bool));
+	IndexInfo 		*indexInfo = BuildIndexInfo(irel);
+	EState			*estate = CreateExecutorState();
+	ExprContext		*econtext = GetPerTupleExprContext(estate);
+	ExprState		*predicate = ExecPrepareQual(indexInfo->ii_Predicate, estate);
+	TupleTableSlot	*slot = MakeSingleTupleTableSlot(RelationGetDescr(hrel));
+
+	IndexTargetDeleteResult	stats;
+	IndexTargetDeleteInfo	ivinfo;
+
+	Assert(found != NULL);
+
+	stats.tuples_removed = 0;
+	ivinfo.indexRelation = irel;
+	ivinfo.heapRelation = hrel;
+
+	econtext->ecxt_scantuple = slot;
+
+	/* Get tuple from heap */
+	for (tnum = num_dead_tuples-1; tnum >= 0; tnum--)
+	{
+		HeapTuple		tuple;
+		Datum			values[INDEX_MAX_KEYS];
+		bool			isnull[INDEX_MAX_KEYS];
+
+		/* Index entry for the TID was deleted early */
+		if (found[tnum])
+			continue;
+
+		/* Get a tuple from heap */
+		if ((tuple = get_tuple_by_tid(hrel, &(dead_tuples[tnum]))) == NULL)
+		{
+			/*
+			 * Tuple has 'not used' status.
+			 */
+			found[tnum] = true;
+			continue;
+		}
+
+		/*
+		 * Form values[] and isnull[] arrays of index tuple
+		 * by heap tuple
+		 */
+		MemoryContextReset(econtext->ecxt_per_tuple_memory);
+
+		ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+
+		/*
+		 * In a partial index, ignore tuples that don't satisfy the
+		 * predicate.
+		 */
+		if ((predicate != NULL) && (!ExecQual(predicate, econtext)))
+		{
+			found[tnum] = true;
+			continue;
+		}
+
+		FormIndexDatum(indexInfo, slot, estate, values, isnull);
+
+		/*
+		 * Make attempt to delete some index entries by one tree descent.
+		 * We use only a part of TID list, which contains not found TID's.
+		 */
+		ivinfo.dead_tuples = dead_tuples;
+		ivinfo.last_dead_tuple = tnum;
+		ivinfo.found_dead_tuples = found;
+
+		index_target_delete(&ivinfo, &stats, values, isnull);
+	}
+
+	ExecDropSingleTupleTableSlot(slot);
+	FreeExecutorState(estate);
+	pfree(found);
+}
 
 /*
  * Main logic of HEAP and index relations cleaning
@@ -413,16 +551,17 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		}
 	}
 
-	dead_tuples_num = 0;
-
-	/* Collect DEAD tuples */
 	for (SHASH_SeqReset(res->items);
 		 (item = (WorkerTask *) SHASH_SeqNext(res->items)) != NULL; )
 	{
 		Buffer			buffer;
 		Page 			page;
 		OffsetNumber	offnum;
-
+		int				dead_tuples_num = 0;
+		ItemPointerData dead_tuples[MaxHeapTuplesPerPage];
+		OffsetNumber	unusable[MaxOffsetNumber];
+		int				nunusable = 0;
+//elog(LOG, "CLEAN New block: %d", item->blkno);
 		Assert(item->hits > 0);
 
 		nblocks = RelationGetNumberOfBlocks(heapRelation);
@@ -432,12 +571,16 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			continue;
 
 		/* Get and pin the buffer. We get in-memory buffer only */
-		buffer = ReadBufferExtended(heapRelation, MAIN_FORKNUM, item->blkno,
-									RBM_NORMAL_NO_READ, NULL);
+		buffer = ReadBufferExtended(heapRelation,
+												MAIN_FORKNUM,
+												item->blkno,
+												RBM_NORMAL_NO_READ, NULL);
 
 		if (BufferIsInvalid(buffer))
+		{
 			/* Buffer was evicted from shared buffers already. */
 			continue;
+		}
 
 		if (!ConditionalLockBuffer(buffer))
 		{
@@ -453,74 +596,38 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 
 		/* Collect dead tuples TID's */
 		for (offnum = FirstOffsetNumber;
-			 (offnum < PageGetMaxOffsetNumber(page)) &&
-					 (dead_tuples_num < DEAD_TUPLES_MAX_NUM);
+			 offnum <= PageGetMaxOffsetNumber(page);
 			 offnum = OffsetNumberNext(offnum))
 		{
 			ItemId	lp = PageGetItemId(page, offnum);
+
 			if (ItemIdIsDead(lp))
 			{
 				ItemPointerSet(&(dead_tuples[dead_tuples_num]), item->blkno, offnum);
 				dead_tuples_num++;
+//				elog(LOG, "GOT DEAD: (%d, %d)", item->blkno, offnum);
 			}
 		}
 
-		UnlockReleaseBuffer(buffer);
-
-		if (offnum < PageGetMaxOffsetNumber(page))
-		{
-			/* Block not scanned fully. Scan at next iteration. */
-			save_to_list(AuxiliaryList, item);
-			break;
-		}
-	}
-
-	/* The rest of block list we send to Auxiliary list for next iteration */
-	for (; (item = (WorkerTask *) SHASH_SeqNext(res->items)) != NULL; )
-		save_to_list(AuxiliaryList, item);
-
-	/* Iterate across all index relations */
-	for (irnum = 0; irnum < nindexes; irnum++)
-		quick_vacuum_index(IndexRelations[irnum],
-						   heapRelation,
-						   dead_tuples,
-						   dead_tuples_num);
-
-	vac_close_indexes(nindexes, IndexRelations, ShareLock);
-
-	for (tnum = 0; tnum < dead_tuples_num;)
-	{
-		BlockNumber	blkno = ItemPointerGetBlockNumber(&dead_tuples[tnum]);
-		Buffer		buffer = ReadBuffer(heapRelation, blkno);
-		Page		page;
-		OffsetNumber	unusable[MaxOffsetNumber];
-		int				nunusable = 0;
-//elog(LOG, "blkno: %d %d %d", blkno, tnum, dead_tuples_num);
-		if (!ConditionalLockBufferForCleanup(buffer))
-		{
-			ReleaseBuffer(buffer);
-			stat_not_acquired_locks++;
-			pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
-
-			for (; (tnum < dead_tuples_num) &&
-				   (ItemPointerGetBlockNumber(&dead_tuples[tnum]) == blkno); tnum++);
-
-			continue;
-		}
+		/* Iterate across all index relations */
+		for (irnum = 0; irnum < nindexes; irnum++)
+			quick_vacuum_index1(IndexRelations[irnum],
+							   heapRelation,
+							   dead_tuples,
+							   dead_tuples_num);
 
 		START_CRIT_SECTION();
 
-		page = BufferGetPage(buffer);
-
-		/* Release DEAD heap tuples storage */
-		for (; (tnum < dead_tuples_num) &&
-			   (ItemPointerGetBlockNumber(&dead_tuples[tnum]) == blkno); tnum++)
+		for (tnum = 0; tnum < dead_tuples_num; tnum++)
 		{
-			OffsetNumber	offnum = ItemPointerGetOffsetNumber(&dead_tuples[tnum]);
-			ItemId			lp = PageGetItemId(page, offnum);
+			ItemId	lp;
 
-			if (!ItemIdIsDead(lp))
-				continue;
+			offnum = ItemPointerGetOffsetNumber(&dead_tuples[tnum]);
+			lp = PageGetItemId(page, offnum);
+
+//			if (!ItemIdIsDead(lp))
+//				elog(LOG, "NOT DEAD: (%d, %d), flags=%d", ItemPointerGetBlockNumber(&dead_tuples[tnum]), offnum, lp->lp_flags);
+			Assert(ItemIdIsDead(lp));
 
 			ItemIdSetUnused(lp);
 			unusable[nunusable++] = offnum;
@@ -549,13 +656,15 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		}
 
 		END_CRIT_SECTION();
+
 		freespace = PageGetHeapFreeSpace(page);
 
 		UnlockReleaseBuffer(buffer);
-		RecordPageWithFreeSpace(heapRelation, blkno, freespace);
+		RecordPageWithFreeSpace(heapRelation, item->blkno, freespace);
 		pgstat_update_heap_dead_tuples(heapRelation, nunusable);
-
 	}
+
+	vac_close_indexes(nindexes, IndexRelations, ShareLock);
 
 	/*
 	 * ToDo: that we will do with TOAST relation?
