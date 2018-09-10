@@ -1447,6 +1447,31 @@ insert_task_into_buffer(int listId, CleanerTask* task)
 
 	return true;
 }
+
+#define TIMEOUT_MIN	(1L)
+#define TIMEOUT_MAX	(100L)
+
+static long
+timeout_change(long timeout, int percent)
+{
+	long dt;
+
+	if ((percent <= 0) && (timeout <= TIMEOUT_MIN))
+		return timeout;
+
+	if ((percent >= 0) && (timeout >= TIMEOUT_MAX))
+		return timeout;
+
+	dt = timeout + (double)percent/100.*timeout;
+
+	if (dt < TIMEOUT_MIN)
+		return TIMEOUT_MIN;
+	else if (dt > TIMEOUT_MAX)
+		return TIMEOUT_MAX;
+	else
+		return dt;
+}
+
 /*
  * Entry point of a launcher behavior logic
  * Работает в соответствии с приоритетами:
@@ -1466,7 +1491,7 @@ insert_task_into_buffer(int listId, CleanerTask* task)
 static void
 main_launcher_loop(void)
 {
-	long	timeout = -1L;
+	long	timeout = 5;// = -1L;
 	int		i;
 
 	Assert(HeapCleanerSock != PGINVALID_SOCKET);
@@ -1477,7 +1502,7 @@ main_launcher_loop(void)
 	 * timeout <= 0 tells us that the launcher does not have any work right now,
 	 * and it will sleep until the socket message or the system signal.
 	 */
-	while (!got_SIGTERM || (timeout > 0))
+	while (!got_SIGTERM)
 	{
 		int			rc;
 		int			len;
@@ -1485,8 +1510,6 @@ main_launcher_loop(void)
 		CleanerTask	table[BACKEND_DIRTY_ITEMS_MAX];
 		WorkerInfo	worker;
 		dlist_node	*node;
-
-		timeout = -1L;
 
 		/* Reread configuration files */
 		if (got_SIGHUP)
@@ -1545,7 +1568,8 @@ main_launcher_loop(void)
 					launch_worker(mptr->dbNode);
 				}
 			}
-		}
+		}// else
+		//	timeout = -1L;
 
 		/*
 		 * Pass across general waiting list.
@@ -1585,8 +1609,8 @@ main_launcher_loop(void)
 		 * Check: if we can't process all incoming messages, we need too small
 		 * timeout, check latches and go to next iteration.
 		 */
-		if (SHASH_Entries(wTab[heapcleaner_max_workers]) > 0)
-			timeout = 4L;
+//		if (SHASH_Entries(wTab[heapcleaner_max_workers]) > 0)
+//			timeout = 4L;
 
 		/*
 		 * See waiting lists of active workers and try to send messages.
@@ -1658,8 +1682,8 @@ main_launcher_loop(void)
 				 * If launcher has any tasks, It check signals quickly
 				 * and to work on further.
 				 */
-				if (SHASH_Entries(wTab[worker->id]) > 0)
-					timeout = 5L;
+//				if (SHASH_Entries(wTab[worker->id]) > 0)
+//					timeout = 5L;
 
 				if (!dlist_has_next(&HeapCleanerShmem->runningWorkers, node))
 					break;
@@ -1669,9 +1693,9 @@ main_launcher_loop(void)
 			 * Launcher have'nt any immediate tasks and
 			 * need to manage idle workers only
 			 */
-			if (timeout < 0)
+//			if (timeout < 0)
 				/* We only need to wait idle workers */
-				timeout = 100L;
+//				timeout = 100L;
 		}
 
 		LWLockRelease(HeapCleanerLock);
@@ -1684,6 +1708,17 @@ main_launcher_loop(void)
 			lc_stat_wait_tasks += SHASH_Entries(wTab[i]);
 		pgstat_progress_update_param(PROGRESS_CLAUNCHER_WAIT_TASKS, lc_stat_wait_tasks);
 		pgstat_progress_update_param(PROGRESS_CLAUNCHER_GENLIST_WAIT_TASKS, SHASH_Entries(wTab[heapcleaner_max_workers]));
+
+//		if (timeout < 0)
+//			timeout = 5;
+		if (len > 0)
+			timeout = timeout_change(timeout, -20);
+		else if (SHASH_Entries(wTab[heapcleaner_max_workers]) > (double)(wTab[heapcleaner_max_workers]->Header.ElementsMaxNum)/2.)
+			timeout = timeout_change(timeout, -100);
+		else if (lc_stat_wait_tasks > (double)(wTab[heapcleaner_max_workers]->Header.ElementsMaxNum)/1.5)
+			timeout = timeout_change(timeout, -100);
+		else
+			timeout = (timeout > 2) ? timeout_change(timeout, 50) : timeout+1;
 
 		if (!got_SIGTERM)
 		{
@@ -1779,7 +1814,7 @@ main_worker_loop(void)
 			if (incoming_items_num == WORKER_TASK_ITEMS_MAX)
 				timeout = 1L;
 			else
-				timeout = 5L;
+				timeout = 10L;
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_MISSED_BLOCKS, stat_missed_blocks);
 
@@ -1952,7 +1987,6 @@ SIGTERM_Handler(SIGNAL_ARGS)
 	got_SIGTERM = true;
 
 	SetLatch(MyLatch);
-	elog(LOG, "Worker got SIGTERM.");
 	errno = save_errno;
 }
 
