@@ -539,14 +539,14 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 */
 
 	/* Open and lock index relations correspond to the heap relation */
-	vac_open_indexes(heapRelation, ShareLock, &nindexes, &IndexRelations);
+	vac_open_indexes(heapRelation, AccessShareLock, &nindexes, &IndexRelations);
 
 	for (irnum = 0; irnum < nindexes; irnum++)
 	{
 		if (IndexRelations[irnum]->rd_amroutine->amtargetdelete == NULL)
 		{
 			/* if we can't clean index relation - exit */
-			vac_close_indexes(nindexes, IndexRelations, ShareLock);
+			vac_close_indexes(nindexes, IndexRelations, AccessShareLock);
 			return AuxiliaryList;
 		}
 	}
@@ -664,7 +664,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		pgstat_update_heap_dead_tuples(heapRelation, nunusable);
 	}
 
-	vac_close_indexes(nindexes, IndexRelations, ShareLock);
+	vac_close_indexes(nindexes, IndexRelations, AccessShareLock);
 
 	/*
 	 * ToDo: that we will do with TOAST relation?
@@ -1828,7 +1828,7 @@ main_worker_loop(void)
 			/* */
 			timeout = (TIMEOUT_MAX - ((double)incoming_items_num/
 					WORKER_TASK_ITEMS_MAX)*TIMEOUT_MAX)+1;
-//elog(LOG, "timeout=%ld incoming_items_num=%d", timeout, incoming_items_num);
+
 			pgstat_progress_update_param(PROGRESS_CLEANER_MISSED_BLOCKS, stat_missed_blocks);
 
 			/* Pass across items and sort by relation */
