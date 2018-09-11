@@ -548,6 +548,9 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		{
 			/* if we can't clean index relation - exit */
 			vac_close_indexes(nindexes, IndexRelations, lmode_index);
+			PopActiveSnapshot();
+			CommitTransactionCommand();
+			SHASH_Clean(res->items);
 			return AuxiliaryList;
 		}
 	}
