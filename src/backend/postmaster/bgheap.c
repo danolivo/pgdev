@@ -448,17 +448,8 @@ quick_vacuum_index1(Relation irel, Relation hrel,
 		ivinfo.dead_tuples = dead_tuples;
 		ivinfo.last_dead_tuple = tnum;
 		ivinfo.found_dead_tuples = found;
-		{
-			FILE *f = fopen("r1", "wt");
-			fprintf(f, "cntr=%lu\n", counter2++);
-			fclose(f);
-		}
+
 		index_target_delete(&ivinfo, &stats, values, isnull);
-		{
-			FILE *f = fopen("r1", "wt");
-			fprintf(f, "cntr1=%lu\n", counter2);
-			fclose(f);
-		}
 	}
 
 	ExecDropSingleTupleTableSlot(slot);

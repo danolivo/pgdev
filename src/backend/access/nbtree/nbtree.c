@@ -889,6 +889,7 @@ btbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	return stats;
 }
 
+static long counter2 = 0;
 /*
  * Deletion of index entries pointing to heap tuples.
  *
@@ -928,10 +929,18 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	/* Assemble scankey */
 	itup = index_form_tuple(RelationGetDescr(irel), values, isnull);
 	skey = _bt_mkscankey(irel, itup);
-
+	{
+		FILE *f = fopen("r1", "wt");
+		fprintf(f, "cntr=%lu\n", counter2++);
+		fclose(f);
+	}
 	/* Descend the tree and position ourselves on the target leaf page. */
 	stack = _bt_search(irel, keysCount, skey, &info->dead_tuples[pos], false, &buf, BT_WRITE, NULL);
-
+	{
+		FILE *f = fopen("r1", "wt");
+		fprintf(f, "cntr1=%lu\n", counter2);
+		fclose(f);
+	}
 	/* trade in our read lock for a write lock */
 //	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 //	LockBuffer(buf, BT_WRITE);
@@ -962,11 +971,24 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 			if (ndeletable > 0)
 			{
 				/* trade in our read lock for a write lock */
+				{
+					FILE *f = fopen("r1", "wt");
+					fprintf(f, "cntr2=%lu\n", counter2);
+					fclose(f);
+				}
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 				LockBufferForCleanup(buf);
-
+				{
+					FILE *f = fopen("r1", "wt");
+					fprintf(f, "cntr3=%lu\n", counter2);
+					fclose(f);
+				}
 				_bt_delitems_delete(irel, buf, deletable, ndeletable, hrel);
-
+				{
+					FILE *f = fopen("r1", "wt");
+					fprintf(f, "cntr4=%lu\n", counter2);
+					fclose(f);
+				}
 				stats->tuples_removed += ndeletable;
 				ndeletable = 0;
 			}
@@ -977,7 +999,11 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 			if (P_RIGHTMOST(opaque))
 				/* it is rightmost leaf */
 				break;
-
+			{
+				FILE *f = fopen("r1", "wt");
+				fprintf(f, "cntr5=%lu\n", counter2);
+				fclose(f);
+			}
 			/*
 			 * Traverse to a next reliable index page
 			 */
@@ -989,7 +1015,11 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 			Assert(!P_IGNORE(opaque));
 			/* Set offnum to first potentially interesting item */
 			offnum = _bt_binsrch(irel, buf, keysCount, skey, &info->dead_tuples[pos], P_FIRSTDATAKEY(opaque), false);
-
+			{
+				FILE *f = fopen("r1", "wt");
+				fprintf(f, "cntr6=%lu\n", counter2);
+				fclose(f);
+			}
 			if (offnum > PageGetMaxOffsetNumber(page))
 				break;
 			else
@@ -1042,12 +1072,26 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	 */
 	if (ndeletable > 0)
 	{
+		{
+			FILE *f = fopen("r1", "wt");
+			fprintf(f, "cntr7=%lu\n", counter2);
+			fclose(f);
+		}
 		/* trade in our read lock for a write lock */
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 		LockBufferForCleanup(buf);
-
+		{
+			FILE *f = fopen("r1", "wt");
+			fprintf(f, "cntr8=%lu\n", counter2);
+			fclose(f);
+		}
 		_bt_delitems_delete(irel, buf, deletable, ndeletable, hrel);
 		stats->tuples_removed += ndeletable;
+		{
+			FILE *f = fopen("r1", "wt");
+			fprintf(f, "cntr9=%lu\n", counter2);
+			fclose(f);
+		}
 	}
 
 	/* Release stack, scan key, unpin and unlock buffer */
