@@ -147,7 +147,7 @@ typedef struct DirtyRelation
 } DirtyRelation;
 
 static int		stat_vainly_cleaned_tuples = 0;
-static int		stat_vainly_cleaned_blocks = 0;
+static uint64	stat_cleanup_iterations = 0;
 static uint64	stat_total_deletions = 0;
 static uint64	stat_total_cleaned_blocks = 0;
 static uint64	stat_not_acquired_locks = 0;
@@ -614,21 +614,21 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 							   heapRelation,
 							   dead_tuples,
 							   dead_tuples_num);
-
+/*
 		START_CRIT_SECTION();
 
-		for (tnum = 0; tnum < dead_tuples_num; tnum++)
-		{
-			ItemId	lp;
+//		for (tnum = 0; tnum < dead_tuples_num; tnum++)
+//		{
+//			ItemId	lp;
 
-			offnum = ItemPointerGetOffsetNumber(&dead_tuples[tnum]);
-			lp = PageGetItemId(page, offnum);
+//			offnum = ItemPointerGetOffsetNumber(&dead_tuples[tnum]);
+//			lp = PageGetItemId(page, offnum);
 
-			Assert(ItemIdIsDead(lp));
+//			Assert(ItemIdIsDead(lp));
 
 //			ItemIdSetUnused(lp);
 //			unusable[nunusable++] = offnum;
-		}
+//		}
 
 		if (nunusable > 0)
 		{
@@ -658,7 +658,8 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 
 		UnlockReleaseBuffer(buffer);
 		RecordPageWithFreeSpace(heapRelation, item->blkno, freespace);
-		pgstat_update_heap_dead_tuples(heapRelation, nunusable);
+		pgstat_update_heap_dead_tuples(heapRelation, nunusable); */
+		UnlockReleaseBuffer(buffer);
 	}
 
 	vac_close_indexes(nindexes, IndexRelations, RowShareLock);
@@ -1904,6 +1905,9 @@ main_worker_loop(void)
 				FreeDirtyBlocksList = cleanup_relations(dirty_relation[relcounter], FreeDirtyBlocksList, got_SIGTERM);
 			}
 
+			stat_cleanup_iterations++;
+
+			pgstat_progress_update_param(PROGRESS_CWORKER_AVG_IT_BLOCKS_CLEANUP, stat_total_cleaned_blocks/stat_cleanup_iterations);
 			pgstat_progress_update_param(PROGRESS_CLEANER_TIMEOUT, timeout);
 			pgstat_progress_update_param(PROGRESS_CLEANER_BUF_NINMEM, stat_buf_ninmem);
 			pgstat_progress_update_param(PROGRESS_CLEANER_TOTAL_QUEUE_LENGTH, stat_tot_wait_queue_len);

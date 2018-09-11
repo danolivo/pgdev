@@ -921,7 +921,7 @@ CREATE VIEW pg_stat_progress_cleaner AS
 		S.param1 AS relations, S.param2 AS queue_len, S.param3 AS ninmem,
 		S.param4 AS cleaned_tuples, S.param5 AS vain_tuples,
 		S.param6 AS missed_blocks, S.param7 AS cleaned_blocks,
-		S.param8 AS vain_blocks, S.param9 AS nlocks, S.param10 AS timeout
+		S.param8 AS avg_blcks_clnd, S.param9 AS nlocks, S.param10 AS timeout
     FROM pg_stat_get_progress_info('CLEANER') AS S
 		LEFT JOIN pg_database D ON S.datid = D.oid;
 
