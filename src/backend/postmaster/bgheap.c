@@ -539,14 +539,14 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 */
 
 	/* Open and lock index relations correspond to the heap relation */
-	vac_open_indexes(heapRelation, AccessShareLock, &nindexes, &IndexRelations);
+	vac_open_indexes(heapRelation, RowShareLock, &nindexes, &IndexRelations);
 
 	for (irnum = 0; irnum < nindexes; irnum++)
 	{
 		if (IndexRelations[irnum]->rd_amroutine->amtargetdelete == NULL)
 		{
 			/* if we can't clean index relation - exit */
-			vac_close_indexes(nindexes, IndexRelations, AccessShareLock);
+			vac_close_indexes(nindexes, IndexRelations, RowShareLock);
 			return AuxiliaryList;
 		}
 	}
@@ -561,7 +561,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		ItemPointerData dead_tuples[MaxHeapTuplesPerPage];
 		OffsetNumber	unusable[MaxOffsetNumber];
 		int				nunusable = 0;
-//elog(LOG, "CLEAN New block: %d", item->blkno);
+
 		Assert(item->hits > 0);
 
 		nblocks = RelationGetNumberOfBlocks(heapRelation);
@@ -605,7 +605,6 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			{
 				ItemPointerSet(&(dead_tuples[dead_tuples_num]), item->blkno, offnum);
 				dead_tuples_num++;
-//				elog(LOG, "GOT DEAD: (%d, %d)", item->blkno, offnum);
 			}
 		}
 
@@ -625,8 +624,6 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			offnum = ItemPointerGetOffsetNumber(&dead_tuples[tnum]);
 			lp = PageGetItemId(page, offnum);
 
-//			if (!ItemIdIsDead(lp))
-//				elog(LOG, "NOT DEAD: (%d, %d), flags=%d", ItemPointerGetBlockNumber(&dead_tuples[tnum]), offnum, lp->lp_flags);
 			Assert(ItemIdIsDead(lp));
 
 			ItemIdSetUnused(lp);
@@ -664,7 +661,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		pgstat_update_heap_dead_tuples(heapRelation, nunusable);
 	}
 
-	vac_close_indexes(nindexes, IndexRelations, AccessShareLock);
+	vac_close_indexes(nindexes, IndexRelations, RowShareLock);
 
 	/*
 	 * ToDo: that we will do with TOAST relation?
