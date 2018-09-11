@@ -1707,7 +1707,7 @@ main_launcher_loop(void)
 		if (lc_stat_wait_tasks > (double)(wTab[heapcleaner_max_workers]->Header.ElementsMaxNum)/1.5)
 			timeout = (timeout > 1) ? (timeout/1.5) : timeout;
 
-		timeout = (timeout < LAUNCHER_TIMEOUT_MAX) ? (timeout+1) : -1L;
+		timeout = (timeout < LAUNCHER_TIMEOUT_MAX) ? (timeout+1) : LAUNCHER_TIMEOUT_MAX;
 
 		pgstat_progress_update_param(PROGRESS_CLAUNCHER_TIMEOUT, timeout);
 
