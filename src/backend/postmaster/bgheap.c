@@ -626,8 +626,8 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 
 			Assert(ItemIdIsDead(lp));
 
-			ItemIdSetUnused(lp);
-			unusable[nunusable++] = offnum;
+//			ItemIdSetUnused(lp);
+//			unusable[nunusable++] = offnum;
 		}
 
 		if (nunusable > 0)
