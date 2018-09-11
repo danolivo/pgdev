@@ -2127,7 +2127,7 @@ CommitTransaction(void)
 	AtEOXact_Files(true);
 	AtEOXact_ComboCid();
 	AtEOXact_HashTables(true);
-	AtEOXact_BGHeap_tables(true);
+//	AtEOXact_BGHeap_tables(true);
 	AtEOXact_PgStat(true);
 	AtEOXact_Snapshot(true, false);
 	AtEOXact_ApplyLauncher(true);
