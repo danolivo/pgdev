@@ -1456,10 +1456,13 @@ timeout_change(long timeout, int percent)
 {
 	long dt;
 
-	if ((percent <= 0) && (timeout <= TIMEOUT_MIN))
+	if (percent == 0)
 		return timeout;
 
-	if ((percent >= 0) && (timeout >= TIMEOUT_MAX))
+	if ((percent < 0) && (timeout <= TIMEOUT_MIN))
+		return timeout;
+
+	if ((percent > 0) && (timeout >= TIMEOUT_MAX))
 		return timeout;
 
 	dt = timeout + (double)percent/100.*timeout;
@@ -1469,7 +1472,15 @@ timeout_change(long timeout, int percent)
 	else if (dt > TIMEOUT_MAX)
 		return TIMEOUT_MAX;
 	else
+	{
+		if (dt == timeout)
+			if (percent > 0)
+				dt++;
+			else
+				dt--;
+
 		return dt;
+	}
 }
 
 /*
@@ -1711,14 +1722,15 @@ main_launcher_loop(void)
 
 //		if (timeout < 0)
 //			timeout = 5;
-		if (len > 0)
-			timeout = timeout_change(timeout, -20);
-		else if (SHASH_Entries(wTab[heapcleaner_max_workers]) > (double)(wTab[heapcleaner_max_workers]->Header.ElementsMaxNum)/2.)
-			timeout = timeout_change(timeout, -100);
+//		if (len > 0)
+//			timeout = timeout_change(timeout, -20);
+//		else
+		if (SHASH_Entries(wTab[heapcleaner_max_workers]) > (double)(wTab[heapcleaner_max_workers]->Header.ElementsMaxNum)/2.)
+			timeout = timeout_change(timeout, -10);
 		else if (lc_stat_wait_tasks > (double)(wTab[heapcleaner_max_workers]->Header.ElementsMaxNum)/1.5)
-			timeout = timeout_change(timeout, -100);
+			timeout = timeout_change(timeout, -10);
 		else
-			timeout = (timeout > 2) ? timeout_change(timeout, 50) : timeout+1;
+			timeout = timeout_change(timeout, 10);
 
 		if (!got_SIGTERM)
 		{
@@ -1811,11 +1823,9 @@ main_worker_loop(void)
 			int				i;
 
 			/* */
-			if (incoming_items_num == WORKER_TASK_ITEMS_MAX)
-				timeout = 1L;
-			else
-				timeout = 10L;
-
+			timeout = (TIMEOUT_MAX - ((double)incoming_items_num/
+					WORKER_TASK_ITEMS_MAX)*TIMEOUT_MAX)+1;
+//elog(LOG, "timeout=%ld incoming_items_num=%d", timeout, incoming_items_num);
 			pgstat_progress_update_param(PROGRESS_CLEANER_MISSED_BLOCKS, stat_missed_blocks);
 
 			/* Pass across items and sort by relation */
