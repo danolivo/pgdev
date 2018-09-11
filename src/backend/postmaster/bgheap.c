@@ -1732,7 +1732,6 @@ main_launcher_loop(void)
 
 		if (lc_stat_wait_tasks > (double)(wTab[heapcleaner_max_workers]->Header.ElementsMaxNum)/1.5)
 			timeout = (timeout > 1) ? (timeout/1.5) : timeout;
-		}
 
 		timeout = (timeout < LAUNCHER_TIMEOUT_MAX) ? (timeout+1) : -1L;
 
@@ -1786,12 +1785,10 @@ main_worker_loop(void)
 
 	FreeDirtyBlocksList = SHASH_Create(shctl);
 
-	while (!got_SIGTERM || (timeout > 0))
+	while (!got_SIGTERM)
 	{
 		int	rc;
 		int	incoming_items_num = 0;
-
-		timeout = -1L;
 
 		if (got_SIGHUP)
 		{
@@ -1920,6 +1917,9 @@ main_worker_loop(void)
 			incoming_items_num = 0;
 		}
 
+		if (timeout == TIMEOUT_MAX)
+			timeout = -1L;
+
 		PG_TRY();
 		{
 			int relcounter;
@@ -1934,13 +1934,6 @@ main_worker_loop(void)
 					SHASH_Clean(FreeDirtyBlocksList);
 
 				FreeDirtyBlocksList = cleanup_relations(dirty_relation[relcounter], FreeDirtyBlocksList, got_SIGTERM);
-
-				/*
-				 * Some blocks from the list may blocked by a backend.
-				 * Deferred its for next cleanup attempt.
-				 */
-//				if ((stat_tot_wait_queue_len += SHASH_Entries(dirty_relation[relcounter]->items)) > 0)
-//					timeout = 5L;
 			}
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_TIMEOUT, timeout);
