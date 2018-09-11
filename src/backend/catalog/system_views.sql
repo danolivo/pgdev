@@ -909,7 +909,7 @@ CREATE VIEW pg_stat_progress_clauncher AS
 		S.relid AS relid,
 		S.param1 AS tot_incoming_hits, S.param2 AS wait_tasks,
 		S.param3 AS wait_genl_tasks, S.param4 AS toworker_hits,
-		S.param5 AS cur_buf_items
+		S.param5 AS cur_buf_items, S.param6 AS timeout
     FROM pg_stat_get_progress_info('CLAUNCHER') AS S
 		LEFT JOIN pg_database D ON S.datid = D.oid;
 

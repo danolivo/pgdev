@@ -1474,10 +1474,7 @@ timeout_change(long timeout, int percent)
 	else
 	{
 		if (dt == timeout)
-			if (percent > 0)
-				dt++;
-			else
-				dt--;
+			dt = (percent > 0) ? (dt+1) : (dt-1);
 
 		return dt;
 	}
@@ -1725,12 +1722,22 @@ main_launcher_loop(void)
 //		if (len > 0)
 //			timeout = timeout_change(timeout, -20);
 //		else
-		if (SHASH_Entries(wTab[heapcleaner_max_workers]) > (double)(wTab[heapcleaner_max_workers]->Header.ElementsMaxNum)/2.)
-			timeout = timeout_change(timeout, -10);
-		else if (lc_stat_wait_tasks > (double)(wTab[heapcleaner_max_workers]->Header.ElementsMaxNum)/1.5)
-			timeout = timeout_change(timeout, -10);
+		if (len > 0)
+		{
+			if (timeout < 0)
+				timeout = 1;
+			timeout = (timeout > 1) ? (timeout-1) : timeout;
+
+			if (SHASH_Entries(wTab[heapcleaner_max_workers]) > (double)(wTab[heapcleaner_max_workers]->Header.ElementsMaxNum)/2.)
+				timeout = (timeout > 1) ? (timeout-1) : timeout;
+
+			if (lc_stat_wait_tasks > (double)(wTab[heapcleaner_max_workers]->Header.ElementsMaxNum)/1.5)
+				timeout = (timeout > 1) ? (timeout-1) : timeout;
+		}
 		else
-			timeout = timeout_change(timeout, 10);
+			timeout = (timeout < TIMEOUT_MAX) ? (timeout+1) : timeout;
+
+		pgstat_progress_update_param(PROGRESS_CLAUNCHER_TIMEOUT, timeout);
 
 		if (!got_SIGTERM)
 		{
