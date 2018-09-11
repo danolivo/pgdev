@@ -933,11 +933,11 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	stack = _bt_search(irel, keysCount, skey, &info->dead_tuples[pos], false, &buf, BT_WRITE, NULL);
 
 	/* trade in our read lock for a write lock */
-	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-	LockBuffer(buf, BT_WRITE);
+//	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+//	LockBuffer(buf, BT_WRITE);
 
-	buf = _bt_moveright(irel, buf, keysCount, skey, &info->dead_tuples[pos],
-													false, true, stack, BT_WRITE, NULL);
+//	buf = _bt_moveright(irel, buf, keysCount, skey, &info->dead_tuples[pos],
+//													false, true, stack, BT_WRITE, NULL);
 
 	/* To prepare tuple entries search across index pages */
 	Assert(BufferIsValid(buf));
