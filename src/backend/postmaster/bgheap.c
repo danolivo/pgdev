@@ -66,7 +66,7 @@
  * Maximum number of task items in storage at a backend side before shipping to a
  * background heap cleaner
  */
-#define BACKEND_DIRTY_ITEMS_MAX			(10)
+#define BACKEND_DIRTY_ITEMS_MAX			(20)
 
 /*
  * Maximum number of task items in waiting list at a Launcher side.
@@ -1725,7 +1725,7 @@ main_launcher_loop(void)
 //			timeout = timeout_change(timeout, -20);
 //		else
 		if (len > 0)
-			timeout = (timeout < 0) ? 1 : (timeout/2);
+			timeout = (timeout < 0) ? 1 : (timeout/1.5);
 
 		if (SHASH_Entries(wTab[heapcleaner_max_workers]) > (double)(wTab[heapcleaner_max_workers]->Header.ElementsMaxNum)/2.)
 			timeout = (timeout > 1) ? (timeout/1.5) : timeout;
