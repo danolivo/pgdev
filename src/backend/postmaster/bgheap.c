@@ -1448,35 +1448,6 @@ insert_task_into_buffer(int listId, CleanerTask* task)
 #define TIMEOUT_MIN	(1L)
 #define TIMEOUT_MAX	(100L)
 
-static long
-timeout_change(long timeout, int percent)
-{
-	long dt;
-
-	if (percent == 0)
-		return timeout;
-
-	if ((percent < 0) && (timeout <= TIMEOUT_MIN))
-		return timeout;
-
-	if ((percent > 0) && (timeout >= TIMEOUT_MAX))
-		return timeout;
-
-	dt = timeout + (double)percent/100.*timeout;
-
-	if (dt < TIMEOUT_MIN)
-		return TIMEOUT_MIN;
-	else if (dt > TIMEOUT_MAX)
-		return TIMEOUT_MAX;
-	else
-	{
-		if (dt == timeout)
-			dt = (percent > 0) ? (dt+1) : (dt-1);
-
-		return dt;
-	}
-}
-
 #define LAUNCHER_TIMEOUT_MAX	(10)
 
 /*
