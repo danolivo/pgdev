@@ -930,14 +930,14 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	skey = _bt_mkscankey(irel, itup);
 
 	/* Descend the tree and position ourselves on the target leaf page. */
-	stack = _bt_search(irel, keysCount, skey, &info->dead_tuples[pos], false, &buf, BT_WRITE, NULL);
+	stack = _bt_search(irel, keysCount, skey, &info->dead_tuples[pos], false, &buf, BT_READ, NULL);
 
 	/* trade in our read lock for a write lock */
-	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-	LockBuffer(buf, BT_WRITE);
+//	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+//	LockBuffer(buf, BT_WRITE);
 
-	buf = _bt_moveright(irel, buf, keysCount, skey, &info->dead_tuples[pos],
-													false, true, stack, BT_WRITE, NULL);
+//	buf = _bt_moveright(irel, buf, keysCount, skey, &info->dead_tuples[pos],
+//													false, true, stack, BT_READ, NULL);
 
 	/* To prepare tuple entries search across index pages */
 	Assert(BufferIsValid(buf));
@@ -982,7 +982,7 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 			 * Traverse to a next reliable index page
 			 */
 			buf = _bt_moveright(irel, buf, keysCount, skey, &info->dead_tuples[pos],
-												false, true, stack, BT_WRITE, NULL);
+												false, true, stack, BT_READ, NULL);
 			page = BufferGetPage(buf);
 			_bt_checkpage(irel, buf);
 			opaque = (BTPageOpaque) PageGetSpecialPointer(page);
