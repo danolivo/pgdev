@@ -1898,7 +1898,7 @@ elog(LOG, "1");
 		{
 			int relcounter;
 			int64 stat_tot_wait_queue_len = 0;
-
+			elog(LOG, "1.1");
 			/* Pass along dirty relations and try to clean it */
 			for (relcounter = 0; relcounter < dirty_relations_num; relcounter++)
 			{
@@ -1907,7 +1907,7 @@ elog(LOG, "1");
 
 				FreeDirtyBlocksList = cleanup_relations(dirty_relation[relcounter], FreeDirtyBlocksList, got_SIGTERM);
 			}
-
+			elog(LOG, "1.2");
 			stat_cleanup_iterations++;
 
 			pgstat_progress_update_param(PROGRESS_CWORKER_AVG_IT_BLOCKS_CLEANUP, stat_total_cleaned_blocks/stat_cleanup_iterations);
@@ -1938,7 +1938,7 @@ elog(LOG, "1");
 				wakeEvents |= WL_TIMEOUT;
 			rc = WaitLatch(MyLatch, wakeEvents, timeout, WAIT_EVENT_BGHEAP_MAIN);
 		}
-		elog(LOG, "3");
+
 		ResetLatch(MyLatch);
 
 		/* Emergency bailout if postmaster has died */
