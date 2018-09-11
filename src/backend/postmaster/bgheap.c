@@ -1763,7 +1763,7 @@ main_worker_loop(void)
 	{
 		int	rc;
 		int	incoming_items_num = 0;
-
+elog(LOG, "1");
 		if (got_SIGHUP)
 		{
 			got_SIGHUP = false;
@@ -1930,7 +1930,7 @@ main_worker_loop(void)
 			RESUME_INTERRUPTS();
 		}
 		PG_END_TRY();
-
+		elog(LOG, "2");
 		if (!got_SIGTERM)
 		{
 			int	wakeEvents = WL_LATCH_SET | WL_POSTMASTER_DEATH;
@@ -1938,7 +1938,7 @@ main_worker_loop(void)
 				wakeEvents |= WL_TIMEOUT;
 			rc = WaitLatch(MyLatch, wakeEvents, timeout, WAIT_EVENT_BGHEAP_MAIN);
 		}
-
+		elog(LOG, "3");
 		ResetLatch(MyLatch);
 
 		/* Emergency bailout if postmaster has died */
