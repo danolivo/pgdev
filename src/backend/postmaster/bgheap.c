@@ -538,7 +538,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		return AuxiliaryList;
 	}
 */
-
+	elog(LOG, "BEF VAC LOCK");
 	/* Open and lock index relations correspond to the heap relation */
 	vac_open_indexes(heapRelation, lmode_index, &nindexes, &IndexRelations);
 
@@ -554,7 +554,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			return AuxiliaryList;
 		}
 	}
-
+	elog(LOG, "BEF CLEAN");
 	for (SHASH_SeqReset(res->items);
 		 (item = (WorkerTask *) SHASH_SeqNext(res->items)) != NULL; )
 	{
@@ -666,7 +666,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		pgstat_update_heap_dead_tuples(heapRelation, nunusable); */
 		UnlockReleaseBuffer(buffer);
 	}
-
+	elog(LOG, "AFT CLEAN");
 	vac_close_indexes(nindexes, IndexRelations, lmode_index);
 
 	/*
@@ -1763,7 +1763,7 @@ main_worker_loop(void)
 	{
 		int	rc;
 		int	incoming_items_num = 0;
-elog(LOG, "1");
+
 		if (got_SIGHUP)
 		{
 			got_SIGHUP = false;
@@ -1930,7 +1930,7 @@ elog(LOG, "1");
 			RESUME_INTERRUPTS();
 		}
 		PG_END_TRY();
-		elog(LOG, "2");
+
 		if (!got_SIGTERM)
 		{
 			int	wakeEvents = WL_LATCH_SET | WL_POSTMASTER_DEATH;
