@@ -1725,7 +1725,7 @@ main_launcher_loop(void)
 //			timeout = timeout_change(timeout, -20);
 //		else
 		if (len > 0)
-			timeout = (timeout < 0) ? 1 : (timeout/10);
+			timeout = (timeout < 0) ? 1 : (timeout/2);
 
 		if (SHASH_Entries(wTab[heapcleaner_max_workers]) > (double)(wTab[heapcleaner_max_workers]->Header.ElementsMaxNum)/2.)
 			timeout = (timeout > 1) ? (timeout/1.5) : timeout;
