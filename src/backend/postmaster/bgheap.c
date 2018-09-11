@@ -151,7 +151,7 @@ static uint64	stat_cleanup_iterations = 0;
 static uint64	stat_total_deletions = 0;
 static uint64	stat_total_cleaned_blocks = 0;
 static uint64	stat_not_acquired_locks = 0;
-static int		stat_buf_ninmem = 0;
+static uint64	stat_buf_ninmem = 0;
 static uint32	stat_missed_blocks = 0;
 
 static uint32	lc_stat_total_incoming_hits = 0;
@@ -467,6 +467,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	Relation   		*IndexRelations;
 	int				nindexes;
 	LOCKMODE		lockmode = AccessShareLock;
+	LOCKMODE		lmode_index = AccessShareLock;
 	WorkerTask		*item;
 	BlockNumber		nblocks;
 	int				irnum;
@@ -539,14 +540,14 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 */
 
 	/* Open and lock index relations correspond to the heap relation */
-	vac_open_indexes(heapRelation, RowShareLock, &nindexes, &IndexRelations);
+	vac_open_indexes(heapRelation, lmode_index, &nindexes, &IndexRelations);
 
 	for (irnum = 0; irnum < nindexes; irnum++)
 	{
 		if (IndexRelations[irnum]->rd_amroutine->amtargetdelete == NULL)
 		{
 			/* if we can't clean index relation - exit */
-			vac_close_indexes(nindexes, IndexRelations, RowShareLock);
+			vac_close_indexes(nindexes, IndexRelations, lmode_index);
 			return AuxiliaryList;
 		}
 	}
@@ -579,13 +580,13 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		if (BufferIsInvalid(buffer))
 		{
 			/* Buffer was evicted from shared buffers already. */
+			stat_buf_ninmem++;
 			continue;
 		}
 
 		if (!ConditionalLockBuffer(buffer))
 		{
 			stat_not_acquired_locks++;
-			pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
 
 			/* Can't lock buffer. */
 			ReleaseBuffer(buffer);
@@ -607,14 +608,15 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 				dead_tuples_num++;
 			}
 		}
-
+//elog(LOG, "1 dead_tuples_num=%d", dead_tuples_num);
 		/* Iterate across all index relations */
 		for (irnum = 0; irnum < nindexes; irnum++)
 			quick_vacuum_index1(IndexRelations[irnum],
 							   heapRelation,
 							   dead_tuples,
 							   dead_tuples_num);
-/*
+//elog(LOG, "2");
+		/*
 		START_CRIT_SECTION();
 
 //		for (tnum = 0; tnum < dead_tuples_num; tnum++)
@@ -662,7 +664,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		UnlockReleaseBuffer(buffer);
 	}
 
-	vac_close_indexes(nindexes, IndexRelations, RowShareLock);
+	vac_close_indexes(nindexes, IndexRelations, lmode_index);
 
 	/*
 	 * ToDo: that we will do with TOAST relation?
@@ -1894,8 +1896,6 @@ main_worker_loop(void)
 			int relcounter;
 			int64 stat_tot_wait_queue_len = 0;
 
-			stat_buf_ninmem = 0;
-
 			/* Pass along dirty relations and try to clean it */
 			for (relcounter = 0; relcounter < dirty_relations_num; relcounter++)
 			{
@@ -1909,8 +1909,12 @@ main_worker_loop(void)
 
 			pgstat_progress_update_param(PROGRESS_CWORKER_AVG_IT_BLOCKS_CLEANUP, stat_total_cleaned_blocks/stat_cleanup_iterations);
 			pgstat_progress_update_param(PROGRESS_CLEANER_TIMEOUT, timeout);
-			pgstat_progress_update_param(PROGRESS_CLEANER_BUF_NINMEM, stat_buf_ninmem);
+//			elog(LOG, "stat_buf_ninmem=%lu stat_total_cleaned_blocks=%u", stat_buf_ninmem, stat_total_cleaned_blocks);
+			if (stat_total_cleaned_blocks > 0)
+				pgstat_progress_update_param(PROGRESS_CLEANER_BUF_NINMEM, (uint64)((double)stat_buf_ninmem/stat_total_cleaned_blocks*100.));
 			pgstat_progress_update_param(PROGRESS_CLEANER_TOTAL_QUEUE_LENGTH, stat_tot_wait_queue_len);
+			pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
+
 			QueryCancelPending = false;
 		}
 		PG_CATCH();
