@@ -457,6 +457,7 @@ quick_vacuum_index1(Relation irel, Relation hrel,
 	pfree(found);
 }
 
+static int counter = 0;
 /*
  * Main logic of HEAP and index relations cleaning
  */
@@ -538,7 +539,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		return AuxiliaryList;
 	}
 */
-	elog(LOG, "BEF VAC LOCK");
+
 	/* Open and lock index relations correspond to the heap relation */
 	vac_open_indexes(heapRelation, lmode_index, &nindexes, &IndexRelations);
 
@@ -554,7 +555,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			return AuxiliaryList;
 		}
 	}
-	elog(LOG, "BEF CLEAN");
+	elog(LOG, "BEF CLEAN %d", counter++);
 	for (SHASH_SeqReset(res->items);
 		 (item = (WorkerTask *) SHASH_SeqNext(res->items)) != NULL; )
 	{
@@ -597,7 +598,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		}
 
 		page = BufferGetPage(buffer);
-
+		elog(LOG, "BEF COLLECT");
 		/* Collect dead tuples TID's */
 		for (offnum = FirstOffsetNumber;
 			 offnum <= PageGetMaxOffsetNumber(page);
@@ -611,14 +612,14 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 				dead_tuples_num++;
 			}
 		}
-//elog(LOG, "1 dead_tuples_num=%d", dead_tuples_num);
+elog(LOG, "1 dead_tuples_num=%d", dead_tuples_num);
 		/* Iterate across all index relations */
 		for (irnum = 0; irnum < nindexes; irnum++)
 			quick_vacuum_index1(IndexRelations[irnum],
 							   heapRelation,
 							   dead_tuples,
 							   dead_tuples_num);
-//elog(LOG, "2");
+		elog(LOG, "AFT INDEX");
 		/*
 		START_CRIT_SECTION();
 
@@ -1898,7 +1899,7 @@ main_worker_loop(void)
 		{
 			int relcounter;
 			int64 stat_tot_wait_queue_len = 0;
-			elog(LOG, "1.1");
+
 			/* Pass along dirty relations and try to clean it */
 			for (relcounter = 0; relcounter < dirty_relations_num; relcounter++)
 			{
@@ -1907,7 +1908,7 @@ main_worker_loop(void)
 
 				FreeDirtyBlocksList = cleanup_relations(dirty_relation[relcounter], FreeDirtyBlocksList, got_SIGTERM);
 			}
-			elog(LOG, "1.2");
+
 			stat_cleanup_iterations++;
 
 			pgstat_progress_update_param(PROGRESS_CWORKER_AVG_IT_BLOCKS_CLEANUP, stat_total_cleaned_blocks/stat_cleanup_iterations);
