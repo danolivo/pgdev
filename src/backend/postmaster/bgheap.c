@@ -1480,6 +1480,8 @@ timeout_change(long timeout, int percent)
 	}
 }
 
+#define LAUNCHER_TIMEOUT_MAX	(10)
+
 /*
  * Entry point of a launcher behavior logic
  * Работает в соответствии с приоритетами:
@@ -1723,19 +1725,16 @@ main_launcher_loop(void)
 //			timeout = timeout_change(timeout, -20);
 //		else
 		if (len > 0)
-		{
-			if (timeout < 0)
-				timeout = 1;
-			timeout = (timeout > 1) ? (timeout-1) : timeout;
+			timeout = (timeout < 0) ? 1 : (timeout/10);
 
-			if (SHASH_Entries(wTab[heapcleaner_max_workers]) > (double)(wTab[heapcleaner_max_workers]->Header.ElementsMaxNum)/2.)
-				timeout = (timeout > 1) ? (timeout-1) : timeout;
+		if (SHASH_Entries(wTab[heapcleaner_max_workers]) > (double)(wTab[heapcleaner_max_workers]->Header.ElementsMaxNum)/2.)
+			timeout = (timeout > 1) ? (timeout/1.5) : timeout;
 
-			if (lc_stat_wait_tasks > (double)(wTab[heapcleaner_max_workers]->Header.ElementsMaxNum)/1.5)
-				timeout = (timeout > 1) ? (timeout-1) : timeout;
+		if (lc_stat_wait_tasks > (double)(wTab[heapcleaner_max_workers]->Header.ElementsMaxNum)/1.5)
+			timeout = (timeout > 1) ? (timeout/1.5) : timeout;
 		}
-		else
-			timeout = (timeout < TIMEOUT_MAX) ? (timeout+1) : timeout;
+
+		timeout = (timeout < LAUNCHER_TIMEOUT_MAX) ? (timeout+1) : -1L;
 
 		pgstat_progress_update_param(PROGRESS_CLAUNCHER_TIMEOUT, timeout);
 
