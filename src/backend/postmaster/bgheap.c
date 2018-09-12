@@ -555,7 +555,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			return AuxiliaryList;
 		}
 	}
-	elog(LOG, "BEF CLEAN %d", counter++);
+//	elog(LOG, "BEF CLEAN %d", counter++);
 	for (SHASH_SeqReset(res->items);
 		 (item = (WorkerTask *) SHASH_SeqNext(res->items)) != NULL; )
 	{
@@ -612,14 +612,14 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 				dead_tuples_num++;
 			}
 		}
-elog(LOG, "1 dead_tuples_num=%d", dead_tuples_num);
+//elog(LOG, "1 dead_tuples_num=%d", dead_tuples_num);
 		/* Iterate across all index relations */
 		for (irnum = 0; irnum < nindexes; irnum++)
 			quick_vacuum_index1(IndexRelations[irnum],
 							   heapRelation,
 							   dead_tuples,
 							   dead_tuples_num);
-		elog(LOG, "AFT INDEX");
+//		elog(LOG, "AFT INDEX");
 		/*
 		START_CRIT_SECTION();
 
@@ -667,7 +667,7 @@ elog(LOG, "1 dead_tuples_num=%d", dead_tuples_num);
 		pgstat_update_heap_dead_tuples(heapRelation, nunusable); */
 		UnlockReleaseBuffer(buffer);
 	}
-	elog(LOG, "AFT CLEAN");
+//	elog(LOG, "AFT CLEAN");
 	vac_close_indexes(nindexes, IndexRelations, lmode_index);
 
 	/*
