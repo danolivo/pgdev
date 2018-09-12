@@ -547,14 +547,11 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	{
 		if (IndexRelations[irnum]->rd_amroutine->amtargetdelete == NULL)
 		{
-			/* if we can't clean index relation - exit */
-			vac_close_indexes(nindexes, IndexRelations, lmode_index);
-			PopActiveSnapshot();
-			CommitTransactionCommand();
 			SHASH_Clean(res->items);
-			return AuxiliaryList;
+			break;
 		}
 	}
+	vac_close_indexes(nindexes, IndexRelations, lmode_index);
 
 	for (SHASH_SeqReset(res->items);
 		 (item = (WorkerTask *) SHASH_SeqNext(res->items)) != NULL; )
@@ -597,6 +594,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			continue;
 		}
 
+		vac_open_indexes(heapRelation, lmode_index, &nindexes, &IndexRelations);
 		page = BufferGetPage(buffer);
 
 		/* Collect dead tuples TID's */
@@ -665,10 +663,10 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		UnlockReleaseBuffer(buffer);
 		RecordPageWithFreeSpace(heapRelation, item->blkno, freespace);
 		pgstat_update_heap_dead_tuples(heapRelation, nunusable); */
+		vac_close_indexes(nindexes, IndexRelations, lmode_index);
 		UnlockReleaseBuffer(buffer);
 	}
 //	elog(LOG, "AFT CLEAN");
-	vac_close_indexes(nindexes, IndexRelations, lmode_index);
 
 	/*
 	 * ToDo: that we will do with TOAST relation?
