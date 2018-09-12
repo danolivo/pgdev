@@ -1721,10 +1721,10 @@ main_launcher_loop(void)
 static long
 get_timeout(int ntuples, int ntuples_max, long timeout_min, long timeout_max)
 {
-	double factor = log10(9. * (double)ntuples/ntuples_max+1);
+	double factor = log10(9. * (double)ntuples/ntuples_max + 1);
 
 	Assert((factor >= 0.) && (factor <= 1.));
-	return timeout_min + (1-factor) * (timeout_max - timeout_min);
+	return timeout_min + (1.-factor) * (timeout_max - timeout_min);
 }
 
 /*
@@ -1899,7 +1899,7 @@ main_worker_loop(void)
 
 			stat_cleanup_iterations++;
 
-			pgstat_progress_update_param(PROGRESS_CWORKER_AVG_IT_BLOCKS_CLEANUP, stat_total_cleaned_blocks/stat_cleanup_iterations);
+			pgstat_progress_update_param(PROGRESS_CWORKER_AVG_IT_BLOCKS_CLEANUP, /*stat_total_cleaned_blocks/*/stat_cleanup_iterations);
 			pgstat_progress_update_param(PROGRESS_CLEANER_TIMEOUT, timeout);
 //			elog(LOG, "stat_buf_ninmem=%lu stat_total_cleaned_blocks=%u", stat_buf_ninmem, stat_total_cleaned_blocks);
 			if (stat_total_cleaned_blocks > 0)
