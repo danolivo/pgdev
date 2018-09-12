@@ -965,7 +965,8 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 			{
 				/* trade in our read lock for a write lock */
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-				LockBufferForCleanup(buf);
+				LockBuffer(buf, BT_WRITE);
+//				LockBufferForCleanup(buf);
 
 				_bt_delitems_delete(irel, buf, deletable, ndeletable, hrel);
 
@@ -1047,7 +1048,8 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	{
 		/* trade in our read lock for a write lock */
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-		LockBufferForCleanup(buf);
+		LockBuffer(buf, BT_WRITE);
+//		LockBufferForCleanup(buf);
 
 		_bt_delitems_delete(irel, buf, deletable, ndeletable, hrel);
 		stats->tuples_removed += ndeletable;
