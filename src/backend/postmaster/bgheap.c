@@ -1790,7 +1790,7 @@ main_worker_loop(void)
 			int				i;
 
 			/* */
-			timeout = get_timeout(incoming_items_num, WORKER_TASK_ITEMS_MAX, 1L, TIMEOUT_MAX);
+			timeout = get_timeout(incoming_items_num, WORKER_TASK_ITEMS_MAX, 0L, TIMEOUT_MAX);
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_MISSED_BLOCKS, stat_missed_blocks);
 
@@ -1920,15 +1920,15 @@ main_worker_loop(void)
 		}
 		PG_END_TRY();
 
-		if (!got_SIGTERM)
+		if (!got_SIGTERM && (timeout != 0))
 		{
 			int	wakeEvents = WL_LATCH_SET | WL_POSTMASTER_DEATH;
 			if (timeout > 0)
 				wakeEvents |= WL_TIMEOUT;
 			rc = WaitLatch(MyLatch, wakeEvents, timeout, WAIT_EVENT_BGHEAP_MAIN);
-		}
 
-		ResetLatch(MyLatch);
+			ResetLatch(MyLatch);
+		}
 
 		/* Emergency bailout if postmaster has died */
 		if (rc & WL_POSTMASTER_DEATH)
