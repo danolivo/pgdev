@@ -632,21 +632,27 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 //			continue;
 //		}
 
-		/*
+
 		START_CRIT_SECTION();
 
-//		for (tnum = 0; tnum < dead_tuples_num; tnum++)
-//		{
-//			ItemId	lp;
+		for (tnum = 0; tnum < dead_tuples_num; tnum++)
+		{
+			ItemId	lp;
 
-//			offnum = ItemPointerGetOffsetNumber(&dead_tuples[tnum]);
-//			lp = PageGetItemId(page, offnum);
+			offnum = ItemPointerGetOffsetNumber(&dead_tuples[tnum]);
+			lp = PageGetItemId(page, offnum);
 
-//			Assert(ItemIdIsDead(lp));
+			/*
+			 * After a DEAD tuples collecting process buffer was unlocked, but
+			 * not unpinned. Now in Postgres all processes, who can change state
+			 * of DEAD tuple acquired cleanup lock and now we have guarantee, what
+			 * the tuple not cleaned out before.
+			 */
+			Assert(ItemIdIsDead(lp));
 
-//			ItemIdSetUnused(lp);
-//			unusable[nunusable++] = offnum;
-//		}
+			ItemIdSetUnused(lp);
+			unusable[nunusable++] = offnum;
+		}
 
 		if (nunusable > 0)
 		{
@@ -676,8 +682,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 
 		UnlockReleaseBuffer(buffer);
 		RecordPageWithFreeSpace(heapRelation, item->blkno, freespace);
-		pgstat_update_heap_dead_tuples(heapRelation, nunusable); */
-		UnlockReleaseBuffer(buffer);
+		pgstat_update_heap_dead_tuples(heapRelation, nunusable);
 	}
 
 	vac_close_indexes(nindexes, IndexRelations, lmode_index);
