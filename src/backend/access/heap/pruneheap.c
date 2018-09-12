@@ -157,12 +157,13 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 
 			/* OK to prune */
 			(void) heap_page_prune(relation, buffer, OldestXmin, true, &ignore);
-			if (IsBufferDirty(buffer))
-				HeapCleanerSend(relation, BufferGetBlockNumber(buffer));
 		}
 
 		/* And release buffer lock */
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+
+		if (IsBufferDirty(buffer))
+			HeapCleanerSend(relation, BufferGetBlockNumber(buffer));
 	}
 }
 
