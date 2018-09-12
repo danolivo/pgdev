@@ -457,7 +457,7 @@ quick_vacuum_index1(Relation irel, Relation hrel,
 	pfree(found);
 }
 
-static int counter = 0;
+//static int counter = 0;
 /*
  * Main logic of HEAP and index relations cleaning
  */
@@ -468,7 +468,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	Relation   		*IndexRelations;
 	int				nindexes;
 	LOCKMODE		lockmode = AccessShareLock;
-	LOCKMODE		lmode_index = RowExclusiveLock;
+	LOCKMODE		lmode_index = ExclusiveLock;
 	WorkerTask		*item;
 	BlockNumber		nblocks;
 	int				irnum;

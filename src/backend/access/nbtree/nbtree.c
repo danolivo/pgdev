@@ -944,7 +944,7 @@ counter2=0;
 	buf = _bt_moveright(irel, buf, keysCount, skey, &info->dead_tuples[pos],
 													false, true, stack, BT_WRITE, NULL);
 
-	CheckForSerializableConflictIn(irel, NULL, buf);
+//	CheckForSerializableConflictIn(irel, NULL, buf);
 
 	/* To prepare tuple entries search across index pages */
 	Assert(BufferIsValid(buf));
