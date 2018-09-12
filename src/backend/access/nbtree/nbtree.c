@@ -889,7 +889,6 @@ btbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	return stats;
 }
 
-//static long counter2 = 0;
 /*
  * Deletion of index entries pointing to heap tuples.
  *
@@ -922,7 +921,7 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	OffsetNumber	deletable[MaxOffsetNumber];
 	IndexTuple		itup;
 	int				pos = info->last_dead_tuple;
-//counter2=0;
+
 	if (stats == NULL)
 		stats = (IndexTargetDeleteResult *) palloc0(sizeof(IndexTargetDeleteResult));
 
@@ -955,7 +954,6 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 		ItemId		itemid;
 		IndexTuple	itup;
 
-//		Assert(counter2++ < 1000);
 		/* Switch to the next page */
 		if (offnum > PageGetMaxOffsetNumber(page))
 		{
@@ -991,6 +989,7 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 			_bt_checkpage(irel, buf);
 			opaque = (BTPageOpaque) PageGetSpecialPointer(page);
 			Assert(!P_IGNORE(opaque));
+
 			/* Set offnum to first potentially interesting item */
 			offnum = _bt_binsrch(irel, buf, keysCount, skey, &info->dead_tuples[pos], P_FIRSTDATAKEY(opaque), false);
 
