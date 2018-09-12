@@ -22,6 +22,7 @@
 
 #include "postgres.h"
 
+#include <math.h>
 #include <unistd.h>
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
@@ -1720,7 +1721,7 @@ main_launcher_loop(void)
 static long
 get_timeout(int ntuples, int ntuples_max, long timeout_min, long timeout_max)
 {
-	double factor = log(2.-(double)ntuples/ntuples_max);
+	double factor = log10(10.-(double)ntuples/ntuples_max);
 
 	return timeout_min + factor * (timeout_max - timeout_min);
 }
