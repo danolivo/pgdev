@@ -922,7 +922,7 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	OffsetNumber	deletable[MaxOffsetNumber];
 	IndexTuple		itup;
 	int				pos = info->last_dead_tuple;
-
+counter2=0;
 	if (stats == NULL)
 		stats = (IndexTargetDeleteResult *) palloc0(sizeof(IndexTargetDeleteResult));
 
@@ -959,6 +959,7 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 		ItemId		itemid;
 		IndexTuple	itup;
 
+		Assert(counter2++ < 1000);
 		/* Switch to the next page */
 		if (offnum > PageGetMaxOffsetNumber(page))
 		{
@@ -969,8 +970,8 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 			if (ndeletable > 0)
 			{
 				/* trade in our read lock for a write lock */
-				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-				LockBufferForCleanup(buf);
+//				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+//				LockBufferForCleanup(buf);
 
 				_bt_delitems_delete(irel, buf, deletable, ndeletable, hrel);
 
@@ -1050,8 +1051,8 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	if (ndeletable > 0)
 	{
 		/* trade in our read lock for a write lock */
-		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-		LockBufferForCleanup(buf);
+//		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+//		LockBufferForCleanup(buf);
 
 		_bt_delitems_delete(irel, buf, deletable, ndeletable, hrel);
 		stats->tuples_removed += ndeletable;
