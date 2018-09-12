@@ -1717,6 +1717,14 @@ main_launcher_loop(void)
 	proc_exit(0);
 }
 
+static long
+get_timeout(int ntuples, int ntuples_max, long timeout_min, long timeout_max)
+{
+	double factor = log(2.-(double)ntuples/ntuples_max);
+
+	return timeout_min + factor * (timeout_max - timeout_min);
+}
+
 /*
  * Entry point of a worker behavior logic
  */
@@ -1780,8 +1788,7 @@ main_worker_loop(void)
 			int				i;
 
 			/* */
-			timeout = 1L;//(TIMEOUT_MAX - ((double)incoming_items_num/
-			//		WORKER_TASK_ITEMS_MAX)*TIMEOUT_MAX)+1;
+			timeout = get_timeout(incoming_items_num, WORKER_TASK_ITEMS_MAX, 1L, TIMEOUT_MAX);
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_MISSED_BLOCKS, stat_missed_blocks);
 
