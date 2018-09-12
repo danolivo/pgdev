@@ -889,7 +889,7 @@ btbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	return stats;
 }
 
-static long counter2 = 0;
+//static long counter2 = 0;
 /*
  * Deletion of index entries pointing to heap tuples.
  *
@@ -922,7 +922,7 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	OffsetNumber	deletable[MaxOffsetNumber];
 	IndexTuple		itup;
 	int				pos = info->last_dead_tuple;
-counter2=0;
+//counter2=0;
 	if (stats == NULL)
 		stats = (IndexTargetDeleteResult *) palloc0(sizeof(IndexTargetDeleteResult));
 
@@ -938,11 +938,11 @@ counter2=0;
 	stack = _bt_search(irel, keysCount, skey, &info->dead_tuples[pos], false, &buf, BT_READ, NULL);
 
 	/* trade in our read lock for a write lock */
-	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-	LockBuffer(buf, BT_WRITE);
+//	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+//	LockBuffer(buf, BT_WRITE);
 
 	buf = _bt_moveright(irel, buf, keysCount, skey, &info->dead_tuples[pos],
-													false, true, stack, BT_WRITE, NULL);
+													false, true, stack, BT_READ, NULL);
 
 //	CheckForSerializableConflictIn(irel, NULL, buf);
 
@@ -959,7 +959,7 @@ counter2=0;
 		ItemId		itemid;
 		IndexTuple	itup;
 
-		Assert(counter2++ < 1000);
+//		Assert(counter2++ < 1000);
 		/* Switch to the next page */
 		if (offnum > PageGetMaxOffsetNumber(page))
 		{
@@ -970,8 +970,8 @@ counter2=0;
 			if (ndeletable > 0)
 			{
 				/* trade in our read lock for a write lock */
-//				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-//				LockBufferForCleanup(buf);
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				LockBufferForCleanup(buf);
 
 				_bt_delitems_delete(irel, buf, deletable, ndeletable, hrel);
 
@@ -990,7 +990,7 @@ counter2=0;
 			 * Traverse to a next reliable index page
 			 */
 			buf = _bt_moveright(irel, buf, keysCount, skey, &info->dead_tuples[pos],
-												true, true, stack, BT_WRITE, NULL);
+												true, true, stack, BT_READ, NULL);
 			page = BufferGetPage(buf);
 			_bt_checkpage(irel, buf);
 			opaque = (BTPageOpaque) PageGetSpecialPointer(page);
@@ -1051,8 +1051,8 @@ counter2=0;
 	if (ndeletable > 0)
 	{
 		/* trade in our read lock for a write lock */
-//		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-//		LockBufferForCleanup(buf);
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		LockBufferForCleanup(buf);
 
 		_bt_delitems_delete(irel, buf, deletable, ndeletable, hrel);
 		stats->tuples_removed += ndeletable;
