@@ -1790,7 +1790,7 @@ main_worker_loop(void)
 			int				i;
 
 			/* */
-			timeout = get_timeout(incoming_items_num, WORKER_TASK_ITEMS_MAX, 0L, TIMEOUT_MAX);
+			timeout = get_timeout(incoming_items_num, WORKER_TASK_ITEMS_MAX, 1L, TIMEOUT_MAX);
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_MISSED_BLOCKS, stat_missed_blocks);
 
