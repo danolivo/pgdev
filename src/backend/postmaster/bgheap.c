@@ -1920,7 +1920,7 @@ main_worker_loop(void)
 		}
 		PG_END_TRY();
 
-		if (!got_SIGTERM && (timeout != 0))
+		if (!got_SIGTERM)
 		{
 			int	wakeEvents = WL_LATCH_SET | WL_POSTMASTER_DEATH;
 			if (timeout > 0)
