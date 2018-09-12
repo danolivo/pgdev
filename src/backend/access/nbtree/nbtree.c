@@ -929,11 +929,7 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	/* Assemble scankey */
 	itup = index_form_tuple(RelationGetDescr(irel), values, isnull);
 	skey = _bt_mkscankey(irel, itup);
-//	{
-//		FILE *f = fopen("r1", "wt");
-//		fprintf(f, "cntr=%lu\n", counter2++);
-//		fclose(f);
-//	}
+
 	/* Descend the tree and position ourselves on the target leaf page. */
 	stack = _bt_search(irel, keysCount, skey, &info->dead_tuples[pos], false, &buf, BT_READ, NULL);
 
