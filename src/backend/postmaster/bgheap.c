@@ -588,15 +588,15 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			continue;
 		}
 
-		if (!ConditionalLockBuffer(buffer))
-		{
-			stat_not_acquired_locks++;
+//		if (!ConditionalLockBuffer(buffer))
+//		{
+//			stat_not_acquired_locks++;
 
 			/* Can't lock buffer. */
-			ReleaseBuffer(buffer);
-			continue;
-		}
-
+//			ReleaseBuffer(buffer);
+//			continue;
+//		}
+		LockBuffer(buffer, AccessShareLock);
 		page = BufferGetPage(buffer);
 
 		/* Collect dead tuples TID's */
@@ -622,14 +622,15 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 							   dead_tuples,
 							   dead_tuples_num);
 
-		if (!ConditionalLockBufferForCleanup(buffer))
-		{
-			stat_not_acquired_locks++;
+		LockBufferForCleanup(buffer);
+//		if (!ConditionalLockBufferForCleanup(buffer))
+//		{
+//			stat_not_acquired_locks++;
 
 			/* Can't lock buffer. */
-			ReleaseBuffer(buffer);
-			continue;
-		}
+//			ReleaseBuffer(buffer);
+//			continue;
+//		}
 
 		/*
 		START_CRIT_SECTION();
