@@ -467,7 +467,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	Relation		heapRelation;
 	Relation   		*IndexRelations;
 	int				nindexes;
-	LOCKMODE		lockmode = AccessShareLock;
+	LOCKMODE		lockmode = RowExclusiveLock;
 	LOCKMODE		lmode_index = RowExclusiveLock;
 	WorkerTask		*item;
 	BlockNumber		nblocks;
