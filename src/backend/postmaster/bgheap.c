@@ -1721,9 +1721,9 @@ main_launcher_loop(void)
 static long
 get_timeout(int ntuples, int ntuples_max, long timeout_min, long timeout_max)
 {
-	double factor = log10(10.-(double)ntuples/ntuples_max);
+	double factor = log10(10. - 9. * (double)ntuples/ntuples_max);
 
-	Assert((factor >=0.) && (factor <=1.));
+	Assert((factor >= 0.) && (factor <= 1.));
 	return timeout_min + factor * (timeout_max - timeout_min);
 }
 
