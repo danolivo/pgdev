@@ -1915,7 +1915,7 @@ main_worker_loop(void)
 			EmitErrorReport();
 			AbortOutOfAnyTransaction();
 			FlushErrorState();
-
+elog(LOG, "CATCH");
 			RESUME_INTERRUPTS();
 		}
 		PG_END_TRY();
