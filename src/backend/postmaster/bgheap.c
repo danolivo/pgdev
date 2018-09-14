@@ -1,9 +1,9 @@
 /*
  * bgheap.c
  *
- * PostgreSQL integrated cleaner of HEAP and INDEX relations
+ * PostgreSQL-integrated cleaner of HEAP and INDEX relations
  *
- * Made in autovacuum analogy. Uses 'Target' strategy for clean relations,
+ * Made by analogy with autovacuum. Uses 'Target' strategy for clean relations,
  * without full scan.
  * The cleaner to consist of one Launcher and Workers.
  * One worker corresponds to one database.
@@ -106,7 +106,7 @@ typedef struct CleanerMessage
 typedef struct WorkerTask
 {
 	BlockNumber		blkno;
-	TransactionId	lastXid;
+	TransactionId	xid;
 	uint16			hits;
 } WorkerTask;
 
@@ -152,7 +152,9 @@ static uint64	stat_cleanup_iterations = 0;
 static uint64	stat_total_deletions = 0;
 static uint64	stat_total_cleaned_blocks = 0;
 static uint64	stat_not_acquired_locks = 0;
-static uint64	stat_buf_ninmem = 0;
+
+/* Count attempts of cleaning not-in-memory buffers (it should ignored) */
+static uint64	w_stat_buf_ninmem = 0;
 static uint32	stat_missed_blocks = 0;
 
 static uint32	lc_stat_total_incoming_hits = 0;
@@ -313,7 +315,7 @@ save_to_list(PSHTAB AuxiliaryList, WorkerTask *item)
 
 	Assert((new_item != NULL) && (!found));
 	new_item->hits = item->hits;
-	new_item->lastXid = item->lastXid;
+	new_item->xid = item->xid;
 }
 
 /*
@@ -370,7 +372,7 @@ get_tuple_by_tid(Relation rel, ItemPointer tid)
 	ReleaseBuffer(buffer);
 	return tuple;
 }
-static long counter2 = 0;
+
 /*
  *	quick_vacuum_index() -- quick vacuum one index relation.
  *
@@ -584,7 +586,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		if (BufferIsInvalid(buffer))
 		{
 			/* Buffer was evicted from shared buffers already. */
-			stat_buf_ninmem++;
+			w_stat_buf_ninmem++;
 			continue;
 		}
 
@@ -1469,8 +1471,7 @@ insert_task_into_buffer(int listId, CleanerTask* task)
 	return true;
 }
 
-#define TIMEOUT_MIN	(1L)
-#define TIMEOUT_MAX	(100L)
+#define WORKER_TIMEOUT_MAX	(100L)
 
 #define LAUNCHER_TIMEOUT_MAX	(10)
 
@@ -1493,7 +1494,7 @@ insert_task_into_buffer(int listId, CleanerTask* task)
 static void
 main_launcher_loop(void)
 {
-	long	timeout = 5;// = -1L;
+	long	timeout = 5;
 	int		i;
 
 	Assert(HeapCleanerSock != PGINVALID_SOCKET);
@@ -1688,11 +1689,6 @@ main_launcher_loop(void)
 		pgstat_progress_update_param(PROGRESS_CLAUNCHER_WAIT_TASKS, lc_stat_wait_tasks);
 		pgstat_progress_update_param(PROGRESS_CLAUNCHER_GENLIST_WAIT_TASKS, SHASH_Entries(wTab[heapcleaner_max_workers]));
 
-//		if (timeout < 0)
-//			timeout = 5;
-//		if (len > 0)
-//			timeout = timeout_change(timeout, -20);
-//		else
 		if (len > 0)
 			timeout = (timeout < 0) ? 1 : (timeout/1.5);
 
@@ -1705,7 +1701,7 @@ main_launcher_loop(void)
 		if (lc_stat_wait_tasks > (double)(wTab[heapcleaner_max_workers]->Header.ElementsMaxNum)/5)
 			timeout /= 2;
 
-		timeout = (timeout < LAUNCHER_TIMEOUT_MAX) ? (timeout+1) : LAUNCHER_TIMEOUT_MAX;
+		timeout = (timeout < LAUNCHER_TIMEOUT_MAX) ? (timeout+1) : -1L;
 
 		pgstat_progress_update_param(PROGRESS_CLAUNCHER_TIMEOUT, timeout);
 
@@ -1735,13 +1731,26 @@ main_launcher_loop(void)
 	proc_exit(0);
 }
 
+/*
+ * Timeout between cleanup iterations used to reduce usage of
+ * CPU resources. It is based on logarithmic function of items
+ * at incoming buffer.
+ * If buffer is full, we ignore signals and latches at all.
+ * If buffer has not any items we wait for signals and latches
+ * without timeout.
+ */
 static long
 get_timeout(int ntuples, int ntuples_max, long timeout_min, long timeout_max)
 {
-	double factor = log10(9. * (double)ntuples/ntuples_max + 1);
+	if (ntuples == 0)
+		return -1L;
+	else
+	{
+		double factor = log10(9. * (double)ntuples/ntuples_max + 1);
 
-	Assert((factor >= 0.) && (factor <= 1.));
-	return timeout_min + (1.-factor) * (timeout_max - timeout_min);
+		Assert((factor >= 0.) && (factor <= 1.));
+		return timeout_min + (1.-factor) * (timeout_max - timeout_min);
+	}
 }
 
 /*
@@ -1750,7 +1759,7 @@ get_timeout(int ntuples, int ntuples_max, long timeout_min, long timeout_max)
 static void
 main_worker_loop(void)
 {
-	CleanerTask	task_item[WORKER_TASK_ITEMS_MAX];
+	CleanerTask		task_item[WORKER_TASK_ITEMS_MAX];
 	DirtyRelation	*dirty_relation[WORKER_RELATIONS_MAX_NUM];
 	PSHTAB			FreeDirtyBlocksList;
 	long			timeout = -1L;
@@ -1768,7 +1777,6 @@ main_worker_loop(void)
 
 	while (!got_SIGTERM)
 	{
-		int	rc;
 		int	incoming_items_num = 0;
 
 		if (got_SIGHUP)
@@ -1796,6 +1804,10 @@ main_worker_loop(void)
 		}
 		LWLockRelease(&MyWorkerInfo->WorkItemLock);
 
+		/* Get new timeout value */
+		timeout = get_timeout(incoming_items_num, WORKER_TASK_ITEMS_MAX,
+							  0L, WORKER_TIMEOUT_MAX);
+
 		/*
 		 * If launcher receive some task items it need to distribute between
 		 * workers and waiting lists.
@@ -1805,9 +1817,6 @@ main_worker_loop(void)
 			DirtyRelation	*hashent;
 			bool			found;
 			int				i;
-
-			/* */
-			timeout = get_timeout(incoming_items_num, WORKER_TASK_ITEMS_MAX, 0L, TIMEOUT_MAX);
 
 			pgstat_progress_update_param(PROGRESS_CLEANER_MISSED_BLOCKS, stat_missed_blocks);
 
@@ -1862,7 +1871,9 @@ main_worker_loop(void)
 					}
 
 					/* Insert new relid to hash table */
-					hashent = SHASH_Search(PrivateRelationsTable, (void *) &(task_item[i].relid), HASH_ENTER, &found);
+					hashent = SHASH_Search(PrivateRelationsTable,
+										   (void *) &(task_item[i].relid),
+										   HASH_ENTER, &found);
 					Assert(!found);
 					Assert(hashent != NULL);
 
@@ -1871,14 +1882,17 @@ main_worker_loop(void)
 					 */
 					hashent->items = SHASH_Create(shctl);
 					dirty_relation[dirty_relations_num++] = hashent;
-					pgstat_progress_update_param(PROGRESS_CLEANER_RELATIONS, SHASH_Entries(PrivateRelationsTable));
+					pgstat_progress_update_param(PROGRESS_CLEANER_RELATIONS,
+										SHASH_Entries(PrivateRelationsTable));
 				}
 
 				/*
 				 * Relation entry found or create.
 				 * Now, add an item to a waiting list.
 				 */
-				item = (WorkerTask *) SHASH_Search(hashent->items, (void *) &(task_item[i].blkno), HASH_ENTER, &found);
+				item = (WorkerTask *) SHASH_Search(hashent->items,
+												   (void *) &(task_item[i].blkno),
+												   HASH_ENTER, &found);
 				if (item == NULL)
 					stat_missed_blocks++;
 				else
@@ -1886,19 +1900,17 @@ main_worker_loop(void)
 					if (!found)
 					{
 						item->hits = 0;
-						item->lastXid = InvalidTransactionId;
+						item->xid = InvalidTransactionId;
 					}
 
 					item->hits += task_item[i].hits;
 					Assert(item->hits > 0);
-					item->lastXid = (item->lastXid > task_item[i].xid) ? item->lastXid : task_item[i].xid;
+					item->xid = (item->xid > task_item[i].xid) ? item->xid :
+															task_item[i].xid;
 				}
 			}
 			incoming_items_num = 0;
 		}
-
-		if (timeout == TIMEOUT_MAX)
-			timeout = -1L;
 
 		PG_TRY();
 		{
@@ -1916,11 +1928,9 @@ main_worker_loop(void)
 
 			stat_cleanup_iterations++;
 
-			pgstat_progress_update_param(PROGRESS_CWORKER_AVG_IT_BLOCKS_CLEANUP, /*stat_total_cleaned_blocks/*/stat_cleanup_iterations);
+			pgstat_progress_update_param(PROGRESS_CWORKER_AVG_IT_BLOCKS_CLEANUP, stat_total_cleaned_blocks/stat_cleanup_iterations);
 			pgstat_progress_update_param(PROGRESS_CLEANER_TIMEOUT, timeout);
-//			elog(LOG, "stat_buf_ninmem=%lu stat_total_cleaned_blocks=%u", stat_buf_ninmem, stat_total_cleaned_blocks);
-			if (stat_total_cleaned_blocks > 0)
-				pgstat_progress_update_param(PROGRESS_CLEANER_BUF_NINMEM, (uint64)((double)stat_buf_ninmem/stat_total_cleaned_blocks*100.));
+			pgstat_progress_update_param(PROGRESS_CLEANER_BUF_NINMEM, w_stat_buf_ninmem);
 			pgstat_progress_update_param(PROGRESS_CLEANER_TOTAL_QUEUE_LENGTH, stat_tot_wait_queue_len);
 			pgstat_progress_update_param(PROGRESS_CLEANER_NACQUIRED_LOCKS, stat_not_acquired_locks);
 
@@ -1932,16 +1942,19 @@ main_worker_loop(void)
 			EmitErrorReport();
 			AbortOutOfAnyTransaction();
 			FlushErrorState();
-elog(LOG, "CATCH");
 			RESUME_INTERRUPTS();
 		}
 		PG_END_TRY();
 
+		/* Check signals, latches or sleep before next cleanup iteration */
 		if (!got_SIGTERM && (timeout != 0))
 		{
+			int	rc;
 			int	wakeEvents = WL_LATCH_SET | WL_POSTMASTER_DEATH;
+
 			if (timeout > 0)
 				wakeEvents |= WL_TIMEOUT;
+
 			rc = WaitLatch(MyLatch, wakeEvents, timeout, WAIT_EVENT_BGHEAP_MAIN);
 
 			ResetLatch(MyLatch);
