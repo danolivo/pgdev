@@ -930,14 +930,14 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	skey = _bt_mkscankey(irel, itup);
 
 	/* Descend the tree and position ourselves on the target leaf page. */
-	stack = _bt_search(irel, keysCount, skey, &info->dead_tuples[pos], false, &buf, BT_READ, NULL);
+	stack = _bt_search(irel, keysCount, skey, &info->dead_tuples[pos], false, &buf, BT_WRITE, NULL);
 
 	/* trade in our read lock for a write lock */
-//	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-//	LockBuffer(buf, BT_WRITE);
+	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+	LockBuffer(buf, BT_WRITE);
 
 	buf = _bt_moveright(irel, buf, keysCount, skey, &info->dead_tuples[pos],
-													false, true, stack, BT_READ, NULL);
+													false, true, stack, BT_WRITE, NULL);
 
 //	CheckForSerializableConflictIn(irel, NULL, buf);
 
@@ -965,8 +965,8 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 			{
 				/* trade in our read lock for a write lock */
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-				LockBuffer(buf, BT_WRITE);
-//				LockBufferForCleanup(buf);
+//				LockBuffer(buf, BT_WRITE);
+				LockBufferForCleanup(buf);
 
 				_bt_delitems_delete(irel, buf, deletable, ndeletable, hrel);
 
@@ -985,7 +985,7 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 			 * Traverse to a next reliable index page
 			 */
 			buf = _bt_moveright(irel, buf, keysCount, skey, &info->dead_tuples[pos],
-												true, true, stack, BT_READ, NULL);
+												true, true, stack, BT_WRITE, NULL);
 			page = BufferGetPage(buf);
 			_bt_checkpage(irel, buf);
 			opaque = (BTPageOpaque) PageGetSpecialPointer(page);
@@ -1048,8 +1048,8 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	{
 		/* trade in our read lock for a write lock */
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-		LockBuffer(buf, BT_WRITE);
-//		LockBufferForCleanup(buf);
+//		LockBuffer(buf, BT_WRITE);
+		LockBufferForCleanup(buf);
 
 		_bt_delitems_delete(irel, buf, deletable, ndeletable, hrel);
 		stats->tuples_removed += ndeletable;
