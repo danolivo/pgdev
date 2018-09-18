@@ -478,7 +478,7 @@ DETAIL:  Key (i)=(1) already exists.
 ROLLBACK;
 -- check is done at end of statement, so this should succeed
 UPDATE unique_tbl SET i = i+1;
-SELECT * FROM unique_tbl ORDER BY i;
+SELECT * FROM unique_tbl;
  i |  t   
 ---+------
  1 | one
@@ -494,14 +494,14 @@ SET CONSTRAINTS unique_tbl_i_key DEFERRED;
 INSERT INTO unique_tbl VALUES (3, 'three');
 DELETE FROM unique_tbl WHERE t = 'tree'; -- makes constraint valid again
 COMMIT; -- should succeed
-SELECT * FROM unique_tbl ORDER BY i;
+SELECT * FROM unique_tbl;
  i |   t   
 ---+-------
  1 | one
  2 | two
- 3 | three
  4 | four
  5 | five
+ 3 | three
 (5 rows)
 
 -- try adding an initially deferred constraint
@@ -516,14 +516,14 @@ UPDATE unique_tbl SET i = 2 WHERE i = 4 AND t = 'four';
 DELETE FROM unique_tbl WHERE i = 1 AND t = 'one';
 DELETE FROM unique_tbl WHERE i = 5 AND t = 'five';
 COMMIT;
-SELECT * FROM unique_tbl ORDER BY i;
+SELECT * FROM unique_tbl;
  i |   t   
 ---+-------
- 1 | five
- 2 | four
  3 | three
- 4 | two
+ 1 | five
  5 | one
+ 4 | two
+ 2 | four
 (5 rows)
 
 -- should fail at commit-time
@@ -581,14 +581,14 @@ UPDATE unique_tbl SET t = 'THREE' WHERE i = 3 AND t = 'Three';
 COMMIT; -- should fail
 ERROR:  duplicate key value violates unique constraint "unique_tbl_i_key"
 DETAIL:  Key (i)=(3) already exists.
-SELECT * FROM unique_tbl ORDER BY i;
+SELECT * FROM unique_tbl;
  i |   t   
 ---+-------
- 1 | five
- 2 | four
  3 | three
- 4 | two
+ 1 | five
  5 | one
+ 4 | two
+ 2 | four
 (5 rows)
 
 -- test a HOT update that modifies the newly inserted tuple,
@@ -597,25 +597,25 @@ BEGIN;
 INSERT INTO unique_tbl VALUES(3, 'tree'); -- should succeed for now
 UPDATE unique_tbl SET t = 'threex' WHERE t = 'tree';
 DELETE FROM unique_tbl WHERE t = 'three';
-SELECT * FROM unique_tbl ORDER BY i;
+SELECT * FROM unique_tbl;
  i |   t    
 ---+--------
  1 | five
+ 5 | one
+ 4 | two
  2 | four
  3 | threex
- 4 | two
- 5 | one
 (5 rows)
 
 COMMIT;
-SELECT * FROM unique_tbl ORDER BY i;
+SELECT * FROM unique_tbl;
  i |   t    
 ---+--------
  1 | five
+ 5 | one
+ 4 | two
  2 | four
  3 | threex
- 4 | two
- 5 | one
 (5 rows)
 
 DROP TABLE unique_tbl;

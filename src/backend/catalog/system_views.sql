@@ -903,28 +903,6 @@ CREATE VIEW pg_stat_progress_vacuum AS
     FROM pg_stat_get_progress_info('VACUUM') AS S
 		LEFT JOIN pg_database D ON S.datid = D.oid;
 
-CREATE VIEW pg_stat_progress_clauncher AS
-	SELECT
-		S.pid AS pid, S.datid AS datid, D.datname AS datname,
-		S.relid AS relid,
-		S.param1 AS tot_incoming_hits, S.param2 AS wait_tasks,
-		S.param3 AS wait_genl_tasks, S.param4 AS toworker_hits,
-		S.param5 AS cur_buf_items, S.param6 AS timeout
-    FROM pg_stat_get_progress_info('CLAUNCHER') AS S
-		LEFT JOIN pg_database D ON S.datid = D.oid;
-
-
-CREATE VIEW pg_stat_progress_cleaner AS
-	SELECT
-		S.pid AS pid, S.datid AS datid, D.datname AS datname,
-		S.relid AS relid,
-		S.param1 AS relations, S.param2 AS queue_len, S.param3 AS ninmem,
-		S.param4 AS cleaned_tuples, S.param5 AS vain_tuples,
-		S.param6 AS missed_blocks, S.param7 AS cleaned_blocks,
-		S.param8 AS avg_blcks_clnd, S.param9 AS nlocks, S.param10 AS timeout
-    FROM pg_stat_get_progress_info('CLEANER') AS S
-		LEFT JOIN pg_database D ON S.datid = D.oid;
-
 CREATE VIEW pg_user_mappings AS
     SELECT
         U.oid       AS umid,

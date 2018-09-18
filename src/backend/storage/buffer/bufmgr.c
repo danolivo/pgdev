@@ -449,7 +449,6 @@ static BufferDesc *BufferAlloc(SMgrRelation smgr,
 			ForkNumber forkNum,
 			BlockNumber blockNum,
 			BufferAccessStrategy strategy,
-			bool onlyInMemory,
 			bool *foundPtr);
 static void FlushBuffer(BufferDesc *buf, SMgrRelation reln);
 static void AtProcExit_Buffers(int code, Datum arg);
@@ -718,8 +717,6 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 
 	isExtend = (blockNum == P_NEW);
 
-	Assert(!(isExtend && mode == RBM_NORMAL_NO_READ));
-
 	TRACE_POSTGRESQL_BUFFER_READ_START(forkNum, blockNum,
 									   smgr->smgr_rnode.node.spcNode,
 									   smgr->smgr_rnode.node.dbNode,
@@ -746,11 +743,9 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		 * not currently in memory.
 		 */
 		bufHdr = BufferAlloc(smgr, relpersistence, forkNum, blockNum,
-							 strategy, (mode == RBM_NORMAL_NO_READ), &found);
+							 strategy, &found);
 		if (found)
 			pgBufferUsage.shared_blks_hit++;
-		else if (mode == RBM_NORMAL_NO_READ)
-			return InvalidBuffer;
 		else
 			pgBufferUsage.shared_blks_read++;
 	}
@@ -792,8 +787,6 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 
 			return BufferDescriptorGetBuffer(bufHdr);
 		}
-
-		Assert(mode != RBM_NORMAL_NO_READ);
 
 		/*
 		 * We get here only in the corner case where we are trying to extend
@@ -994,7 +987,6 @@ static BufferDesc *
 BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 			BlockNumber blockNum,
 			BufferAccessStrategy strategy,
-			bool onlyInMemory,
 			bool *foundPtr)
 {
 	BufferTag	newTag;			/* identity of requested block */
@@ -1044,17 +1036,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 			 * own read attempt if the page is still not BM_VALID.
 			 * StartBufferIO does it all.
 			 */
-			if (onlyInMemory == true)
-			{
-				/*
-				 * We cannot get buffer immediately, go away if caller just
-				 * tried to get access to already in-memory page
-				 */
-				UnpinBuffer(buf, true);
-				*foundPtr = false;
-				return NULL;
-			}
-			else if (StartBufferIO(buf, true))
+			if (StartBufferIO(buf, true))
 			{
 				/*
 				 * If we get here, previous attempts to read the buffer must
@@ -1072,13 +1054,6 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	 * buffer.  Remember to unlock the mapping lock while doing the work.
 	 */
 	LWLockRelease(newPartitionLock);
-
-	/* will not read a page from disk */
-	if (onlyInMemory == true)
-	{
-		*foundPtr = false;
-		return NULL;
-	}
 
 	/* Loop here in case we have to try another victim buffer */
 	for (;;)
@@ -1519,37 +1494,6 @@ MarkBufferDirty(Buffer buffer)
 		if (VacuumCostActive)
 			VacuumCostBalance += VacuumCostPageDirty;
 	}
-}
-
-/*
- * IsBufferDirty - is buffer marked dirty?
- *
- * Buffer should be pinned, if caller wishes to get consistent result,
- * buffer should be exclusively locked.
- */
-bool
-IsBufferDirty(Buffer buffer)
-{
-	BufferDesc *bufHdr;
-	uint32		buf_state;
-
-	if (!BufferIsValid(buffer))
-		elog(ERROR, "bad buffer ID: %d", buffer);
-
-	Assert(BufferIsPinned(buffer));
-
-	if (BufferIsLocal(buffer))
-		return IsLocalBufferDirty(buffer);
-
-	bufHdr = GetBufferDescriptor(buffer - 1);
-
-	buf_state = pg_atomic_read_u32(&bufHdr->state);
-
-	/*
-	 * if buffer is not exclusively locked, buf_state could be out of sync
-	 * already...
-	 */
-	return (buf_state & BM_DIRTY) ? true : false;
 }
 
 /*

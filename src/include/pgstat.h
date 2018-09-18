@@ -56,7 +56,6 @@ typedef enum StatMsgType
 	PGSTAT_MTYPE_RESETSHAREDCOUNTER,
 	PGSTAT_MTYPE_RESETSINGLECOUNTER,
 	PGSTAT_MTYPE_AUTOVAC_START,
-	PGSTAT_MTYPE_BGHEAP_START,
 	PGSTAT_MTYPE_VACUUM,
 	PGSTAT_MTYPE_ANALYZE,
 	PGSTAT_MTYPE_ARCHIVER,
@@ -355,12 +354,6 @@ typedef struct PgStat_MsgAutovacStart
 	TimestampTz m_start_time;
 } PgStat_MsgAutovacStart;
 
-typedef struct PgStat_MsgHeapCleanerStart
-{
-	PgStat_MsgHdr m_hdr;
-	Oid			m_databaseid;
-	TimestampTz m_start_time;
-} PgStat_MsgHeapCleanerStart;
 
 /* ----------
  * PgStat_MsgVacuum				Sent by the backend or autovacuum daemon
@@ -711,8 +704,6 @@ typedef enum BackendType
 	B_AUTOVAC_LAUNCHER,
 	B_AUTOVAC_WORKER,
 	B_BACKEND,
-	B_BG_HEAPCLNR_LAUNCHER,
-	B_BG_HEAPCLNR_WORKER,
 	B_BG_WORKER,
 	B_BG_WRITER,
 	B_CHECKPOINTER,
@@ -765,7 +756,6 @@ typedef enum
 {
 	WAIT_EVENT_ARCHIVER_MAIN = PG_WAIT_ACTIVITY,
 	WAIT_EVENT_AUTOVACUUM_MAIN,
-	WAIT_EVENT_BGHEAP_MAIN,
 	WAIT_EVENT_BGWRITER_HIBERNATE,
 	WAIT_EVENT_BGWRITER_MAIN,
 	WAIT_EVENT_CHECKPOINTER_MAIN,
@@ -943,9 +933,7 @@ typedef enum
 typedef enum ProgressCommandType
 {
 	PROGRESS_COMMAND_INVALID,
-	PROGRESS_COMMAND_VACUUM,
-	PROGRESS_COMMAND_CLEANER,
-	PROGRESS_COMMAND_CLAUNCHER
+	PROGRESS_COMMAND_VACUUM
 } ProgressCommandType;
 
 #define PGSTAT_NUM_PROGRESS_PARAM	10
@@ -1193,7 +1181,6 @@ extern void pgstat_reset_shared_counters(const char *);
 extern void pgstat_reset_single_counter(Oid objectid, PgStat_Single_Reset_Type type);
 
 extern void pgstat_report_autovac(Oid dboid);
-extern void pgstat_report_heapcleaner(Oid dboid);
 extern void pgstat_report_vacuum(Oid tableoid, bool shared,
 					 PgStat_Counter livetuples, PgStat_Counter deadtuples);
 extern void pgstat_report_analyze(Relation rel,

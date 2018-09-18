@@ -40,7 +40,6 @@
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
-#include "postmaster/bgheap.h"
 #include "replication/logical.h"
 #include "replication/logicallauncher.h"
 #include "replication/origin.h"
@@ -2127,7 +2126,6 @@ CommitTransaction(void)
 	AtEOXact_Files(true);
 	AtEOXact_ComboCid();
 	AtEOXact_HashTables(true);
-//	AtEOXact_BGHeap_tables(true);
 	AtEOXact_PgStat(true);
 	AtEOXact_Snapshot(true, false);
 	AtEOXact_ApplyLauncher(true);
@@ -2406,7 +2404,6 @@ PrepareTransaction(void)
 	AtEOXact_Files(true);
 	AtEOXact_ComboCid();
 	AtEOXact_HashTables(true);
-	AtEOXact_BGHeap_tables(true);
 	/* don't call AtEOXact_PgStat here; we fixed pgstat state above */
 	AtEOXact_Snapshot(true, true);
 	pgstat_report_xact_timestamp(0);
@@ -2609,7 +2606,6 @@ AbortTransaction(void)
 		AtEOXact_Files(false);
 		AtEOXact_ComboCid();
 		AtEOXact_HashTables(false);
-		AtEOXact_BGHeap_tables(true);
 		AtEOXact_PgStat(false);
 		AtEOXact_ApplyLauncher(false);
 		pgstat_report_xact_timestamp(0);

@@ -76,11 +76,9 @@ static Buffer _bt_split(Relation rel, Buffer buf, Buffer cbuf,
 static void _bt_insert_parent(Relation rel, Buffer buf, Buffer rbuf,
 				  BTStack stack, bool is_root, bool is_only);
 static OffsetNumber _bt_findsplitloc(Relation rel, Page page,
-				 bool disjunctpass,
 				 OffsetNumber newitemoff,
 				 Size newitemsz,
 				 bool *newitemonleft);
-static bool _bt_split_isdisjunct(Page page, OffsetNumber item);
 static void _bt_checksplitloc(FindSplitData *state,
 				  OffsetNumber firstoldonright, bool newitemonleft,
 				  int dataitemstoleft, Size firstoldonrightsz);
@@ -115,12 +113,9 @@ _bt_doinsert(Relation rel, IndexTuple itup,
 	bool		is_unique = false;
 	int			indnkeyatts;
 	ScanKey		itup_scankey;
-	ItemPointer itup_scantid;
 	BTStack		stack = NULL;
 	Buffer		buf;
 	OffsetNumber offset;
-	Page		page;
-	BTPageOpaque lpageop;
 	bool		fastpath;
 
 	indnkeyatts = IndexRelationGetNumberOfKeyAttributes(rel);
@@ -128,8 +123,6 @@ _bt_doinsert(Relation rel, IndexTuple itup,
 
 	/* we need an insertion scan key to do our search, so build one */
 	itup_scankey = _bt_mkscankey(rel, itup);
-	/* we use a heap TID with scan key if this isn't unique case */
-	itup_scantid = (checkUnique == UNIQUE_CHECK_NO ? &itup->t_tid : NULL);
 
 	/*
 	 * It's very common to have an index on an auto-incremented or
@@ -156,6 +149,8 @@ top:
 	if (RelationGetTargetBlock(rel) != InvalidBlockNumber)
 	{
 		Size		itemsz;
+		Page		page;
+		BTPageOpaque lpageop;
 
 		/*
 		 * Conditionally acquire exclusive lock on the buffer before doing any
@@ -185,7 +180,7 @@ top:
 				!P_IGNORE(lpageop) &&
 				(PageGetFreeSpace(page) > itemsz) &&
 				PageGetMaxOffsetNumber(page) >= P_FIRSTDATAKEY(lpageop) &&
-				_bt_compare(rel, indnkeyatts, itup_scankey, itup_scantid, page,
+				_bt_compare(rel, indnkeyatts, itup_scankey, page,
 							P_FIRSTDATAKEY(lpageop)) > 0)
 			{
 				/*
@@ -222,8 +217,8 @@ top:
 	if (!fastpath)
 	{
 		/* find the first page containing this key */
-		stack = _bt_search(rel, indnkeyatts, itup_scankey, itup_scantid, false,
-						   &buf, BT_WRITE, NULL);
+		stack = _bt_search(rel, indnkeyatts, itup_scankey, false, &buf, BT_WRITE,
+						   NULL);
 
 		/* trade in our read lock for a write lock */
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
@@ -236,8 +231,8 @@ top:
 		 * need to move right in the tree.  See Lehman and Yao for an
 		 * excruciatingly precise description.
 		 */
-		buf = _bt_moveright(rel, buf, indnkeyatts, itup_scankey, itup_scantid,
-							false, true, stack, BT_WRITE, NULL);
+		buf = _bt_moveright(rel, buf, indnkeyatts, itup_scankey, false,
+							true, stack, BT_WRITE, NULL);
 	}
 
 	/*
@@ -247,13 +242,12 @@ top:
 	 * NOTE: obviously, _bt_check_unique can only detect keys that are already
 	 * in the index; so it cannot defend against concurrent insertions of the
 	 * same key.  We protect against that by means of holding a write lock on
-	 * the first page the value could be on, regardless of the value of its
-	 * implicit heap TID tie-breaker attribute.  Any other would-be inserter of
-	 * the same key must acquire a write lock on the same page, so only one
-	 * would-be inserter can be making the check at one time.  Furthermore,
-	 * once we are past the check we hold write locks continuously until we
-	 * have performed our insertion, so no later inserter can fail to see our
-	 * insertion.  (This requires some care in _bt_findinsertloc.)
+	 * the target page.  Any other would-be inserter of the same key must
+	 * acquire a write lock on the same target page, so only one would-be
+	 * inserter can be making the check at one time.  Furthermore, once we are
+	 * past the check we hold write locks continuously until we have performed
+	 * our insertion, so no later inserter can fail to see our insertion.
+	 * (This requires some care in _bt_findinsertloc.)
 	 *
 	 * If we must wait for another xact, we release the lock while waiting,
 	 * and then must start over completely.
@@ -267,11 +261,7 @@ top:
 		TransactionId xwait;
 		uint32		speculativeToken;
 
-		page = BufferGetPage(buf);
-		lpageop = (BTPageOpaque) PageGetSpecialPointer(page);
-		Assert(itup_scantid == NULL);
-		offset = _bt_binsrch(rel, buf, indnkeyatts, itup_scankey, NULL,
-							 P_FIRSTDATAKEY(lpageop), false);
+		offset = _bt_binsrch(rel, buf, indnkeyatts, itup_scankey, false);
 		xwait = _bt_check_unique(rel, itup, heapRel, buf, offset, itup_scankey,
 								 checkUnique, &is_unique, &speculativeToken);
 
@@ -309,7 +299,7 @@ top:
 		 * attributes are not considered part of the key space.
 		 */
 		CheckForSerializableConflictIn(rel, NULL, buf);
-		/* do the insertion, possibly on a page to the right in unique case */
+		/* do the insertion */
 		_bt_findinsertloc(rel, &buf, &offset, indnkeyatts, itup_scankey, itup,
 						  stack, heapRel);
 		_bt_insertonpg(rel, buf, InvalidBuffer, stack, itup, offset, false);
@@ -574,11 +564,11 @@ _bt_check_unique(Relation rel, IndexTuple itup, Relation heapRel,
 			offset = OffsetNumberNext(offset);
 		else
 		{
-			/* If scankey <= hikey we gotta check the next page too */
+			/* If scankey == hikey we gotta check the next page too */
 			if (P_RIGHTMOST(opaque))
 				break;
-			/* _bt_isequal()'s special NULL semantics not required here */
-			if (_bt_compare(rel, indnkeyatts, itup_scankey, NULL, page, P_HIKEY) > 0)
+			if (!_bt_isequal(itupdesc, page, P_HIKEY,
+							 indnkeyatts, itup_scankey))
 				break;
 			/* Advance to next non-dead page --- there must be one */
 			for (;;)
@@ -622,22 +612,31 @@ _bt_check_unique(Relation rel, IndexTuple itup, Relation heapRel,
 /*
  *	_bt_findinsertloc() -- Finds an insert location for a tuple
  *
- *		On entry, *bufptr and *offsetptr point to the first legal position
- *		where the new tuple could be inserted if we were to treat it as having
- *		no implicit heap TID; only callers that just called _bt_check_unique()
- *		provide this hint (all other callers should set *offsetptr to
- *		InvalidOffsetNumber).  The caller should hold an exclusive lock on
- *		*bufptr in all cases.  On exit, they both point to the chosen insert
- *		location in all cases.  If _bt_findinsertloc decides to move right, the
- *		lock and pin on the original page will be released, and the new page
- *		returned to the caller is exclusively locked instead.
+ *		If the new key is equal to one or more existing keys, we can
+ *		legitimately place it anywhere in the series of equal keys --- in fact,
+ *		if the new key is equal to the page's "high key" we can place it on
+ *		the next page.  If it is equal to the high key, and there's not room
+ *		to insert the new tuple on the current page without splitting, then
+ *		we can move right hoping to find more free space and avoid a split.
+ *		(We should not move right indefinitely, however, since that leads to
+ *		O(N^2) insertion behavior in the presence of many equal keys.)
+ *		Once we have chosen the page to put the key on, we'll insert it before
+ *		any existing equal keys because of the way _bt_binsrch() works.
  *
- *		This is also where opportunistic microvacuuming of LP_DEAD tuples
- *		occurs.
+ *		If there's not enough room in the space, we try to make room by
+ *		removing any LP_DEAD tuples.
+ *
+ *		On entry, *bufptr and *offsetptr point to the first legal position
+ *		where the new tuple could be inserted.  The caller should hold an
+ *		exclusive lock on *bufptr.  *offsetptr can also be set to
+ *		InvalidOffsetNumber, in which case the function will search for the
+ *		right location within the page if needed.  On exit, they point to the
+ *		chosen insert location.  If _bt_findinsertloc decides to move right,
+ *		the lock and pin on the original page will be released and the new
+ *		page returned to the caller is exclusively locked instead.
  *
  *		newtup is the new tuple we're inserting, and scankey is an insertion
- *		type scan key for it.  We take a "scantid" heap TID attribute value
- *		from newtup directly.
+ *		type scan key for it.
  */
 static void
 _bt_findinsertloc(Relation rel,
@@ -653,9 +652,9 @@ _bt_findinsertloc(Relation rel,
 	Page		page = BufferGetPage(buf);
 	Size		itemsz;
 	BTPageOpaque lpageop;
-	bool		hintinvalidated;
+	bool		movedright,
+				vacuumed;
 	OffsetNumber newitemoff;
-	OffsetNumber lowitemoff;
 	OffsetNumber firstlegaloff = *offsetptr;
 
 	lpageop = (BTPageOpaque) PageGetSpecialPointer(page);
@@ -685,30 +684,59 @@ _bt_findinsertloc(Relation rel,
 				 errtableconstraint(heapRel,
 									RelationGetRelationName(rel))));
 
-	/* firstlegaloff/offsetptr hint (if any) assumed valid initially */
-	hintinvalidated = false;
-
-	/*
-	 * TODO: Restore the logic for finding a page to insert on in the event of
-	 * many duplicates for pre-pg_upgrade indexes.  The whole search through
-	 * pages of logical duplicates to determine where to insert seems like
-	 * something that has little upside, but that doesn't make it okay to
-	 * ignore the performance characteristics after pg_upgrade is run, but
-	 * before a REINDEX can run to bump BTREE_VERSION.
+	/*----------
+	 * If we will need to split the page to put the item on this page,
+	 * check whether we can put the tuple somewhere to the right,
+	 * instead.  Keep scanning right until we
+	 *		(a) find a page with enough free space,
+	 *		(b) reach the last page where the tuple can legally go, or
+	 *		(c) get tired of searching.
+	 * (c) is not flippant; it is important because if there are many
+	 * pages' worth of equal keys, it's better to split one of the early
+	 * pages than to scan all the way to the end of the run of equal keys
+	 * on every insert.  We implement "get tired" as a random choice,
+	 * since stopping after scanning a fixed number of pages wouldn't work
+	 * well (we'd never reach the right-hand side of previously split
+	 * pages).  Currently the probability of moving right is set at 0.99,
+	 * which may seem too high to change the behavior much, but it does an
+	 * excellent job of preventing O(N^2) behavior with many equal keys.
+	 *----------
 	 */
-	while (true)
+	movedright = false;
+	vacuumed = false;
+	while (PageGetFreeSpace(page) < itemsz)
 	{
 		Buffer		rbuf;
 		BlockNumber rblkno;
 
+		/*
+		 * before considering moving right, see if we can obtain enough space
+		 * by erasing LP_DEAD items
+		 */
+		if (P_ISLEAF(lpageop) && P_HAS_GARBAGE(lpageop))
+		{
+			_bt_vacuum_one_page(rel, buf, heapRel);
+
+			/*
+			 * remember that we vacuumed this page, because that makes the
+			 * hint supplied by the caller invalid
+			 */
+			vacuumed = true;
+
+			if (PageGetFreeSpace(page) >= itemsz)
+				break;			/* OK, now we have enough space */
+		}
+
+		/*
+		 * nope, so check conditions (b) and (c) enumerated above
+		 */
 		if (P_RIGHTMOST(lpageop) ||
-			_bt_compare(rel, keysz, scankey, &newtup->t_tid, page, P_HIKEY) <= 0)
+			_bt_compare(rel, keysz, scankey, page, P_HIKEY) != 0 ||
+			random() <= (MAX_RANDOM_VALUE / 100))
 			break;
 
 		/*
-		 * step right to next non-dead page.  this is only needed for unique
-		 * indexes, and pg_upgrade'd indexes that still use BTREE_VERSION 2 or
-		 * 3, where heap TID isn't considered to be a part of the keyspace.
+		 * step right to next non-dead page
 		 *
 		 * must write-lock that page before releasing write lock on current
 		 * page; else someone else's _bt_check_unique scan could fail to see
@@ -747,40 +775,24 @@ _bt_findinsertloc(Relation rel,
 		}
 		_bt_relbuf(rel, buf);
 		buf = rbuf;
-		hintinvalidated = true;
-	}
-
-	Assert(P_ISLEAF(lpageop));
-
-	/*
-	 * Perform micro-vacuuming of the page we're about to insert tuple on to if
-	 * it looks like it has LP_DEAD items.
-	 */
-	if (P_HAS_GARBAGE(lpageop) && PageGetFreeSpace(page) < itemsz)
-	{
-		_bt_vacuum_one_page(rel, buf, heapRel);
-
-		hintinvalidated = true;
+		movedright = true;
+		vacuumed = false;
 	}
 
 	/*
-	 * Consider using caller's hint to avoid repeated binary search effort.
-	 *
-	 * Note that the hint is only provided by callers that checked uniqueness.
-	 * The hint is used as a lower bound for a new binary search, since
-	 * caller's original binary search won't have specified a scan tid.
+	 * Now we are on the right page, so find the insert position. If we moved
+	 * right at all, we know we should insert at the start of the page. If we
+	 * didn't move right, we can use the firstlegaloff hint if the caller
+	 * supplied one, unless we vacuumed the page which might have moved tuples
+	 * around making the hint invalid. If we didn't move right or can't use
+	 * the hint, find the position by searching.
 	 */
-	if (firstlegaloff == InvalidOffsetNumber || hintinvalidated)
-		lowitemoff = P_FIRSTDATAKEY(lpageop);
+	if (movedright)
+		newitemoff = P_FIRSTDATAKEY(lpageop);
+	else if (firstlegaloff != InvalidOffsetNumber && !vacuumed)
+		newitemoff = firstlegaloff;
 	else
-	{
-		Assert(firstlegaloff == _bt_binsrch(rel, buf, keysz, scankey, NULL,
-											P_FIRSTDATAKEY(lpageop), false));
-		lowitemoff = firstlegaloff;
-	}
-
-	newitemoff = _bt_binsrch(rel, buf, keysz, scankey, &newtup->t_tid,
-							 lowitemoff, false);
+		newitemoff = _bt_binsrch(rel, buf, keysz, scankey, false);
 
 	*bufptr = buf;
 	*offsetptr = newitemoff;
@@ -839,12 +851,11 @@ _bt_insertonpg(Relation rel,
 	/* child buffer must be given iff inserting on an internal page */
 	Assert(P_ISLEAF(lpageop) == !BufferIsValid(cbuf));
 	/* tuple must have appropriate number of attributes */
-	Assert(BTreeTupleGetNAtts(itup, rel) > 0);
 	Assert(!P_ISLEAF(lpageop) ||
 		   BTreeTupleGetNAtts(itup, rel) ==
 		   IndexRelationGetNumberOfAttributes(rel));
 	Assert(P_ISLEAF(lpageop) ||
-		   BTreeTupleGetNAtts(itup, rel) <=
+		   BTreeTupleGetNAtts(itup, rel) ==
 		   IndexRelationGetNumberOfKeyAttributes(rel));
 
 	/* The caller should've finished any incomplete splits already. */
@@ -889,7 +900,7 @@ _bt_insertonpg(Relation rel,
 				 BlockNumberIsValid(RelationGetTargetBlock(rel))));
 
 		/* Choose the split point */
-		firstright = _bt_findsplitloc(rel, page, true,
+		firstright = _bt_findsplitloc(rel, page,
 									  newitemoff, itemsz,
 									  &newitemonleft);
 
@@ -1132,6 +1143,8 @@ _bt_split(Relation rel, Buffer buf, Buffer cbuf, OffsetNumber firstright,
 	OffsetNumber i;
 	bool		isleaf;
 	IndexTuple	lefthikey;
+	int			indnatts = IndexRelationGetNumberOfAttributes(rel);
+	int			indnkeyatts = IndexRelationGetNumberOfKeyAttributes(rel);
 
 	/* Acquire a new page to split into */
 	rbuf = _bt_getbuf(rel, P_NEW, BT_WRITE);
@@ -1201,9 +1214,7 @@ _bt_split(Relation rel, Buffer buf, Buffer cbuf, OffsetNumber firstright,
 		itemid = PageGetItemId(origpage, P_HIKEY);
 		itemsz = ItemIdGetLength(itemid);
 		item = (IndexTuple) PageGetItem(origpage, itemid);
-		Assert(BTreeTupleGetNAtts(item, rel) > 0);
-		Assert(BTreeTupleGetNAtts(item, rel) <=
-			   IndexRelationGetNumberOfKeyAttributes(rel));
+		Assert(BTreeTupleGetNAtts(item, rel) == indnkeyatts);
 		if (PageAddItem(rightpage, (Item) item, itemsz, rightoff,
 						false, false) == InvalidOffsetNumber)
 		{
@@ -1217,9 +1228,8 @@ _bt_split(Relation rel, Buffer buf, Buffer cbuf, OffsetNumber firstright,
 
 	/*
 	 * The "high key" for the new left page will be the first key that's going
-	 * to go into the new right page, or possibly a truncated version if this
-	 * is a leaf page split.  This might be either the existing data item at
-	 * position firstright, or the incoming tuple.
+	 * to go into the new right page.  This might be either the existing data
+	 * item at position firstright, or the incoming tuple.
 	 */
 	leftoff = P_HIKEY;
 	if (!newitemonleft && newitemoff == firstright)
@@ -1237,77 +1247,25 @@ _bt_split(Relation rel, Buffer buf, Buffer cbuf, OffsetNumber firstright,
 	}
 
 	/*
-	 * Truncate attributes of the high key item before inserting it on the left
-	 * page.  This can only happen at the leaf level, since in general all
-	 * pivot tuple values originate from leaf level high keys.  This isn't just
-	 * about avoiding unnecessary work, though; truncating unneeded key suffix
-	 * attributes can only be performed at the leaf level anyway.  This is
-	 * because a pivot tuple in a grandparent page must guide a search not only
-	 * to the correct parent page, but also to the correct leaf page.
-	 *
-	 * Note that non-key (INCLUDE) attributes are always truncated away here.
-	 * Additional key attributes are truncated away when they're not required
-	 * to correctly separate the key space.
+	 * Truncate non-key (INCLUDE) attributes of the high key item before
+	 * inserting it on the left page.  This only needs to happen at the leaf
+	 * level, since in general all pivot tuple values originate from leaf
+	 * level high keys.  This isn't just about avoiding unnecessary work,
+	 * though; truncating unneeded key attributes (more aggressive suffix
+	 * truncation) can only be performed at the leaf level anyway.  This is
+	 * because a pivot tuple in a grandparent page must guide a search not
+	 * only to the correct parent page, but also to the correct leaf page.
 	 */
-	if (isleaf)
+	if (indnatts != indnkeyatts && isleaf)
 	{
-		OffsetNumber	lastleftoff;
-		IndexTuple		lastleft;
-
-		/*
-		 * Determine which tuple is on the left side of the split point, and
-		 * generate truncated copy of the right tuple.  Truncate as
-		 * aggressively as possible without generating a high key for the left
-		 * side of the split (and later downlink for the right side) that fails
-		 * to distinguish each side.  The new high key needs to be strictly
-		 * less than all tuples on the right side of the split, but can be
-		 * equal to items on the left side of the split.  We almost always find
-		 * a way to make it strictly greater than lastleft, though.
-		 *
-		 * Handle the case where the incoming tuple is about to become the last
-		 * item on the left side of the split.
-		 */
-		if (newitemonleft && newitemoff == firstright)
-			lastleft = newitem;
-		else
-		{
-			lastleftoff = OffsetNumberPrev(firstright);
-			itemid = PageGetItemId(origpage, lastleftoff);
-			lastleft = (IndexTuple) PageGetItem(origpage, itemid);
-		}
-
-		Assert(lastleft != item);
-		lefthikey = _bt_suffix_truncate(rel, lastleft, item);
+		lefthikey = _bt_nonkey_truncate(rel, item);
 		itemsz = IndexTupleSize(lefthikey);
 		itemsz = MAXALIGN(itemsz);
-#ifdef DEBUG_SPLITS
-		{
-			TupleDesc	itupdesc = RelationGetDescr(rel);
-			Datum		values[INDEX_MAX_KEYS];
-			bool		isnull[INDEX_MAX_KEYS];
-			char	   *lastleftstr;
-			char	   *firstrightstr;
-
-			index_deform_tuple(lastleft, itupdesc, values, isnull);
-			lastleftstr = BuildIndexValueDescription(rel, values, isnull);
-			index_deform_tuple(item, itupdesc, values, isnull);
-			firstrightstr = BuildIndexValueDescription(rel, values, isnull);
-
-			elog(LOG, "split of block %u "
-				 "last left %s first right %s "
-				 "attributes in new high key for left page %u%s",
-				 BufferGetBlockNumber(buf), lastleftstr, firstrightstr,
-				 BTreeTupleGetNAtts(lefthikey, rel),
-				 BTreeTupleGetHeapTID(lefthikey) != NULL ? " (plus heap TID)":"");
-		}
-#endif
 	}
 	else
 		lefthikey = item;
 
-	Assert(BTreeTupleGetNAtts(lefthikey, rel) > 0);
-	Assert(BTreeTupleGetNAtts(lefthikey, rel) <=
-		   IndexRelationGetNumberOfKeyAttributes(rel));
+	Assert(BTreeTupleGetNAtts(lefthikey, rel) == indnkeyatts);
 	if (PageAddItem(leftpage, (Item) lefthikey, itemsz, leftoff,
 					false, false) == InvalidOffsetNumber)
 	{
@@ -1500,6 +1458,7 @@ _bt_split(Relation rel, Buffer buf, Buffer cbuf, OffsetNumber firstright,
 		xl_btree_split xlrec;
 		uint8		xlinfo;
 		XLogRecPtr	recptr;
+		bool		loglhikey = false;
 
 		xlrec.level = ropaque->btpo.level;
 		xlrec.firstright = firstright;
@@ -1528,10 +1487,22 @@ _bt_split(Relation rel, Buffer buf, Buffer cbuf, OffsetNumber firstright,
 		if (newitemonleft)
 			XLogRegisterBufData(0, (char *) newitem, MAXALIGN(newitemsz));
 
-		/* Log left page.  We must also log the left page's high key. */
-		itemid = PageGetItemId(origpage, P_HIKEY);
-		item = (IndexTuple) PageGetItem(origpage, itemid);
-		XLogRegisterBufData(0, (char *) item, MAXALIGN(IndexTupleSize(item)));
+		/* Log left page */
+		if (!isleaf || indnatts != indnkeyatts)
+		{
+			/*
+			 * We must also log the left page's high key.  There are two
+			 * reasons for that: right page's leftmost key is suppressed on
+			 * non-leaf levels and in covering indexes included columns are
+			 * truncated from high keys.  Show it as belonging to the left
+			 * page buffer, so that it is not stored if XLogInsert decides it
+			 * needs a full-page image of the left page.
+			 */
+			itemid = PageGetItemId(origpage, P_HIKEY);
+			item = (IndexTuple) PageGetItem(origpage, itemid);
+			XLogRegisterBufData(0, (char *) item, MAXALIGN(IndexTupleSize(item)));
+			loglhikey = true;
+		}
 
 		/*
 		 * Log the contents of the right page in the format understood by
@@ -1549,7 +1520,9 @@ _bt_split(Relation rel, Buffer buf, Buffer cbuf, OffsetNumber firstright,
 							(char *) rightpage + ((PageHeader) rightpage)->pd_upper,
 							((PageHeader) rightpage)->pd_special - ((PageHeader) rightpage)->pd_upper);
 
-		xlinfo = newitemonleft ? XLOG_BTREE_SPLIT_L : XLOG_BTREE_SPLIT_R;
+		xlinfo = newitemonleft ?
+			(loglhikey ? XLOG_BTREE_SPLIT_L_HIGHKEY : XLOG_BTREE_SPLIT_L) :
+			(loglhikey ? XLOG_BTREE_SPLIT_R_HIGHKEY : XLOG_BTREE_SPLIT_R);
 		recptr = XLogInsert(RM_BTREE_ID, xlinfo);
 
 		PageSetLSN(origpage, recptr);
@@ -1602,31 +1575,10 @@ _bt_split(Relation rel, Buffer buf, Buffer cbuf, OffsetNumber firstright,
  * righthand page, plus a boolean indicating whether the new tuple goes on
  * the left or right page.  The bool is necessary to disambiguate the case
  * where firstright == newitemoff.
- *
- * The top-level caller should specify disjunctpass as true.  This makes
- * finding a split location refuse to consider candidate split points that
- * will result in a non-discriminating downlink for the right half of the
- * split in the parent page.  If we fail to find a split point this way, we
- * call ourselves recursively without insisting on a disjunct split point.
- * This avoids cases where suffix truncation must add an extra heap TID to
- * the new pivot during a leaf page split.  It also makes it far less likely
- * that any pivot tuples that have a heap attribute TID added despite our
- * best efforts will get used as a downlink a second time, in the
- * grandparent.  There should only be downlinks with an extra heap TID
- * attribute in pages at higher levels of the tree when a very large
- * proportion of leaf tuples happen to be logical duplicates.
- *
- * The disjunctpass strategy may seem very aggressive, as it could lead to
- * each half of the split having very different amounts of free space.
- * Note, however, that logical duplicate downlinks in internal pages can
- * only help _bt_search() callers that pass a scantid argument (i.e.
- * UNIQUE_CHECK_NO inserters).  Even there, the effect on performance ought
- * to be self-limiting.
  */
 static OffsetNumber
 _bt_findsplitloc(Relation rel,
 				 Page page,
-				 bool disjunctpass,
 				 OffsetNumber newitemoff,
 				 Size newitemsz,
 				 bool *newitemonleft)
@@ -1710,14 +1662,6 @@ _bt_findsplitloc(Relation rel,
 		itemsz = MAXALIGN(ItemIdGetLength(itemid)) + sizeof(ItemIdData);
 
 		/*
-		 * FIXME:  This doesn't consider the case where the tuple to be
-		 * inserted is placed immediately before or after item.
-		 */
-		if (disjunctpass && offnum > P_FIRSTDATAKEY(opaque) &&
-			!_bt_split_isdisjunct(page, offnum))
-			goto skipnondisjunct;
-
-		/*
 		 * Will the new item go to left or right of split?
 		 */
 		if (offnum > newitemoff)
@@ -1744,8 +1688,6 @@ _bt_findsplitloc(Relation rel,
 			break;
 		}
 
-skipnondisjunct:
-
 		olddataitemstoleft += itemsz;
 	}
 
@@ -1757,78 +1699,16 @@ skipnondisjunct:
 	if (newitemoff > maxoff && !goodenoughfound)
 		_bt_checksplitloc(&state, newitemoff, false, olddataitemstotal, 0);
 
+	/*
+	 * I believe it is not possible to fail to find a feasible split, but just
+	 * in case ...
+	 */
 	if (!state.have_split)
-	{
-		/*
-		 * We couldn't find a split point using disjunctpass strategy.  Take
-		 * a second pass at it, this time only weighing space utilization on
-		 * the page that we're about to split.
-		 */
-		if (disjunctpass)
-			return _bt_findsplitloc(rel, page, false, newitemoff, newitemsz,
-									newitemonleft);
-		/*
-		 * I believe it is not possible to fail to find a feasible split, but
-		 * just in case ...
-		 */
 		elog(ERROR, "could not find a feasible split point for index \"%s\"",
 			 RelationGetRelationName(rel));
-	}
 
 	*newitemonleft = state.newitemonleft;
 	return state.firstright;
-}
-
-/*
- * _bt_split_isdisjunct - does split point separate key space well?
- *
- * firstoldonright is a candidate split point.
- *
- * Checks if point between the would-be last left and first right tuples on the
- * hypothetical post-split halves are disjunct.
- */
-static bool
-_bt_split_isdisjunct(Page page, OffsetNumber firstoldonright)
-{
-	BTPageOpaque	opaque;
-	ItemId			itemid;
-	IndexTuple		itup;
-
-	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
-	itemid = PageGetItemId(page, firstoldonright);
-	itup = (IndexTuple) PageGetItem(page, itemid);
-
-	if (P_ISLEAF(opaque))
-	{
-		IndexTuple	lastitup;
-		char	   *curTup;
-		char	   *lastTup;
-		Size		datasz;
-
-		/*
-		 * Use memcmp() to cheaply approximate real comparisons.
-		 *
-		 * XXX: This clearly needs more work, especially to make things like
-		 * TPC-C's order_lines pkey make better use of suffix truncation.
-		 *
-		 * FIXME: What about covering index pivot tuples?  Clearly using
-		 * memcmp() there does not approximate comparing key attributes very
-		 * well at all.
-		 */
-		itemid = PageGetItemId(page, OffsetNumberPrev(firstoldonright));
-		lastitup = (IndexTuple) PageGetItem(page, itemid);
-		lastTup = (char *) lastitup + IndexInfoFindDataOffset(lastitup->t_info);
-		curTup = (char *) itup + IndexInfoFindDataOffset(itup->t_info);
-		datasz = IndexTupleSize(itup) - IndexInfoFindDataOffset(itup->t_info);
-
-		if (IndexTupleSize(lastitup) == IndexTupleSize(itup) &&
-			memcmp(lastTup, curTup, datasz) == 0)
-			return false;
-	}
-	else if (BTreeTupleGetHeapTID(itup) != NULL)
-		return false;
-
-	return true;
 }
 
 /*
@@ -1880,9 +1760,6 @@ _bt_checksplitloc(FindSplitData *state,
 	 * key truncation.
 	 */
 	leftfree -= firstrightitemsz;
-
-	/* Charge for case where a heap TID is added */
-	leftfree -= MAXALIGN(sizeof(ItemPointerData));
 
 	/* account for the new item */
 	if (newitemonleft)
@@ -2333,8 +2210,7 @@ _bt_newroot(Relation rel, Buffer lbuf, Buffer rbuf)
 	/*
 	 * insert the right page pointer into the new root page.
 	 */
-	Assert(BTreeTupleGetNAtts(right_item, rel) > 0);
-	Assert(BTreeTupleGetNAtts(right_item, rel) <=
+	Assert(BTreeTupleGetNAtts(right_item, rel) ==
 		   IndexRelationGetNumberOfKeyAttributes(rel));
 	if (PageAddItem(rootpage, (Item) right_item, right_item_sz, P_FIRSTKEY,
 					false, false) == InvalidOffsetNumber)
@@ -2446,8 +2322,8 @@ _bt_pgaddtup(Page page,
 /*
  * _bt_isequal - used in _bt_doinsert in check for duplicates.
  *
- * This is very similar to _bt_compare, except for NULL and negative infinity
- * handling.  Rule is simple: NOT_NULL not equal NULL, NULL not equal NULL too.
+ * This is very similar to _bt_compare, except for NULL handling.
+ * Rule is simple: NOT_NULL not equal NULL, NULL not equal NULL too.
  */
 static bool
 _bt_isequal(TupleDesc itupdesc, Page page, OffsetNumber offnum,
@@ -2461,6 +2337,12 @@ _bt_isequal(TupleDesc itupdesc, Page page, OffsetNumber offnum,
 
 	itup = (IndexTuple) PageGetItem(page, PageGetItemId(page, offnum));
 
+	/*
+	 * It's okay that we might perform a comparison against a truncated page
+	 * high key when caller needs to determine if _bt_check_unique scan must
+	 * continue on to the next page.  Caller never asks us to compare non-key
+	 * attributes within an INCLUDE index.
+	 */
 	for (i = 1; i <= keysz; i++)
 	{
 		AttrNumber	attno;

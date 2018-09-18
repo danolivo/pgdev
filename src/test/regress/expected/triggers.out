@@ -637,7 +637,7 @@ select * from trigtest2;
 
 -- ensure we still insert, even when all triggers are disabled
 insert into trigtest default values;
-select *  from trigtest ORDER BY i;
+select *  from trigtest;
  i 
 ---
  3

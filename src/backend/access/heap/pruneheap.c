@@ -22,7 +22,6 @@
 #include "catalog/catalog.h"
 #include "miscadmin.h"
 #include "pgstat.h"
-#include "postmaster/bgheap.h"
 #include "storage/bufmgr.h"
 #include "utils/snapmgr.h"
 #include "utils/rel.h"
@@ -161,9 +160,6 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 
 		/* And release buffer lock */
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-
-		if (IsBufferDirty(buffer))
-			HeapCleanerSend(relation, BufferGetBlockNumber(buffer));
 	}
 }
 
@@ -415,6 +411,7 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 				heap_prune_record_dead(prstate, rootoffnum);
 				HeapTupleHeaderAdvanceLatestRemovedXid(htup,
 													   &prstate->latestRemovedXid);
+				ndeleted++;
 			}
 
 			/* Nothing more to do */
@@ -586,9 +583,9 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 		 */
 		for (i = 1; (i < nchain) && (chainitems[i - 1] != latestdead); i++)
 		{
+			ndeleted++;
 			if (chainitems[i] == latestdead)
 				continue;
-			ndeleted++;
 			heap_prune_record_unused(prstate, chainitems[i]);
 		}
 

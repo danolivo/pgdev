@@ -854,8 +854,10 @@ PageIndexMultiDelete(Page page, OffsetNumber *itemnos, int nitems)
 	 * PageIndexTupleDelete is the best way.  Delete the items in reverse
 	 * order so we don't have to think about adjusting item numbers for
 	 * previous deletions.
+	 *
+	 * TODO: tune the magic number here
 	 */
-	if (nitems <= 7)
+	if (nitems <= 2)
 	{
 		while (--nitems >= 0)
 			PageIndexTupleDelete(page, itemnos[nitems]);

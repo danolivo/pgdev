@@ -25,7 +25,6 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
-#include "postmaster/bgheap.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/postmaster.h"
@@ -141,7 +140,6 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 		size = add_size(size, ProcSignalShmemSize());
 		size = add_size(size, CheckpointerShmemSize());
 		size = add_size(size, AutoVacuumShmemSize());
-		size = add_size(size, HeapCleanerShmemSize());
 		size = add_size(size, ReplicationSlotsShmemSize());
 		size = add_size(size, ReplicationOriginShmemSize());
 		size = add_size(size, WalSndShmemSize());
@@ -258,7 +256,6 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 	ProcSignalShmemInit();
 	CheckpointerShmemInit();
 	AutoVacuumShmemInit();
-	HeapCleanerShmemInit();
 	ReplicationSlotsShmemInit();
 	ReplicationOriginShmemInit();
 	WalSndShmemInit();

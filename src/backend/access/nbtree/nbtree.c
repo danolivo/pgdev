@@ -889,19 +889,15 @@ btbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	return stats;
 }
 
-/*
- * Deletion of index entries pointing to heap tuples.
- *
- * Constraints:
- * 1. TID list info->dead_tuples arranged in ASC order.
- * 2. Logical duplicates of index tuples stored in DESC order.
- *
- * The function generates an insertion scan key and descent by btree for first
- * index tuple what satisfies scan key and last TID in info->dead_tuples list.
- * For the scan results it deletes all index entries, matched to the TID list.
- *
- * Result: a palloc'd struct containing statistical info.
- */
+static int
+tid_list_search(ItemPointer tid, ItemPointer tid_list, int ntid)
+{
+	for (int i = 0; i < ntid; i++)
+		if (ItemPointerEquals(tid, &(tid_list[i])))
+			return i;
+	return -1;
+}
+
 IndexTargetDeleteResult*
 bttargetdelete(IndexTargetDeleteInfo *info,
 			   IndexTargetDeleteResult *stats,
@@ -920,42 +916,33 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	int				ndeletable = 0;
 	OffsetNumber	deletable[MaxOffsetNumber];
 	IndexTuple		itup;
-	int				pos = info->last_dead_tuple;
 
 	if (stats == NULL)
 		stats = (IndexTargetDeleteResult *) palloc0(sizeof(IndexTargetDeleteResult));
 
-	/* Assemble scankey */
 	itup = index_form_tuple(RelationGetDescr(irel), values, isnull);
 	skey = _bt_mkscankey(irel, itup);
 
 	/* Descend the tree and position ourselves on the target leaf page. */
-	stack = _bt_search(irel, keysCount, skey, &info->dead_tuples[pos], false, &buf, BT_READ, NULL);
-
-	/* trade in our read lock for a write lock */
-//	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-//	LockBuffer(buf, BT_WRITE);
-
-	buf = _bt_moveright(irel, buf, keysCount, skey, &info->dead_tuples[pos],
-													false, true, stack, BT_READ, NULL);
-
-//	CheckForSerializableConflictIn(irel, NULL, buf);
+	stack = _bt_search(irel, keysCount, skey, false, &buf, BT_READ, NULL);
+	_bt_freestack(stack);
 
 	/* To prepare tuple entries search across index pages */
 	Assert(BufferIsValid(buf));
+	offnum = _bt_binsrch(irel, buf, keysCount, skey, false);
 	page = BufferGetPage(buf);
 	_bt_checkpage(irel, buf);
 	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
-	offnum = _bt_binsrch(irel, buf, keysCount, skey, &info->dead_tuples[pos], P_FIRSTDATAKEY(opaque), false);
 
 	for (;;)
 	{
 		int32		cmpval;
 		ItemId		itemid;
 		IndexTuple	itup;
+		int			pos;
 
 		/* Switch to the next page */
-		if (offnum > PageGetMaxOffsetNumber(page))
+		if (P_IGNORE(opaque) || (offnum > PageGetMaxOffsetNumber(page)))
 		{
 			/*
 			 * Before unlocking index page we need to delete
@@ -963,10 +950,8 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 			 */
 			if (ndeletable > 0)
 			{
-				/* trade in our read lock for a write lock */
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-				LockBuffer(buf, BT_WRITE);
-//				LockBufferForCleanup(buf);
+				LockBufferForCleanup(buf);
 
 				_bt_delitems_delete(irel, buf, deletable, ndeletable, hrel);
 
@@ -982,28 +967,20 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 				break;
 
 			/*
-			 * Traverse to a next reliable index page
+			 * Switch to the next index page
 			 */
-			buf = _bt_moveright(irel, buf, keysCount, skey, &info->dead_tuples[pos],
-												true, true, stack, BT_READ, NULL);
+			buf = _bt_relandgetbuf(irel, buf, opaque->btpo_next, BT_READ);
 			page = BufferGetPage(buf);
 			_bt_checkpage(irel, buf);
 			opaque = (BTPageOpaque) PageGetSpecialPointer(page);
-			Assert(!P_IGNORE(opaque));
-
-			/* Set offnum to first potentially interesting item */
-			offnum = _bt_binsrch(irel, buf, keysCount, skey, &info->dead_tuples[pos], P_FIRSTDATAKEY(opaque), false);
-
-			if (offnum > PageGetMaxOffsetNumber(page))
-				break;
-			else
-				continue;
+			offnum = P_FIRSTDATAKEY(opaque);
+			continue;
 		}
 
 		/*
 		 * This index entry satisfied to the scan key?
 		 */
-		cmpval = _bt_compare(irel, keysCount, skey, NULL, page, offnum);
+		cmpval = _bt_compare(irel, keysCount, skey, page, offnum);
 
 		if (cmpval != 0)
 			/* End of index entries, satisfied to the scan key */
@@ -1015,28 +992,14 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 		 */
 		itemid = PageGetItemId(page, offnum);
 		itup = (IndexTuple) PageGetItem(page, itemid);
+		pos = tid_list_search(&(itup->t_tid), info->dead_tuples, info->num_dead_tuples);
 
-		/*
-		 * Search for next TID from presorted btree result comparable
-		 * to TID from presorted dead_tuples tid list
-		 */
-		while (pos >= 0)
+		if ((pos >= 0) && (!info->found_dead_tuples[pos]))
 		{
-			int res = ItemPointerCompare(&(itup->t_tid), &info->dead_tuples[pos]);
-			if ((res == 0) && (!info->found_dead_tuples[pos]))
-			{
-				/* index entry for TID of dead tuple is found */
-				deletable[ndeletable++] = offnum;
-				info->found_dead_tuples[pos] = true;
-			}
-			else if (res > 0)
-				break;
-
-			pos--;
+			/* index entry for TID of dead tuple is found */
+			deletable[ndeletable++] = offnum;
+			info->found_dead_tuples[pos] = true;
 		}
-
-		if (pos < 0)
-			break;
 
 		offnum = OffsetNumberNext(offnum);
 	}
@@ -1046,18 +1009,15 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	 */
 	if (ndeletable > 0)
 	{
-		/* trade in our read lock for a write lock */
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-		LockBuffer(buf, BT_WRITE);
-//		LockBufferForCleanup(buf);
+		LockBufferForCleanup(buf);
 
 		_bt_delitems_delete(irel, buf, deletable, ndeletable, hrel);
+
 		stats->tuples_removed += ndeletable;
 	}
 
-	/* Release stack, scan key, unpin and unlock buffer */
-	if (stack)
-		_bt_freestack(stack);
+	/* Release scan key, unpin and unlock buffer */
 	_bt_freeskey(skey);
 	_bt_relbuf(irel, buf);
 

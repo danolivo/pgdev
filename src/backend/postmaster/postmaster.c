@@ -109,7 +109,6 @@
 #include "pgstat.h"
 #include "port/pg_bswap.h"
 #include "postmaster/autovacuum.h"
-#include "postmaster/bgheap.h"
 #include "postmaster/bgworker_internals.h"
 #include "postmaster/fork_process.h"
 #include "postmaster/pgarch.h"
@@ -146,10 +145,9 @@
 #define BACKEND_TYPE_AUTOVAC	0x0002	/* autovacuum worker process */
 #define BACKEND_TYPE_WALSND		0x0004	/* walsender process */
 #define BACKEND_TYPE_BGWORKER	0x0008	/* bgworker process */
-#define BACKEND_TYPE_BGHEAP		0x0010	/* autovacuum worker process */
-#define BACKEND_TYPE_ALL		0x001F	/* OR of all the above */
+#define BACKEND_TYPE_ALL		0x000F	/* OR of all the above */
 
-#define BACKEND_TYPE_WORKER		(BACKEND_TYPE_AUTOVAC | BACKEND_TYPE_BGWORKER | BACKEND_TYPE_BGHEAP)
+#define BACKEND_TYPE_WORKER		(BACKEND_TYPE_AUTOVAC | BACKEND_TYPE_BGWORKER)
 
 /*
  * List of active backends (or child processes anyway; we don't actually
@@ -254,7 +252,6 @@ static pid_t StartupPID = 0,
 			WalWriterPID = 0,
 			WalReceiverPID = 0,
 			AutoVacPID = 0,
-			HeapClnrPID = 0,
 			PgArchPID = 0,
 			PgStatPID = 0,
 			SysLoggerPID = 0;
@@ -358,7 +355,6 @@ bool		redirection_done = false;	/* stderr redirected for syslogger? */
 
 /* received START_AUTOVAC_LAUNCHER signal */
 static volatile sig_atomic_t start_autovac_launcher = false;
-static volatile sig_atomic_t start_heapclnr_launcher = false;
 
 /* the launcher needs to be signalled to communicate some condition */
 static volatile bool avlauncher_needs_signal = false;
@@ -436,7 +432,6 @@ static void maybe_start_bgworkers(void);
 static bool CreateOptsFile(int argc, char *argv[], char *fullprogname);
 static pid_t StartChildProcess(AuxProcType type);
 static void StartAutovacuumWorker(void);
-static void StartBgHeapWorker(void);
 static void MaybeStartWalReceiver(void);
 static void InitPostmasterDeathWatchHandle(void);
 
@@ -1315,7 +1310,6 @@ PostmasterMain(int argc, char *argv[])
 	 */
 	autovac_init();
 
-	HeapCleanerInit();
 	/*
 	 * Load configuration files for client authentication.
 	 */
@@ -1763,14 +1757,6 @@ ServerLoop(void)
 				start_autovac_launcher = false; /* signal processed */
 		}
 
-		if (!IsBinaryUpgrade && HeapClnrPID == 0 && start_heapclnr_launcher &&
-			pmState == PM_RUN)
-		{
-			HeapClnrPID = StartHeapCleanerLauncher();
-			if (HeapClnrPID != 0)
-				start_heapclnr_launcher = false; /* signal processed */
-		}
-
 		/* If we have lost the stats collector, try to start a new one */
 		if (PgStatPID == 0 &&
 			(pmState == PM_RUN || pmState == PM_HOT_STANDBY))
@@ -1786,12 +1772,6 @@ ServerLoop(void)
 			avlauncher_needs_signal = false;
 			if (AutoVacPID != 0)
 				kill(AutoVacPID, SIGUSR2);
-		}
-
-		/* If we have lost the background heap cleaner, try to start a new one. */
-		if (!IsBinaryUpgrade && HeapClnrPID == 0 && pmState == PM_RUN )
-		{
-			HeapClnrPID = StartHeapCleanerLauncher();
 		}
 
 		/* If we need to start a WAL receiver, try to do that now */
@@ -2561,8 +2541,6 @@ SIGHUP_handler(SIGNAL_ARGS)
 			signal_child(WalReceiverPID, SIGHUP);
 		if (AutoVacPID != 0)
 			signal_child(AutoVacPID, SIGHUP);
-		if (HeapClnrPID != 0)
-			signal_child(HeapClnrPID, SIGHUP);
 		if (PgArchPID != 0)
 			signal_child(PgArchPID, SIGHUP);
 		if (SysLoggerPID != 0)
@@ -2649,12 +2627,10 @@ pmdie(SIGNAL_ARGS)
 				/* autovac workers are told to shut down immediately */
 				/* and bgworkers too; does this need tweaking? */
 				SignalSomeChildren(SIGTERM,
-								   BACKEND_TYPE_AUTOVAC | BACKEND_TYPE_BGWORKER | BACKEND_TYPE_BGHEAP);
+								   BACKEND_TYPE_AUTOVAC | BACKEND_TYPE_BGWORKER);
 				/* and the autovac launcher too */
 				if (AutoVacPID != 0)
 					signal_child(AutoVacPID, SIGTERM);
-				if (HeapClnrPID != 0)
-					signal_child(HeapClnrPID, SIGTERM);
 				/* and the bgwriter too */
 				if (BgWriterPID != 0)
 					signal_child(BgWriterPID, SIGTERM);
@@ -2711,7 +2687,7 @@ pmdie(SIGNAL_ARGS)
 				signal_child(WalReceiverPID, SIGTERM);
 			if (pmState == PM_RECOVERY)
 			{
-				SignalSomeChildren(SIGTERM, BACKEND_TYPE_BGWORKER | BACKEND_TYPE_BGHEAP);
+				SignalSomeChildren(SIGTERM, BACKEND_TYPE_BGWORKER);
 
 				/*
 				 * Only startup, bgwriter, walreceiver, possibly bgworkers,
@@ -2732,12 +2708,10 @@ pmdie(SIGNAL_ARGS)
 				/* shut down all backends and workers */
 				SignalSomeChildren(SIGTERM,
 								   BACKEND_TYPE_NORMAL | BACKEND_TYPE_AUTOVAC |
-								   BACKEND_TYPE_BGWORKER | BACKEND_TYPE_BGHEAP);
+								   BACKEND_TYPE_BGWORKER);
 				/* and the autovac launcher too */
 				if (AutoVacPID != 0)
 					signal_child(AutoVacPID, SIGTERM);
-				if (HeapClnrPID != 0)
-					signal_child(HeapClnrPID, SIGTERM);
 				/* and the walwriter too */
 				if (WalWriterPID != 0)
 					signal_child(WalWriterPID, SIGTERM);
@@ -2901,8 +2875,6 @@ reaper(SIGNAL_ARGS)
 			 */
 			if (!IsBinaryUpgrade && AutoVacuumingActive() && AutoVacPID == 0)
 				AutoVacPID = StartAutoVacLauncher();
-			if (!IsBinaryUpgrade && (HeapClnrPID == 0))
-				HeapClnrPID = StartHeapCleanerLauncher();
 			if (PgArchStartupAllowed() && PgArchPID == 0)
 				PgArchPID = pgarch_start();
 			if (PgStatPID == 0)
@@ -3035,14 +3007,6 @@ reaper(SIGNAL_ARGS)
 			if (!EXIT_STATUS_0(exitstatus))
 				HandleChildCrash(pid, exitstatus,
 								 _("autovacuum launcher process"));
-			continue;
-		}
-		if (pid == HeapClnrPID)
-		{
-			HeapClnrPID = 0;
-			if (!EXIT_STATUS_0(exitstatus))
-				HandleChildCrash(pid, exitstatus,
-								 _("heap cleaner launcher process"));
 			continue;
 		}
 
@@ -3511,17 +3475,6 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 		signal_child(AutoVacPID, (SendStop ? SIGSTOP : SIGQUIT));
 	}
 
-	if (pid == HeapClnrPID)
-		HeapClnrPID = 0;
-	else if (HeapClnrPID != 0 && take_action)
-	{
-		ereport(DEBUG2,
-				(errmsg_internal("sending %s to process %d",
-								 "SIGQUIT",
-								 (int) HeapClnrPID)));
-		signal_child(HeapClnrPID, SIGQUIT);
-	}
-
 	/*
 	 * Force a power-cycle of the pgarch process too.  (This isn't absolutely
 	 * necessary, but it seems like a good idea for robustness, and it
@@ -3708,7 +3661,6 @@ PostmasterStateMachine(void)
 			(CheckpointerPID == 0 ||
 			 (!FatalError && Shutdown < ImmediateShutdown)) &&
 			WalWriterPID == 0 &&
-			HeapClnrPID == 0 &&
 			AutoVacPID == 0)
 		{
 			if (Shutdown >= ImmediateShutdown || FatalError)
@@ -3807,7 +3759,6 @@ PostmasterStateMachine(void)
 			Assert(CheckpointerPID == 0);
 			Assert(WalWriterPID == 0);
 			Assert(AutoVacPID == 0);
-			Assert(HeapClnrPID == 0);
 			/* syslogger is not considered here */
 			pmState = PM_NO_CHILDREN;
 		}
@@ -3997,8 +3948,6 @@ TerminateChildren(int signal)
 		signal_child(WalReceiverPID, signal);
 	if (AutoVacPID != 0)
 		signal_child(AutoVacPID, signal);
-	if (HeapClnrPID != 0)
-			signal_child(HeapClnrPID, signal);
 	if (PgArchPID != 0)
 		signal_child(PgArchPID, signal);
 	if (PgStatPID != 0)
@@ -4832,7 +4781,6 @@ SubPostmasterMain(int argc, char *argv[])
 	if (strcmp(argv[1], "--forkbackend") == 0 ||
 		strcmp(argv[1], "--forkavlauncher") == 0 ||
 		strcmp(argv[1], "--forkavworker") == 0 ||
-		strcmp(argv[1], "--forkbgheap") == 0 ||
 		strcmp(argv[1], "--forkboot") == 0 ||
 		strncmp(argv[1], "--forkbgworker=", 15) == 0)
 		PGSharedMemoryReAttach();
@@ -4844,8 +4792,6 @@ SubPostmasterMain(int argc, char *argv[])
 		AutovacuumLauncherIAm();
 	if (strcmp(argv[1], "--forkavworker") == 0)
 		AutovacuumWorkerIAm();
-	if (strcmp(argv[1], "--forkbgheap") == 0)
-		BgHeapCleanerIAm();
 
 	/*
 	 * Start our win32 signal implementation. This has to be done after we
@@ -4974,19 +4920,6 @@ SubPostmasterMain(int argc, char *argv[])
 		CreateSharedMemoryAndSemaphores(false, 0);
 
 		AutoVacWorkerMain(argc - 2, argv + 2);	/* does not return */
-	}
-	if (strcmp(argv[1], "--forkbgheap") == 0)
-	{
-		/* Restore basic shared memory pointers */
-		InitShmemAccess(UsedShmemSegAddr);
-
-		/* Need a PGPROC to run CreateSharedMemoryAndSemaphores */
-		InitProcess();
-
-		/* Attach process to shared data structures */
-		CreateSharedMemoryAndSemaphores(false, 0);
-
-		BgHeapMain(argc, argv);	/* does not return */
 	}
 	if (strncmp(argv[1], "--forkbgworker=", 15) == 0)
 	{
@@ -5189,24 +5122,11 @@ sigusr1_handler(SIGNAL_ARGS)
 		start_autovac_launcher = true;
 	}
 
-	if (CheckPostmasterSignal(PMSIGNAL_START_HEAPCLNR_LAUNCHER) &&
-		Shutdown == NoShutdown)
-	{
-		start_heapclnr_launcher = true;
-	}
-
 	if (CheckPostmasterSignal(PMSIGNAL_START_AUTOVAC_WORKER) &&
 		Shutdown == NoShutdown)
 	{
 		/* The autovacuum launcher wants us to start a worker process. */
 		StartAutovacuumWorker();
-	}
-
-	if (CheckPostmasterSignal(PMSIGNAL_START_HEAPCLNR_WORKER) &&
-		Shutdown == NoShutdown)
-	{
-		/* The autovacuum launcher wants us to start a worker process. */
-		StartBgHeapWorker();
 	}
 
 	if (CheckPostmasterSignal(PMSIGNAL_START_WALRECEIVER))
@@ -5550,73 +5470,6 @@ StartAutovacuumWorker(void)
 	}
 }
 
-static void
-StartBgHeapWorker(void)
-{
-	Backend    *bn;
-
-	/*
-	 * If not in condition to run a process, don't try, but handle it like a
-	 * fork failure.  This does not normally happen, since the signal is only
-	 * supposed to be sent by autovacuum launcher when it's OK to do it, but
-	 * we have to check to avoid race-condition problems during DB state
-	 * changes.
-	 */
-	if (canAcceptConnections() == CAC_OK)
-	{
-		/*
-		 * Compute the cancel key that will be assigned to this session. We
-		 * probably don't need cancel keys for autovac workers, but we'd
-		 * better have something random in the field to prevent unfriendly
-		 * people from sending cancels to them.
-		 */
-		if (!RandomCancelKey(&MyCancelKey))
-		{
-			ereport(LOG,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("could not generate random cancel key")));
-			return;
-		}
-
-		bn = (Backend *) malloc(sizeof(Backend));
-		if (bn)
-		{
-			bn->cancel_key = MyCancelKey;
-
-			/* Autovac workers are not dead_end and need a child slot */
-			bn->dead_end = false;
-			bn->child_slot = MyPMChildSlot = AssignPostmasterChildSlot();
-			bn->bgworker_notify = false;
-
-			bn->pid = StartHeapCleanerWorker();
-
-			if (bn->pid > 0)
-			{
-				bn->bkend_type = BACKEND_TYPE_BGHEAP;
-				dlist_push_head(&BackendList, &bn->elem);
-#ifdef EXEC_BACKEND
-				ShmemBackendArrayAdd(bn);
-#endif
-				/* all OK */
-				return;
-			}
-
-			/*
-			 * fork failed, fall through to report -- actual error message was
-			 * logged by StartAutoVacWorker
-			 */
-			(void) ReleasePostmasterChildSlot(bn->child_slot);
-			free(bn);
-		}
-		else
-			ereport(LOG,
-					(errcode(ERRCODE_OUT_OF_MEMORY),
-					 errmsg("out of memory")));
-	}
-
-	elog(ERROR, "Some BGHEAP Worker start error!");
-}
-
 /*
  * MaybeStartWalReceiver
  *		Start the WAL receiver process, if not running and our state allows.
@@ -5681,8 +5534,7 @@ CreateOptsFile(int argc, char *argv[], char *fullprogname)
 int
 MaxLivePostmasterChildren(void)
 {
-	return 2 * (MaxConnections + autovacuum_max_workers +
-				heapcleaner_max_workers + 1 +
+	return 2 * (MaxConnections + autovacuum_max_workers + 1 +
 				max_worker_processes);
 }
 

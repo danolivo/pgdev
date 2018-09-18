@@ -159,8 +159,7 @@ static void lazy_scan_heap(Relation onerel, int options,
 static void lazy_vacuum_heap(Relation onerel, LVRelStats *vacrelstats);
 static bool lazy_check_needs_freeze(Buffer buf, bool *hastup);
 static void quick_vacuum_index(Relation irel, Relation hrel,
-		   ItemPointer dead_tuples,
-		   int num_dead_tuples);
+					LVRelStats *vacrelstats);
 static void lazy_vacuum_index(Relation indrel,
 				  IndexBulkDeleteResult **stats,
 				  LVRelStats *vacrelstats);
@@ -743,7 +742,7 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 				bool use_quick_strategy = (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
 
 				if (use_quick_strategy && (Irel[i]->rd_amroutine->amtargetdelete != NULL))
-					quick_vacuum_index(Irel[i], onerel, vacrelstats->dead_tuples, vacrelstats->num_dead_tuples);
+					quick_vacuum_index(Irel[i], onerel, vacrelstats);
 				else
 					lazy_vacuum_index(Irel[i],
 								  &indstats[i],
@@ -1395,7 +1394,7 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 			bool use_quick_strategy = (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
 
 			if (use_quick_strategy && (Irel[i]->rd_amroutine->amtargetdelete != NULL))
-				quick_vacuum_index(Irel[i], onerel, vacrelstats->dead_tuples, vacrelstats->num_dead_tuples);
+				quick_vacuum_index(Irel[i], onerel, vacrelstats);
 			else
 				lazy_vacuum_index(Irel[i],
 							  &indstats[i],
@@ -1731,12 +1730,7 @@ get_tuple_by_tid(Relation rel, ItemPointer tid)
 	{
 		offnum = ItemIdGetRedirect(lp);
 		lp = PageGetItemId(page, offnum);
-
-		if (!ItemIdIsUsed(lp))
-		{
-			UnlockReleaseBuffer(buffer);
-			return NULL;
-		}
+		Assert(ItemIdIsUsed(lp));
 	}
 
 	/* Form a tuple */
@@ -1753,34 +1747,30 @@ get_tuple_by_tid(Relation rel, ItemPointer tid)
  *	quick_vacuum_index() -- quick vacuum one index relation.
  *
  *		Delete all the index entries pointing to tuples listed in
- *		dead_tuples.
+ *		vacrelstats->dead_tuples.
  */
 static void
 quick_vacuum_index(Relation irel, Relation hrel,
-				   ItemPointer dead_tuples,
-				   int num_dead_tuples)
+				   LVRelStats *vacrelstats)
 {
 	int				tnum;
-	bool			*found = palloc0(num_dead_tuples*sizeof(bool));
-	IndexInfo 		*indexInfo = BuildIndexInfo(irel);
-	EState			*estate = CreateExecutorState();
-	ExprContext		*econtext = GetPerTupleExprContext(estate);
-	ExprState		*predicate = ExecPrepareQual(indexInfo->ii_Predicate, estate);
-	TupleTableSlot	*slot = MakeSingleTupleTableSlot(RelationGetDescr(hrel));
+	bool*			found = palloc0(vacrelstats->num_dead_tuples*sizeof(bool));
+	IndexInfo* 		indexInfo = BuildIndexInfo(irel);
+	EState*			estate = CreateExecutorState();
+	ExprContext*	econtext = GetPerTupleExprContext(estate);
+	ExprState*		predicate = ExecPrepareQual(indexInfo->ii_Predicate, estate);
+	TupleTableSlot*	slot = MakeSingleTupleTableSlot(RelationGetDescr(hrel));
 
 	IndexTargetDeleteResult	stats;
 	IndexTargetDeleteInfo	ivinfo;
 
-	Assert(found != NULL);
-
-	stats.tuples_removed = 0;
 	ivinfo.indexRelation = irel;
 	ivinfo.heapRelation = hrel;
 
 	econtext->ecxt_scantuple = slot;
 
 	/* Get tuple from heap */
-	for (tnum = num_dead_tuples-1; tnum >= 0; tnum--)
+	for (tnum = 0; tnum < vacrelstats->num_dead_tuples; tnum++)
 	{
 		HeapTuple		tuple;
 		Datum			values[INDEX_MAX_KEYS];
@@ -1791,7 +1781,7 @@ quick_vacuum_index(Relation irel, Relation hrel,
 			continue;
 
 		/* Get a tuple from heap */
-		if ((tuple = get_tuple_by_tid(hrel, &(dead_tuples[tnum]))) == NULL)
+		if ((tuple = get_tuple_by_tid(hrel, &(vacrelstats->dead_tuples[tnum]))) == NULL)
 		{
 			/*
 			 * Tuple has 'not used' status.
@@ -1801,7 +1791,7 @@ quick_vacuum_index(Relation irel, Relation hrel,
 		}
 
 		/*
-		 * Form values[] and isnull[] arrays of index tuple
+		 * Form values[] and isnull[] arrays from for index tuple
 		 * by heap tuple
 		 */
 		MemoryContextReset(econtext->ecxt_per_tuple_memory);
@@ -1824,16 +1814,15 @@ quick_vacuum_index(Relation irel, Relation hrel,
 		 * Make attempt to delete some index entries by one tree descent.
 		 * We use only a part of TID list, which contains not found TID's.
 		 */
-		ivinfo.dead_tuples = dead_tuples;
-		ivinfo.last_dead_tuple = tnum;
-		ivinfo.found_dead_tuples = found;
-
+		ivinfo.dead_tuples = &(vacrelstats->dead_tuples[tnum]);
+		ivinfo.num_dead_tuples = vacrelstats->num_dead_tuples - tnum;
+		ivinfo.found_dead_tuples = found + tnum;
 		index_target_delete(&ivinfo, &stats, values, isnull);
 	}
 
+	pfree(found);
 	ExecDropSingleTupleTableSlot(slot);
 	FreeExecutorState(estate);
-	pfree(found);
 }
 
 /*
