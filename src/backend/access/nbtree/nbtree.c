@@ -964,9 +964,9 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 			if (ndeletable > 0)
 			{
 				/* trade in our read lock for a write lock */
-				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+//				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 //				LockBuffer(buf, BT_WRITE);
-				LockBufferForCleanup(buf);
+//				LockBufferForCleanup(buf);
 
 				_bt_delitems_delete(irel, buf, deletable, ndeletable, hrel);
 
@@ -995,6 +995,7 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 			offnum = _bt_binsrch(irel, buf, keysCount, skey, &info->dead_tuples[pos], P_FIRSTDATAKEY(opaque), false);
 
 			if (offnum > PageGetMaxOffsetNumber(page))
+//				Assert(0);
 				break;
 			else
 				continue;
@@ -1047,9 +1048,9 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	if (ndeletable > 0)
 	{
 		/* trade in our read lock for a write lock */
-		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+//		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 //		LockBuffer(buf, BT_WRITE);
-		LockBufferForCleanup(buf);
+//		LockBufferForCleanup(buf);
 
 		_bt_delitems_delete(irel, buf, deletable, ndeletable, hrel);
 		stats->tuples_removed += ndeletable;
