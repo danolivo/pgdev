@@ -134,6 +134,14 @@ ExecLimit(PlanState *pstate)
 					node->position - node->offset >= node->count)
 				{
 					node->lstate = LIMIT_WINDOWEND;
+
+					/*
+					 * If we know we won't need to back up, we can release
+					 * resources at this point.
+					 */
+					if (!(node->ps.state->es_top_eflags & EXEC_FLAG_BACKWARD))
+						(void) ExecShutdownNode(outerPlan);
+
 					return NULL;
 				}
 

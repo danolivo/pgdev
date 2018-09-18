@@ -28,12 +28,16 @@
 #include <llvm-c/BitReader.h>
 #include <llvm-c/BitWriter.h>
 #include <llvm-c/Core.h>
+#include <llvm-c/ExecutionEngine.h>
 #include <llvm-c/OrcBindings.h>
 #include <llvm-c/Support.h>
 #include <llvm-c/Target.h>
 #include <llvm-c/Transforms/IPO.h>
 #include <llvm-c/Transforms/PassManagerBuilder.h>
 #include <llvm-c/Transforms/Scalar.h>
+#if LLVM_VERSION_MAJOR > 6
+#include <llvm-c/Transforms/Utils.h>
+#endif
 
 
 /* Handle of a module emitted via ORC JIT */
@@ -663,18 +667,22 @@ llvm_session_initialize(void)
 	llvm_opt0_orc = LLVMOrcCreateInstance(llvm_opt0_targetmachine);
 	llvm_opt3_orc = LLVMOrcCreateInstance(llvm_opt3_targetmachine);
 
-#if defined(HAVE_DECL_LLVMORCREGISTERGDB) && HAVE_DECL_LLVMORCREGISTERGDB
+#if defined(HAVE_DECL_LLVMCREATEGDBREGISTRATIONLISTENER) && HAVE_DECL_LLVMCREATEGDBREGISTRATIONLISTENER
 	if (jit_debugging_support)
 	{
-		LLVMOrcRegisterGDB(llvm_opt0_orc);
-		LLVMOrcRegisterGDB(llvm_opt3_orc);
+		LLVMJITEventListenerRef l = LLVMCreateGDBRegistrationListener();
+
+		LLVMOrcRegisterJITEventListener(llvm_opt0_orc, l);
+		LLVMOrcRegisterJITEventListener(llvm_opt3_orc, l);
 	}
 #endif
-#if defined(HAVE_DECL_LLVMORCREGISTERPERF) && HAVE_DECL_LLVMORCREGISTERPERF
+#if defined(HAVE_DECL_LLVMCREATEPERFJITEVENTLISTENER) && HAVE_DECL_LLVMCREATEPERFJITEVENTLISTENER
 	if (jit_profiling_support)
 	{
-		LLVMOrcRegisterPerf(llvm_opt0_orc);
-		LLVMOrcRegisterPerf(llvm_opt3_orc);
+		LLVMJITEventListenerRef l = LLVMCreatePerfJITEventListener();
+
+		LLVMOrcRegisterJITEventListener(llvm_opt0_orc, l);
+		LLVMOrcRegisterJITEventListener(llvm_opt3_orc, l);
 	}
 #endif
 
