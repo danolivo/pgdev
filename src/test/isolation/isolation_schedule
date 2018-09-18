@@ -66,6 +66,7 @@ test: async-notify
 test: vacuum-reltuples
 test: timeouts
 test: vacuum-concurrent-drop
+test: vacuum-conflict
 test: predicate-hash
 test: predicate-gist
 test: predicate-gin
@@ -76,3 +77,4 @@ test: partition-key-update-2
 test: partition-key-update-3
 test: partition-key-update-4
 test: plpgsql-toast
+test: truncate-conflict

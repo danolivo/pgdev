@@ -112,6 +112,11 @@ typedef struct PruneStepResult
 } PruneStepResult;
 
 
+static List *make_partitionedrel_pruneinfo(PlannerInfo *root,
+							  RelOptInfo *parentrel,
+							  int *relid_subplan_map,
+							  List *partitioned_rels, List *prunequal,
+							  Bitmapset **matchedsubplans);
 static List *gen_partprune_steps(RelOptInfo *rel, List *clauses,
 					bool *contradictory);
 static List *gen_partprune_steps_internal(GeneratePruningStepsContext *context,
@@ -160,7 +165,7 @@ static PruneStepResult *get_matching_range_bounds(PartitionPruneContext *context
 						  FmgrInfo *partsupfunc, Bitmapset *nullkeys);
 static Bitmapset *pull_exec_paramids(Expr *expr);
 static bool pull_exec_paramids_walker(Node *node, Bitmapset **context);
-static bool analyze_partkey_exprs(PartitionPruneInfo *pinfo, List *steps,
+static bool analyze_partkey_exprs(PartitionedRelPruneInfo *pinfo, List *steps,
 					  int partnatts);
 static PruneStepResult *perform_pruning_base_step(PartitionPruneContext *context,
 						  PartitionPruneStepOp *opstep);
@@ -176,38 +181,43 @@ static bool partkey_datum_from_expr(PartitionPruneContext *context,
 
 /*
  * make_partition_pruneinfo
- *		Build List of PartitionPruneInfos, one for each partitioned rel.
- *		These can be used in the executor to allow additional partition
- *		pruning to take place.
+ *		Builds a PartitionPruneInfo which can be used in the executor to allow
+ *		additional partition pruning to take place.  Returns NULL when
+ *		partition pruning would be useless.
  *
- * Here we generate partition pruning steps for 'prunequal' and also build a
- * data structure which allows mapping of partition indexes into 'subpaths'
- * indexes.
+ * 'parentrel' is the RelOptInfo for an appendrel, and 'subpaths' is the list
+ * of scan paths for its child rels.
  *
- * If no non-Const expressions are being compared to the partition key in any
- * of the 'partitioned_rels', then we return NIL to indicate no run-time
- * pruning should be performed.  Run-time pruning would be useless, since the
- * pruning done during planning will have pruned everything that can be.
+ * 'partitioned_rels' is a List containing Lists of relids of partitioned
+ * tables (a/k/a non-leaf partitions) that are parents of some of the child
+ * rels.  Here we attempt to populate the PartitionPruneInfo by adding a
+ * 'prune_infos' item for each sublist in the 'partitioned_rels' list.
+ * However, some of the sets of partitioned relations may not require any
+ * run-time pruning.  In these cases we'll simply not include a 'prune_infos'
+ * item for that set and instead we'll add all the subplans which belong to
+ * that set into the PartitionPruneInfo's 'other_subplans' field.  Callers
+ * will likely never want to prune subplans which are mentioned in this field.
+ *
+ * 'prunequal' is a list of potential pruning quals.
  */
-List *
-make_partition_pruneinfo(PlannerInfo *root, List *partitioned_rels,
-						 List *subpaths, List *prunequal)
+PartitionPruneInfo *
+make_partition_pruneinfo(PlannerInfo *root, RelOptInfo *parentrel,
+						 List *subpaths, List *partitioned_rels,
+						 List *prunequal)
 {
-	RelOptInfo *targetpart = NULL;
-	List	   *pinfolist = NIL;
-	bool		doruntimeprune = false;
+	PartitionPruneInfo *pruneinfo;
+	Bitmapset  *allmatchedsubplans = NULL;
 	int		   *relid_subplan_map;
-	int		   *relid_subpart_map;
 	ListCell   *lc;
+	List	   *prunerelinfos;
 	int			i;
 
 	/*
-	 * Construct two temporary arrays to map from planner relids to subplan
-	 * and sub-partition indexes.  For convenience, we use 1-based indexes
-	 * here, so that zero can represent an un-filled array entry.
+	 * Construct a temporary array to map from planner relids to subplan
+	 * indexes.  For convenience, we use 1-based indexes here, so that zero
+	 * can represent an un-filled array entry.
 	 */
 	relid_subplan_map = palloc0(sizeof(int) * root->simple_rel_array_size);
-	relid_subpart_map = palloc0(sizeof(int) * root->simple_rel_array_size);
 
 	/*
 	 * relid_subplan_map maps relid of a leaf partition to the index in
@@ -227,10 +237,107 @@ make_partition_pruneinfo(PlannerInfo *root, List *partitioned_rels,
 		relid_subplan_map[pathrel->relid] = i++;
 	}
 
+	/* We now build a PartitionedRelPruneInfo for each partitioned rel. */
+	prunerelinfos = NIL;
+	foreach(lc, partitioned_rels)
+	{
+		List	   *rels = (List *) lfirst(lc);
+		List	   *pinfolist;
+		Bitmapset  *matchedsubplans = NULL;
+
+		pinfolist = make_partitionedrel_pruneinfo(root, parentrel,
+												  relid_subplan_map,
+												  rels, prunequal,
+												  &matchedsubplans);
+
+		/* When pruning is possible, record the matched subplans */
+		if (pinfolist != NIL)
+		{
+			prunerelinfos = lappend(prunerelinfos, pinfolist);
+			allmatchedsubplans = bms_join(matchedsubplans,
+										  allmatchedsubplans);
+		}
+	}
+
+	pfree(relid_subplan_map);
+
+	/*
+	 * If none of the partition hierarchies had any useful run-time pruning
+	 * quals, then we can just not bother with run-time pruning.
+	 */
+	if (prunerelinfos == NIL)
+		return NULL;
+
+	/* Else build the result data structure */
+	pruneinfo = makeNode(PartitionPruneInfo);
+	pruneinfo->prune_infos = prunerelinfos;
+
+	/*
+	 * Some subplans may not belong to any of the listed partitioned rels.
+	 * This can happen for UNION ALL queries which include a non-partitioned
+	 * table, or when some of the hierarchies aren't run-time prunable.  Build
+	 * a bitmapset of the indexes of all such subplans, so that the executor
+	 * can identify which subplans should never be pruned.
+	 */
+	if (bms_num_members(allmatchedsubplans) < list_length(subpaths))
+	{
+		Bitmapset  *other_subplans;
+
+		/* Create the complement of allmatchedsubplans */
+		other_subplans = bms_add_range(NULL, 0, list_length(subpaths) - 1);
+		other_subplans = bms_del_members(other_subplans, allmatchedsubplans);
+
+		pruneinfo->other_subplans = other_subplans;
+	}
+	else
+		pruneinfo->other_subplans = NULL;
+
+	return pruneinfo;
+}
+
+/*
+ * make_partitionedrel_pruneinfo
+ *		Build a List of PartitionedRelPruneInfos, one for each partitioned
+ *		rel.  These can be used in the executor to allow additional partition
+ *		pruning to take place.
+ *
+ * Here we generate partition pruning steps for 'prunequal' and also build a
+ * data structure which allows mapping of partition indexes into 'subpaths'
+ * indexes.
+ *
+ * If no non-Const expressions are being compared to the partition key in any
+ * of the 'partitioned_rels', then we return NIL to indicate no run-time
+ * pruning should be performed.  Run-time pruning would be useless since the
+ * pruning done during planning will have pruned everything that can be.
+ *
+ * On non-NIL return, 'matchedsubplans' is set to the subplan indexes which
+ * were matched to this partition hierarchy.
+ */
+static List *
+make_partitionedrel_pruneinfo(PlannerInfo *root, RelOptInfo *parentrel,
+							  int *relid_subplan_map,
+							  List *partitioned_rels, List *prunequal,
+							  Bitmapset **matchedsubplans)
+{
+	RelOptInfo *targetpart = NULL;
+	List	   *pinfolist = NIL;
+	bool		doruntimeprune = false;
+	int		   *relid_subpart_map;
+	Bitmapset  *subplansfound = NULL;
+	ListCell   *lc;
+	int			i;
+
+	/*
+	 * Construct a temporary array to map from planner relids to index of the
+	 * partitioned_rel.  For convenience, we use 1-based indexes here, so that
+	 * zero can represent an un-filled array entry.
+	 */
+	relid_subpart_map = palloc0(sizeof(int) * root->simple_rel_array_size);
+
 	/*
 	 * relid_subpart_map maps relid of a non-leaf partition to the index in
 	 * 'partitioned_rels' of that rel (which will also be the index in the
-	 * returned PartitionPruneInfo list of the info for that partition).
+	 * returned PartitionedRelPruneInfo list of the info for that partition).
 	 */
 	i = 1;
 	foreach(lc, partitioned_rels)
@@ -240,18 +347,16 @@ make_partition_pruneinfo(PlannerInfo *root, List *partitioned_rels,
 		Assert(rti < root->simple_rel_array_size);
 		/* No duplicates please */
 		Assert(relid_subpart_map[rti] == 0);
-		/* Same rel cannot be both leaf and non-leaf */
-		Assert(relid_subplan_map[rti] == 0);
 
 		relid_subpart_map[rti] = i++;
 	}
 
-	/* We now build a PartitionPruneInfo for each partitioned rel */
+	/* We now build a PartitionedRelPruneInfo for each partitioned rel */
 	foreach(lc, partitioned_rels)
 	{
 		Index		rti = lfirst_int(lc);
 		RelOptInfo *subpart = find_base_rel(root, rti);
-		PartitionPruneInfo *pinfo;
+		PartitionedRelPruneInfo *pinfo;
 		RangeTblEntry *rte;
 		Bitmapset  *present_parts;
 		int			nparts = subpart->nparts;
@@ -263,12 +368,35 @@ make_partition_pruneinfo(PlannerInfo *root, List *partitioned_rels,
 		bool		contradictory;
 
 		/*
-		 * The first item in the list is the target partitioned relation.  The
-		 * quals belong to this relation, so require no translation.
+		 * The first item in the list is the target partitioned relation.
 		 */
 		if (!targetpart)
 		{
 			targetpart = subpart;
+
+			/*
+			 * The prunequal is presented to us as a qual for 'parentrel'.
+			 * Frequently this rel is the same as targetpart, so we can skip
+			 * an adjust_appendrel_attrs step.  But it might not be, and then
+			 * we have to translate.  We update the prunequal parameter here,
+			 * because in later iterations of the loop for child partitions,
+			 * we want to translate from parent to child variables.
+			 */
+			if (!bms_equal(parentrel->relids, subpart->relids))
+			{
+				int			nappinfos;
+				AppendRelInfo **appinfos = find_appinfos_by_relids(root,
+																   subpart->relids,
+																   &nappinfos);
+
+				prunequal = (List *) adjust_appendrel_attrs(root, (Node *)
+															prunequal,
+															nappinfos,
+															appinfos);
+
+				pfree(appinfos);
+			}
+
 			partprunequal = prunequal;
 		}
 		else
@@ -320,13 +448,20 @@ make_partition_pruneinfo(PlannerInfo *root, List *partitioned_rels,
 
 			subplan_map[i] = subplanidx;
 			subpart_map[i] = subpartidx;
-			if (subplanidx >= 0 || subpartidx >= 0)
+			if (subplanidx >= 0)
+			{
+				present_parts = bms_add_member(present_parts, i);
+
+				/* Record finding this subplan  */
+				subplansfound = bms_add_member(subplansfound, subplanidx);
+			}
+			else if (subpartidx >= 0)
 				present_parts = bms_add_member(present_parts, i);
 		}
 
 		rte = root->simple_rte_array[subpart->relid];
 
-		pinfo = makeNode(PartitionPruneInfo);
+		pinfo = makeNode(PartitionedRelPruneInfo);
 		pinfo->reloid = rte->relid;
 		pinfo->pruning_steps = pruning_steps;
 		pinfo->present_parts = present_parts;
@@ -341,14 +476,17 @@ make_partition_pruneinfo(PlannerInfo *root, List *partitioned_rels,
 		pinfolist = lappend(pinfolist, pinfo);
 	}
 
-	pfree(relid_subplan_map);
 	pfree(relid_subpart_map);
 
-	if (doruntimeprune)
-		return pinfolist;
+	if (!doruntimeprune)
+	{
+		/* No run-time pruning required. */
+		return NIL;
+	}
 
-	/* No run-time pruning required. */
-	return NIL;
+	*matchedsubplans = subplansfound;
+
+	return pinfolist;
 }
 
 /*
@@ -486,7 +624,10 @@ get_matching_partitions(PartitionPruneContext *context, List *pruning_steps)
 
 	/* If there are no pruning steps then all partitions match. */
 	if (num_steps == 0)
+	{
+		Assert(context->nparts > 0);
 		return bms_add_range(NULL, 0, context->nparts - 1);
+	}
 
 	/*
 	 * Allocate space for individual pruning steps to store its result.  Each
@@ -1287,7 +1428,7 @@ gen_prune_steps_from_opexps(PartitionScheme part_scheme,
 					/*
 					 * For each clause for the "last" column, after appending
 					 * the clause's own expression to the 'prefix', we'll
-					 * generate one step using the so generated vector and and
+					 * generate one step using the so generated vector and
 					 * assign = as its strategy.  Actually, 'prefix' might
 					 * contain multiple clauses for the same key, in which
 					 * case, we must generate steps for various combinations
@@ -2048,8 +2189,12 @@ get_matching_hash_bounds(PartitionPruneContext *context,
 				bms_make_singleton(rowHash % greatest_modulus);
 	}
 	else
+	{
+		/* Getting here means at least one hash partition exists. */
+		Assert(boundinfo->ndatums > 0);
 		result->bound_offsets = bms_add_range(NULL, 0,
 											  boundinfo->ndatums - 1);
+	}
 
 	/*
 	 * There is neither a special hash null partition or the default hash
@@ -2128,6 +2273,7 @@ get_matching_list_bounds(PartitionPruneContext *context,
 	 */
 	if (nvalues == 0)
 	{
+		Assert(boundinfo->ndatums > 0);
 		result->bound_offsets = bms_add_range(NULL, 0,
 											  boundinfo->ndatums - 1);
 		result->scan_default = partition_bound_has_default(boundinfo);
@@ -2140,6 +2286,7 @@ get_matching_list_bounds(PartitionPruneContext *context,
 		/*
 		 * First match to all bounds.  We'll remove any matching datums below.
 		 */
+		Assert(boundinfo->ndatums > 0);
 		result->bound_offsets = bms_add_range(NULL, 0,
 											  boundinfo->ndatums - 1);
 
@@ -2250,6 +2397,7 @@ get_matching_list_bounds(PartitionPruneContext *context,
 			break;
 	}
 
+	Assert(minoff >= 0 && maxoff >= 0);
 	result->bound_offsets = bms_add_range(NULL, minoff, maxoff);
 	return result;
 }
@@ -2327,6 +2475,7 @@ get_matching_range_bounds(PartitionPruneContext *context,
 			maxoff--;
 
 		result->scan_default = partition_bound_has_default(boundinfo);
+		Assert(minoff >= 0 && maxoff >= 0);
 		result->bound_offsets = bms_add_range(NULL, minoff, maxoff);
 
 		return result;
@@ -2334,7 +2483,7 @@ get_matching_range_bounds(PartitionPruneContext *context,
 
 	/*
 	 * If the query does not constrain all key columns, we'll need to scan the
-	 * the default partition, if any.
+	 * default partition, if any.
 	 */
 	if (nvalues < partnatts)
 		result->scan_default = partition_bound_has_default(boundinfo);
@@ -2679,9 +2828,9 @@ get_matching_range_bounds(PartitionPruneContext *context,
 	}
 
 	/*
-	 * Skip a gap.  See the above comment about how we decide whether or or
-	 * not to scan the default partition based whether the datum that will
-	 * become the maximum datum is finite or not.
+	 * Skip a gap.  See the above comment about how we decide whether or not
+	 * to scan the default partition based whether the datum that will become
+	 * the maximum datum is finite or not.
 	 */
 	if (maxoff >= 1 && partindices[maxoff] < 0)
 	{
@@ -2761,7 +2910,8 @@ pull_exec_paramids_walker(Node *node, Bitmapset **context)
  * level.  Also fills fields of *pinfo to record how to process each step.
  */
 static bool
-analyze_partkey_exprs(PartitionPruneInfo *pinfo, List *steps, int partnatts)
+analyze_partkey_exprs(PartitionedRelPruneInfo *pinfo, List *steps,
+					  int partnatts)
 {
 	bool		doruntimeprune = false;
 	ListCell   *lc;

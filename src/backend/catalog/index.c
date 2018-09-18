@@ -319,9 +319,7 @@ ConstructTupleDescriptor(Relation heapRelation,
 	indexTupDesc = CreateTemplateTupleDesc(numatts, false);
 
 	/*
-	 * For simple index columns, we copy the pg_attribute row from the parent
-	 * relation and modify it as necessary.  For expressions we have to cons
-	 * up a pg_attribute row the hard way.
+	 * Fill in the pg_attribute row.
 	 */
 	for (i = 0; i < numatts; i++)
 	{
@@ -332,6 +330,19 @@ ConstructTupleDescriptor(Relation heapRelation,
 		Form_pg_opclass opclassTup;
 		Oid			keyType;
 
+		MemSet(to, 0, ATTRIBUTE_FIXED_PART_SIZE);
+		to->attnum = i + 1;
+		to->attstattarget = -1;
+		to->attcacheoff = -1;
+		to->attislocal = true;
+		to->attcollation = (i < numkeyatts) ?
+			collationObjectId[i] : InvalidOid;
+
+		/*
+		 * For simple index columns, we copy some pg_attribute fields from the
+		 * parent relation.  For expressions we have to look at the expression
+		 * result.
+		 */
 		if (atnum != 0)
 		{
 			/* Simple index column */
@@ -356,35 +367,19 @@ ConstructTupleDescriptor(Relation heapRelation,
 									 AttrNumberGetAttrOffset(atnum));
 			}
 
-			/*
-			 * now that we've determined the "from", let's copy the tuple desc
-			 * data...
-			 */
-			memcpy(to, from, ATTRIBUTE_FIXED_PART_SIZE);
-
-			/*
-			 * Fix the stuff that should not be the same as the underlying
-			 * attr
-			 */
-			to->attnum = i + 1;
-
-			to->attstattarget = -1;
-			to->attcacheoff = -1;
-			to->attnotnull = false;
-			to->atthasdef = false;
-			to->atthasmissing = false;
-			to->attidentity = '\0';
-			to->attislocal = true;
-			to->attinhcount = 0;
-			to->attcollation = (i < numkeyatts) ?
-				collationObjectId[i] : InvalidOid;
+			namecpy(&to->attname, &from->attname);
+			to->atttypid = from->atttypid;
+			to->attlen = from->attlen;
+			to->attndims = from->attndims;
+			to->atttypmod = from->atttypmod;
+			to->attbyval = from->attbyval;
+			to->attstorage = from->attstorage;
+			to->attalign = from->attalign;
 		}
 		else
 		{
 			/* Expressional index */
 			Node	   *indexkey;
-
-			MemSet(to, 0, ATTRIBUTE_FIXED_PART_SIZE);
 
 			if (indexpr_item == NULL)	/* shouldn't happen */
 				elog(ERROR, "too few entries in indexprs list");
@@ -401,20 +396,14 @@ ConstructTupleDescriptor(Relation heapRelation,
 			typeTup = (Form_pg_type) GETSTRUCT(tuple);
 
 			/*
-			 * Assign some of the attributes values. Leave the rest as 0.
+			 * Assign some of the attributes values. Leave the rest.
 			 */
-			to->attnum = i + 1;
 			to->atttypid = keyType;
 			to->attlen = typeTup->typlen;
 			to->attbyval = typeTup->typbyval;
 			to->attstorage = typeTup->typstorage;
 			to->attalign = typeTup->typalign;
-			to->attstattarget = -1;
-			to->attcacheoff = -1;
 			to->atttypmod = exprTypmod(indexkey);
-			to->attislocal = true;
-			to->attcollation = (i < numkeyatts) ?
-				collationObjectId[i] : InvalidOid;
 
 			ReleaseSysCache(tuple);
 
@@ -557,12 +546,7 @@ AppendAttributeTuples(Relation indexRelation, int numatts)
 	{
 		Form_pg_attribute attr = TupleDescAttr(indexTupDesc, i);
 
-		/*
-		 * There used to be very grotty code here to set these fields, but I
-		 * think it's unnecessary.  They should be set already.
-		 */
 		Assert(attr->attnum == i + 1);
-		Assert(attr->attcacheoff == -1);
 
 		InsertPgAttributeTuple(pg_attribute, attr, indstate);
 	}
@@ -847,6 +831,12 @@ index_create(Relation heapRelation,
 	if (shared_relation && tableSpaceId != GLOBALTABLESPACE_OID)
 		elog(ERROR, "shared relations must be placed in pg_global tablespace");
 
+	/*
+	 * Check for duplicate name (both as to the index, and as to the
+	 * associated constraint if any).  Such cases would fail on the relevant
+	 * catalogs' unique indexes anyway, but we prefer to give a friendlier
+	 * error message.
+	 */
 	if (get_relname_relid(indexRelationName, namespaceId))
 	{
 		if ((flags & INDEX_CREATE_IF_NOT_EXISTS) != 0)
@@ -863,6 +853,20 @@ index_create(Relation heapRelation,
 				(errcode(ERRCODE_DUPLICATE_TABLE),
 				 errmsg("relation \"%s\" already exists",
 						indexRelationName)));
+	}
+
+	if ((flags & INDEX_CREATE_ADD_CONSTRAINT) != 0 &&
+		ConstraintNameIsUsed(CONSTRAINT_RELATION, heapRelationId,
+							 indexRelationName))
+	{
+		/*
+		 * INDEX_CREATE_IF_NOT_EXISTS does not apply here, since the
+		 * conflicting constraint is not an index.
+		 */
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_OBJECT),
+				 errmsg("constraint \"%s\" for relation \"%s\" already exists",
+						indexRelationName, RelationGetRelationName(heapRelation))));
 	}
 
 	/*
@@ -977,6 +981,12 @@ index_create(Relation heapRelation,
 						(constr_flags & INDEX_CONSTR_CREATE_DEFERRABLE) == 0,
 						!concurrent && !invalid,
 						!concurrent);
+
+	/*
+	 * Register relcache invalidation on the indexes' heap relation, to
+	 * maintain consistency of its index list
+	 */
+	CacheInvalidateRelcache(heapRelation);
 
 	/* update pg_inherits, if needed */
 	if (OidIsValid(parentIndexRelid))

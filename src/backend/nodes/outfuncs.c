@@ -15,9 +15,13 @@
  *	  have an output function defined here (as well as an input function
  *	  in readfuncs.c).  In addition, plan nodes should have input and
  *	  output functions so that they can be sent to parallel workers.
+ *
  *	  For use in debugging, we also provide output functions for nodes
- *	  that appear in raw parsetrees and path.  These nodes however need
- *	  not have input functions.
+ *	  that appear in raw parsetrees and planner Paths.  These node types
+ *	  need not have input functions.  Output support for raw parsetrees
+ *	  is somewhat incomplete, too; in particular, utility statements are
+ *	  almost entirely unsupported.  We try to support everything that can
+ *	  appear in a raw SELECT, though.
  *
  *-------------------------------------------------------------------------
  */
@@ -402,7 +406,7 @@ _outAppend(StringInfo str, const Append *node)
 	WRITE_NODE_FIELD(appendplans);
 	WRITE_INT_FIELD(first_partial_plan);
 	WRITE_NODE_FIELD(partitioned_rels);
-	WRITE_NODE_FIELD(part_prune_infos);
+	WRITE_NODE_FIELD(part_prune_info);
 }
 
 static void
@@ -435,7 +439,7 @@ _outMergeAppend(StringInfo str, const MergeAppend *node)
 	for (i = 0; i < node->numCols; i++)
 		appendStringInfo(str, " %s", booltostr(node->nullsFirst[i]));
 
-	WRITE_NODE_FIELD(part_prune_infos);
+	WRITE_NODE_FIELD(part_prune_info);
 }
 
 static void
@@ -1015,9 +1019,18 @@ _outPlanRowMark(StringInfo str, const PlanRowMark *node)
 static void
 _outPartitionPruneInfo(StringInfo str, const PartitionPruneInfo *node)
 {
+	WRITE_NODE_TYPE("PARTITIONPRUNEINFO");
+
+	WRITE_NODE_FIELD(prune_infos);
+	WRITE_BITMAPSET_FIELD(other_subplans);
+}
+
+static void
+_outPartitionedRelPruneInfo(StringInfo str, const PartitionedRelPruneInfo *node)
+{
 	int			i;
 
-	WRITE_NODE_TYPE("PARTITIONPRUNEINFO");
+	WRITE_NODE_TYPE("PARTITIONEDRELPRUNEINFO");
 
 	WRITE_OID_FIELD(reloid);
 	WRITE_NODE_FIELD(pruning_steps);
@@ -2359,6 +2372,7 @@ _outRelOptInfo(StringInfo str, const RelOptInfo *node)
 	WRITE_UINT_FIELD(baserestrict_min_security);
 	WRITE_NODE_FIELD(joininfo);
 	WRITE_BOOL_FIELD(has_eclass_joins);
+	WRITE_BOOL_FIELD(consider_partitionwise_join);
 	WRITE_BITMAPSET_FIELD(top_parent_relids);
 	WRITE_NODE_FIELD(partitioned_child_rels);
 }
@@ -3337,6 +3351,20 @@ _outParamRef(StringInfo str, const ParamRef *node)
 	WRITE_LOCATION_FIELD(location);
 }
 
+/*
+ * Node types found in raw parse trees (supported for debug purposes)
+ */
+
+static void
+_outRawStmt(StringInfo str, const RawStmt *node)
+{
+	WRITE_NODE_TYPE("RAWSTMT");
+
+	WRITE_NODE_FIELD(stmt);
+	WRITE_LOCATION_FIELD(stmt_location);
+	WRITE_INT_FIELD(stmt_len);
+}
+
 static void
 _outAConst(StringInfo str, const A_Const *node)
 {
@@ -3831,6 +3859,9 @@ outNode(StringInfo str, const void *obj)
 			case T_PartitionPruneInfo:
 				_outPartitionPruneInfo(str, obj);
 				break;
+			case T_PartitionedRelPruneInfo:
+				_outPartitionedRelPruneInfo(str, obj);
+				break;
 			case T_PartitionPruneStepOp:
 				_outPartitionPruneStepOp(str, obj);
 				break;
@@ -4238,6 +4269,9 @@ outNode(StringInfo str, const void *obj)
 				break;
 			case T_ParamRef:
 				_outParamRef(str, obj);
+				break;
+			case T_RawStmt:
+				_outRawStmt(str, obj);
 				break;
 			case T_A_Const:
 				_outAConst(str, obj);
