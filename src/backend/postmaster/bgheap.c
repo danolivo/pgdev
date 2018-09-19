@@ -472,11 +472,11 @@ cleanup_relations(DirtyRelation *res, bool got_SIGTERM)
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
 		/* Iterate across all index relations */
-		for (irnum = 0; irnum < nindexes; irnum++)
-			quick_vacuum_index1(IndexRelations[irnum],
-							   heapRelation,
-							   dead_tuples,
-							   dead_tuples_num);
+//		for (irnum = 0; irnum < nindexes; irnum++)
+//			quick_vacuum_index1(IndexRelations[irnum],
+//							   heapRelation,
+//							   dead_tuples,
+//							   dead_tuples_num);
 
 		LockBufferForCleanup(buffer);
 
@@ -497,8 +497,8 @@ cleanup_relations(DirtyRelation *res, bool got_SIGTERM)
 			 */
 			Assert(ItemIdIsDead(lp));
 
-			ItemIdSetUnused(lp);
-			unusable[nunusable++] = offnum;
+//			ItemIdSetUnused(lp);
+//			unusable[nunusable++] = offnum;
 		}
 
 		if (nunusable > 0)

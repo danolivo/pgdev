@@ -4219,6 +4219,7 @@ htid2IndexDatum(Relation hrel, Relation irel, ItemPointer htid, Datum *values, b
 	 */
 	if ((predicate != NULL) && (!ExecQual(predicate, econtext)))
 	{
+		pfree(tuple);
 		ExecDropSingleTupleTableSlot(slot);
 		FreeExecutorState(estate);
 		return false;
@@ -4226,6 +4227,7 @@ htid2IndexDatum(Relation hrel, Relation irel, ItemPointer htid, Datum *values, b
 
 	FormIndexDatum(indexInfo, slot, estate, values, isnull);
 
+	pfree(tuple);
 	ExecDropSingleTupleTableSlot(slot);
 	FreeExecutorState(estate);
 	return true;
