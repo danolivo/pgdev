@@ -1706,7 +1706,6 @@ main_worker_loop(void)
 {
 	CleanerTask		task_item[WORKER_TASK_ITEMS_MAX];
 	DirtyRelation	*dirty_relation[WORKER_RELATIONS_MAX_NUM];
-	PSHTAB			FreeDirtyBlocksList;
 	long			timeout = -1L;
 	int				dirty_relations_num = 0;
 	SHTABCTL		shctl;
@@ -1717,8 +1716,6 @@ main_worker_loop(void)
 	shctl.KeySize = sizeof(BlockNumber);
 	shctl.HashFunc = DefaultHashValueFunc;
 	shctl.CompFunc = DefaultCompareFunc;
-
-	FreeDirtyBlocksList = SHASH_Create(shctl);
 
 	while (!got_SIGTERM)
 	{
@@ -1865,12 +1862,7 @@ main_worker_loop(void)
 
 			/* Pass along dirty relations and try to clean it */
 			for (relcounter = 0; relcounter < dirty_relations_num; relcounter++)
-			{
-				if (SHASH_Entries(FreeDirtyBlocksList) > 0)
-					SHASH_Clean(FreeDirtyBlocksList);
-
-				FreeDirtyBlocksList = cleanup_relations(dirty_relation[relcounter], FreeDirtyBlocksList, got_SIGTERM);
-			}
+				cleanup_relations(dirty_relation[relcounter], got_SIGTERM);
 
 			stat_cleanup_iterations++;
 
