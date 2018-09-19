@@ -212,7 +212,7 @@ static pid_t hcworker_forkexec(void);
 #endif
 
 static uint64 CleanerMessageHashFunc(void *key, uint64 size, uint64 base);
-static PSHTAB cleanup_relations(DirtyRelation *res, SHTAB *AuxiliaryList, bool got_SIGTERM);
+static void cleanup_relations(DirtyRelation *res, bool got_SIGTERM);
 static bool DefaultCompareFunc(void* bucket1, void* bucket2);
 NON_EXEC_STATIC void HeapCleanerLauncherMain(int argc, char *argv[]) pg_attribute_noreturn();
 NON_EXEC_STATIC void HeapCleanerWorkerMain(int argc, char *argv[]) pg_attribute_noreturn();
@@ -406,9 +406,9 @@ quick_vacuum_index1(Relation irel, Relation hrel,
 	/* Get tuple from heap */
 	for (tnum = num_dead_tuples-1; tnum >= 0; tnum--)
 	{
-		HeapTuple		tuple;
-		Datum			values[INDEX_MAX_KEYS];
-		bool			isnull[INDEX_MAX_KEYS];
+		HeapTuple	tuple;
+		Datum		values[INDEX_MAX_KEYS];
+		bool		isnull[INDEX_MAX_KEYS];
 
 		/* Index entry for the TID was deleted early */
 		if (found[tnum])
@@ -463,8 +463,8 @@ quick_vacuum_index1(Relation irel, Relation hrel,
 /*
  * Main logic of HEAP and index relations cleaning
  */
-static PSHTAB
-cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
+static void
+cleanup_relations(DirtyRelation *res, bool got_SIGTERM)
 {
 	Relation		heapRelation;
 	Relation   		*IndexRelations;
@@ -479,16 +479,14 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 
 	Assert(res != NULL);
 	Assert(res->items != NULL);
-	Assert(AuxiliaryList != NULL);
-	Assert(SHASH_Entries(AuxiliaryList) == 0);
 
 	if (SHASH_Entries(res->items) == 0)
-		return AuxiliaryList;
+		return;
 
 	if (RecoveryInProgress())
 	{
 		SHASH_Clean(res->items);
-		return AuxiliaryList;
+		return;
 	}
 
 	CHECK_FOR_INTERRUPTS();
@@ -510,37 +508,8 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 		SHASH_Clean(res->items);
-		return AuxiliaryList;
+		return;
 	}
-
-	/*
-	 * Check relation type similarly vacuum
-	 */
-/*
- * Ship it to heapRelation queue generation
- *
-	if (!(pg_class_ownercheck(RelationGetRelid(heapRelation), GetUserId()) ||
-		  (pg_database_ownercheck(MyDatabaseId, GetUserId()) && !heapRelation->rd_rel->relisshared)))
-	{
-		if (heapRelation->rd_rel->relisshared)
-			ereport(WARNING,
-					(errmsg("skipping \"%s\" --- only superuser can vacuum it",
-							RelationGetRelationName(heapRelation))));
-		else if (heapRelation->rd_rel->relnamespace == PG_CATALOG_NAMESPACE)
-			ereport(WARNING,
-					(errmsg("skipping \"%s\" --- only superuser or database owner can vacuum it",
-							RelationGetRelationName(heapRelation))));
-		else
-			ereport(WARNING,
-					(errmsg("skipping \"%s\" --- only table or database owner can vacuum it",
-							RelationGetRelationName(heapRelation))));
-		relation_close(heapRelation, lockmode);
-		PopActiveSnapshot();
-		CommitTransactionCommand();
-		SHASH_Clean(res->items);
-		return AuxiliaryList;
-	}
-*/
 
 	/* Open and lock index relations correspond to the heap relation */
 	vac_open_indexes(heapRelation, lmode_index, &nindexes, &IndexRelations);
@@ -554,7 +523,7 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			relation_close(heapRelation, lockmode);
 			PopActiveSnapshot();
 			CommitTransactionCommand();
-			return AuxiliaryList;
+			return;
 		}
 	}
 
@@ -590,14 +559,6 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 			continue;
 		}
 
-//		if (!ConditionalLockBuffer(buffer))
-//		{
-//			stat_not_acquired_locks++;
-
-			/* Can't lock buffer. */
-//			ReleaseBuffer(buffer);
-//			continue;
-//		}
 		LockBuffer(buffer, AccessShareLock);
 		page = BufferGetPage(buffer);
 
@@ -625,15 +586,6 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 							   dead_tuples_num);
 
 		LockBufferForCleanup(buffer);
-//		if (!ConditionalLockBufferForCleanup(buffer))
-//		{
-//			stat_not_acquired_locks++;
-
-			/* Can't lock buffer. */
-//			ReleaseBuffer(buffer);
-//			continue;
-//		}
-
 
 		START_CRIT_SECTION();
 
@@ -695,13 +647,6 @@ cleanup_relations(DirtyRelation *res, PSHTAB AuxiliaryList, bool got_SIGTERM)
 	relation_close(heapRelation, lockmode);
 	PopActiveSnapshot();
 	CommitTransactionCommand();
-
-	{
-		SHTAB	*tmp = res->items;
-		SHASH_Clean(tmp);
-		res->items = AuxiliaryList;
-		return tmp;
-	}
 }
 
 static bool

@@ -963,13 +963,7 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 			 */
 			if (ndeletable > 0)
 			{
-				/* trade in our read lock for a write lock */
-//				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-//				LockBuffer(buf, BT_WRITE);
-//				LockBufferForCleanup(buf);
-
 				_bt_delitems_delete(irel, buf, deletable, ndeletable, hrel);
-
 				stats->tuples_removed += ndeletable;
 				ndeletable = 0;
 			}
@@ -982,10 +976,11 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 				break;
 
 			/*
-			 * Traverse to a next reliable index page
+			 * Traverse to a next reliable index page if current page do not
+			 * includes the (scan key; TID) value at the range.
 			 */
 			buf = _bt_moveright(irel, buf, keysCount, skey, &info->dead_tuples[pos],
-												true, true, stack, BT_WRITE, NULL);
+												false, true, stack, BT_WRITE, NULL);
 			page = BufferGetPage(buf);
 			_bt_checkpage(irel, buf);
 			opaque = (BTPageOpaque) PageGetSpecialPointer(page);
@@ -995,10 +990,8 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 			offnum = _bt_binsrch(irel, buf, keysCount, skey, &info->dead_tuples[pos], P_FIRSTDATAKEY(opaque), false);
 
 			if (offnum > PageGetMaxOffsetNumber(page))
-//				Assert(0);
+				/* Index relation do not contain TID of this DEAD tuple. */
 				break;
-			else
-				continue;
 		}
 
 		/*
@@ -1047,11 +1040,6 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	 */
 	if (ndeletable > 0)
 	{
-		/* trade in our read lock for a write lock */
-//		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-//		LockBuffer(buf, BT_WRITE);
-//		LockBufferForCleanup(buf);
-
 		_bt_delitems_delete(irel, buf, deletable, ndeletable, hrel);
 		stats->tuples_removed += ndeletable;
 	}
