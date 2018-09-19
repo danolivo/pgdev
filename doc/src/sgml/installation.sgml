@@ -85,7 +85,7 @@ su - postgres
     <listitem>
      <para>
       You need an <acronym>ISO</acronym>/<acronym>ANSI</acronym> C compiler (at least
-      C89-compliant). Recent
+      C99-compliant). Recent
       versions of <productname>GCC</productname> are recommended, but
       <productname>PostgreSQL</productname> is known to build using a wide variety
       of compilers from different vendors.
@@ -1599,12 +1599,13 @@ su - postgres
    <title>Build</title>
 
    <para>
-    To start the build, type:
+    To start the build, type either of:
 <screen>
 <userinput>make</userinput>
+<userinput>make all</userinput>
 </screen>
-    (Remember to use <acronym>GNU</acronym> <application>make</application>.) The build
-    will take a few minutes depending on your
+    (Remember to use <acronym>GNU</acronym> <application>make</application>.)
+    The build will take a few minutes depending on your
     hardware. The last line displayed should be:
 <screen>
 All of PostgreSQL successfully made. Ready to install.
@@ -1622,6 +1623,18 @@ All of PostgreSQL successfully made. Ready to install.
 <screen>
 PostgreSQL, contrib, and documentation successfully made. Ready to install.
 </screen>
+   </para>
+
+   <para>
+    If you want to invoke the build from another makefile rather than
+    manually, you must unset <varname>MAKELEVEL</varname> or set it to zero,
+    for instance like this:
+<programlisting>
+build-postgresql:
+        $(MAKE) -C postgresql MAKELEVEL=0 all
+</programlisting>
+    Failure to do that can lead to strange error messages, typically about
+    missing header files.
    </para>
   </step>
 
@@ -2620,30 +2633,6 @@ configure ... LDFLAGS="-R /usr/sfw/lib:/opt/sfw/lib:/usr/local/lib"
      See
      the <citerefentry><refentrytitle>ld</refentrytitle><manvolnum>1</manvolnum></citerefentry>
      man page for more information.
-    </para>
-   </sect3>
-
-   <sect3>
-    <title>64-bit Build Sometimes Crashes</title>
-
-    <para>
-     On Solaris 7 and older, the 64-bit version of libc has a buggy
-     <function>vsnprintf</function> routine, which leads to erratic
-     core dumps in PostgreSQL.  The simplest known workaround is to
-     force PostgreSQL to use its own version of <function>vsnprintf</function> rather than
-     the library copy.  To do this, after you
-     run <command>configure</command> edit a file produced by
-     <command>configure</command>:
-     In <filename>src/Makefile.global</filename>, change the line
-<programlisting>
-LIBOBJS =
-</programlisting>
-     to read
-<programlisting>
-LIBOBJS = snprintf.o
-</programlisting>
-     (There might be other files already listed in this variable.
-     Order does not matter.)  Then build as usual.
     </para>
    </sect3>
 
