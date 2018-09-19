@@ -734,8 +734,7 @@ index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap)
 IndexTargetDeleteResult *
 index_target_delete(IndexTargetDeleteInfo *info,
 					IndexTargetDeleteResult *stats,
-					Datum *values,
-					bool *isnull)
+					Datum *values, bool *isnull)
 {
 	Relation indexRelation = info->indexRelation;
 
