@@ -153,5 +153,7 @@ extern void SerializeReindexState(Size maxsize, char *start_address);
 extern void RestoreReindexState(void *reindexstate);
 
 extern void IndexSetParentIndex(Relation idx, Oid parentOid);
+extern bool htid2IndexDatum(Relation hrel, Relation irel, ItemPointer htid,
+									Datum *values, bool *isnull);
 
 #endif							/* INDEX_H */

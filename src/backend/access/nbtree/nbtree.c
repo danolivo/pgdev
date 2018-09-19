@@ -905,8 +905,7 @@ btbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 IndexTargetDeleteResult*
 bttargetdelete(IndexTargetDeleteInfo *info,
 			   IndexTargetDeleteResult *stats,
-			   Datum *values,
-			   bool *isnull)
+			   Datum *values, bool *isnull)
 {
 	Relation		irel = info->indexRelation;
 	Relation		hrel = info->heapRelation;
@@ -919,8 +918,8 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 	OffsetNumber	offnum;
 	int				ndeletable = 0;
 	OffsetNumber	deletable[MaxOffsetNumber];
-	IndexTuple		itup;
 	int				pos = info->last_dead_tuple;
+	IndexTuple		itup;
 
 	if (stats == NULL)
 		stats = (IndexTargetDeleteResult *) palloc0(sizeof(IndexTargetDeleteResult));
@@ -938,8 +937,6 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 
 	buf = _bt_moveright(irel, buf, keysCount, skey, &info->dead_tuples[pos],
 													false, true, stack, BT_WRITE, NULL);
-
-//	CheckForSerializableConflictIn(irel, NULL, buf);
 
 	/* To prepare tuple entries search across index pages */
 	Assert(BufferIsValid(buf));

@@ -179,8 +179,7 @@ extern int64 index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap);
 
 extern IndexTargetDeleteResult *index_target_delete(IndexTargetDeleteInfo *info,
 													IndexTargetDeleteResult *stats,
-													Datum *values,
-													bool *isnull);
+													Datum *values, bool *isnull);
 extern IndexBulkDeleteResult *index_bulk_delete(IndexVacuumInfo *info,
 				  IndexBulkDeleteResult *stats,
 				  IndexBulkDeleteCallback callback,

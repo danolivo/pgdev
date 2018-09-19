@@ -303,76 +303,6 @@ AtEOXact_BGHeap_tables(bool isCommit)
 	MemoryContextSwitchTo(oldMemCxt);
 }
 
-static void
-save_to_list(PSHTAB AuxiliaryList, WorkerTask *item)
-{
-	bool found;
-
-	WorkerTask *new_item = (WorkerTask *)
-							SHASH_Search(AuxiliaryList,
-							(void *) &(item->blkno),
-							HASH_ENTER, &found);
-
-	Assert((new_item != NULL) && (!found));
-	new_item->hits = item->hits;
-	new_item->xid = item->xid;
-}
-
-/*
- * Get tuple from heap for a scan key building.
- */
-static HeapTuple
-get_tuple_by_tid(Relation rel, ItemPointer tid)
-{
-	Buffer			buffer;
-	Page			page;
-	OffsetNumber	offnum;
-	ItemId			lp;
-	HeapTuple		tuple;
-	BlockNumber		npages;
-
-	npages = RelationGetNumberOfBlocks(rel);
-
-	if (ItemPointerGetBlockNumber(tid) > npages)
-		return NULL;
-
-	buffer = ReadBuffer(rel, ItemPointerGetBlockNumber(tid));
-
-	page = (Page) BufferGetPage(buffer);
-	offnum = ItemPointerGetOffsetNumber(tid);
-	lp = PageGetItemId(page, offnum);
-
-	/*
-	 * VACUUM Races: someone already remove the tuple from HEAP. Ignore it.
-	 */
-	if (!ItemIdIsUsed(lp))
-	{
-		ReleaseBuffer(buffer);
-		return NULL;
-	}
-	/* Walk along the chain */
-	while (!ItemIdHasStorage(lp))
-	{
-		offnum = ItemIdGetRedirect(lp);
-		lp = PageGetItemId(page, offnum);
-
-		if (!ItemIdIsUsed(lp))
-		{
-			ReleaseBuffer(buffer);
-			return NULL;
-		}
-	}
-
-	/* Form a tuple */
-	tuple = palloc(sizeof(HeapTupleData));
-	ItemPointerSet(&(tuple->t_self), BufferGetBlockNumber(buffer), offnum);
-	tuple->t_tableOid = RelationGetRelid(rel);
-	tuple->t_data = (HeapTupleHeader) PageGetItem(page, lp);
-	tuple->t_len = ItemIdGetLength(lp);
-	ReleaseBuffer(buffer);
-	return tuple;
-}
-
 /*
  *	quick_vacuum_index() -- quick vacuum one index relation.
  *
@@ -384,14 +314,8 @@ quick_vacuum_index1(Relation irel, Relation hrel,
 				   ItemPointer dead_tuples,
 				   int num_dead_tuples)
 {
-	int				tnum;
-	bool			*found = palloc0(num_dead_tuples*sizeof(bool));
-	IndexInfo 		*indexInfo = BuildIndexInfo(irel);
-	EState			*estate = CreateExecutorState();
-	ExprContext		*econtext = GetPerTupleExprContext(estate);
-	ExprState		*predicate = ExecPrepareQual(indexInfo->ii_Predicate, estate);
-	TupleTableSlot	*slot = MakeSingleTupleTableSlot(RelationGetDescr(hrel));
-
+	int						tnum;
+	bool					*found = palloc0(num_dead_tuples*sizeof(bool));
 	IndexTargetDeleteResult	stats;
 	IndexTargetDeleteInfo	ivinfo;
 
@@ -401,12 +325,9 @@ quick_vacuum_index1(Relation irel, Relation hrel,
 	ivinfo.indexRelation = irel;
 	ivinfo.heapRelation = hrel;
 
-	econtext->ecxt_scantuple = slot;
-
 	/* Get tuple from heap */
 	for (tnum = num_dead_tuples-1; tnum >= 0; tnum--)
 	{
-		HeapTuple	tuple;
 		Datum		values[INDEX_MAX_KEYS];
 		bool		isnull[INDEX_MAX_KEYS];
 
@@ -414,35 +335,9 @@ quick_vacuum_index1(Relation irel, Relation hrel,
 		if (found[tnum])
 			continue;
 
-		/* Get a tuple from heap */
-		if ((tuple = get_tuple_by_tid(hrel, &(dead_tuples[tnum]))) == NULL)
-		{
-			/*
-			 * Tuple has 'not used' status.
-			 */
-			found[tnum] = true;
+		/* Get an index tuple building data by heap tid */
+		if (!htid2IndexDatum(hrel, irel, &(dead_tuples[tnum]), values, isnull))
 			continue;
-		}
-
-		/*
-		 * Form values[] and isnull[] arrays of index tuple
-		 * by heap tuple
-		 */
-		MemoryContextReset(econtext->ecxt_per_tuple_memory);
-
-		ExecStoreTuple(tuple, slot, InvalidBuffer, false);
-
-		/*
-		 * In a partial index, ignore tuples that don't satisfy the
-		 * predicate.
-		 */
-		if ((predicate != NULL) && (!ExecQual(predicate, econtext)))
-		{
-			found[tnum] = true;
-			continue;
-		}
-
-		FormIndexDatum(indexInfo, slot, estate, values, isnull);
 
 		/*
 		 * Make attempt to delete some index entries by one tree descent.
@@ -455,8 +350,6 @@ quick_vacuum_index1(Relation irel, Relation hrel,
 		index_target_delete(&ivinfo, &stats, values, isnull);
 	}
 
-	ExecDropSingleTupleTableSlot(slot);
-	FreeExecutorState(estate);
 	pfree(found);
 }
 
@@ -683,13 +576,13 @@ FreeWorkerInfo(int code, Datum arg)
 	elog(LOG, "Free Worker Info");
 
 	Assert(MyWorkerInfo != NULL);
-	Assert(HeapCleanerShmem->terminatingWorker == MyWorkerInfo);
+	if (HeapCleanerShmem->terminatingWorker != MyWorkerInfo)
+		return;
 
 	LWLockAcquire(HeapCleanerLock, LW_EXCLUSIVE);
 
 	MyWorkerInfo->dbOid = InvalidOid;
 	MyWorkerInfo->launchtime = 0;
-//		dlist_delete(&MyWorkerInfo->links);
 	dlist_push_head(&HeapCleanerShmem->freeWorkers, &MyWorkerInfo->links);
 
 	/* not mine anymore */
