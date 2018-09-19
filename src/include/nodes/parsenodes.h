@@ -168,9 +168,8 @@ typedef struct Query
 	List	   *constraintDeps; /* a list of pg_constraint OIDs that the query
 								 * depends on to be semantically valid */
 
-	List	   *withCheckOptions;	/* a list of WithCheckOption's, which are
-									 * only added during rewrite and therefore
-									 * are not written out as part of Query. */
+	List	   *withCheckOptions;	/* a list of WithCheckOption's (added
+									 * during rewrite) */
 
 	/*
 	 * The following two fields identify the portion of the source text string
@@ -1034,7 +1033,7 @@ typedef struct RangeTblEntry
 	bool		self_reference; /* is this a recursive self-reference? */
 
 	/*
-	 * Fields valid for table functions, values, CTE and ENR RTEs (else NIL):
+	 * Fields valid for CTE, VALUES, ENR, and TableFunc RTEs (else NIL):
 	 *
 	 * We need these for CTE RTEs so that the types of self-referential
 	 * columns are well-defined.  For VALUES RTEs, storing these explicitly
@@ -1042,7 +1041,9 @@ typedef struct RangeTblEntry
 	 * ENRs, we store the types explicitly here (we could get the information
 	 * from the catalogs if 'relid' was supplied, but we'd still need these
 	 * for TupleDesc-based ENRs, so we might as well always store the type
-	 * info here).
+	 * info here).  For TableFuncs, these fields are redundant with data in
+	 * the TableFunc node, but keeping them here allows some code sharing with
+	 * the other cases.
 	 *
 	 * For ENRs only, we have to consider the possibility of dropped columns.
 	 * A dropped column is included in these lists, but it will have zeroes in
