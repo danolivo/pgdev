@@ -956,8 +956,8 @@ info_cb(const SSL *ssl, int type, int args)
  * precomputed.
  *
  * Since few sites will bother to create a parameter file, we also
- * also provide a fallback to the parameters provided by the
- * OpenSSL project.
+ * provide a fallback to the parameters provided by the OpenSSL
+ * project.
  *
  * These values can be static (once loaded or computed) since the
  * OpenSSL library can efficiently generate random keys from the
@@ -1105,28 +1105,10 @@ be_tls_get_peerdn_name(Port *port, char *ptr, size_t len)
 		ptr[0] = '\0';
 }
 
-char *
-be_tls_get_peer_finished(Port *port, size_t *len)
-{
-	char		dummy[1];
-	char	   *result;
-
-	/*
-	 * OpenSSL does not offer an API to directly get the length of the
-	 * expected TLS Finished message, so just do a dummy call to grab this
-	 * information to allow caller to do an allocation with a correct size.
-	 */
-	*len = SSL_get_peer_finished(port->ssl, dummy, sizeof(dummy));
-	result = palloc(*len);
-	(void) SSL_get_peer_finished(port->ssl, result, *len);
-
-	return result;
-}
-
+#ifdef HAVE_X509_GET_SIGNATURE_NID
 char *
 be_tls_get_certificate_hash(Port *port, size_t *len)
 {
-#ifdef HAVE_X509_GET_SIGNATURE_NID
 	X509	   *server_cert;
 	char	   *cert_hash;
 	const EVP_MD *algo_type = NULL;
@@ -1176,13 +1158,8 @@ be_tls_get_certificate_hash(Port *port, size_t *len)
 	*len = hash_size;
 
 	return cert_hash;
-#else
-	ereport(ERROR,
-			(errcode(ERRCODE_PROTOCOL_VIOLATION),
-			 errmsg("channel binding type \"tls-server-end-point\" is not supported by this build")));
-	return NULL;
-#endif
 }
+#endif
 
 /*
  * Convert an X509 subject name to a cstring.

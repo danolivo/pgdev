@@ -330,6 +330,7 @@ ClosePortalStmt
 ClosePtrType
 Clump
 ClusterInfo
+ClusterOption
 ClusterStmt
 CmdType
 CoalesceExpr
@@ -2206,6 +2207,8 @@ SpecialJoinInfo
 SpinDelayStatus
 SplitInterval
 SplitLR
+SplitMode
+SplitPoint
 SplitVar
 SplitedPageLayout
 StackElem

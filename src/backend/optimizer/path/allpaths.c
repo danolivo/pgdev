@@ -620,7 +620,20 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 			 * the SubqueryScanPath as not parallel-safe.  (Note that
 			 * set_subquery_pathlist() might push some of these quals down
 			 * into the subquery itself, but that doesn't change anything.)
+			 *
+			 * We can't push sub-select containing LIMIT/OFFSET to workers as
+			 * there is no guarantee that the row order will be fully
+			 * deterministic, and applying LIMIT/OFFSET will lead to
+			 * inconsistent results at the top-level.  (In some cases, where
+			 * the result is ordered, we could relax this restriction.  But it
+			 * doesn't currently seem worth expending extra effort to do so.)
 			 */
+			{
+				Query	   *subquery = castNode(Query, rte->subquery);
+
+				if (limit_needed(subquery))
+					return;
+			}
 			break;
 
 		case RTE_JOIN:
@@ -910,6 +923,17 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 	}
 
 	/*
+	 * If this is a partitioned baserel, set the consider_partitionwise_join
+	 * flag; currently, we only consider partitionwise joins with the baserel
+	 * if its targetlist doesn't contain a whole-row Var.
+	 */
+	if (enable_partitionwise_join &&
+		rel->reloptkind == RELOPT_BASEREL &&
+		rte->relkind == RELKIND_PARTITIONED_TABLE &&
+		rel->attr_needed[InvalidAttrNumber - rel->min_attr] == NULL)
+		rel->consider_partitionwise_join = true;
+
+	/*
 	 * Initialize to compute size estimates for whole append relation.
 	 *
 	 * We handle width estimates by weighting the widths of different child
@@ -955,54 +979,6 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 		 */
 		childrel = find_base_rel(root, childRTindex);
 		Assert(childrel->reloptkind == RELOPT_OTHER_MEMBER_REL);
-
-		if (rel->part_scheme)
-		{
-			AttrNumber	attno;
-
-			/*
-			 * We need attr_needed data for building targetlist of a join
-			 * relation representing join between matching partitions for
-			 * partitionwise join. A given attribute of a child will be needed
-			 * in the same highest joinrel where the corresponding attribute
-			 * of parent is needed. Hence it suffices to use the same Relids
-			 * set for parent and child.
-			 */
-			for (attno = rel->min_attr; attno <= rel->max_attr; attno++)
-			{
-				int			index = attno - rel->min_attr;
-				Relids		attr_needed = rel->attr_needed[index];
-
-				/* System attributes do not need translation. */
-				if (attno <= 0)
-				{
-					Assert(rel->min_attr == childrel->min_attr);
-					childrel->attr_needed[index] = attr_needed;
-				}
-				else
-				{
-					Var		   *var = list_nth_node(Var,
-													appinfo->translated_vars,
-													attno - 1);
-					int			child_index;
-
-					/*
-					 * Ignore any column dropped from the parent.
-					 * Corresponding Var won't have any translation. It won't
-					 * have attr_needed information, since it can not be
-					 * referenced in the query.
-					 */
-					if (var == NULL)
-					{
-						Assert(attr_needed == NULL);
-						continue;
-					}
-
-					child_index = var->varattno - childrel->min_attr;
-					childrel->attr_needed[child_index] = attr_needed;
-				}
-			}
-		}
 
 		/*
 		 * Copy/Modify targetlist. Even if this child is deemed empty, we need
@@ -1179,6 +1155,22 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 			adjust_appendrel_attrs(root,
 								   (Node *) rel->joininfo,
 								   1, &appinfo);
+
+		/*
+		 * Note: we could compute appropriate attr_needed data for the child's
+		 * variables, by transforming the parent's attr_needed through the
+		 * translated_vars mapping.  However, currently there's no need
+		 * because attr_needed is only examined for base relations not
+		 * otherrels.  So we just leave the child's attr_needed empty.
+		 */
+
+		/*
+		 * If we consider partitionwise joins with the parent rel, do the same
+		 * for partitioned child rels.
+		 */
+		if (rel->consider_partitionwise_join &&
+			childRTE->relkind == RELKIND_PARTITIONED_TABLE)
+			childrel->consider_partitionwise_join = true;
 
 		/*
 		 * If parallelism is allowable for this query in general, see whether
@@ -1388,7 +1380,6 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 	List	   *all_child_outers = NIL;
 	ListCell   *l;
 	List	   *partitioned_rels = NIL;
-	bool		build_partitioned_rels = false;
 	double		partial_rows = -1;
 
 	/* If appropriate, consider parallel append */
@@ -1413,10 +1404,11 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 	if (rel->part_scheme != NULL)
 	{
 		if (IS_SIMPLE_REL(rel))
-			partitioned_rels = rel->partitioned_child_rels;
+			partitioned_rels = list_make1(rel->partitioned_child_rels);
 		else if (IS_JOIN_REL(rel))
 		{
 			int			relid = -1;
+			List	   *partrels = NIL;
 
 			/*
 			 * For a partitioned joinrel, concatenate the component rels'
@@ -1430,16 +1422,16 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 				component = root->simple_rel_array[relid];
 				Assert(component->part_scheme != NULL);
 				Assert(list_length(component->partitioned_child_rels) >= 1);
-				partitioned_rels =
-					list_concat(partitioned_rels,
+				partrels =
+					list_concat(partrels,
 								list_copy(component->partitioned_child_rels));
 			}
+
+			partitioned_rels = list_make1(partrels);
 		}
 
 		Assert(list_length(partitioned_rels) >= 1);
 	}
-	else if (rel->rtekind == RTE_SUBQUERY)
-		build_partitioned_rels = true;
 
 	/*
 	 * For every non-dummy child, remember the cheapest path.  Also, identify
@@ -1453,17 +1445,12 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		Path	   *cheapest_partial_path = NULL;
 
 		/*
-		 * If we need to build partitioned_rels, accumulate the partitioned
-		 * rels for this child.  We must ensure that parents are always listed
-		 * before their child partitioned tables.
+		 * For UNION ALLs with non-empty partitioned_child_rels, accumulate
+		 * the Lists of child relations.
 		 */
-		if (build_partitioned_rels)
-		{
-			List	   *cprels = childrel->partitioned_child_rels;
-
-			partitioned_rels = list_concat(partitioned_rels,
-										   list_copy(cprels));
-		}
+		if (rel->rtekind == RTE_SUBQUERY && childrel->partitioned_child_rels != NIL)
+			partitioned_rels = lappend(partitioned_rels,
+									   childrel->partitioned_child_rels);
 
 		/*
 		 * If child has an unparameterized cheapest-total path, add that to
@@ -3542,6 +3529,9 @@ generate_partitionwise_join_paths(PlannerInfo *root, RelOptInfo *rel)
 	/* We've nothing to do if the relation is not partitioned. */
 	if (!IS_PARTITIONED_REL(rel))
 		return;
+
+	/* The relation should have consider_partitionwise_join set. */
+	Assert(rel->consider_partitionwise_join);
 
 	/* Guard against stack overflow due to overly deep partition hierarchy. */
 	check_stack_depth();

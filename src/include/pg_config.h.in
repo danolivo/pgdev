@@ -134,6 +134,18 @@
    don't. */
 #undef HAVE_DECL_F_FULLFSYNC
 
+/* Define to 1 if you have the declaration of
+   `LLVMCreateGDBRegistrationListener', and to 0 if you don't. */
+#undef HAVE_DECL_LLVMCREATEGDBREGISTRATIONLISTENER
+
+/* Define to 1 if you have the declaration of
+   `LLVMCreatePerfJITEventListener', and to 0 if you don't. */
+#undef HAVE_DECL_LLVMCREATEPERFJITEVENTLISTENER
+
+/* Define to 1 if you have the declaration of `LLVMGetHostCPUFeatures', and to
+   0 if you don't. */
+#undef HAVE_DECL_LLVMGETHOSTCPUFEATURES
+
 /* Define to 1 if you have the declaration of `LLVMGetHostCPUName', and to 0
    if you don't. */
 #undef HAVE_DECL_LLVMGETHOSTCPUNAME
@@ -142,17 +154,17 @@
    to 0 if you don't. */
 #undef HAVE_DECL_LLVMORCGETSYMBOLADDRESSIN
 
-/* Define to 1 if you have the declaration of `LLVMOrcRegisterGDB', and to 0
-   if you don't. */
-#undef HAVE_DECL_LLVMORCREGISTERGDB
-
-/* Define to 1 if you have the declaration of `LLVMOrcRegisterPerf', and to 0
-   if you don't. */
-#undef HAVE_DECL_LLVMORCREGISTERPERF
-
 /* Define to 1 if you have the declaration of `posix_fadvise', and to 0 if you
    don't. */
 #undef HAVE_DECL_POSIX_FADVISE
+
+/* Define to 1 if you have the declaration of `RTLD_GLOBAL', and to 0 if you
+   don't. */
+#undef HAVE_DECL_RTLD_GLOBAL
+
+/* Define to 1 if you have the declaration of `RTLD_NOW', and to 0 if you
+   don't. */
+#undef HAVE_DECL_RTLD_NOW
 
 /* Define to 1 if you have the declaration of `snprintf', and to 0 if you
    don't. */
@@ -185,9 +197,6 @@
 /* Define to 1 if you have the declaration of `vsnprintf', and to 0 if you
    don't. */
 #undef HAVE_DECL_VSNPRINTF
-
-/* Define to 1 if you have the <dld.h> header file. */
-#undef HAVE_DLD_H
 
 /* Define to 1 if you have the `dlopen' function. */
 #undef HAVE_DLOPEN
@@ -489,6 +498,9 @@
 /* Define to 1 if you have the `setproctitle' function. */
 #undef HAVE_SETPROCTITLE
 
+/* Define to 1 if you have the `setproctitle_fast' function. */
+#undef HAVE_SETPROCTITLE_FAST
+
 /* Define to 1 if you have the `setsid' function. */
 #undef HAVE_SETSID
 
@@ -753,9 +765,6 @@
 
 /* Define to 1 if your compiler understands _Static_assert. */
 #undef HAVE__STATIC_ASSERT
-
-/* Define to 1 if your compiler understands __VA_ARGS__ in macros. */
-#undef HAVE__VA_ARGS
 
 /* Define to 1 if you have the `__strtoll' function. */
 #undef HAVE___STRTOLL

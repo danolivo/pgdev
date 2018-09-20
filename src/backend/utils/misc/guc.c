@@ -80,6 +80,7 @@
 #include "utils/builtins.h"
 #include "utils/bytea.h"
 #include "utils/guc_tables.h"
+#include "utils/float.h"
 #include "utils/memutils.h"
 #include "utils/pg_locale.h"
 #include "utils/plancache.h"
@@ -961,7 +962,7 @@ static struct config_bool ConfigureNamesBool[] =
 	},
 	{
 		{"enable_parallel_hash", PGC_USERSET, QUERY_TUNING_METHOD,
-			gettext_noop("Enables the planner's user of parallel hash plans."),
+			gettext_noop("Enables the planner's use of parallel hash plans."),
 			NULL
 		},
 		&enable_parallel_hash,
@@ -3723,6 +3724,21 @@ static struct config_string ConfigureNamesString[] =
 	},
 
 	{
+		{"ssl_library", PGC_INTERNAL, PRESET_OPTIONS,
+			gettext_noop("Name of the SSL library."),
+			NULL,
+			GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE
+		},
+		&ssl_library,
+#ifdef USE_SSL
+		"OpenSSL",
+#else
+		"",
+#endif
+		NULL, NULL, NULL
+	},
+
+	{
 		{"ssl_cert_file", PGC_SIGHUP, CONN_AUTH_SSL,
 			gettext_noop("Location of the SSL server certificate file."),
 			NULL
@@ -3879,7 +3895,7 @@ static struct config_string ConfigureNamesString[] =
 	},
 
 	{
-		{"jit_provider", PGC_POSTMASTER, FILE_LOCATIONS,
+		{"jit_provider", PGC_POSTMASTER, CLIENT_CONN_PRELOAD,
 			gettext_noop("JIT provider to use."),
 			NULL,
 			GUC_SUPERUSER_ONLY
@@ -8438,13 +8454,13 @@ GetConfigOptionByNum(int varnum, const char **values, bool *noshow)
 		values[2] = NULL;
 
 	/* group */
-	values[3] = config_group_names[conf->group];
+	values[3] = _(config_group_names[conf->group]);
 
 	/* short_desc */
-	values[4] = conf->short_desc;
+	values[4] = _(conf->short_desc);
 
 	/* extra_desc */
-	values[5] = conf->long_desc;
+	values[5] = _(conf->long_desc);
 
 	/* context */
 	values[6] = GucContext_Names[conf->context];
@@ -9429,20 +9445,15 @@ do_serialize(char **destptr, Size *maxbytes, const char *fmt,...)
 	n = vsnprintf(*destptr, *maxbytes, fmt, vargs);
 	va_end(vargs);
 
-	/*
-	 * Cater to portability hazards in the vsnprintf() return value just like
-	 * appendPQExpBufferVA() does.  Note that this requires an extra byte of
-	 * slack at the end of the buffer.  Since serialize_variable() ends with a
-	 * do_serialize_binary() rather than a do_serialize(), we'll always have
-	 * that slack; estimate_variable_size() need not add a byte for it.
-	 */
-	if (n < 0 || n >= *maxbytes - 1)
+	if (n < 0)
 	{
-		if (n < 0 && errno != 0 && errno != ENOMEM)
-			/* Shouldn't happen. Better show errno description. */
-			elog(ERROR, "vsnprintf failed: %m");
-		else
-			elog(ERROR, "not enough space to serialize GUC state");
+		/* Shouldn't happen. Better show errno description. */
+		elog(ERROR, "vsnprintf failed: %m");
+	}
+	if (n >= *maxbytes)
+	{
+		/* This shouldn't happen either, really. */
+		elog(ERROR, "not enough space to serialize GUC state");
 	}
 
 	/* Shift the destptr ahead of the null terminator */

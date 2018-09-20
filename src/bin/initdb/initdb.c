@@ -173,7 +173,8 @@ static char *pgdata_native;
 /* defaults */
 static int	n_connections = 10;
 static int	n_buffers = 50;
-static char *dynamic_shared_memory_type = NULL;
+static const char *dynamic_shared_memory_type = NULL;
+static const char *default_timezone = NULL;
 
 /*
  * Warning messages for authentication methods
@@ -490,7 +491,15 @@ readfile(const char *path)
 	char	   *buffer;
 	int			c;
 
+#ifdef WIN32
+	/*
+	 * On Windows, we have to open the file in text mode so that carriage
+	 * returns are stripped.
+	 */
+	if ((infile = fopen(path, "rt")) == NULL)
+#else
 	if ((infile = fopen(path, "r")) == NULL)
+#endif
 	{
 		fprintf(stderr, _("%s: could not open file \"%s\" for reading: %s\n"),
 				progname, path, strerror(errno));
@@ -916,7 +925,7 @@ set_null_conf(void)
  * the postmaster either, and configure the cluster for System V shared
  * memory instead.
  */
-static char *
+static const char *
 choose_dsm_implementation(void)
 {
 #ifdef HAVE_SHM_OPEN
@@ -952,9 +961,7 @@ choose_dsm_implementation(void)
 /*
  * Determine platform-specific config settings
  *
- * Use reasonable values if kernel will let us, else scale back.  Probe
- * for max_connections first since it is subject to more constraints than
- * shared_buffers.
+ * Use reasonable values if kernel will let us, else scale back.
  */
 static void
 test_config_settings(void)
@@ -983,7 +990,6 @@ test_config_settings(void)
 				test_buffs,
 				ok_buffers = 0;
 
-
 	/*
 	 * Need to determine working DSM implementation first so that subsequent
 	 * tests don't fail because DSM setting doesn't work.
@@ -993,6 +999,10 @@ test_config_settings(void)
 	dynamic_shared_memory_type = choose_dsm_implementation();
 	printf("%s\n", dynamic_shared_memory_type);
 
+	/*
+	 * Probe for max_connections before shared_buffers, since it is subject to
+	 * more constraints than shared_buffers.
+	 */
 	printf(_("selecting default max_connections ... "));
 	fflush(stdout);
 
@@ -1057,6 +1067,11 @@ test_config_settings(void)
 		printf("%dMB\n", (n_buffers * (BLCKSZ / 1024)) / 1024);
 	else
 		printf("%dkB\n", n_buffers * (BLCKSZ / 1024));
+
+	printf(_("selecting default timezone ... "));
+	fflush(stdout);
+	default_timezone = select_default_timezone(share_path);
+	printf("%s\n", default_timezone ? default_timezone : "GMT");
 }
 
 /*
@@ -1085,7 +1100,6 @@ setup_config(void)
 	char	  **conflines;
 	char		repltok[MAXPGPATH];
 	char		path[MAXPGPATH];
-	const char *default_timezone;
 	char	   *autoconflines[3];
 
 	fputs(_("creating configuration files ... "), stdout);
@@ -1167,7 +1181,6 @@ setup_config(void)
 							  "#default_text_search_config = 'pg_catalog.simple'",
 							  repltok);
 
-	default_timezone = select_default_timezone(share_path);
 	if (default_timezone)
 	{
 		snprintf(repltok, sizeof(repltok), "timezone = '%s'",
