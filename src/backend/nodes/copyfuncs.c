@@ -245,7 +245,7 @@ _copyAppend(const Append *from)
 	COPY_NODE_FIELD(appendplans);
 	COPY_SCALAR_FIELD(first_partial_plan);
 	COPY_NODE_FIELD(partitioned_rels);
-	COPY_NODE_FIELD(part_prune_infos);
+	COPY_NODE_FIELD(part_prune_info);
 
 	return newnode;
 }
@@ -273,7 +273,7 @@ _copyMergeAppend(const MergeAppend *from)
 	COPY_POINTER_FIELD(sortOperators, from->numCols * sizeof(Oid));
 	COPY_POINTER_FIELD(collations, from->numCols * sizeof(Oid));
 	COPY_POINTER_FIELD(nullsFirst, from->numCols * sizeof(bool));
-	COPY_NODE_FIELD(part_prune_infos);
+	COPY_NODE_FIELD(part_prune_info);
 
 	return newnode;
 }
@@ -1181,6 +1181,17 @@ static PartitionPruneInfo *
 _copyPartitionPruneInfo(const PartitionPruneInfo *from)
 {
 	PartitionPruneInfo *newnode = makeNode(PartitionPruneInfo);
+
+	COPY_NODE_FIELD(prune_infos);
+	COPY_BITMAPSET_FIELD(other_subplans);
+
+	return newnode;
+}
+
+static PartitionedRelPruneInfo *
+_copyPartitionedRelPruneInfo(const PartitionedRelPruneInfo *from)
+{
+	PartitionedRelPruneInfo *newnode = makeNode(PartitionedRelPruneInfo);
 
 	COPY_SCALAR_FIELD(reloid);
 	COPY_NODE_FIELD(pruning_steps);
@@ -3284,7 +3295,7 @@ _copyClusterStmt(const ClusterStmt *from)
 
 	COPY_NODE_FIELD(relation);
 	COPY_STRING_FIELD(indexname);
-	COPY_SCALAR_FIELD(verbose);
+	COPY_SCALAR_FIELD(options);
 
 	return newnode;
 }
@@ -4907,6 +4918,9 @@ copyObjectImpl(const void *from)
 			break;
 		case T_PartitionPruneInfo:
 			retval = _copyPartitionPruneInfo(from);
+			break;
+		case T_PartitionedRelPruneInfo:
+			retval = _copyPartitionedRelPruneInfo(from);
 			break;
 		case T_PartitionPruneStepOp:
 			retval = _copyPartitionPruneStepOp(from);

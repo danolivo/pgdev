@@ -15,6 +15,7 @@
 #include <ctype.h>
 
 #include "catalog/pg_attribute_d.h"
+#include "catalog/pg_cast_d.h"
 #include "catalog/pg_class_d.h"
 #include "catalog/pg_default_acl_d.h"
 #include "fe_utils/string_utils.h"
@@ -312,6 +313,7 @@ describeFunctions(const char *functypes, const char *pattern, bool verbose, bool
 {
 	bool		showAggregate = strchr(functypes, 'a') != NULL;
 	bool		showNormal = strchr(functypes, 'n') != NULL;
+	bool		showProcedure = strchr(functypes, 'p') != NULL;
 	bool		showTrigger = strchr(functypes, 't') != NULL;
 	bool		showWindow = strchr(functypes, 'w') != NULL;
 	bool		have_where;
@@ -323,9 +325,20 @@ describeFunctions(const char *functypes, const char *pattern, bool verbose, bool
 	/* No "Parallel" column before 9.6 */
 	static const bool translate_columns_pre_96[] = {false, false, false, false, true, true, false, true, false, false, false, false};
 
-	if (strlen(functypes) != strspn(functypes, "antwS+"))
+	if (strlen(functypes) != strspn(functypes, "anptwS+"))
 	{
-		psql_error("\\df only takes [antwS+] as options\n");
+		psql_error("\\df only takes [anptwS+] as options\n");
+		return true;
+	}
+
+	if (showProcedure && pset.sversion < 110000)
+	{
+		char		sverbuf[32];
+
+		psql_error("\\df does not take a \"%c\" option with server version %s\n",
+				   'p',
+				   formatPGVersionNumber(pset.sversion, false,
+										 sverbuf, sizeof(sverbuf)));
 		return true;
 	}
 
@@ -333,15 +346,18 @@ describeFunctions(const char *functypes, const char *pattern, bool verbose, bool
 	{
 		char		sverbuf[32];
 
-		psql_error("\\df does not take a \"w\" option with server version %s\n",
+		psql_error("\\df does not take a \"%c\" option with server version %s\n",
+				   'w',
 				   formatPGVersionNumber(pset.sversion, false,
 										 sverbuf, sizeof(sverbuf)));
 		return true;
 	}
 
-	if (!showAggregate && !showNormal && !showTrigger && !showWindow)
+	if (!showAggregate && !showNormal && !showProcedure && !showTrigger && !showWindow)
 	{
 		showAggregate = showNormal = showTrigger = true;
+		if (pset.sversion >= 110000)
+			showProcedure = true;
 		if (pset.sversion >= 80400)
 			showWindow = true;
 	}
@@ -505,7 +521,7 @@ describeFunctions(const char *functypes, const char *pattern, bool verbose, bool
 	have_where = false;
 
 	/* filter by function type, if requested */
-	if (showNormal && showAggregate && showTrigger && showWindow)
+	if (showNormal && showAggregate && showProcedure && showTrigger && showWindow)
 		 /* Do nothing */ ;
 	else if (showNormal)
 	{
@@ -522,6 +538,17 @@ describeFunctions(const char *functypes, const char *pattern, bool verbose, bool
 				appendPQExpBufferStr(&buf, "p.prokind <> 'a'\n");
 			else
 				appendPQExpBufferStr(&buf, "NOT p.proisagg\n");
+		}
+		if (!showProcedure && pset.sversion >= 110000)
+		{
+			if (have_where)
+				appendPQExpBufferStr(&buf, "      AND ");
+			else
+			{
+				appendPQExpBufferStr(&buf, "WHERE ");
+				have_where = true;
+			}
+			appendPQExpBufferStr(&buf, "p.prokind <> 'p'\n");
 		}
 		if (!showTrigger)
 		{
@@ -570,6 +597,13 @@ describeFunctions(const char *functypes, const char *pattern, bool verbose, bool
 				appendPQExpBufferStr(&buf, "       OR ");
 			appendPQExpBufferStr(&buf,
 								 "p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype\n");
+			needs_or = true;
+		}
+		if (showProcedure)
+		{
+			if (needs_or)
+				appendPQExpBufferStr(&buf, "       OR ");
+			appendPQExpBufferStr(&buf, "p.prokind = 'p'\n");
 			needs_or = true;
 		}
 		if (showWindow)
@@ -3874,7 +3908,7 @@ listEventTriggers(const char *pattern, bool verbose)
 					  gettext_noop("always"),
 					  gettext_noop("disabled"),
 					  gettext_noop("Enabled"),
-					  gettext_noop("Procedure"),
+					  gettext_noop("Function"),
 					  gettext_noop("Tags"));
 	if (verbose)
 		appendPQExpBuffer(&buf,
@@ -3920,37 +3954,56 @@ listCasts(const char *pattern, bool verbose)
 
 	initPQExpBuffer(&buf);
 
-	/*
-	 * We need a left join to pg_proc for binary casts; the others are just
-	 * paranoia.  Also note that we don't attempt to localize '(binary
-	 * coercible)', because there's too much risk of gettext translating a
-	 * function name that happens to match some string in the PO database.
-	 */
 	printfPQExpBuffer(&buf,
 					  "SELECT pg_catalog.format_type(castsource, NULL) AS \"%s\",\n"
-					  "       pg_catalog.format_type(casttarget, NULL) AS \"%s\",\n"
-					  "       CASE WHEN castfunc = 0 THEN '(binary coercible)'\n"
-					  "            ELSE p.proname\n"
-					  "       END as \"%s\",\n"
-					  "       CASE WHEN c.castcontext = 'e' THEN '%s'\n"
-					  "            WHEN c.castcontext = 'a' THEN '%s'\n"
-					  "            ELSE '%s'\n"
-					  "       END as \"%s\"",
+					  "       pg_catalog.format_type(casttarget, NULL) AS \"%s\",\n",
 					  gettext_noop("Source type"),
-					  gettext_noop("Target type"),
-					  gettext_noop("Function"),
+					  gettext_noop("Target type"));
+
+	/*
+	 * We don't attempt to localize '(binary coercible)' or '(with inout)',
+	 * because there's too much risk of gettext translating a function name
+	 * that happens to match some string in the PO database.
+	 */
+	if (pset.sversion >= 80400)
+		appendPQExpBuffer(&buf,
+						  "       CASE WHEN c.castmethod = '%c' THEN '(binary coercible)'\n"
+						  "            WHEN c.castmethod = '%c' THEN '(with inout)'\n"
+						  "            ELSE p.proname\n"
+						  "       END AS \"%s\",\n",
+						  COERCION_METHOD_BINARY,
+						  COERCION_METHOD_INOUT,
+						  gettext_noop("Function"));
+	else
+		appendPQExpBuffer(&buf,
+						  "       CASE WHEN c.castfunc = 0 THEN '(binary coercible)'\n"
+						  "            ELSE p.proname\n"
+						  "       END AS \"%s\",\n",
+						  gettext_noop("Function"));
+
+	appendPQExpBuffer(&buf,
+					  "       CASE WHEN c.castcontext = '%c' THEN '%s'\n"
+					  "            WHEN c.castcontext = '%c' THEN '%s'\n"
+					  "            ELSE '%s'\n"
+					  "       END AS \"%s\"",
+					  COERCION_CODE_EXPLICIT,
 					  gettext_noop("no"),
+					  COERCION_CODE_ASSIGNMENT,
 					  gettext_noop("in assignment"),
 					  gettext_noop("yes"),
 					  gettext_noop("Implicit?"));
 
 	if (verbose)
 		appendPQExpBuffer(&buf,
-						  ",\n       d.description AS \"%s\"\n",
+						  ",\n       d.description AS \"%s\"",
 						  gettext_noop("Description"));
 
+	/*
+	 * We need a left join to pg_proc for binary casts; the others are just
+	 * paranoia.
+	 */
 	appendPQExpBufferStr(&buf,
-						 "FROM pg_catalog.pg_cast c LEFT JOIN pg_catalog.pg_proc p\n"
+						 "\nFROM pg_catalog.pg_cast c LEFT JOIN pg_catalog.pg_proc p\n"
 						 "     ON c.castfunc = p.oid\n"
 						 "     LEFT JOIN pg_catalog.pg_type ts\n"
 						 "     ON c.castsource = ts.oid\n"

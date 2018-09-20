@@ -628,8 +628,7 @@ ReplicationSlotDropPtr(ReplicationSlot *slot)
 	 */
 	if (!rmtree(tmppath, true))
 		ereport(WARNING,
-				(errcode_for_file_access(),
-				 errmsg("could not remove directory \"%s\"", tmppath)));
+				(errmsg("could not remove directory \"%s\"", tmppath)));
 
 	/*
 	 * We release this at the very end, so that nobody starts trying to create
@@ -1132,8 +1131,8 @@ StartupReplicationSlots(void)
 			if (!rmtree(path, true))
 			{
 				ereport(WARNING,
-						(errcode_for_file_access(),
-						 errmsg("could not remove directory \"%s\"", path)));
+						(errmsg("could not remove directory \"%s\"",
+								path)));
 				continue;
 			}
 			fsync_fname("pg_replslot", true);
@@ -1275,6 +1274,7 @@ SaveSlotToPath(ReplicationSlot *slot, const char *dir, int elevel)
 				SnapBuildOnDiskChecksummedSize);
 	FIN_CRC32C(cp.checksum);
 
+	errno = 0;
 	pgstat_report_wait_start(WAIT_EVENT_REPLICATION_SLOT_WRITE);
 	if ((write(fd, &cp, sizeof(cp))) != sizeof(cp))
 	{
@@ -1351,6 +1351,7 @@ RestoreSlotFromDisk(const char *name)
 {
 	ReplicationSlotOnDisk cp;
 	int			i;
+	char		slotdir[MAXPGPATH + 12];
 	char		path[MAXPGPATH + 22];
 	int			fd;
 	bool		restored = false;
@@ -1360,13 +1361,14 @@ RestoreSlotFromDisk(const char *name)
 	/* no need to lock here, no concurrent access allowed yet */
 
 	/* delete temp file if it exists */
-	sprintf(path, "pg_replslot/%s/state.tmp", name);
+	sprintf(slotdir, "pg_replslot/%s", name);
+	sprintf(path, "%s/state.tmp", slotdir);
 	if (unlink(path) < 0 && errno != ENOENT)
 		ereport(PANIC,
 				(errcode_for_file_access(),
 				 errmsg("could not remove file \"%s\": %m", path)));
 
-	sprintf(path, "pg_replslot/%s/state", name);
+	sprintf(path, "%s/state", slotdir);
 
 	elog(DEBUG1, "restoring replication slot from \"%s\"", path);
 
@@ -1401,7 +1403,7 @@ RestoreSlotFromDisk(const char *name)
 
 	/* Also sync the parent directory */
 	START_CRIT_SECTION();
-	fsync_fname(path, true);
+	fsync_fname(slotdir, true);
 	END_CRIT_SECTION();
 
 	/* read part of statefile that's guaranteed to be version independent */
@@ -1429,21 +1431,21 @@ RestoreSlotFromDisk(const char *name)
 	/* verify magic */
 	if (cp.magic != SLOT_MAGIC)
 		ereport(PANIC,
-				(errcode_for_file_access(),
+				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("replication slot file \"%s\" has wrong magic number: %u instead of %u",
 						path, cp.magic, SLOT_MAGIC)));
 
 	/* verify version */
 	if (cp.version != SLOT_VERSION)
 		ereport(PANIC,
-				(errcode_for_file_access(),
+				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("replication slot file \"%s\" has unsupported version %u",
 						path, cp.version)));
 
 	/* boundary check on length */
 	if (cp.length != ReplicationSlotOnDiskV2Size)
 		ereport(PANIC,
-				(errcode_for_file_access(),
+				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("replication slot file \"%s\" has corrupted length %u",
 						path, cp.length)));
 
@@ -1490,13 +1492,11 @@ RestoreSlotFromDisk(const char *name)
 	 */
 	if (cp.slotdata.persistency != RS_PERSISTENT)
 	{
-		sprintf(path, "pg_replslot/%s", name);
-
-		if (!rmtree(path, true))
+		if (!rmtree(slotdir, true))
 		{
 			ereport(WARNING,
-					(errcode_for_file_access(),
-					 errmsg("could not remove directory \"%s\"", path)));
+					(errmsg("could not remove directory \"%s\"",
+							slotdir)));
 		}
 		fsync_fname("pg_replslot", true);
 		return;

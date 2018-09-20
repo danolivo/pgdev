@@ -595,25 +595,7 @@ exec_command_conninfo(PsqlScanState scan_state, bool active_branch)
 			printf(_("You are currently not connected to a database.\n"));
 		else
 		{
-			char	   *host;
-			PQconninfoOption *connOptions;
-			PQconninfoOption *option;
-
-			host = PQhost(pset.db);
-			/* A usable "hostaddr" overrides the basic sense of host. */
-			connOptions = PQconninfo(pset.db);
-			if (connOptions == NULL)
-			{
-				psql_error("out of memory\n");
-				exit(EXIT_FAILURE);
-			}
-			for (option = connOptions; option && option->keyword; option++)
-				if (strcmp(option->keyword, "hostaddr") == 0)
-				{
-					if (option->val != NULL && option->val[0] != '\0')
-						host = option->val;
-					break;
-				}
+			char	   *host = PQhost(pset.db);
 
 			/* If the host is an absolute path, the connection is via socket */
 			if (is_absolute_path(host))
@@ -623,8 +605,6 @@ exec_command_conninfo(PsqlScanState scan_state, bool active_branch)
 				printf(_("You are connected to database \"%s\" as user \"%s\" on host \"%s\" at port \"%s\".\n"),
 					   db, PQuser(pset.db), host, PQport(pset.db));
 			printSSLInfo();
-
-			PQconninfoFree(connOptions);
 		}
 	}
 
@@ -754,6 +734,7 @@ exec_command_d(PsqlScanState scan_state, bool active_branch, const char *cmd)
 					case 'S':
 					case 'a':
 					case 'n':
+					case 'p':
 					case 't':
 					case 'w':
 						success = describeFunctions(&cmd[2], pattern, show_verbose, show_system);
