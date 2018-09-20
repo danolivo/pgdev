@@ -167,7 +167,7 @@ select * from rtest_v1;
 
 insert into rtest_v1 values (2, 12);
 insert into rtest_v1 values (2, 13);
-select * from rtest_v1;
+select * from rtest_v1 ORDER BY a, b;
  a | b  
 ---+----
  1 | 11
@@ -1821,6 +1821,34 @@ pg_stat_database_conflicts| SELECT d.oid AS datid,
     pg_stat_get_db_conflict_bufferpin(d.oid) AS confl_bufferpin,
     pg_stat_get_db_conflict_startup_deadlock(d.oid) AS confl_deadlock
    FROM pg_database d;
+pg_stat_progress_clauncher| SELECT s.pid,
+    s.datid,
+    d.datname,
+    s.relid,
+    s.param1 AS tot_incoming_hits,
+    s.param2 AS wait_tasks,
+    s.param3 AS wait_genl_tasks,
+    s.param4 AS toworker_hits,
+    s.param5 AS cur_buf_items,
+    s.param6 AS timeout
+   FROM (pg_stat_get_progress_info('CLAUNCHER'::text) s(pid, datid, relid, param1, param2, param3, param4, param5, param6, param7, param8, param9, param10)
+     LEFT JOIN pg_database d ON ((s.datid = d.oid)));
+pg_stat_progress_cleaner| SELECT s.pid,
+    s.datid,
+    d.datname,
+    s.relid,
+    s.param1 AS relations,
+    s.param2 AS queue_len,
+    s.param3 AS ninmem,
+    s.param4 AS cleaned_tuples,
+    s.param5 AS vain_tuples,
+    s.param6 AS missed_blocks,
+    s.param7 AS cleaned_blocks,
+    s.param8 AS avg_blcks_clnd,
+    s.param9 AS nlocks,
+    s.param10 AS timeout
+   FROM (pg_stat_get_progress_info('CLEANER'::text) s(pid, datid, relid, param1, param2, param3, param4, param5, param6, param7, param8, param9, param10)
+     LEFT JOIN pg_database d ON ((s.datid = d.oid)));
 pg_stat_progress_vacuum| SELECT s.pid,
     s.datid,
     d.datname,

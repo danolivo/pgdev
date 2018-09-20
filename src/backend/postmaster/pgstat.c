@@ -48,6 +48,7 @@
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "postmaster/autovacuum.h"
+#include "postmaster/bgheap.h"
 #include "postmaster/fork_process.h"
 #include "postmaster/postmaster.h"
 #include "replication/walsender.h"
@@ -1394,6 +1395,20 @@ pgstat_report_autovac(Oid dboid)
 	pgstat_send(&msg, sizeof(msg));
 }
 
+void
+pgstat_report_heapcleaner(Oid dboid)
+{
+	PgStat_MsgAutovacStart msg;
+
+	if (pgStatSock == PGINVALID_SOCKET)
+		return;
+
+	pgstat_setheader(&msg.m_hdr, PGSTAT_MTYPE_BGHEAP_START);
+	msg.m_databaseid = dboid;
+	msg.m_start_time = GetCurrentTimestamp();
+
+	pgstat_send(&msg, sizeof(msg));
+}
 
 /* ---------
  * pgstat_report_vacuum() -
@@ -2833,6 +2848,14 @@ pgstat_bestart(void)
 			/* Autovacuum Worker */
 			beentry->st_backendType = B_AUTOVAC_WORKER;
 		}
+		else if (IsHeapCleanerLauncherProcess())
+		{
+			beentry->st_backendType = B_BG_HEAPCLNR_LAUNCHER;
+		}
+		else if (IsHeapCleanerWorkerProcess())
+		{
+			beentry->st_backendType = B_BG_HEAPCLNR_WORKER;
+		}
 		else if (am_walsender)
 		{
 			/* Wal sender */
@@ -3483,6 +3506,9 @@ pgstat_get_wait_activity(WaitEventActivity w)
 		case WAIT_EVENT_AUTOVACUUM_MAIN:
 			event_name = "AutoVacuumMain";
 			break;
+		case WAIT_EVENT_BGHEAP_MAIN:
+			event_name = "BgHeapMain";
+			break;
 		case WAIT_EVENT_BGWRITER_HIBERNATE:
 			event_name = "BgWriterHibernate";
 			break;
@@ -4111,6 +4137,12 @@ pgstat_get_backend_desc(BackendType backendType)
 		case B_AUTOVAC_WORKER:
 			backendDesc = "autovacuum worker";
 			break;
+		case B_BG_HEAPCLNR_LAUNCHER:
+			backendDesc = "heap cleaner launcher";
+			break;
+		case B_BG_HEAPCLNR_WORKER:
+			backendDesc = "heap cleaner worker";
+			break;
 		case B_BACKEND:
 			backendDesc = "client backend";
 			break;
@@ -4420,6 +4452,10 @@ PgstatCollectorMain(int argc, char *argv[])
 
 				case PGSTAT_MTYPE_AUTOVAC_START:
 					pgstat_recv_autovac((PgStat_MsgAutovacStart *) &msg, len);
+					break;
+
+				case PGSTAT_MTYPE_BGHEAP_START:
+//					pgstat_recv_autovac((PgStat_MsgHeapCleanerStart *) &msg, len);
 					break;
 
 				case PGSTAT_MTYPE_VACUUM:

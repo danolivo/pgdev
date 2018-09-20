@@ -306,6 +306,30 @@ MarkLocalBufferDirty(Buffer buffer)
 }
 
 /*
+ * IsLocalBufferDirty
+ *		returns true of buffer is dirty
+ */
+bool
+IsLocalBufferDirty(Buffer buffer)
+{
+	int			bufid;
+	BufferDesc *bufHdr;
+	uint32		buf_state;
+
+	Assert(BufferIsLocal(buffer));
+
+	bufid = -(buffer + 1);
+
+	Assert(LocalRefCount[bufid] > 0);
+
+	bufHdr = GetLocalBufferDescriptor(bufid);
+
+	buf_state = pg_atomic_read_u32(&bufHdr->state);
+
+	return	(buf_state & BM_DIRTY) != 0;
+}
+
+/*
  * DropRelFileNodeLocalBuffers
  *		This function removes from the buffer pool all the pages of the
  *		specified relation that have block numbers >= firstDelBlock.

@@ -22,6 +22,7 @@
 #include "catalog/catalog.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "postmaster/bgheap.h"
 #include "storage/bufmgr.h"
 #include "utils/snapmgr.h"
 #include "utils/rel.h"
@@ -42,6 +43,9 @@ typedef struct
 	/* marked[i] is true if item i is entered in one of the above arrays */
 	bool		marked[MaxHeapTuplesPerPage + 1];
 } PruneState;
+
+/* Parameter for target deletion strategy in lazy vacuum */
+double target_index_deletion_factor = 0.01;
 
 /* Local functions */
 static int heap_prune_chain(Relation relation, Buffer buffer,
@@ -157,6 +161,9 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 
 		/* And release buffer lock */
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+
+		if (IsBufferDirty(buffer))
+			HeapCleanerSend(relation, BufferGetBlockNumber(buffer));
 	}
 }
 
@@ -405,10 +412,9 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 			if (HeapTupleSatisfiesVacuum(&tup, OldestXmin, buffer)
 				== HEAPTUPLE_DEAD && !HeapTupleHeaderIsHotUpdated(htup))
 			{
-				heap_prune_record_unused(prstate, rootoffnum);
+				heap_prune_record_dead(prstate, rootoffnum);
 				HeapTupleHeaderAdvanceLatestRemovedXid(htup,
 													   &prstate->latestRemovedXid);
-				ndeleted++;
 			}
 
 			/* Nothing more to do */
@@ -580,8 +586,10 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 		 */
 		for (i = 1; (i < nchain) && (chainitems[i - 1] != latestdead); i++)
 		{
-			heap_prune_record_unused(prstate, chainitems[i]);
+			if (chainitems[i] == latestdead)
+				continue;
 			ndeleted++;
+			heap_prune_record_unused(prstate, chainitems[i]);
 		}
 
 		/*
@@ -598,9 +606,28 @@ heap_prune_chain(Relation relation, Buffer buffer, OffsetNumber rootoffnum,
 		 * redirect the root to the correct chain member.
 		 */
 		if (i >= nchain)
+		{
+			if (rootoffnum != latestdead)
+			{
+				if (ItemIdIsNormal(rootlp))
+					heap_prune_record_unused(prstate, latestdead);
+				else
+				{
+					/*
+					 * We allow overlapping of redirected and dead items
+					 */
+					heap_prune_record_redirect(prstate, rootoffnum, latestdead);
+					heap_prune_record_dead(prstate, latestdead);
+				}
+			}
 			heap_prune_record_dead(prstate, rootoffnum);
+		}
 		else
+		{
+			if (rootoffnum != latestdead)
+				heap_prune_record_unused(prstate, latestdead);
 			heap_prune_record_redirect(prstate, rootoffnum, chainitems[i]);
+		}
 	}
 	else if (nchain < 2 && ItemIdIsRedirected(rootlp))
 	{
@@ -653,7 +680,12 @@ heap_prune_record_dead(PruneState *prstate, OffsetNumber offnum)
 	Assert(prstate->ndead < MaxHeapTuplesPerPage);
 	prstate->nowdead[prstate->ndead] = offnum;
 	prstate->ndead++;
-	Assert(!prstate->marked[offnum]);
+
+	/*
+	 * We suppress checking prstate->marked[offnum]. It is not the best idea,
+	 * but this is most simplistic way to enable Dead Redirecting by
+	 * overlapping Dead and Redirected states.
+	 */
 	prstate->marked[offnum] = true;
 }
 
@@ -706,7 +738,10 @@ heap_page_prune_execute(Buffer buffer,
 		OffsetNumber off = *offnum++;
 		ItemId		lp = PageGetItemId(page, off);
 
-		ItemIdSetDead(lp);
+		if (target_index_deletion_factor > 0)
+			ItemIdMarkDead(lp);
+		else
+			ItemIdSetDead(lp);
 	}
 
 	/* Update all now-unused line pointers */

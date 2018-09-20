@@ -41,13 +41,16 @@
 #include "access/heapam_xlog.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/nbtree.h"
 #include "access/transam.h"
 #include "access/visibilitymap.h"
 #include "access/xlog.h"
+#include "catalog/index.h"
 #include "catalog/storage.h"
 #include "commands/dbcommands.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
+#include "executor/executor.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "portability/instr_time.h"
@@ -138,7 +141,6 @@ typedef struct LVRelStats
 	TransactionId latestRemovedXid;
 	bool		lock_waiter_detected;
 } LVRelStats;
-
 
 /* A few variables that don't seem worth passing around as parameters */
 static int	elevel = -1;
@@ -744,10 +746,12 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 
 			/* Remove index entries */
 			for (i = 0; i < nindexes; i++)
-				lazy_vacuum_index(Irel[i],
+			{
+					lazy_vacuum_index(Irel[i],
 								  &indstats[i],
 								  vacrelstats);
 
+			}
 			/*
 			 * Report that we are now vacuuming the heap.  We also increase
 			 * the number of index scans here; note that by using
@@ -1389,10 +1393,11 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 
 		/* Remove index entries */
 		for (i = 0; i < nindexes; i++)
-			lazy_vacuum_index(Irel[i],
+		{
+				lazy_vacuum_index(Irel[i],
 							  &indstats[i],
 							  vacrelstats);
-
+		}
 		/* Report that we are now vacuuming the heap */
 		hvp_val[0] = PROGRESS_VACUUM_PHASE_VACUUM_HEAP;
 		hvp_val[1] = vacrelstats->num_index_scans + 1;
@@ -1680,7 +1685,6 @@ lazy_check_needs_freeze(Buffer buf, bool *hastup)
 
 	return false;
 }
-
 
 /*
  *	lazy_vacuum_index() -- vacuum one index relation.

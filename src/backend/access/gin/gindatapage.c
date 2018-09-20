@@ -630,6 +630,7 @@ dataBeginPlaceToPageLeaf(GinBtree btree, Buffer buf, GinBtreeStack *stack,
 		 * subsequent insertions will probably also go to the end. This packs
 		 * the index somewhat tighter when appending to a table, which is very
 		 * common.
+		 *
 		 */
 		if (!btree->isBuild)
 		{

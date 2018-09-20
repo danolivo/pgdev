@@ -3244,7 +3244,15 @@ static struct config_real ConfigureNamesReal[] =
 		0.1, 0.0, 100.0,
 		NULL, NULL, NULL
 	},
-
+	{
+		{"target_index_deletion_factor", PGC_SIGHUP, AUTOVACUUM,
+			gettext_noop("Maximum number of vacuumed tuples as a fraction of reltuples where we can use target index vacuum strategy."),
+			NULL
+		},
+		&target_index_deletion_factor,
+		0.01, 0.0, 1.0,
+		NULL, NULL, NULL
+	},
 	{
 		{"checkpoint_completion_target", PGC_SIGHUP, WAL_CHECKPOINTS,
 			gettext_noop("Time spent flushing dirty buffers during checkpoint, as fraction of checkpoint interval."),
