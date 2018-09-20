@@ -41,9 +41,11 @@
 #include "access/heapam_xlog.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
+#include "access/nbtree.h"
 #include "access/transam.h"
 #include "access/visibilitymap.h"
 #include "access/xlog.h"
+#include "catalog/index.h"
 #include "catalog/storage.h"
 #include "commands/dbcommands.h"
 #include "commands/progress.h"
@@ -744,9 +746,18 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 
 			/* Remove index entries */
 			for (i = 0; i < nindexes; i++)
-				lazy_vacuum_index(Irel[i],
-								  &indstats[i],
-								  vacrelstats);
+			{
+				bool use_quick_strategy = (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
+
+				if (use_quick_strategy && (Irel[i]->rd_amroutine->amtargetdelete != NULL))
+					quick_vacuum_index(Irel[i], onerel,
+									   vacrelstats->dead_tuples,
+									   vacrelstats->num_dead_tuples);
+				else
+					lazy_vacuum_index(Irel[i],
+									  &indstats[i],
+									  vacrelstats);
+			}
 
 			/*
 			 * Report that we are now vacuuming the heap.  We also increase
@@ -1389,10 +1400,18 @@ lazy_scan_heap(Relation onerel, int options, LVRelStats *vacrelstats,
 
 		/* Remove index entries */
 		for (i = 0; i < nindexes; i++)
-			lazy_vacuum_index(Irel[i],
-							  &indstats[i],
-							  vacrelstats);
+		{
+			bool use_quick_strategy = (vacrelstats->num_dead_tuples/vacrelstats->old_live_tuples < target_index_deletion_factor);
 
+			if (use_quick_strategy && (Irel[i]->rd_amroutine->amtargetdelete != NULL))
+				quick_vacuum_index(Irel[i], onerel,
+								   vacrelstats->dead_tuples,
+								   vacrelstats->num_dead_tuples);
+			else
+				lazy_vacuum_index(Irel[i],
+								  &indstats[i],
+								  vacrelstats);
+		}
 		/* Report that we are now vacuuming the heap */
 		hvp_val[0] = PROGRESS_VACUUM_PHASE_VACUUM_HEAP;
 		hvp_val[1] = vacrelstats->num_index_scans + 1;
@@ -1680,7 +1699,6 @@ lazy_check_needs_freeze(Buffer buf, bool *hastup)
 
 	return false;
 }
-
 
 /*
  *	lazy_vacuum_index() -- vacuum one index relation.
