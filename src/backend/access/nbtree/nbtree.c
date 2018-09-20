@@ -991,9 +991,7 @@ bttargetdelete(IndexTargetDeleteInfo *info,
 				break;
 		}
 
-		/*
-		 * This index entry satisfied to the scan key?
-		 */
+		/* This index entry satisfied to the scan key? */
 		cmpval = _bt_compare(irel, keysCount, skey, NULL, page, offnum);
 
 		if (cmpval != 0)

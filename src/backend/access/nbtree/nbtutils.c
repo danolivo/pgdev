@@ -52,6 +52,7 @@ static bool _bt_check_rowcompare(ScanKey skey,
 static int _bt_leave_natts(Relation rel, IndexTuple lastleft,
 						   IndexTuple firstright);
 
+
 /*
  * _bt_mkscankey
  *		Build an insertion scan key that contains comparison data from itup
