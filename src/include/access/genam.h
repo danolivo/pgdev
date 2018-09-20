@@ -51,15 +51,6 @@ typedef struct IndexVacuumInfo
 	BufferAccessStrategy strategy;	/* access strategy for reads */
 } IndexVacuumInfo;
 
-typedef struct IndexTargetDeleteInfo
-{
-	Relation	heapRelation;
-	Relation	indexRelation;			/* the index being vacuumed */
-	int			last_dead_tuple;
-	ItemPointer	dead_tuples;
-	bool*		found_dead_tuples;
-} IndexTargetDeleteInfo
-
 /*
  * Struct for statistics returned by ambulkdelete and amvacuumcleanup
  *
@@ -87,11 +78,6 @@ typedef struct IndexBulkDeleteResult
 	BlockNumber pages_deleted;	/* # unused pages in index */
 	BlockNumber pages_free;		/* # pages available for reuse */
 } IndexBulkDeleteResult;
-
-typedef struct IndexTargetDeleteResult
-{
-	int		tuples_removed; /* # removed during vacuum operation */
-} IndexTargetDeleteResult;
 
 /* Typedef for callback function to determine if a tuple is bulk-deletable */
 typedef bool (*IndexBulkDeleteCallback) (ItemPointer itemptr, void *state);
@@ -177,10 +163,6 @@ extern HeapTuple index_fetch_heap(IndexScanDesc scan);
 extern HeapTuple index_getnext(IndexScanDesc scan, ScanDirection direction);
 extern int64 index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap);
 
-extern IndexTargetDeleteResult *index_target_delete(IndexTargetDeleteInfo *info,
-													IndexTargetDeleteResult *stats,
-													Datum *values,
-													bool *isnull);
 extern IndexBulkDeleteResult *index_bulk_delete(IndexVacuumInfo *info,
 				  IndexBulkDeleteResult *stats,
 				  IndexBulkDeleteCallback callback,
