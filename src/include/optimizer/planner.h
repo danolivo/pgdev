@@ -61,4 +61,11 @@ extern Expr *preprocess_phv_expression(PlannerInfo *root, Expr *expr);
 extern bool plan_cluster_use_sort(Oid tableOid, Oid indexOid);
 extern int	plan_create_index_workers(Oid tableOid, Oid indexOid);
 
+#include "executor/executor.h"
+
+extern char *serialize_plan(QueryDesc *queryDesc, int eflags);
+extern PlannedStmt* deserialize_plan(const char *data, char **queryString,
+							ParamListInfo *paramLI,
+							int *instrument_options, int *eflags);
+
 #endif							/* PLANNER_H */

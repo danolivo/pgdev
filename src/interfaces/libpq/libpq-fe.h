@@ -400,6 +400,7 @@ extern PGresult *PQexecPrepared(PGconn *conn,
 
 /* Interface for multiple-result or asynchronous queries */
 extern int	PQsendQuery(PGconn *conn, const char *query);
+extern int PQsendPlan(PGconn *conn, const char *plan);
 extern int PQsendQueryParams(PGconn *conn,
 				  const char *command,
 				  int nParams,

@@ -61,6 +61,13 @@ typedef struct AttStatsSlot
 typedef int32 (*get_attavgwidth_hook_type) (Oid relid, AttrNumber attnum);
 extern PGDLLIMPORT get_attavgwidth_hook_type get_attavgwidth_hook;
 
+extern char *get_typ_name(Oid typid);
+extern Oid	get_typ_namespace(Oid typid);
+extern Oid	get_typname_typid(const char *typname, Oid typnamespace);
+extern Oid	get_funcid(const char *funcname, oidvector *argtypes, Oid funcnsp);
+extern Oid	get_opnamespace(Oid opno);
+extern Oid	get_operid(const char *oprname, Oid oprleft, Oid oprright, Oid oprnsp);
+
 extern bool op_in_opfamily(Oid opno, Oid opfamily);
 extern int	get_op_opfamily_strategy(Oid opno, Oid opfamily);
 extern Oid	get_op_opfamily_sortfamily(Oid opno, Oid opfamily);
@@ -97,6 +104,11 @@ extern Oid	get_opclass_family(Oid opclass);
 extern Oid	get_opclass_input_type(Oid opclass);
 extern bool get_opclass_opfamily_and_input_type(Oid opclass,
 									Oid *opfamily, Oid *opcintype);
+
+extern int32 get_collation_encoding(Oid colloid);
+extern Oid get_collation_namespace(Oid colloid);
+extern Oid get_collid(const char *collname, int32 collencoding, Oid collnsp);
+
 extern RegProcedure get_opcode(Oid opno);
 extern char *get_opname(Oid opno);
 extern Oid	get_op_rettype(Oid opno);

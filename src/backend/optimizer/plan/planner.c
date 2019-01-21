@@ -7258,3 +7258,113 @@ group_by_has_partkey(RelOptInfo *input_rel,
 
 	return true;
 }
+
+#include "common/base64.h"
+#include "storage/ipc.h"
+
+char *
+serialize_plan(QueryDesc *queryDesc, int eflags)
+{
+	int		splan_len,
+			sparams_len,
+			qtext_len,
+			tot_len,
+			econtainer_len;
+	char	*serialized_plan,
+			*container,
+			*econtainer,
+			*start_address;
+
+	set_portable_output(true);
+	serialized_plan = nodeToString(queryDesc->plannedstmt);
+	set_portable_output(false);
+
+	/* We use len+1 bytes for include end-of-string symbol. */
+	splan_len = strlen(serialized_plan) + 1;
+	qtext_len = strlen(queryDesc->sourceText) + 1;
+
+	sparams_len = EstimateParamListSpace(queryDesc->params);
+	tot_len = splan_len + sparams_len + qtext_len + 2*sizeof(int);
+
+	container = (char *) palloc0(tot_len);
+	start_address = container;
+
+	memcpy(start_address, serialized_plan, splan_len);
+	start_address += splan_len;
+	SerializeParamList(queryDesc->params, &start_address);
+	Assert(start_address == container + splan_len + sparams_len);
+	memcpy(start_address, queryDesc->sourceText, qtext_len);
+
+	/* Add instrument_options */
+	start_address += qtext_len;
+	memcpy(start_address, &queryDesc->instrument_options, sizeof(int));
+
+	/* Add flags */
+	start_address += sizeof(int);
+	memcpy(start_address, &eflags, sizeof(int));
+	start_address += sizeof(int);
+
+	Assert((start_address - container) == tot_len);
+
+	econtainer_len = pg_b64_enc_len(tot_len);
+	econtainer = (char *) palloc0(econtainer_len+1);
+	Assert(pg_b64_encode(container, tot_len, econtainer) <= econtainer_len);
+
+	/* In accordance with example from fe-auth-scram.c */
+	econtainer[econtainer_len] = '\0';
+
+	return econtainer;
+}
+
+PlannedStmt*
+deserialize_plan(const char *data, char **queryString, ParamListInfo *paramLI,
+				 int *instrument_options, int *eflags)
+{
+	char			*decdata,
+					*start_addr;
+	int				decdata_len;
+	PlannedStmt		*pstmt = NULL;
+
+	Assert(	(data != NULL) &&
+			(queryString != NULL) &&
+			(paramLI != NULL) &&
+			(instrument_options != NULL) &&
+			(eflags != NULL) );
+
+	/* Decode base64 string into a byte sequence */
+	decdata_len = pg_b64_dec_len(strlen(data));
+	decdata = (char *) palloc(decdata_len);
+	pg_b64_decode(data, strlen(data), decdata);
+
+	/* Restore parameters list. */
+	start_addr = decdata + strlen(decdata) + 1;
+	*paramLI = RestoreParamList((char **) &start_addr);
+
+	/* Restore query source text string */
+	*queryString = pstrdup(start_addr);
+
+	PG_TRY();
+	{
+		/* Create query plan */
+		set_portable_input(true);
+		pstmt = (PlannedStmt *) stringToNode((char *) decdata);
+	}
+	PG_CATCH();
+	{
+		set_portable_input(false);
+		elog(LOG, "Deparse problems. Plan: %s", decdata);
+		EmitErrorReport();
+		proc_exit(0);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	set_portable_input(false);
+	/* Restore instrument and flags */
+	start_addr += strlen(*queryString) + 1;
+	*instrument_options = *(int *) start_addr;
+	start_addr += sizeof(int);
+	*eflags = *(int *) start_addr;
+
+	return pstmt;
+}

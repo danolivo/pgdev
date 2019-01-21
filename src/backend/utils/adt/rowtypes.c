@@ -65,7 +65,6 @@ typedef struct RecordCompareData
 	ColumnCompareData columns[FLEXIBLE_ARRAY_MEMBER];
 } RecordCompareData;
 
-
 /*
  * record_in		- input routine for any composite type.
  */

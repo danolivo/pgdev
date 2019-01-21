@@ -54,6 +54,7 @@
 #include "pg_trace.h"
 #include "parser/analyze.h"
 #include "parser/parser.h"
+#include "parser/parse_type.h"
 #include "pg_getopt.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/postmaster.h"
@@ -437,6 +438,7 @@ SocketBackend(StringInfo inBuf)
 		case 'E':				/* execute */
 		case 'H':				/* flush */
 		case 'P':				/* parse */
+		case 'p':
 			doing_extended_query_message = true;
 			/* these are only legal in protocol 3 */
 			if (PG_PROTOCOL_MAJOR(FrontendProtocol) < 3)
@@ -1542,6 +1544,116 @@ exec_parse_message(const char *query_string,	/* string to execute */
 		ShowUsage("PARSE MESSAGE STATISTICS");
 
 	debug_query_string = NULL;
+}
+
+/*
+ * exec_plan_message
+ *
+ * Execute a Plan.
+ * For acquire all locks we use cached plans machinery.
+ * The code made by analogy with exec_simple_query() routine.
+ */
+static void
+exec_plan_message(const char *plan)
+{
+	CommandDest			dest = whereToSendOutput;
+	MemoryContext		oldcontext;
+	DestReceiver		*receiver;
+	bool				save_log_statement_stats = log_statement_stats;
+	const char			*commandTag;
+	char				completionTag[COMPLETION_TAG_BUFSIZE];
+	CachedPlanSource	*psrc;
+	Portal				portal;
+	char				*query_string = NULL;
+	ParamListInfo 		paramLI;
+	Oid		   			*paramTypes = NULL;
+	int					cnt_param;
+	CachedPlan			*cplan;
+	int					instrument_options;
+	int					eflags;
+	PlannedStmt			*pstmt = NULL;
+	int16				format = 0;
+
+	start_xact_command();
+
+	CHECK_FOR_INTERRUPTS();
+	pstmt = deserialize_plan(plan, &query_string, &paramLI, &instrument_options, &eflags);
+	debug_query_string = query_string;
+
+	pgstat_report_activity(STATE_RUNNING, query_string);
+
+	TRACE_POSTGRESQL_QUERY_START(query_string);
+
+	if (save_log_statement_stats)
+		ResetUsage();
+
+	commandTag = CreateCommandTag((Node *) pstmt);
+	set_ps_display(commandTag, false);
+
+	BeginCommand(commandTag, dest);
+
+	if (IsAbortedTransactionBlockState() &&
+		!IsTransactionExitStmt((Node *)(pstmt->planTree)))
+		ereport(ERROR,
+				(errcode(ERRCODE_IN_FAILED_SQL_TRANSACTION),
+				 errmsg("current transaction is aborted, "
+						"commands ignored until end of transaction block"),
+				 errdetail_abort()));
+
+	oldcontext = MemoryContextSwitchTo(MessageContext);
+	psrc = CreateCachedPlan(NULL, query_string, commandTag);
+
+	paramTypes = (Oid *) palloc(paramLI->numParams * sizeof(Oid));
+	for (cnt_param = 0; cnt_param < paramLI->numParams; cnt_param++)
+		paramTypes[cnt_param] = paramLI->params[cnt_param].ptype;
+
+	CompleteCachedPlan(psrc, NIL, NULL, paramTypes, paramLI->numParams, NULL, NULL,
+						   CURSOR_OPT_GENERIC_PLAN, false);
+
+	StorePreparedStatement(commandTag, psrc, false);
+	SetRemoteSubplan(psrc, pstmt);
+
+	/* Create a new portal to run the query in */
+	portal = CreateNewPortal();
+	/* Don't display the portal in pg_cursors, it is for internal use only */
+	portal->visible = false;
+
+	cplan = GetCachedPlan(psrc, paramLI, false, NULL);
+
+	PortalDefineQuery(portal,
+					  NULL,
+					  query_string,
+					  commandTag,
+					  cplan->stmt_list,
+					  cplan);
+
+	PortalStart(portal, paramLI, eflags, InvalidSnapshot);
+	PortalSetResultFormat(portal, 1, &format);
+
+	/* Now we can create the destination receiver object. */
+	receiver = CreateDestReceiver(dest);
+	if (dest == DestRemote)
+		SetRemoteDestReceiverParams(receiver, portal);
+
+	MemoryContextSwitchTo(oldcontext);
+	(void) PortalRun(portal,
+					 FETCH_ALL,
+					 true,
+					 true,
+					 receiver,
+					 receiver,
+					 completionTag);
+	receiver->rDestroy(receiver);
+	PortalDrop(portal, false);
+	DropPreparedStatement(commandTag, false);
+
+	EndCommand(completionTag, dest);
+	NullCommand(dest);
+	TRACE_POSTGRESQL_QUERY_DONE(query_string);
+	debug_query_string = NULL;
+	finish_xact_command();
+
+	return;
 }
 
 /*
@@ -4248,6 +4360,21 @@ PostgresMain(int argc, char *argv[],
 
 					exec_parse_message(query_string, stmt_name,
 									   paramTypes, numParams);
+				}
+				break;
+
+			case 'p':			/* plan */
+				{
+					const char *plan_string;
+
+					/* Set statement_timestamp() */
+					SetCurrentStatementStartTimestamp();
+
+					plan_string = pq_getmsgstring(&input_message);
+					pq_getmsgend(&input_message);
+
+					exec_plan_message(plan_string);
+					send_ready_for_query = true;
 				}
 				break;
 

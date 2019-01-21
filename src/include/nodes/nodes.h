@@ -595,6 +595,7 @@ castNodeImpl(NodeTag type, void *ptr)
 /*
  * nodes/{outfuncs.c,print.c}
  */
+extern void set_portable_output(bool value);
 struct Bitmapset;				/* not to include bitmapset.h here */
 struct StringInfoData;			/* not to include stringinfo.h here */
 
@@ -610,6 +611,7 @@ extern char *bmsToString(const struct Bitmapset *bms);
 /*
  * nodes/{readfuncs.c,read.c}
  */
+extern bool set_portable_input(bool value);
 extern void *stringToNode(const char *str);
 #ifdef WRITE_READ_PARSE_PLAN_TREES
 extern void *stringToNodeWithLocations(const char *str);

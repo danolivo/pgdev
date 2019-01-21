@@ -229,6 +229,7 @@ typedef enum
 	PGQUERY_SIMPLE,				/* simple Query protocol (PQexec) */
 	PGQUERY_EXTENDED,			/* full Extended protocol (PQexecParams) */
 	PGQUERY_PREPARE,			/* Parse only (PQprepare) */
+	PGQUERY_PLAN,
 	PGQUERY_DESCRIBE			/* Describe Statement or Portal */
 } PGQueryClass;
 

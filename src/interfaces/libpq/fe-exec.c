@@ -1253,6 +1253,62 @@ PQsendQuery(PGconn *conn, const char *query)
 }
 
 /*
+ * Serialized plan contains query text, params and executor options
+ */
+int
+PQsendPlan(PGconn *conn, const char *plan)
+{
+	if (!PQsendQueryStart(conn))
+		return 0;
+
+	/* check the arguments */
+	if (!plan)
+	{
+		printfPQExpBuffer(&conn->errorMessage,
+						  libpq_gettext("plan string is a null pointer\n"));
+		return 0;
+	}
+
+	/* This isn't gonna work on a 2.0 server */
+	if (PG_PROTOCOL_MAJOR(conn->pversion) < 3)
+	{
+		printfPQExpBuffer(&conn->errorMessage,
+						  libpq_gettext("function requires at least protocol version 3.0\n"));
+		return 0;
+	}
+
+	/* construct the Execute plan message */
+	if ((pqPutMsgStart('p', false, conn) < 0) ||
+		(pqPuts(plan, conn) < 0) ||
+		(pqPutMsgEnd(conn) < 0))
+		goto sendFailed;
+
+	/* remember we are doing just a Parse */
+	conn->queryclass = PGQUERY_PLAN;
+
+	/* and remember the query text too, if possible */
+	/* if insufficient memory, last_query just winds up NULL */
+	if (conn->last_query)
+		free(conn->last_query);
+	conn->last_query = strdup(plan);
+
+	/*
+	 * Give the data a push.  In nonblock mode, don't complain if we're unable
+	 * to send it all; PQgetResult() will do any additional flushing needed.
+	 */
+	if (pqFlush(conn) < 0)
+		goto sendFailed;
+
+	/* OK, it's launched! */
+	conn->asyncStatus = PGASYNC_BUSY;
+	return 1;
+
+sendFailed:
+	pqHandleSendFailure(conn);
+	return 0;
+}
+
+/*
  * PQsendQueryParams
  *		Like PQsendQuery, but use protocol 3.0 so we can pass parameters
  */
