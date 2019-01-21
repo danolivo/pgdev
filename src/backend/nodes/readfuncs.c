@@ -34,6 +34,7 @@
 
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_type.h"
 #include "fmgr.h"
 #include "nodes/extensible.h"
 #include "nodes/parsenodes.h"
@@ -3656,7 +3657,7 @@ scanDatum(Oid typid, int typmod)
 	Datum		res;
 	READ_TEMP_LOCALS();
 
-	if (typid == 26)
+	if (typid == OIDOID)
 	{
 		token = pg_strtok(&length);
 		if (atooid(token) == 1)

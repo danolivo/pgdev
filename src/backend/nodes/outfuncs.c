@@ -30,7 +30,7 @@
 #include <ctype.h>
 
 #include "catalog/namespace.h"
-#include "catalog/pg_type_d.h"
+#include "catalog/pg_type.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "nodes/extensible.h"

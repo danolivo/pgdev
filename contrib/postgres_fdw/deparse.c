@@ -857,8 +857,12 @@ deparse_type_name(Oid type_oid, int32 typemod)
 {
 	bits16		flags = FORMAT_TYPE_TYPEMOD_GIVEN;
 
-/*	if (!is_builtin(type_oid)) */
-		flags |= FORMAT_TYPE_FORCE_QUALIFY;
+	/*
+	 * Temporarily switch off this option. Not all regression tests passes
+	 * correctly without including 'public' value in default search path.
+	 */
+	/*	if (!is_builtin(type_oid)) */
+	flags |= FORMAT_TYPE_FORCE_QUALIFY;
 
 	return format_type_extended(type_oid, typemod, flags);
 }

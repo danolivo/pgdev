@@ -1652,8 +1652,6 @@ exec_plan_message(const char *plan)
 	TRACE_POSTGRESQL_QUERY_DONE(query_string);
 	debug_query_string = NULL;
 	finish_xact_command();
-
-	return;
 }
 
 /*
