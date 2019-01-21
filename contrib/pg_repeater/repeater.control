@@ -1,0 +1,6 @@
+# Repeater extension
+comment = 'Pass all UTILITY queries and query plans on remote node'
+default_version = '0.1'
+module_pathname = '$libdir/pg_repeater'
+relocatable = false
+requires = 'postgres_fdw'
