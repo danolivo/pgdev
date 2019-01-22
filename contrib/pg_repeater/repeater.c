@@ -80,7 +80,7 @@ ExtensionIsActive(void)
 
 	if (
 		!IsTransactionState() ||
-		!OidIsValid(get_extension_oid("repeater", true))
+		!OidIsValid(get_extension_oid("pg_repeater", true))
 		)
 		return false;
 
