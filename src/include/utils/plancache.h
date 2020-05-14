@@ -232,4 +232,6 @@ extern bool CachedPlanIsSimplyValid(CachedPlanSource *plansource,
 extern CachedExpression *GetCachedExpression(Node *expr);
 extern void FreeCachedExpression(CachedExpression *cexpr);
 
+extern Size CachedPlanMemoryUsage(CachedPlanSource *plansource);
+
 #endif							/* PLANCACHE_H */
