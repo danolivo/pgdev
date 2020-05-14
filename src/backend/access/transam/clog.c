@@ -87,6 +87,7 @@ static SlruCtlData ClogCtlData;
 
 #define ClogCtl (&ClogCtlData)
 
+double clog_keep_min_age;
 
 static int	ZeroCLOGPage(int pageno, bool writeXlog);
 static bool CLOGPagePrecedes(int page1, int page2);
@@ -899,6 +900,11 @@ void
 TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid)
 {
 	int			cutoffPage;
+
+	if (oldestXact > FirstNormalTransactionId + clog_keep_min_age)
+		oldestXact -= clog_keep_min_age;
+	else
+		oldestXact = FirstNormalTransactionId;
 
 	/*
 	 * The cutoff point is the start of the segment containing oldestXact. We

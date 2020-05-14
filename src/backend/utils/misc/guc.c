@@ -26,6 +26,7 @@
 #include <syslog.h>
 #endif
 
+#include "access/clog.h"
 #include "access/commit_ts.h"
 #include "access/gin.h"
 #include "access/global_snapshot.h"
@@ -3714,6 +3715,16 @@ static struct config_real ConfigureNamesReal[] =
 		},
 		&log_xact_sample_rate,
 		0.0, 0.0, 1.0,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"clog_keep_min_age", PGC_SUSET, AUTOVACUUM,
+			gettext_noop("Minimum age for keeping CLOG segments."),
+			NULL
+		},
+		&clog_keep_min_age,
+		INT64CONST(4000000000), INT64CONST(0), INT64CONST(0x7FFFFFFFFFFFFFFF),
 		NULL, NULL, NULL
 	},
 

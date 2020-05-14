@@ -54,6 +54,8 @@ extern void TruncateCLOG(TransactionId oldestXact, Oid oldestxid_datoid);
 #define CLOG_ZEROPAGE		0x00
 #define CLOG_TRUNCATE		0x10
 
+extern double clog_keep_min_age;
+
 extern void clog_redo(XLogReaderState *record);
 extern void clog_desc(StringInfo buf, XLogReaderState *record);
 extern const char *clog_identify(uint8 info);
