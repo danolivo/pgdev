@@ -20,6 +20,9 @@
 #include "storage/buf.h"
 
 
+typedef uint64 GlobalCSN;
+extern bool track_global_snapshots;
+
 /*
  * The different snapshot types.  We use SnapshotData structures to represent
  * both "regular" (MVCC) snapshots and "special" snapshots that have non-MVCC
