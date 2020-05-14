@@ -1152,7 +1152,7 @@ exec_simple_query(const char *query_string)
 	bool		was_logged = false;
 	bool		use_implicit_block;
 	char		msec_str[32];
-
+elog(LOG, "query_string: %s", query_string);
 	/*
 	 * Report query to various monitoring facilities.
 	 */
@@ -1522,7 +1522,7 @@ exec_parse_message(const char *query_string,	/* string to execute */
 	bool		is_named;
 	bool		save_log_statement_stats = log_statement_stats;
 	char		msec_str[32];
-
+elog(LOG, "Parse msg: %s | stmt_name: %s", query_string, stmt_name);
 	/*
 	 * Report query to various monitoring facilities.
 	 */
@@ -2316,7 +2316,7 @@ exec_execute_message(const char *portal_name, long max_rows)
 	char		msec_str[32];
 	ParamsErrorCbData params_data;
 	ErrorContextCallback params_errcxt;
-
+elog(LOG, "Exec msg. portal: %s, max_rows: %lu", portal_name, max_rows);
 	/* Adjust destination to tell printtup.c what to do */
 	dest = whereToSendOutput;
 	if (dest == DestRemote)
