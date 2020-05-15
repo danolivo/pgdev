@@ -171,7 +171,6 @@ typedef struct PgFdwModifyState
 
 	/* for remote query execution */
 	PGconn	   *conn;			/* connection for the scan */
-	char	   *p_name;			/* name of prepared statement, if created */
 
 	/* extracted fdw_private data */
 	char	   *query;			/* text of INSERT/UPDATE/DELETE command */
@@ -438,10 +437,7 @@ static TupleTableSlot *execute_foreign_modify(EState *estate,
 											  CmdType operation,
 											  TupleTableSlot *slot,
 											  TupleTableSlot *planSlot);
-static void prepare_foreign_modify(PgFdwModifyState *fmstate);
-static const char **convert_prep_stmt_params(PgFdwModifyState *fmstate,
-											 ItemPointer tupleid,
-											 TupleTableSlot *slot);
+
 static void store_returning_result(PgFdwModifyState *fmstate,
 								   TupleTableSlot *slot, PGresult *res);
 static void finish_foreign_modify(PgFdwModifyState *fmstate);
@@ -3570,7 +3566,6 @@ create_foreign_modify(EState *estate,
 
 	/* Open connection; report that we'll create a prepared statement. */
 	fmstate->conn = GetConnection(user, true);
-	fmstate->p_name = NULL;		/* prepared statement not made yet */
 
 	/* Set up remote query information. */
 	fmstate->query = query;
@@ -3646,8 +3641,6 @@ execute_foreign_modify(EState *estate,
 					   TupleTableSlot *planSlot)
 {
 	PgFdwModifyState *fmstate = (PgFdwModifyState *) resultRelInfo->ri_FdwState;
-	ItemPointer ctid = NULL;
-	const char **p_values;
 	PGresult   *res;
 	int			n_rows;
 
@@ -3656,40 +3649,10 @@ execute_foreign_modify(EState *estate,
 		   operation == CMD_UPDATE ||
 		   operation == CMD_DELETE);
 
-	/* Set up the prepared statement on the remote server, if we didn't yet */
-	if (!fmstate->p_name)
-		prepare_foreign_modify(fmstate);
-
-	/*
-	 * For UPDATE/DELETE, get the ctid that was passed up as a resjunk column
-	 */
-	if (operation == CMD_UPDATE || operation == CMD_DELETE)
-	{
-		Datum		datum;
-		bool		isNull;
-
-		datum = ExecGetJunkAttribute(planSlot,
-									 fmstate->ctidAttno,
-									 &isNull);
-		/* shouldn't ever get a null result... */
-		if (isNull)
-			elog(ERROR, "ctid is NULL");
-		ctid = (ItemPointer) DatumGetPointer(datum);
-	}
-
-	/* Convert parameters needed by prepared statement to text form */
-	p_values = convert_prep_stmt_params(fmstate, ctid, slot);
-
 	/*
 	 * Execute the prepared statement.
 	 */
-	if (!PQsendQueryPrepared(fmstate->conn,
-							 fmstate->p_name,
-							 fmstate->p_nums,
-							 p_values,
-							 NULL,
-							 NULL,
-							 0))
+	if (!PQsendQuery(fmstate->conn, fmstate->query))
 		pgfdw_report_error(ERROR, NULL, fmstate->conn, false, fmstate->query);
 
 	/*
@@ -3722,115 +3685,6 @@ execute_foreign_modify(EState *estate,
 	 * Return NULL if nothing was inserted/updated/deleted on the remote end
 	 */
 	return (n_rows > 0) ? slot : NULL;
-}
-
-/*
- * prepare_foreign_modify
- *		Establish a prepared statement for execution of INSERT/UPDATE/DELETE
- */
-static void
-prepare_foreign_modify(PgFdwModifyState *fmstate)
-{
-	char		prep_name[NAMEDATALEN];
-	char	   *p_name;
-	PGresult   *res;
-
-	/* Construct name we'll use for the prepared statement. */
-	snprintf(prep_name, sizeof(prep_name), "pgsql_fdw_prep_%u",
-			 GetPrepStmtNumber(fmstate->conn));
-	p_name = pstrdup(prep_name);
-
-	/*
-	 * We intentionally do not specify parameter types here, but leave the
-	 * remote server to derive them by default.  This avoids possible problems
-	 * with the remote server using different type OIDs than we do.  All of
-	 * the prepared statements we use in this module are simple enough that
-	 * the remote server will make the right choices.
-	 */
-	if (!PQsendPrepare(fmstate->conn,
-					   p_name,
-					   fmstate->query,
-					   0,
-					   NULL))
-		pgfdw_report_error(ERROR, NULL, fmstate->conn, false, fmstate->query);
-
-	/*
-	 * Get the result, and check for success.
-	 *
-	 * We don't use a PG_TRY block here, so be careful not to throw error
-	 * without releasing the PGresult.
-	 */
-	res = pgfdw_get_result(fmstate->conn, fmstate->query);
-	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-		pgfdw_report_error(ERROR, res, fmstate->conn, true, fmstate->query);
-	PQclear(res);
-
-	/* This action shows that the prepare has been done. */
-	fmstate->p_name = p_name;
-}
-
-/*
- * convert_prep_stmt_params
- *		Create array of text strings representing parameter values
- *
- * tupleid is ctid to send, or NULL if none
- * slot is slot to get remaining parameters from, or NULL if none
- *
- * Data is constructed in temp_cxt; caller should reset that after use.
- */
-static const char **
-convert_prep_stmt_params(PgFdwModifyState *fmstate,
-						 ItemPointer tupleid,
-						 TupleTableSlot *slot)
-{
-	const char **p_values;
-	int			pindex = 0;
-	MemoryContext oldcontext;
-
-	oldcontext = MemoryContextSwitchTo(fmstate->temp_cxt);
-
-	p_values = (const char **) palloc(sizeof(char *) * fmstate->p_nums);
-
-	/* 1st parameter should be ctid, if it's in use */
-	if (tupleid != NULL)
-	{
-		/* don't need set_transmission_modes for TID output */
-		p_values[pindex] = OutputFunctionCall(&fmstate->p_flinfo[pindex],
-											  PointerGetDatum(tupleid));
-		pindex++;
-	}
-
-	/* get following parameters from slot */
-	if (slot != NULL && fmstate->target_attrs != NIL)
-	{
-		int			nestlevel;
-		ListCell   *lc;
-
-		nestlevel = set_transmission_modes();
-
-		foreach(lc, fmstate->target_attrs)
-		{
-			int			attnum = lfirst_int(lc);
-			Datum		value;
-			bool		isnull;
-
-			value = slot_getattr(slot, attnum, &isnull);
-			if (isnull)
-				p_values[pindex] = NULL;
-			else
-				p_values[pindex] = OutputFunctionCall(&fmstate->p_flinfo[pindex],
-													  value);
-			pindex++;
-		}
-
-		reset_transmission_modes(nestlevel);
-	}
-
-	Assert(pindex == fmstate->p_nums);
-
-	MemoryContextSwitchTo(oldcontext);
-
-	return p_values;
 }
 
 /*
@@ -3878,25 +3732,6 @@ static void
 finish_foreign_modify(PgFdwModifyState *fmstate)
 {
 	Assert(fmstate != NULL);
-
-	/* If we created a prepared statement, destroy it */
-	if (fmstate->p_name)
-	{
-		char		sql[64];
-		PGresult   *res;
-
-		snprintf(sql, sizeof(sql), "DEALLOCATE %s", fmstate->p_name);
-
-		/*
-		 * We don't use a PG_TRY block here, so be careful not to throw error
-		 * without releasing the PGresult.
-		 */
-		res = pgfdw_exec_query(fmstate->conn, sql);
-		if (PQresultStatus(res) != PGRES_COMMAND_OK)
-			pgfdw_report_error(ERROR, res, fmstate->conn, true, sql);
-		PQclear(res);
-		fmstate->p_name = NULL;
-	}
 
 	/* Release remote connection */
 	ReleaseConnection(fmstate->conn);
