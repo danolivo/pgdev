@@ -2484,6 +2484,7 @@ ImportGlobalSnapshot(GlobalCSN snap_global_csn)
 	if (!TransactionIdIsValid(xmin))
 	{
 		LWLockRelease(ProcArrayLock);
+		Assert(0);
 		elog(ERROR, "GlobalSnapshotToXmin: global snapshot too old");
 	}
 	MyProc->originalXmin = MyPgXact->xmin;
