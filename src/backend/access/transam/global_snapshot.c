@@ -357,6 +357,8 @@ GlobalSnapshotToXmin(GlobalCSN snapshot_global_csn)
 	}
 	else
 	{
+		elog(LOG, "csn_seconds: %lu, last_csn_seconds: %lu, size: %d, head: %d",
+			csn_seconds, last_csn_seconds, gsXidMap->size, gsXidMap->head);
 		/* requested global_csn is too old, let caller know */
 		xmin = InvalidTransactionId;
 	}
