@@ -221,7 +221,7 @@ GetConnection(UserMapping *user, bool will_prep_stmt)
 		entry->have_prep_stmt = false;
 		entry->have_error = false;
 		entry->changing_xact_state = false;
-		entry->invalidated = false;
+		entry->invalidated = true;
 		entry->server_hashvalue =
 			GetSysCacheHashValue1(FOREIGNSERVEROID,
 								  ObjectIdGetDatum(server->serverid));
