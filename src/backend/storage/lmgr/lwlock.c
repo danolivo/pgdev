@@ -134,6 +134,8 @@ static const char *const BuiltinTrancheNames[] = {
 	"CommitTSBuffer",
 	/* LWTRANCHE_SUBTRANS_BUFFER: */
 	"SubtransBuffer",
+	/* LWTRANCHE_GLOBAL_CSN_LOG_BUFFERS */
+	"GlobalCSNLogBuffer",
 	/* LWTRANCHE_MULTIXACTOFFSET_BUFFER: */
 	"MultiXactOffsetBuffer",
 	/* LWTRANCHE_MULTIXACTMEMBER_BUFFER: */
