@@ -10,6 +10,11 @@
  * memory in case of long-lived transactions.  Because of same lifetime and
  * persistancy requirements this module is quite similar to subtrans.c
  *
+ * If we switch database from CSN-based snapshot to xid-based snapshot then,
+ * nothing wrong. But if we switch xid-based snapshot to CSN-based snapshot
+ * it should decide a new xid which begin csn-based check. It can not be
+ * oldestActiveXID because of prepared transaction.
+ *
  * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
@@ -42,7 +47,7 @@ bool track_global_snapshots;
  */
 
 /* We store the commit CSN_t for each xid */
-#define GCSNLOG_XACTS_PER_PAGE (BLCKSZ / sizeof(GlobalCSN))
+#define GCSNLOG_XACTS_PER_PAGE (BLCKSZ / sizeof(CSN_t))
 
 #define TransactionIdToPage(xid)	((xid) / (TransactionId) GCSNLOG_XACTS_PER_PAGE)
 #define TransactionIdToPgIndex(xid) ((xid) % (TransactionId) GCSNLOG_XACTS_PER_PAGE)
@@ -53,13 +58,18 @@ bool track_global_snapshots;
 static SlruCtlData GlobalCSNLogCtlData;
 #define GlobalCsnlogCtl (&GlobalCSNLogCtlData)
 
-static int	ZeroGlobalCSNLogPage(int pageno);
+static int	ZeroGlobalCSNLogPage(int pageno, bool write_xlog);
+static void ZeroTruncateCSNLogPage(int pageno, bool write_xlog);
 static bool GlobalCSNLogPagePrecedes(int page1, int page2);
 static void GlobalCSNLogSetPageStatus(TransactionId xid, int nsubxids,
 									  TransactionId *subxids,
 									  CSN_t csn, int pageno);
 static void GlobalCSNLogSetCSNInSlot(TransactionId xid, CSN_t csn,
 									  int slotno);
+static void WriteCSNXlogRec(TransactionId xid, int nsubxids,
+							   TransactionId *subxids, CSN_t csn);
+static void WriteZeroCSNPageXlogRec(int pageno);
+static void WriteTruncateCSNXlogRec(int pageno);
 
 /*
  * GlobalCSNLogSetCSN
@@ -78,7 +88,8 @@ static void GlobalCSNLogSetCSNInSlot(TransactionId xid, CSN_t csn,
  */
 void
 GlobalCSNLogSetCSN(TransactionId xid, int nsubxids,
-					 TransactionId *subxids, CSN_t csn)
+				   TransactionId *subxids, CSN_t csn,
+				   bool write_xlog)
 {
 	int			pageno;
 	int			i = 0;
@@ -90,6 +101,10 @@ GlobalCSNLogSetCSN(TransactionId xid, int nsubxids,
 	Assert(TransactionIdIsValid(xid));
 
 	pageno = TransactionIdToPage(xid);		/* get page of parent */
+
+	if(write_xlog)
+		WriteCSNXlogRec(xid, nsubxids, subxids, csn);
+
 	for (;;)
 	{
 		int			num_on_page = 0;
@@ -181,9 +196,6 @@ GlobalCSNLogGetCSN(TransactionId xid)
 	/* Callers of GlobalCSNLogGetCSN() must check GUC params */
 	Assert(track_global_snapshots);
 
-	/* Can't ask about stuff that might not be around anymore */
-	Assert(TransactionIdFollowsOrEquals(xid, TransactionXmin));
-
 	/* lock is acquired by SimpleLruReadPage_ReadOnly */
 
 	slotno = SimpleLruReadPage_ReadOnly(GlobalCsnlogCtl, pageno, xid);
@@ -246,28 +258,13 @@ BootStrapGlobalCSNLog(void)
 	LWLockAcquire(GlobalCSNLogControlLock, LW_EXCLUSIVE);
 
 	/* Create and zero the first page of the commit log */
-	slotno = ZeroGlobalCSNLogPage(0);
+	slotno = ZeroGlobalCSNLogPage(0, false);
 
 	/* Make sure it's written out */
 	SimpleLruWritePage(GlobalCsnlogCtl, slotno);
 	Assert(!GlobalCsnlogCtl->shared->page_dirty[slotno]);
 
 	LWLockRelease(GlobalCSNLogControlLock);
-}
-
-/*
- * Initialize (or reinitialize) a page of GlobalCSNLog to zeroes.
- *
- * The page is not actually written, just set up in shared memory.
- * The slot number of the new page is returned.
- *
- * Control lock must be held at entry, and will be held at exit.
- */
-static int
-ZeroGlobalCSNLogPage(int pageno)
-{
-	Assert(LWLockHeldByMe(GlobalCSNLogControlLock));
-	return SimpleLruZeroPage(GlobalCsnlogCtl, pageno);
 }
 
 /*
@@ -295,19 +292,40 @@ StartupGlobalCSNLog(TransactionId oldestActiveXID)
 	LWLockAcquire(GlobalCSNLogControlLock, LW_EXCLUSIVE);
 
 	startPage = TransactionIdToPage(oldestActiveXID);
-	endPage = TransactionIdToPage(XidFromFullTransactionId(ShmemVariableCache->nextFullXid));
+	endPage = TransactionIdToPage(XidFromFullTransactionId(
+											ShmemVariableCache->nextFullXid));
 
 	while (startPage != endPage)
 	{
-		(void) ZeroGlobalCSNLogPage(startPage);
+		(void) ZeroGlobalCSNLogPage(startPage, false);
 		startPage++;
 		/* must account for wraparound */
 		if (startPage > TransactionIdToPage(MaxTransactionId))
 			startPage = 0;
 	}
-	(void) ZeroGlobalCSNLogPage(startPage);
+
+	(void) ZeroGlobalCSNLogPage(startPage, false);
 
 	LWLockRelease(GlobalCSNLogControlLock);
+}
+
+/*
+ * Initialize (or reinitialize) a page of GlobalCSNLog to zeroes.
+ *
+ * The page is not actually written, just set up in shared memory.
+ * The slot number of the new page is returned.
+ *
+ * Control lock must be held at entry, and will be held at exit.
+ */
+static int
+ZeroGlobalCSNLogPage(int pageno, bool write_xlog)
+{
+	Assert(LWLockHeldByMe(GlobalCSNLogControlLock));
+
+	if(write_xlog)
+		WriteZeroCSNPageXlogRec(pageno);
+
+	return SimpleLruZeroPage(GlobalCsnlogCtl, pageno);
 }
 
 /*
@@ -380,9 +398,17 @@ ExtendGlobalCSNLog(TransactionId newestXact)
 	LWLockAcquire(GlobalCSNLogControlLock, LW_EXCLUSIVE);
 
 	/* Zero the page and make an XLOG entry about it */
-	ZeroGlobalCSNLogPage(pageno);
+	ZeroGlobalCSNLogPage(pageno, !InRecovery);
 
 	LWLockRelease(GlobalCSNLogControlLock);
+}
+
+static void
+ZeroTruncateCSNLogPage(int pageno, bool write_xlog)
+{
+	if(write_xlog)
+		WriteTruncateCSNXlogRec(pageno);
+	SimpleLruTruncate(GlobalCsnlogCtl, pageno);
 }
 
 /*
@@ -411,7 +437,7 @@ TruncateGlobalCSNLog(TransactionId oldestXact)
 	TransactionIdRetreat(oldestXact);
 	cutoffPage = TransactionIdToPage(oldestXact);
 
-	SimpleLruTruncate(GlobalCsnlogCtl, cutoffPage);
+	ZeroTruncateCSNLogPage(cutoffPage, true);
 }
 
 /*
@@ -436,4 +462,112 @@ GlobalCSNLogPagePrecedes(int page1, int page2)
 	xid2 += FirstNormalTransactionId;
 
 	return TransactionIdPrecedes(xid1, xid2);
+}
+
+void
+WriteAssignCSNXlogRec(CSN_t csn)
+{
+	CSN_t log_csn = 0;
+
+	if(csn <= get_last_log_wal_csn())
+		return;
+
+	log_csn = CSNAddByNanosec(csn, 0);
+	set_last_log_wal_csn(log_csn);
+
+	XLogBeginInsert();
+	XLogRegisterData((char *) (&log_csn), sizeof(CSN_t));
+	XLogInsert(RM_CSNLOG_ID, XLOG_CSN_ASSIGNMENT);
+}
+
+static void
+WriteCSNXlogRec(TransactionId xid, int nsubxids,
+				TransactionId *subxids, CSN_t csn)
+{
+	xl_csn_set 	xlrec;
+	XLogRecPtr		recptr;
+
+	xlrec.xtop = xid;
+	xlrec.nsubxacts = nsubxids;
+	xlrec.csn = csn;
+
+	XLogBeginInsert();
+	XLogRegisterData((char *) &xlrec, MinSizeOfCSN_tSet);
+	XLogRegisterData((char *) subxids, nsubxids * sizeof(TransactionId));
+	recptr = XLogInsert(RM_CSNLOG_ID, XLOG_CSN_SETXIDCSN);
+	XLogFlush(recptr);
+}
+
+/*
+ * Write a ZEROPAGE xlog record
+ */
+static void
+WriteZeroCSNPageXlogRec(int pageno)
+{
+	XLogBeginInsert();
+	XLogRegisterData((char *) (&pageno), sizeof(int));
+	(void) XLogInsert(RM_CSNLOG_ID, XLOG_CSN_ZEROPAGE);
+}
+
+/*
+ * Write a TRUNCATE xlog record
+ */
+static void
+WriteTruncateCSNXlogRec(int pageno)
+{
+	XLogRecPtr	recptr;
+	return;
+	XLogBeginInsert();
+	XLogRegisterData((char *) (&pageno), sizeof(int));
+	recptr = XLogInsert(RM_CSNLOG_ID, XLOG_CSN_TRUNCATE);
+	XLogFlush(recptr);
+}
+
+
+void
+csnlog_redo(XLogReaderState *record)
+{
+	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+
+	/* Backup blocks are not used in csnlog records */
+	Assert(!XLogRecHasAnyBlockRefs(record));
+
+	if (info == XLOG_CSN_ASSIGNMENT)
+	{
+		CSN_t csn;
+
+		memcpy(&csn, XLogRecGetData(record), sizeof(CSN_t));
+		LWLockAcquire(GlobalCSNLogControlLock, LW_EXCLUSIVE);
+		set_last_max_csn(csn);
+		LWLockRelease(GlobalCSNLogControlLock);
+
+	}
+	else if (info == XLOG_CSN_SETXIDCSN)
+	{
+		xl_csn_set *xlrec = (xl_csn_set *) XLogRecGetData(record);
+		GlobalCSNLogSetCSN(xlrec->xtop, xlrec->nsubxacts, xlrec->xsub, xlrec->csn, false);
+	}
+	else if (info == XLOG_CSN_ZEROPAGE)
+	{
+		int			pageno;
+		int			slotno;
+
+		memcpy(&pageno, XLogRecGetData(record), sizeof(int));
+		LWLockAcquire(GlobalCSNLogControlLock, LW_EXCLUSIVE);
+		slotno = ZeroGlobalCSNLogPage(pageno, false);
+		SimpleLruWritePage(GlobalCsnlogCtl, slotno);
+		LWLockRelease(GlobalCSNLogControlLock);
+		Assert(!GlobalCsnlogCtl->shared->page_dirty[slotno]);
+
+	}
+	else if (info == XLOG_CSN_TRUNCATE)
+	{
+		int			pageno;
+
+		memcpy(&pageno, XLogRecGetData(record), sizeof(int));
+		GlobalCsnlogCtl->shared->latest_page_number = pageno;
+		ZeroTruncateCSNLogPage(pageno, false);
+	}
+	else
+		elog(PANIC, "csnlog_redo: unknown op code %u", info);
 }

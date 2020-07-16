@@ -2407,7 +2407,7 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 		if (XidInvisibleInGlobalSnapshot(xid, snapshot))
 		{
 			CSN_t gcsn = TransactionIdGetGlobalCSN(xid);
-			Assert(GlobalCSNIsAborted(gcsn));
+			Assert(GlobalCSNIsAborted(gcsn) || GlobalCSNIsInProgress(gcsn));
 		}
 #endif
 		return false;

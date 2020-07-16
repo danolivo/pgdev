@@ -1768,7 +1768,7 @@ GetSnapshotData(Snapshot snapshot)
 	 * Take CSN_t under ProcArrayLock so the local/global snapshot stays
 	 * synchronized.
 	 */
-	if (track_global_snapshots)
+	if (!snapshot->takenDuringRecovery && track_global_snapshots)
 		global_csn = GlobalSnapshotGenerate(false);
 
 	LWLockRelease(ProcArrayLock);

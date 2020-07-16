@@ -25,6 +25,7 @@
 #include "access/clog.h"
 #include "access/commit_ts.h"
 #include "access/genam.h"
+#include "access/global_csn_log.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/multixact.h"
@@ -1632,6 +1633,7 @@ vac_truncate_clog(TransactionId frozenXID,
 	 */
 	TruncateCLOG(frozenXID, oldestxid_datoid);
 	TruncateCommitTs(frozenXID);
+	TruncateGlobalCSNLog(frozenXID);
 	TruncateMultiXact(minMulti, minmulti_datoid);
 
 	/*

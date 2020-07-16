@@ -2511,7 +2511,7 @@ GlobalSnapshotPrepareTwophase(const char *gid)
 	ParsePrepareRecord(0, (xl_xact_prepare *) buf, &parsed);
 
 	GlobalCSNLogSetCSN(xid, parsed.nsubxacts,
-					parsed.subxacts, InDoubtGlobalCSN);
+					parsed.subxacts, InDoubtGlobalCSN, false);
 
 	/* Unlock our GXACT */
 	LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);

@@ -9108,7 +9108,6 @@ CreateCheckPoint(int flags)
 	if (!RecoveryInProgress())
 	{
 		TruncateSUBTRANS(GetOldestXmin(NULL, PROCARRAY_FLAGS_DEFAULT));
-		TruncateGlobalCSNLog(GetOldestXmin(NULL, PROCARRAY_FLAGS_DEFAULT));
 	}
 
 	/* Real work is done, but log and update stats before releasing lock. */
@@ -9472,7 +9471,6 @@ CreateRestartPoint(int flags)
 	if (EnableHotStandby)
 	{
 		TruncateSUBTRANS(GetOldestXmin(NULL, PROCARRAY_FLAGS_DEFAULT));
-		TruncateGlobalCSNLog(GetOldestXmin(NULL, PROCARRAY_FLAGS_DEFAULT));
 	}
 
 	/* Real work is done, but log and update before releasing lock. */
