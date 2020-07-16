@@ -20,7 +20,7 @@
 #include "storage/buf.h"
 
 
-typedef uint64 GlobalCSN;
+typedef uint64 CSN_t;
 extern bool track_global_snapshots;
 
 /*
@@ -209,7 +209,7 @@ typedef struct SnapshotData
 	 * GlobalCSN for cross-node snapshot isolation support.
 	 * Will be used only if track_global_snapshots is enabled.
 	 */
-	GlobalCSN	global_csn;
+	CSN_t	global_csn;
 	/* Did we have our own global_csn or imported one from different node */
 	bool		imported_global_csn;
 } SnapshotData;

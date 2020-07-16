@@ -215,7 +215,7 @@ struct PGPROC
 	dlist_node	lockGroupLink;	/* my member link, if I'm a member */
 
 	/*
-	 * assignedGlobalCsn holds GlobalCSN for this transaction.  It is generated
+	 * assignedGlobalCsn holds CSN_t for this transaction.  It is generated
 	 * under a ProcArray lock and later is writter to a GlobalCSNLog.  This
 	 * variable defined as atomic only for case of group commit, in all other
 	 * scenarios only backend responsible for this proc entry is working with

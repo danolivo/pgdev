@@ -248,7 +248,7 @@ typedef struct SerializedSnapshotData
 	CommandId	curcid;
 	TimestampTz whenTaken;
 	XLogRecPtr	lsn;
-	GlobalCSN	global_csn;
+	CSN_t	global_csn;
 	bool		imported_global_csn;
 } SerializedSnapshotData;
 
@@ -2393,7 +2393,7 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 		 *
 		 * TODO: this check can be skipped if we know for sure that there were
 		 * no global transactions when this snapshot was taken. That requires
-		 * some changes to mechanisms of global snapshots exprot/import (if
+		 * some changes to mechanisms of global snapshots export/import (if
 		 * backend set xmin then we should have a-priori knowledge that this
 		 * transaction going to be global or local -- right now this is not
 		 * enforced). Leave that for future and don't complicate this patch.
@@ -2406,7 +2406,7 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 		/* Check that global snapshot gives the same results as local one */
 		if (XidInvisibleInGlobalSnapshot(xid, snapshot))
 		{
-			GlobalCSN gcsn = TransactionIdGetGlobalCSN(xid);
+			CSN_t gcsn = TransactionIdGetGlobalCSN(xid);
 			Assert(GlobalCSNIsAborted(gcsn));
 		}
 #endif
@@ -2424,7 +2424,7 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
  * add some additional checks that transaction did not yet acquired xid, but
  * for current iteration of this patch I don't want to hack on parser.
  */
-GlobalCSN
+CSN_t
 ExportGlobalSnapshot()
 {
 	if (!track_global_snapshots)
@@ -2441,7 +2441,7 @@ ExportGlobalSnapshot()
 Datum
 pg_global_snapshot_export(PG_FUNCTION_ARGS)
 {
-	GlobalCSN	global_csn = ExportGlobalSnapshot();
+	CSN_t	global_csn = ExportGlobalSnapshot();
 	PG_RETURN_UINT64(global_csn);
 }
 
@@ -2456,7 +2456,7 @@ pg_global_snapshot_export(PG_FUNCTION_ARGS)
  * for current iteration of this patch I don't want to hack on parser.
  */
 void
-ImportGlobalSnapshot(GlobalCSN snap_global_csn)
+ImportGlobalSnapshot(CSN_t snap_global_csn)
 {
 	volatile TransactionId xmin;
 
@@ -2503,7 +2503,7 @@ ImportGlobalSnapshot(GlobalCSN snap_global_csn)
 Datum
 pg_global_snapshot_import(PG_FUNCTION_ARGS)
 {
-	GlobalCSN	global_csn = PG_GETARG_UINT64(0);
+	CSN_t	global_csn = PG_GETARG_UINT64(0);
 	ImportGlobalSnapshot(global_csn);
 	PG_RETURN_VOID();
 }

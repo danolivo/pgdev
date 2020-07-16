@@ -40,7 +40,7 @@
  */
 typedef struct
 {
-	GlobalCSN		 last_global_csn;
+	CSN_t		 last_max_csn;
 	volatile slock_t lock;
 } GlobalSnapshotState;
 
@@ -143,7 +143,7 @@ GlobalSnapshotShmemInit()
 								&found);
 		if (!found)
 		{
-			gsState->last_global_csn = 0;
+			gsState->last_max_csn = 0;
 			SpinLockInit(&gsState->lock);
 		}
 	}
@@ -230,11 +230,11 @@ GlobalSnapshotStartup(TransactionId oldestActiveXID)
  *		  oldestXmin's that are bigger then they actually were.
  */
 void
-GlobalSnapshotMapXmin(GlobalCSN snapshot_global_csn)
+GlobalSnapshotMapXmin(CSN_t snapshot_global_csn)
 {
 	int offset, gap, i;
-	GlobalCSN csn_seconds;
-	GlobalCSN last_csn_seconds;
+	CSN_t csn_seconds;
+	CSN_t last_csn_seconds;
 	volatile TransactionId oldest_deferred_xmin;
 	TransactionId current_oldest_xmin, previous_oldest_xmin;
 
@@ -329,11 +329,11 @@ GlobalSnapshotMapXmin(GlobalCSN snapshot_global_csn)
  * Get oldestXmin that took place when snapshot_global_csn was taken.
  */
 TransactionId
-GlobalSnapshotToXmin(GlobalCSN snapshot_global_csn)
+GlobalSnapshotToXmin(CSN_t snapshot_global_csn)
 {
 	TransactionId xmin;
-	GlobalCSN csn_seconds;
-	volatile GlobalCSN last_csn_seconds;
+	CSN_t csn_seconds;
+	volatile CSN_t last_csn_seconds;
 
 	/* Callers should check config values */
 	Assert(global_snapshot_defer_time > 0);
@@ -368,16 +368,16 @@ GlobalSnapshotToXmin(GlobalCSN snapshot_global_csn)
 /*
  * GlobalSnapshotGenerate
  *
- * Generate GlobalCSN which is actually a local time. Also we are forcing
+ * Generate CSN_t which is actually a local time. Also we are forcing
  * this time to be always increasing. Since now it is not uncommon to have
  * millions of read transactions per second we are trying to use nanoseconds
  * if such time resolution is available.
  */
-GlobalCSN
+CSN_t
 GlobalSnapshotGenerate(bool locked)
 {
 	instr_time	current_time;
-	GlobalCSN	global_csn;
+	CSN_t	global_csn;
 
 	Assert(track_global_snapshots || global_snapshot_defer_time > 0);
 
@@ -385,16 +385,16 @@ GlobalSnapshotGenerate(bool locked)
 	 * TODO: create some macro that add small random shift to current time.
 	 */
 	INSTR_TIME_SET_CURRENT(current_time);
-	global_csn = (GlobalCSN) INSTR_TIME_GET_NANOSEC(current_time);
+	global_csn = (CSN_t) INSTR_TIME_GET_NANOSEC(current_time);
 
 	/* TODO: change to atomics? */
 	if (!locked)
 		SpinLockAcquire(&gsState->lock);
 
-	if (global_csn <= gsState->last_global_csn)
-		global_csn = ++gsState->last_global_csn;
+	if (global_csn <= gsState->last_max_csn)
+		global_csn = ++gsState->last_max_csn;
 	else
-		gsState->last_global_csn = global_csn;
+		gsState->last_max_csn = global_csn;
 
 	if (!locked)
 		SpinLockRelease(&gsState->lock);
@@ -413,17 +413,17 @@ GlobalSnapshotGenerate(bool locked)
  * Complain if wait time is more than SNAP_SYNC_COMPLAIN.
  */
 void
-GlobalSnapshotSync(GlobalCSN remote_gcsn)
+GlobalSnapshotSync(CSN_t remote_gcsn)
 {
-	GlobalCSN	local_gcsn;
-	GlobalCSN	delta;
+	CSN_t	local_gcsn;
+	CSN_t	delta;
 
 	Assert(track_global_snapshots);
 
 	for(;;)
 	{
 		SpinLockAcquire(&gsState->lock);
-		if (gsState->last_global_csn > remote_gcsn)
+		if (gsState->last_max_csn > remote_gcsn)
 		{
 			/* Everything is fine */
 			SpinLockRelease(&gsState->lock);
@@ -432,7 +432,7 @@ GlobalSnapshotSync(GlobalCSN remote_gcsn)
 		else if ((local_gcsn = GlobalSnapshotGenerate(true)) >= remote_gcsn)
 		{
 			/*
-			 * Everything is fine too, but last_global_csn wasn't updated for
+			 * Everything is fine too, but last_max_csn wasn't updated for
 			 * some time.
 			 */
 			SpinLockRelease(&gsState->lock);
@@ -463,13 +463,13 @@ GlobalSnapshotSync(GlobalCSN remote_gcsn)
 /*
  * TransactionIdGetGlobalCSN
  *
- * Get GlobalCSN for specified TransactionId taking care about special xids,
+ * Get CSN_t for specified TransactionId taking care about special xids,
  * xids beyond TransactionXmin and InDoubt states.
  */
-GlobalCSN
+CSN_t
 TransactionIdGetGlobalCSN(TransactionId xid)
 {
-	GlobalCSN global_csn;
+	CSN_t global_csn;
 
 	Assert(track_global_snapshots);
 
@@ -492,12 +492,12 @@ TransactionIdGetGlobalCSN(TransactionId xid)
 	if (TransactionIdPrecedes(xid, TransactionXmin))
 		return FrozenGlobalCSN;
 
-	/* Read GlobalCSN from SLRU */
+	/* Read CSN_t from SLRU */
 	global_csn = GlobalCSNLogGetCSN(xid);
 
 	/*
 	 * If we faced InDoubt state then transaction is beeing committed and we
-	 * should wait until GlobalCSN will be assigned so that visibility check
+	 * should wait until CSN_t will be assigned so that visibility check
 	 * could decide whether tuple is in snapshot. See also comments in
 	 * GlobalSnapshotPrecommit().
 	 */
@@ -529,7 +529,7 @@ TransactionIdGetGlobalCSN(TransactionId xid)
 bool
 XidInvisibleInGlobalSnapshot(TransactionId xid, Snapshot snapshot)
 {
-	GlobalCSN csn;
+	CSN_t csn;
 
 	Assert(track_global_snapshots);
 
@@ -572,7 +572,7 @@ XidInvisibleInGlobalSnapshot(TransactionId xid, Snapshot snapshot)
  * Set InDoubt state for currently active transaction and return commit's
  * global snapshot.
  */
-GlobalCSN
+CSN_t
 GlobalSnapshotPrepareCurrent()
 {
 	TransactionId xid = GetCurrentTransactionIdIfAny();
@@ -600,12 +600,12 @@ GlobalSnapshotPrepareCurrent()
 /*
  * GlobalSnapshotAssignCsnCurrent
  *
- * Asign GlobalCSN for currently active transaction. GlobalCSN is supposedly
+ * Asign CSN_t for currently active transaction. CSN_t is supposedly
  * maximal among of values returned by GlobalSnapshotPrepareCurrent and
  * pg_global_snapshot_prepare.
  */
 void
-GlobalSnapshotAssignCsnCurrent(GlobalCSN global_csn)
+GlobalSnapshotAssignCsnCurrent(CSN_t global_csn)
 {
 	if (!track_global_snapshots)
 		ereport(ERROR,
@@ -679,8 +679,8 @@ GlobalSnapshotAbort(PGPROC *proc, TransactionId xid,
  * global csn-based snapshots. We don't hold ProcArray lock while writing
  * csn for transaction in SLRU but instead we set InDoubt status before
  * transaction is deleted from ProcArray so the readers who will read csn
- * in the gap between ProcArray removal and GlobalCSN assignment can wait
- * until GlobalCSN is finally assigned. See also TransactionIdGetGlobalCSN().
+ * in the gap between ProcArray removal and CSN_t assignment can wait
+ * until CSN_t is finally assigned. See also TransactionIdGetGlobalCSN().
  *
  * For global transaction this does nothing as InDoubt state was written
  * earlier.
@@ -692,7 +692,7 @@ void
 GlobalSnapshotPrecommit(PGPROC *proc, TransactionId xid,
 					int nsubxids, TransactionId *subxids)
 {
-	GlobalCSN oldAssignedGlobalCsn = InProgressGlobalCSN;
+	CSN_t oldAssignedGlobalCsn = InProgressGlobalCSN;
 	bool in_progress;
 
 	if (!track_global_snapshots)
@@ -710,7 +710,7 @@ GlobalSnapshotPrecommit(PGPROC *proc, TransactionId xid,
 	}
 	else
 	{
-		/* Otherwise we should have valid GlobalCSN by this time */
+		/* Otherwise we should have valid CSN_t by this time */
 		Assert(GlobalCSNIsNormal(oldAssignedGlobalCsn));
 		/* Also global transaction should already be in InDoubt state */
 		Assert(GlobalCSNIsInDoubt(GlobalCSNLogGetCSN(xid)));
@@ -720,19 +720,19 @@ GlobalSnapshotPrecommit(PGPROC *proc, TransactionId xid,
 /*
  * GlobalSnapshotCommit
  *
- * Write GlobalCSN that were acquired earlier to GlobalCsnLog. Should be
+ * Write CSN_t that were acquired earlier to GlobalCsnLog. Should be
  * preceded by GlobalSnapshotPrecommit() so readers can wait until we finally
  * finished writing to SLRU.
  *
  * Should be called after ProcArrayEndTransaction, but before releasing
  * transaction locks, so that TransactionIdGetGlobalCSN can wait on this
- * lock for GlobalCSN.
+ * lock for CSN_t.
  */
 void
 GlobalSnapshotCommit(PGPROC *proc, TransactionId xid,
 					int nsubxids, TransactionId *subxids)
 {
-	volatile GlobalCSN assigned_global_csn;
+	volatile CSN_t assigned_global_csn;
 
 	if (!track_global_snapshots)
 		return;
@@ -744,7 +744,7 @@ GlobalSnapshotCommit(PGPROC *proc, TransactionId xid,
 		return;
 	}
 
-	/* Finally write resulting GlobalCSN in SLRU */
+	/* Finally write resulting CSN_t in SLRU */
 	assigned_global_csn = pg_atomic_read_u64(&proc->assignedGlobalCsn);
 	Assert(GlobalCSNIsNormal(assigned_global_csn));
 	GlobalCSNLogSetCSN(xid, nsubxids,

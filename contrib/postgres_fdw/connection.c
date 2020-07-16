@@ -79,7 +79,7 @@ typedef struct FdwTransactionState
 {
 	char		*gid;
 	int			nparticipants;
-	GlobalCSN	global_csn;
+	CSN_t	global_csn;
 	bool		two_phase_commit;
 } FdwTransactionState;
 static FdwTransactionState *fdwTransState;
@@ -828,8 +828,8 @@ static bool
 MaxCsnCB(PGresult *result, void *arg)
 {
 	char		   *resp;
-	GlobalCSN	   *max_csn = (GlobalCSN *) arg;
-	GlobalCSN		csn = 0;
+	CSN_t	   *max_csn = (CSN_t *) arg;
+	CSN_t		csn = 0;
 
 	resp = PQgetvalue(result, 0, 0);
 
@@ -874,7 +874,7 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 
 		if (fdwTransState->two_phase_commit)
 		{
-			GlobalCSN	max_csn = InProgressGlobalCSN,
+			CSN_t	max_csn = InProgressGlobalCSN,
 						my_csn = InProgressGlobalCSN;
 			bool	res;
 			char   *sql;

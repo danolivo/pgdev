@@ -2202,7 +2202,7 @@ CommitTransaction(void)
 	ProcArrayEndTransaction(MyProc, latestXid);
 
 	/*
-	 * Stamp our transaction with GlobalCSN in GlobalCsnLog.
+	 * Stamp our transaction with CSN_t in GlobalCsnLog.
 	 * Should be called after ProcArrayEndTransaction, but before releasing
 	 * transaction locks.
 	 */

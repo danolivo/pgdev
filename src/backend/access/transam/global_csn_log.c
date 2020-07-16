@@ -41,7 +41,7 @@ bool track_global_snapshots;
  * and page numbers in TruncateGlobalCSNLog (see GlobalCSNLogPagePrecedes).
  */
 
-/* We store the commit GlobalCSN for each xid */
+/* We store the commit CSN_t for each xid */
 #define GCSNLOG_XACTS_PER_PAGE (BLCKSZ / sizeof(GlobalCSN))
 
 #define TransactionIdToPage(xid)	((xid) / (TransactionId) GCSNLOG_XACTS_PER_PAGE)
@@ -57,8 +57,8 @@ static int	ZeroGlobalCSNLogPage(int pageno);
 static bool GlobalCSNLogPagePrecedes(int page1, int page2);
 static void GlobalCSNLogSetPageStatus(TransactionId xid, int nsubxids,
 									  TransactionId *subxids,
-									  GlobalCSN csn, int pageno);
-static void GlobalCSNLogSetCSNInSlot(TransactionId xid, GlobalCSN csn,
+									  CSN_t csn, int pageno);
+static void GlobalCSNLogSetCSNInSlot(TransactionId xid, CSN_t csn,
 									  int slotno);
 
 /*
@@ -78,7 +78,7 @@ static void GlobalCSNLogSetCSNInSlot(TransactionId xid, GlobalCSN csn,
  */
 void
 GlobalCSNLogSetCSN(TransactionId xid, int nsubxids,
-					 TransactionId *subxids, GlobalCSN csn)
+					 TransactionId *subxids, CSN_t csn)
 {
 	int			pageno;
 	int			i = 0;
@@ -121,7 +121,7 @@ GlobalCSNLogSetCSN(TransactionId xid, int nsubxids,
 static void
 GlobalCSNLogSetPageStatus(TransactionId xid, int nsubxids,
 						   TransactionId *subxids,
-						   GlobalCSN csn, int pageno)
+						   CSN_t csn, int pageno)
 {
 	int			slotno;
 	int			i;
@@ -150,14 +150,14 @@ GlobalCSNLogSetPageStatus(TransactionId xid, int nsubxids,
  * Sets the commit status of a single transaction.
  */
 static void
-GlobalCSNLogSetCSNInSlot(TransactionId xid, GlobalCSN csn, int slotno)
+GlobalCSNLogSetCSNInSlot(TransactionId xid, CSN_t csn, int slotno)
 {
 	int			entryno = TransactionIdToPgIndex(xid);
-	GlobalCSN *ptr;
+	CSN_t *ptr;
 
 	Assert(LWLockHeldByMe(GlobalCSNLogControlLock));
 
-	ptr = (GlobalCSN *) (GlobalCsnlogCtl->shared->page_buffer[slotno] + entryno * sizeof(XLogRecPtr));
+	ptr = (CSN_t *) (GlobalCsnlogCtl->shared->page_buffer[slotno] + entryno * sizeof(XLogRecPtr));
 
 	*ptr = csn;
 }
@@ -169,14 +169,14 @@ GlobalCSNLogSetCSNInSlot(TransactionId xid, GlobalCSN csn, int slotno)
  * for most uses; TransactionIdGetGlobalCSN() in global_snapshot.c is the
  * intended caller.
  */
-GlobalCSN
+CSN_t
 GlobalCSNLogGetCSN(TransactionId xid)
 {
 	int			pageno = TransactionIdToPage(xid);
 	int			entryno = TransactionIdToPgIndex(xid);
 	int			slotno;
-	GlobalCSN *ptr;
-	GlobalCSN	global_csn;
+	CSN_t *ptr;
+	CSN_t	global_csn;
 
 	/* Callers of GlobalCSNLogGetCSN() must check GUC params */
 	Assert(track_global_snapshots);
@@ -187,7 +187,7 @@ GlobalCSNLogGetCSN(TransactionId xid)
 	/* lock is acquired by SimpleLruReadPage_ReadOnly */
 
 	slotno = SimpleLruReadPage_ReadOnly(GlobalCsnlogCtl, pageno, xid);
-	ptr = (GlobalCSN *) (GlobalCsnlogCtl->shared->page_buffer[slotno] + entryno * sizeof(XLogRecPtr));
+	ptr = (CSN_t *) (GlobalCsnlogCtl->shared->page_buffer[slotno] + entryno * sizeof(XLogRecPtr));
 	global_csn = *ptr;
 
 	LWLockRelease(GlobalCSNLogControlLock);

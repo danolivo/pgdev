@@ -15,8 +15,8 @@
 #include "utils/snapshot.h"
 
 extern void GlobalCSNLogSetCSN(TransactionId xid, int nsubxids,
-							   TransactionId *subxids, GlobalCSN csn);
-extern GlobalCSN GlobalCSNLogGetCSN(TransactionId xid);
+							   TransactionId *subxids, CSN_t csn);
+extern CSN_t GlobalCSNLogGetCSN(TransactionId xid);
 
 extern Size GlobalCSNLogShmemSize(void);
 extern void GlobalCSNLogShmemInit(void);

@@ -19,7 +19,7 @@
 #include "utils/guc.h"
 
 /*
- * snapshot.h is used in frontend code so atomic variant of GlobalCSN type
+ * snapshot.h is used in frontend code so atomic variant of CSN_t type
  * is defined here.
  */
 typedef pg_atomic_uint64 GlobalCSN_atomic;
@@ -44,23 +44,23 @@ extern Size GlobalSnapshotShmemSize(void);
 extern void GlobalSnapshotShmemInit(void);
 extern void GlobalSnapshotStartup(TransactionId oldestActiveXID);
 
-extern void GlobalSnapshotMapXmin(GlobalCSN snapshot_global_csn);
-extern TransactionId GlobalSnapshotToXmin(GlobalCSN snapshot_global_csn);
+extern void GlobalSnapshotMapXmin(CSN_t snapshot_global_csn);
+extern TransactionId GlobalSnapshotToXmin(CSN_t snapshot_global_csn);
 
-extern GlobalCSN GlobalSnapshotGenerate(bool locked);
+extern CSN_t GlobalSnapshotGenerate(bool locked);
 
 extern bool XidInvisibleInGlobalSnapshot(TransactionId xid, Snapshot snapshot);
 
-extern void GlobalSnapshotSync(GlobalCSN remote_gcsn);
+extern void GlobalSnapshotSync(CSN_t remote_gcsn);
 
-extern GlobalCSN TransactionIdGetGlobalCSN(TransactionId xid);
+extern CSN_t TransactionIdGetGlobalCSN(TransactionId xid);
 
-extern GlobalCSN GlobalSnapshotPrepareGlobal(const char *gid);
+extern CSN_t GlobalSnapshotPrepareGlobal(const char *gid);
 extern void GlobalSnapshotAssignCsnGlobal(const char *gid,
-										  GlobalCSN global_csn);
+										  CSN_t global_csn);
 
-extern GlobalCSN GlobalSnapshotPrepareCurrent(void);
-extern void GlobalSnapshotAssignCsnCurrent(GlobalCSN global_csn);
+extern CSN_t GlobalSnapshotPrepareCurrent(void);
+extern void GlobalSnapshotAssignCsnCurrent(CSN_t global_csn);
 
 extern void GlobalSnapshotAbort(PGPROC *proc, TransactionId xid, int nsubxids,
 								TransactionId *subxids);

@@ -1494,7 +1494,7 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 	ProcArrayRemove(proc, latestXid);
 
 	/*
-	 * Stamp our transaction with GlobalCSN in GlobalCsnLog.
+	 * Stamp our transaction with CSN_t in GlobalCsnLog.
 	 * Should be called after ProcArrayEndTransaction, but before releasing
 	 * transaction locks, since TransactionIdGetGlobalCSN relies on
 	 * XactLockTableWait to await global_csn.
@@ -2479,7 +2479,7 @@ PrepareRedoRemove(TransactionId xid, bool giveWarning)
  * This function is a counterpart of GlobalSnapshotPrepareCurrent() for
  * twophase transactions.
  */
-static GlobalCSN
+static CSN_t
 GlobalSnapshotPrepareTwophase(const char *gid)
 {
 	GlobalTransaction gxact;
@@ -2532,7 +2532,7 @@ Datum
 pg_global_snapshot_prepare(PG_FUNCTION_ARGS)
 {
 	const char *gid = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	GlobalCSN	global_csn;
+	CSN_t	global_csn;
 
 	global_csn = GlobalSnapshotPrepareTwophase(gid);
 
@@ -2543,7 +2543,7 @@ pg_global_snapshot_prepare(PG_FUNCTION_ARGS)
 /*
  * TwoPhaseAssignGlobalCsn
  *
- * Asign GlobalCSN for currently active transaction. GlobalCSN is supposedly
+ * Asign CSN_t for currently active transaction. CSN_t is supposedly
  * maximal among of values returned by GlobalSnapshotPrepareCurrent and
  * pg_global_snapshot_prepare.
  *
@@ -2551,7 +2551,7 @@ pg_global_snapshot_prepare(PG_FUNCTION_ARGS)
  * twophase transactions.
  */
 static void
-GlobalSnapshotAssignCsnTwoPhase(const char *gid, GlobalCSN global_csn)
+GlobalSnapshotAssignCsnTwoPhase(const char *gid, CSN_t global_csn)
 {
 	GlobalTransaction gxact;
 	PGPROC	   *proc;
@@ -2593,7 +2593,7 @@ Datum
 pg_global_snapshot_assign(PG_FUNCTION_ARGS)
 {
 	const char *gid = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	GlobalCSN	global_csn = PG_GETARG_INT64(1);
+	CSN_t	global_csn = PG_GETARG_INT64(1);
 
 	GlobalSnapshotAssignCsnTwoPhase(gid, global_csn);
 	PG_RETURN_VOID();

@@ -1564,7 +1564,7 @@ GetSnapshotData(Snapshot snapshot)
 	int			count = 0;
 	int			subcount = 0;
 	bool		suboverflowed = false;
-	GlobalCSN	global_csn = FrozenGlobalCSN;
+	CSN_t	global_csn = FrozenGlobalCSN;
 	TransactionId replication_slot_xmin = InvalidTransactionId;
 	TransactionId replication_slot_catalog_xmin = InvalidTransactionId;
 	TransactionId global_snapshot_xmin = InvalidTransactionId;
@@ -1765,7 +1765,7 @@ GetSnapshotData(Snapshot snapshot)
 		MyPgXact->xmin = TransactionXmin = xmin;
 
 	/*
-	 * Take GlobalCSN under ProcArrayLock so the local/global snapshot stays
+	 * Take CSN_t under ProcArrayLock so the local/global snapshot stays
 	 * synchronized.
 	 */
 	if (track_global_snapshots)
