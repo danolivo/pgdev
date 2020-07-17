@@ -127,8 +127,8 @@ extern void AtSubCommit_Snapshot(int level);
 extern void AtSubAbort_Snapshot(int level);
 extern void AtEOXact_Snapshot(bool isCommit, bool resetXmin);
 
-extern CSN_t ExportGlobalSnapshot(void);
-extern void ImportGlobalSnapshot(CSN_t snap_global_csn);
+extern CSN_t ExportCSNSnapshot(void);
+extern void ImportCSNSnapshot(CSN_t snap_csn);
 
 extern void ImportSnapshot(const char *idstr);
 extern bool XactHasExportedSnapshots(void);

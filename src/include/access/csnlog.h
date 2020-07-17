@@ -1,12 +1,12 @@
 /*
- * global_csn_log.h
+ * csnlog.h
  *
  * Commit-Sequence-Number log.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2020, PostgreSQL  Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * src/include/access/global_csn_log.h
+ * src/include/access/csnlog.h
  */
 #ifndef CSNLOG_H
 #define CSNLOG_H
@@ -32,19 +32,19 @@ typedef struct xl_csn_set
 	TransactionId	xsub[FLEXIBLE_ARRAY_MEMBER];	/* assigned subxids */
 } xl_csn_set;
 
-extern void GlobalCSNLogSetCSN(TransactionId xid, int nsubxids,
+extern void CSNLogSetCSN(TransactionId xid, int nsubxids,
 							   TransactionId *subxids, CSN_t csn,
 							   bool write_xlog);
-extern CSN_t GlobalCSNLogGetCSN(TransactionId xid);
+extern CSN_t CSNLogGetCSN(TransactionId xid);
 
-extern Size GlobalCSNLogShmemSize(void);
-extern void GlobalCSNLogShmemInit(void);
-extern void BootStrapGlobalCSNLog(void);
-extern void StartupGlobalCSNLog(TransactionId oldestActiveXID);
-extern void ShutdownGlobalCSNLog(void);
-extern void CheckPointGlobalCSNLog(void);
-extern void ExtendGlobalCSNLog(TransactionId newestXact);
-extern void TruncateGlobalCSNLog(TransactionId oldestXact);
+extern Size CSNLogShmemSize(void);
+extern void CSNLogShmemInit(void);
+extern void BootStrapCSNLog(void);
+extern void StartupCSNLog(TransactionId oldestActiveXID);
+extern void ShutdownCSNLog(void);
+extern void CheckPointCSNLog(void);
+extern void ExtendCSNLog(TransactionId newestXact);
+extern void TruncateCSNLog(TransactionId oldestXact);
 
 extern void csnlog_redo(XLogReaderState *record);
 extern void csnlog_desc(StringInfo buf, XLogReaderState *record);

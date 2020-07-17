@@ -31,7 +31,7 @@
 
 #include "access/commit_ts.h"
 #include "access/gin.h"
-#include "access/global_snapshot.h"
+#include "access/csn_snapshot.h"
 #include "access/rmgr.h"
 #include "access/tableam.h"
 #include "access/transam.h"
@@ -1160,11 +1160,11 @@ static struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
-		{"track_global_snapshots", PGC_POSTMASTER, RESOURCES_MEM,
+		{"enable_csn_snapshot", PGC_POSTMASTER, RESOURCES_MEM,
 			gettext_noop("Enable global snapshot tracking."),
 			gettext_noop("Used to achieve REPEATEBLE READ isolation level for postgres_fdw transactions.")
 		},
-		&track_global_snapshots,
+		&enable_csn_snapshot,
 		false, /* XXX: Seems that RESOURCES_MEM isn't the best catagory */
 		NULL, NULL, NULL
 	},
@@ -2455,11 +2455,11 @@ static struct config_int ConfigureNamesInt[] =
 	},
 
 	{
-		{"global_snapshot_defer_time", PGC_POSTMASTER, REPLICATION_MASTER,
+		{"csn_snapshot_defer_time", PGC_POSTMASTER, REPLICATION_MASTER,
 			gettext_noop("Minimal age of records which allowed to be vacuumed, in seconds."),
 			NULL
 		},
-		&global_snapshot_defer_time,
+		&csn_snapshot_defer_time,
 		5, 0, INT_MAX,
 		NULL, NULL, NULL
 	},

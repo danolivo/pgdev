@@ -24,7 +24,7 @@
 
 #include "access/clog.h"
 #include "access/commit_ts.h"
-#include "access/global_csn_log.h"
+#include "access/csnlog.h"
 #include "access/heaptoast.h"
 #include "access/multixact.h"
 #include "access/rewriteheap.h"
@@ -4607,6 +4607,7 @@ InitControlFile(uint64 sysidentifier)
 	ControlFile->wal_level = wal_level;
 	ControlFile->wal_log_hints = wal_log_hints;
 	ControlFile->track_commit_timestamp = track_commit_timestamp;
+	ControlFile->enable_csn_snapshot = enable_csn_snapshot;
 	ControlFile->data_checksum_version = bootstrap_data_checksum_version;
 }
 
@@ -5346,7 +5347,7 @@ BootStrapXLOG(void)
 
 	/* Bootstrap the commit log, too */
 	BootStrapCLOG();
-	BootStrapGlobalCSNLog();
+	BootStrapCSNLog();
 	BootStrapCommitTs();
 	BootStrapSUBTRANS();
 	BootStrapMultiXact();
@@ -7064,9 +7065,9 @@ StartupXLOG(void)
 			 * maintained during recovery and need not be started yet.
 			 */
 			StartupCLOG();
-			StartupGlobalCSNLog(oldestActiveXID);
+			StartupCSNLog(oldestActiveXID);
 			StartupSUBTRANS(oldestActiveXID);
-			GlobalSnapshotStartup(oldestActiveXID);
+			CSNSnapshotStartup(oldestActiveXID);
 
 			/*
 			 * If we're beginning at a shutdown checkpoint, we know that
@@ -7883,9 +7884,9 @@ StartupXLOG(void)
 	if (standbyState == STANDBY_DISABLED)
 	{
 		StartupCLOG();
-		StartupGlobalCSNLog(oldestActiveXID);
+		StartupCSNLog(oldestActiveXID);
 		StartupSUBTRANS(oldestActiveXID);
-		GlobalSnapshotStartup(oldestActiveXID);
+		CSNSnapshotStartup(oldestActiveXID);
 	}
 
 	/*
@@ -8533,7 +8534,7 @@ ShutdownXLOG(int code, Datum arg)
 		CreateCheckPoint(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_IMMEDIATE);
 	}
 	ShutdownCLOG();
-	ShutdownGlobalCSNLog();
+	ShutdownCSNLog();
 	ShutdownCommitTs();
 	ShutdownSUBTRANS();
 	ShutdownMultiXact();
@@ -9184,7 +9185,7 @@ static void
 CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 {
 	CheckPointCLOG();
-	CheckPointGlobalCSNLog();
+	CheckPointCSNLog();
 	CheckPointCommitTs();
 	CheckPointSUBTRANS();
 	CheckPointMultiXact();
@@ -9742,7 +9743,8 @@ XLogReportParameters(void)
 		max_wal_senders != ControlFile->max_wal_senders ||
 		max_prepared_xacts != ControlFile->max_prepared_xacts ||
 		max_locks_per_xact != ControlFile->max_locks_per_xact ||
-		track_commit_timestamp != ControlFile->track_commit_timestamp)
+		track_commit_timestamp != ControlFile->track_commit_timestamp ||
+		enable_csn_snapshot != ControlFile->enable_csn_snapshot)
 	{
 		/*
 		 * The change in number of backend slots doesn't need to be WAL-logged
@@ -9764,6 +9766,7 @@ XLogReportParameters(void)
 			xlrec.wal_level = wal_level;
 			xlrec.wal_log_hints = wal_log_hints;
 			xlrec.track_commit_timestamp = track_commit_timestamp;
+			xlrec.enable_csn_snapshot = enable_csn_snapshot;
 
 			XLogBeginInsert();
 			XLogRegisterData((char *) &xlrec, sizeof(xlrec));
@@ -9774,6 +9777,9 @@ XLogReportParameters(void)
 
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 
+		if (enable_csn_snapshot != ControlFile->enable_csn_snapshot)
+			set_xmin_for_csn();
+
 		ControlFile->MaxConnections = MaxConnections;
 		ControlFile->max_worker_processes = max_worker_processes;
 		ControlFile->max_wal_senders = max_wal_senders;
@@ -9782,6 +9788,7 @@ XLogReportParameters(void)
 		ControlFile->wal_level = wal_level;
 		ControlFile->wal_log_hints = wal_log_hints;
 		ControlFile->track_commit_timestamp = track_commit_timestamp;
+		ControlFile->enable_csn_snapshot = enable_csn_snapshot;
 		UpdateControlFile();
 
 		LWLockRelease(ControlFileLock);
@@ -10214,6 +10221,7 @@ xlog_redo(XLogReaderState *record)
 		CommitTsParameterChange(xlrec.track_commit_timestamp,
 								ControlFile->track_commit_timestamp);
 		ControlFile->track_commit_timestamp = xlrec.track_commit_timestamp;
+		ControlFile->enable_csn_snapshot = xlrec.enable_csn_snapshot;
 
 		UpdateControlFile();
 		LWLockRelease(ControlFileLock);

@@ -301,7 +301,7 @@ typedef struct
 	List	   *already_used;	/* expressions already dealt with */
 } ec_member_foreign_arg;
 
-bool		UseGlobalSnapshots;
+bool		UseCSNSnapshots;
 void		_PG_init(void);
 
 /*
@@ -6593,6 +6593,6 @@ _PG_init(void)
 {
 	DefineCustomBoolVariable("postgres_fdw.use_global_snapshots",
 							 "Use global snapshots for FDW transactions", NULL,
-							 &UseGlobalSnapshots, false, PGC_USERSET, 0, NULL,
+							 &UseCSNSnapshots, false, PGC_USERSET, 0, NULL,
 							 NULL, NULL);
 }

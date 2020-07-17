@@ -21,7 +21,7 @@
 
 
 typedef uint64 CSN_t;
-extern bool track_global_snapshots;
+extern bool enable_csn_snapshot;
 
 /*
  * The different snapshot types.  We use SnapshotData structures to represent
@@ -206,12 +206,12 @@ typedef struct SnapshotData
 	XLogRecPtr	lsn;			/* position in the WAL stream when taken */
 
 	/*
-	 * GlobalCSN for cross-node snapshot isolation support.
-	 * Will be used only if track_global_snapshots is enabled.
+	 * CSN for cross-node snapshot isolation support.
+	 * Will be used only if enable_csn_snapshot is enabled.
 	 */
-	CSN_t	global_csn;
-	/* Did we have our own global_csn or imported one from different node */
-	bool		imported_global_csn;
+	CSN_t	csn;
+	/* Did we have our own csn or imported one from different node */
+	bool		imported_csn;
 } SnapshotData;
 
 #endif							/* SNAPSHOT_H */

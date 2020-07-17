@@ -77,8 +77,8 @@
 #include <unistd.h>
 
 #include "access/commit_ts.h"
-#include "access/global_snapshot.h"
-#include "access/global_csn_log.h"
+#include "access/csn_snapshot.h"
+#include "access/csnlog.h"
 #include "access/htup_details.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
@@ -1482,13 +1482,13 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 									   gid);
 
 	/*
-	 * GlobalSnapshot callbacks that should be called right before we are
+	 * CSNSnapshot callbacks that should be called right before we are
 	 * going to become visible. Details in comments to this functions.
 	 */
 	if (isCommit)
-		GlobalSnapshotPrecommit(proc, xid, hdr->nsubxacts, children);
+		CSNSnapshotPrecommit(proc, xid, hdr->nsubxacts, children);
 	else
-		GlobalSnapshotAbort(proc, xid, hdr->nsubxacts, children);
+		CSNSnapshotAbort(proc, xid, hdr->nsubxacts, children);
 
 
 	ProcArrayRemove(proc, latestXid);
@@ -1496,17 +1496,17 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 	/*
 	 * Stamp our transaction with CSN_t in GlobalCsnLog.
 	 * Should be called after ProcArrayEndTransaction, but before releasing
-	 * transaction locks, since TransactionIdGetGlobalCSN relies on
-	 * XactLockTableWait to await global_csn.
+	 * transaction locks, since TransactionIdGetCSN relies on
+	 * XactLockTableWait to await csn.
 	 */
 	if (isCommit)
 	{
-		GlobalSnapshotCommit(proc, xid, hdr->nsubxacts, children);
+		CSNSnapshotCommit(proc, xid, hdr->nsubxacts, children);
 	}
 	else
 	{
-		Assert(GlobalCSNIsInProgress(
-				   pg_atomic_read_u64(&proc->assignedGlobalCsn)));
+		Assert(CSNIsInProgress(
+				   pg_atomic_read_u64(&proc->assignedCSN)));
 	}
 
 	/*
@@ -2471,16 +2471,16 @@ PrepareRedoRemove(TransactionId xid, bool giveWarning)
 }
 
 /*
- * GlobalSnapshotPrepareTwophase
+ * CSNSnapshotPrepareTwophase
  *
  * Set InDoubt state for currently active transaction and return commit's
  * global snapshot.
  *
- * This function is a counterpart of GlobalSnapshotPrepareCurrent() for
+ * This function is a counterpart of CSNSnapshotPrepareCurrent() for
  * twophase transactions.
  */
 static CSN_t
-GlobalSnapshotPrepareTwophase(const char *gid)
+CSNSnapshotPrepareTwophase(const char *gid)
 {
 	GlobalTransaction gxact;
 	PGXACT	   *pgxact;
@@ -2488,12 +2488,12 @@ GlobalSnapshotPrepareTwophase(const char *gid)
 	TransactionId xid;
 	xl_xact_parsed_prepare parsed;
 
-	if (!track_global_snapshots)
+	if (!enable_csn_snapshot)
 		ereport(ERROR,
 			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				errmsg("could not prepare transaction for global commit"),
 				errhint("Make sure the configuration parameter \"%s\" is enabled.",
-						"track_global_snapshots")));
+						"enable_csn_snapshot")));
 
 	/*
 	 * Validate the GID, and lock the GXACT to ensure that two backends do not
@@ -2510,8 +2510,8 @@ GlobalSnapshotPrepareTwophase(const char *gid)
 
 	ParsePrepareRecord(0, (xl_xact_prepare *) buf, &parsed);
 
-	GlobalCSNLogSetCSN(xid, parsed.nsubxacts,
-					parsed.subxacts, InDoubtGlobalCSN, false);
+	CSNLogSetCSN(xid, parsed.nsubxacts,
+					parsed.subxacts, InDoubtCSN, false);
 
 	/* Unlock our GXACT */
 	LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
@@ -2520,23 +2520,23 @@ GlobalSnapshotPrepareTwophase(const char *gid)
 
 	pfree(buf);
 
-	return GlobalSnapshotGenerate(false);
+	return CSNSnapshotGenerate(false);
 }
 
 /*
- * SQL interface to GlobalSnapshotPrepareTwophase()
+ * SQL interface to CSNSnapshotPrepareTwophase()
  *
  * TODO: Rewrite this as PREPARE TRANSACTION 'gid' RETURNING SNAPSHOT
  */
 Datum
-pg_global_snapshot_prepare(PG_FUNCTION_ARGS)
+pg_csn_snapshot_prepare(PG_FUNCTION_ARGS)
 {
 	const char *gid = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	CSN_t	global_csn;
+	CSN_t	csn;
 
-	global_csn = GlobalSnapshotPrepareTwophase(gid);
+	csn = CSNSnapshotPrepareTwophase(gid);
 
-	PG_RETURN_INT64(global_csn);
+	PG_RETURN_INT64(csn);
 }
 
 
@@ -2544,29 +2544,29 @@ pg_global_snapshot_prepare(PG_FUNCTION_ARGS)
  * TwoPhaseAssignGlobalCsn
  *
  * Asign CSN_t for currently active transaction. CSN_t is supposedly
- * maximal among of values returned by GlobalSnapshotPrepareCurrent and
- * pg_global_snapshot_prepare.
+ * maximal among of values returned by CSNSnapshotPrepareCurrent and
+ * pg_csn_snapshot_prepare.
  *
- * This function is a counterpart of GlobalSnapshotAssignCsnCurrent() for
+ * This function is a counterpart of CSNSnapshotAssignCurrent() for
  * twophase transactions.
  */
 static void
-GlobalSnapshotAssignCsnTwoPhase(const char *gid, CSN_t global_csn)
+CSNSnapshotAssignTwoPhase(const char *gid, CSN_t csn)
 {
 	GlobalTransaction gxact;
 	PGPROC	   *proc;
 
-	if (!track_global_snapshots)
+	if (!enable_csn_snapshot)
 		ereport(ERROR,
 			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				errmsg("could not prepare transaction for global commit"),
 				errhint("Make sure the configuration parameter \"%s\" is enabled.",
-						"track_global_snapshots")));
+						"enable_csn_snapshot")));
 
-	if (!GlobalCSNIsNormal(global_csn))
+	if (!CSNIsNormal(csn))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("pg_global_snapshot_assign expects normal global_csn")));
+				 errmsg("pg_csn_snapshot_assign expects normal csn")));
 
 	/*
 	 * Validate the GID, and lock the GXACT to ensure that two backends do not
@@ -2575,8 +2575,8 @@ GlobalSnapshotAssignCsnTwoPhase(const char *gid, CSN_t global_csn)
 	gxact = LockGXact(gid, GetUserId());
 	proc = &ProcGlobal->allProcs[gxact->pgprocno];
 
-	/* Set global_csn and defuse ProcArrayRemove from assigning one. */
-	pg_atomic_write_u64(&proc->assignedGlobalCsn, global_csn);
+	/* Set csn and defuse ProcArrayRemove from assigning one. */
+	pg_atomic_write_u64(&proc->assignedCSN, csn);
 
 	/* Unlock our GXACT */
 	LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
@@ -2585,16 +2585,16 @@ GlobalSnapshotAssignCsnTwoPhase(const char *gid, CSN_t global_csn)
 }
 
 /*
- * SQL interface to GlobalSnapshotAssignCsnTwoPhase()
+ * SQL interface to CSNSnapshotAssignTwoPhase()
  *
- * TODO: Rewrite this as COMMIT PREPARED 'gid' SNAPSHOT 'global_csn'
+ * TODO: Rewrite this as COMMIT PREPARED 'gid' SNAPSHOT 'csn'
  */
 Datum
-pg_global_snapshot_assign(PG_FUNCTION_ARGS)
+pg_csn_snapshot_assign(PG_FUNCTION_ARGS)
 {
 	const char *gid = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	CSN_t	global_csn = PG_GETARG_INT64(1);
+	CSN_t	csn = PG_GETARG_INT64(1);
 
-	GlobalSnapshotAssignCsnTwoPhase(gid, global_csn);
+	CSNSnapshotAssignTwoPhase(gid, csn);
 	PG_RETURN_VOID();
 }

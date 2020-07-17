@@ -15,7 +15,7 @@
 #define _PROC_H_
 
 #include "access/clog.h"
-#include "access/global_snapshot.h"
+#include "access/csn_snapshot.h"
 #include "access/xlogdefs.h"
 #include "lib/ilist.h"
 #include "utils/snapshot.h"
@@ -215,13 +215,13 @@ struct PGPROC
 	dlist_node	lockGroupLink;	/* my member link, if I'm a member */
 
 	/*
-	 * assignedGlobalCsn holds CSN_t for this transaction.  It is generated
-	 * under a ProcArray lock and later is writter to a GlobalCSNLog.  This
+	 * assignedCSN holds CSN_t for this transaction.  It is generated
+	 * under a ProcArray lock and later is writter to a CSNLog.  This
 	 * variable defined as atomic only for case of group commit, in all other
 	 * scenarios only backend responsible for this proc entry is working with
 	 * this variable.
 	 */
-	GlobalCSN_atomic assignedGlobalCsn;
+	CSN_atomic assignedCSN;
 
 	/* Original xmin of this backend before global snapshot was imported */
 	TransactionId originalXmin;

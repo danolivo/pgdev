@@ -21,7 +21,7 @@
 #include <unistd.h>
 
 #include "access/commit_ts.h"
-#include "access/global_snapshot.h"
+#include "access/csn_snapshot.h"
 #include "access/multixact.h"
 #include "access/parallel.h"
 #include "access/subtrans.h"
@@ -1444,7 +1444,7 @@ RecordTransactionCommit(void)
 	 * commit.
 	 */
 	if (markXidCommitted)
-		GlobalSnapshotPrecommit(MyProc, xid, nchildren, children);
+		CSNSnapshotPrecommit(MyProc, xid, nchildren, children);
 
 cleanup:
 	/* Clean up local data */
@@ -1710,7 +1710,7 @@ RecordTransactionAbort(bool isSubXact)
 	/*
 	 * Mark our transaction as Aborted in GlobalCsnLog.
 	 */
-	GlobalSnapshotAbort(MyProc, xid, nchildren, children);
+	CSNSnapshotAbort(MyProc, xid, nchildren, children);
 
 	END_CRIT_SECTION();
 
@@ -2213,7 +2213,7 @@ CommitTransaction(void)
 		int			   nsubxids;
 
 		nsubxids = xactGetCommittedChildren(&subxids);
-		GlobalSnapshotCommit(MyProc, xid, nsubxids, subxids);
+		CSNSnapshotCommit(MyProc, xid, nsubxids, subxids);
 	}
 
 	/*

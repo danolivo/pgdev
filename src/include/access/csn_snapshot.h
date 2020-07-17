@@ -51,12 +51,13 @@ extern CSN_t CSNSnapshotGenerate(bool locked);
 
 extern bool XidInvisibleInCSNSnapshot(TransactionId xid, Snapshot snapshot);
 
-extern void CSNSnapshotSync(CSN_t remote_csn);
+extern void CSNSnapshotSync(CSN_t remote_gcsn);
 
 extern CSN_t TransactionIdGetCSN(TransactionId xid);
 
 extern CSN_t SnapshotPrepare(const char *gid);
-extern void SnapshotAssignCsn(const char *gid, CSN_t csn);
+extern void SnapshotAssignCsn(const char *gid,
+										  CSN_t csn);
 
 extern CSN_t CSNSnapshotPrepareCurrent(void);
 extern void CSNSnapshotAssignCurrent(CSN_t csn);

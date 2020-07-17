@@ -11,7 +11,7 @@ $master->append_conf('postgresql.conf', qq(
 	max_prepared_transactions = 30
 	log_checkpoints = true
 	postgres_fdw.use_global_snapshots = on
-	track_global_snapshots = on
+	enable_csn_snapshot = on
 	default_transaction_isolation = 'REPEATABLE READ'
 ));
 $master->start;
@@ -20,8 +20,8 @@ my $shard1 = get_new_node("shard1");
 $shard1->init;
 $shard1->append_conf('postgresql.conf', qq(
 	max_prepared_transactions = 30
-	global_snapshot_defer_time = 15
-	track_global_snapshots = on
+	csn_snapshot_defer_time = 15
+	enable_csn_snapshot = on
 ));
 $shard1->start;
 
@@ -29,8 +29,8 @@ my $shard2 = get_new_node("shard2");
 $shard2->init;
 $shard2->append_conf('postgresql.conf', qq(
 	max_prepared_transactions = 30
-	global_snapshot_defer_time = 15
-	track_global_snapshots = on
+	csn_snapshot_defer_time = 15
+	enable_csn_snapshot = on
 ));
 $shard2->start;
 

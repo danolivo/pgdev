@@ -221,7 +221,7 @@ static const char *const subdirs[] = {
 	"pg_logical",
 	"pg_logical/snapshots",
 	"pg_logical/mappings",
-	"pg_global_csn"
+	"pg_csn"
 };
 
 

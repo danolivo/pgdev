@@ -12,7 +12,7 @@
  */
 #include "postgres.h"
 
-#include "access/global_snapshot.h"
+#include "access/csn_snapshot.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "access/xlog.h" /* GetSystemIdentifier() */
@@ -79,7 +79,7 @@ typedef struct FdwTransactionState
 {
 	char		*gid;
 	int			nparticipants;
-	CSN_t	global_csn;
+	CSN_t		csn;
 	bool		two_phase_commit;
 } FdwTransactionState;
 static FdwTransactionState *fdwTransState;
@@ -519,7 +519,7 @@ begin_remote_xact(ConnCacheEntry *entry)
 		elog(DEBUG3, "starting remote transaction on connection %p",
 			 entry->conn);
 
-		if (UseGlobalSnapshots && (!IsolationUsesXactSnapshot() ||
+		if (UseCSNSnapshots && (!IsolationUsesXactSnapshot() ||
 								   IsolationIsSerializable()))
 			elog(ERROR, "Global snapshots support only REPEATABLE READ");
 
@@ -532,17 +532,17 @@ begin_remote_xact(ConnCacheEntry *entry)
 		entry->xact_depth = 1;
 		entry->changing_xact_state = false;
 
-		if (UseGlobalSnapshots)
+		if (UseCSNSnapshots)
 		{
 			char import_sql[128];
 
 			/* Export our snapshot */
-			if (fdwTransState->global_csn == 0)
-				fdwTransState->global_csn = ExportGlobalSnapshot();
+			if (fdwTransState->csn == 0)
+				fdwTransState->csn = ExportCSNSnapshot();
 
 			snprintf(import_sql, sizeof(import_sql),
-				"SELECT pg_global_snapshot_import("UINT64_FORMAT")",
-				fdwTransState->global_csn);
+				"SELECT pg_csn_snapshot_import("UINT64_FORMAT")",
+				fdwTransState->csn);
 
 			do_sql_command(entry->conn, import_sql);
 		}
@@ -869,13 +869,13 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 		}
 
 		/* Switch to 2PC mode there were more than one participant */
-		if (UseGlobalSnapshots && fdwTransState->nparticipants > 1)
+		if (UseCSNSnapshots && fdwTransState->nparticipants > 1)
 			fdwTransState->two_phase_commit = true;
 
 		if (fdwTransState->two_phase_commit)
 		{
-			CSN_t	max_csn = InProgressGlobalCSN,
-						my_csn = InProgressGlobalCSN;
+			CSN_t	max_csn = InProgressCSN,
+						my_csn = InProgressCSN;
 			bool	res;
 			char   *sql;
 
@@ -893,11 +893,11 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 			if (!res)
 				goto error;
 
-			/* Broadcast pg_global_snapshot_prepare() */
+			/* Broadcast pg_csn_snapshot_prepare() */
 			if (include_local_tx)
-				my_csn = GlobalSnapshotPrepareCurrent();
+				my_csn = CSNSnapshotPrepareCurrent();
 
-			sql = psprintf("SELECT pg_global_snapshot_prepare('%s')",
+			sql = psprintf("SELECT pg_csn_snapshot_prepare('%s')",
 														fdwTransState->gid);
 			res = BroadcastStmt(sql, PGRES_TUPLES_OK, MaxCsnCB, &max_csn);
 			if (!res)
@@ -907,10 +907,10 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 			if (include_local_tx && my_csn > max_csn)
 				max_csn = my_csn;
 
-			/* Broadcast pg_global_snapshot_assign() */
+			/* Broadcast pg_csn_snapshot_assign() */
 			if (include_local_tx)
-				GlobalSnapshotAssignCsnCurrent(max_csn);
-			sql = psprintf("SELECT pg_global_snapshot_assign('%s',"UINT64_FORMAT")",
+				CSNSnapshotAssignCurrent(max_csn);
+			sql = psprintf("SELECT pg_csn_snapshot_assign('%s',"UINT64_FORMAT")",
 							fdwTransState->gid, max_csn);
 			res = BroadcastFunc(sql);
 

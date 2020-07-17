@@ -16,13 +16,13 @@
 
 #include "access/clog.h"
 #include "access/commit_ts.h"
-#include "access/global_csn_log.h"
+#include "access/csnlog.h"
 #include "access/heapam.h"
 #include "access/multixact.h"
 #include "access/nbtree.h"
 #include "access/subtrans.h"
 #include "access/twophase.h"
-#include "access/global_snapshot.h"
+#include "access/csn_snapshot.h"
 #include "commands/async.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -127,7 +127,7 @@ CreateSharedMemoryAndSemaphores(void)
 		size = add_size(size, ProcGlobalShmemSize());
 		size = add_size(size, XLOGShmemSize());
 		size = add_size(size, CLOGShmemSize());
-		size = add_size(size, GlobalCSNLogShmemSize());
+		size = add_size(size, CSNLogShmemSize());
 		size = add_size(size, CommitTsShmemSize());
 		size = add_size(size, SUBTRANSShmemSize());
 		size = add_size(size, TwoPhaseShmemSize());
@@ -146,7 +146,7 @@ CreateSharedMemoryAndSemaphores(void)
 		size = add_size(size, WalSndShmemSize());
 		size = add_size(size, WalRcvShmemSize());
 		size = add_size(size, ApplyLauncherShmemSize());
-		size = add_size(size, GlobalSnapshotShmemSize());
+		size = add_size(size, CSNSnapshotShmemSize());
 		size = add_size(size, SnapMgrShmemSize());
 		size = add_size(size, BTreeShmemSize());
 		size = add_size(size, SyncScanShmemSize());
@@ -217,7 +217,7 @@ CreateSharedMemoryAndSemaphores(void)
 	 */
 	XLOGShmemInit();
 	CLOGShmemInit();
-	GlobalCSNLogShmemInit();
+	CSNLogShmemInit();
 	CommitTsShmemInit();
 	SUBTRANSShmemInit();
 	MultiXactShmemInit();
@@ -268,7 +268,7 @@ CreateSharedMemoryAndSemaphores(void)
 	BTreeShmemInit();
 	SyncScanShmemInit();
 	AsyncShmemInit();
-	GlobalSnapshotShmemInit();
+	CSNSnapshotShmemInit();
 
 #ifdef EXEC_BACKEND
 

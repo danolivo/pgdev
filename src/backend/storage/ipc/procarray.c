@@ -46,8 +46,8 @@
 #include <signal.h>
 
 #include "access/clog.h"
-#include "access/global_csn_log.h"
-#include "access/global_snapshot.h"
+#include "access/csnlog.h"
+#include "access/csn_snapshot.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/twophase.h"
@@ -361,13 +361,13 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
 		/*
 		 * Assign global csn while holding ProcArrayLock for non-global
 		 * COMMIT PREPARED. After lock is released consequent
-		 * GlobalSnapshotCommit() will write this value to GlobalCsnLog.
+		 * CSNSnapshotCommit() will write this value to GlobalCsnLog.
 		 *
-		 * In case of global commit proc->assignedGlobalCsn is already set
+		 * In case of global commit proc->assignedCSN is already set
 		 * by prior AssignGlobalCsn().
 		 */
-		if (GlobalCSNIsInDoubt(pg_atomic_read_u64(&proc->assignedGlobalCsn)))
-			pg_atomic_write_u64(&proc->assignedGlobalCsn, GlobalSnapshotGenerate(false));
+		if (CSNIsInDoubt(pg_atomic_read_u64(&proc->assignedCSN)))
+			pg_atomic_write_u64(&proc->assignedCSN, CSNSnapshotGenerate(false));
 	}
 	else
 	{
@@ -490,17 +490,17 @@ ProcArrayEndTransactionInternal(PGPROC *proc, PGXACT *pgxact,
 
 	/*
 	 * Assign global csn while holding ProcArrayLock for non-global
-	 * COMMIT. After lock is released consequent GlobalSnapshotFinish() will
+	 * COMMIT. After lock is released consequent CSNSnapshotFinish() will
 	 * write this value to GlobalCsnLog.
 	 *
-	 * In case of global commit MyProc->assignedGlobalCsn is already set
+	 * In case of global commit MyProc->assignedCSN is already set
 	 * by prior AssignGlobalCsn().
 	 *
-	 * TODO: in case of group commit we can generate one GlobalSnapshot for
+	 * TODO: in case of group commit we can generate one CSNSnapshot for
 	 * whole group to save time on timestamp aquisition.
 	 */
-	if (GlobalCSNIsInDoubt(pg_atomic_read_u64(&proc->assignedGlobalCsn)))
-		pg_atomic_write_u64(&proc->assignedGlobalCsn, GlobalSnapshotGenerate(false));
+	if (CSNIsInDoubt(pg_atomic_read_u64(&proc->assignedCSN)))
+		pg_atomic_write_u64(&proc->assignedCSN, CSNSnapshotGenerate(false));
 }
 
 /*
@@ -868,7 +868,7 @@ ProcArrayApplyRecoveryInfo(RunningTransactions running)
 	while (TransactionIdPrecedes(latestObservedXid, running->nextXid))
 	{
 		ExtendSUBTRANS(latestObservedXid);
-		ExtendGlobalCSNLog(latestObservedXid);
+		ExtendCSNLog(latestObservedXid);
 		TransactionIdAdvance(latestObservedXid);
 	}
 	TransactionIdRetreat(latestObservedXid);	/* = running->nextXid - 1 */
@@ -1400,9 +1400,9 @@ GetOldestXmin(Relation rel, int flags)
 			 * have an Xmin but not (yet) an Xid; conversely, if it has an
 			 * Xid, that could determine some not-yet-set Xmin.
 			 *
-			 * In case of oldestXmin calculation for GlobalSnapshotMapXmin()
+			 * In case of oldestXmin calculation for CSNSnapshotMapXmin()
 			 * pgxact->xmin should be changed to proc->originalXmin. Details
-			 * in commets to GlobalSnapshotMapXmin.
+			 * in commets to CSNSnapshotMapXmin.
 			 */
 			if ((flags & PROCARRAY_NON_IMPORTED_XMIN) &&
 					TransactionIdIsValid(original_xmin))
@@ -1423,7 +1423,7 @@ GetOldestXmin(Relation rel, int flags)
 	 */
 	replication_slot_xmin = procArray->replication_slot_xmin;
 	replication_slot_catalog_xmin = procArray->replication_slot_catalog_xmin;
-	global_snapshot_xmin = ProcArrayGetGlobalSnapshotXmin();
+	global_snapshot_xmin = ProcArrayGetCSNSnapshotXmin();
 
 	if (RecoveryInProgress())
 	{
@@ -1564,7 +1564,7 @@ GetSnapshotData(Snapshot snapshot)
 	int			count = 0;
 	int			subcount = 0;
 	bool		suboverflowed = false;
-	CSN_t	global_csn = FrozenGlobalCSN;
+	CSN_t	csn = FrozenCSN;
 	TransactionId replication_slot_xmin = InvalidTransactionId;
 	TransactionId replication_slot_catalog_xmin = InvalidTransactionId;
 	TransactionId global_snapshot_xmin = InvalidTransactionId;
@@ -1759,7 +1759,7 @@ GetSnapshotData(Snapshot snapshot)
 	 */
 	replication_slot_xmin = procArray->replication_slot_xmin;
 	replication_slot_catalog_xmin = procArray->replication_slot_catalog_xmin;
-	global_snapshot_xmin = ProcArrayGetGlobalSnapshotXmin();
+	global_snapshot_xmin = ProcArrayGetCSNSnapshotXmin();
 
 	if (!TransactionIdIsValid(MyPgXact->xmin))
 		MyPgXact->xmin = TransactionXmin = xmin;
@@ -1768,8 +1768,8 @@ GetSnapshotData(Snapshot snapshot)
 	 * Take CSN_t under ProcArrayLock so the local/global snapshot stays
 	 * synchronized.
 	 */
-	if (!snapshot->takenDuringRecovery && track_global_snapshots)
-		global_csn = GlobalSnapshotGenerate(false);
+	if (!snapshot->takenDuringRecovery && enable_csn_snapshot)
+		csn = CSNSnapshotGenerate(false);
 
 	LWLockRelease(ProcArrayLock);
 
@@ -1786,7 +1786,7 @@ GetSnapshotData(Snapshot snapshot)
 	if (!TransactionIdIsNormal(RecentGlobalXmin))
 		RecentGlobalXmin = FirstNormalTransactionId;
 
-	if (/*track_global_snapshots && */TransactionIdIsValid(global_snapshot_xmin) &&
+	if (/*enable_csn_snapshot && */TransactionIdIsValid(global_snapshot_xmin) &&
 		TransactionIdPrecedes(global_snapshot_xmin, RecentGlobalXmin))
 		RecentGlobalXmin = global_snapshot_xmin;
 
@@ -1845,10 +1845,10 @@ GetSnapshotData(Snapshot snapshot)
 		MaintainOldSnapshotTimeMapping(snapshot->whenTaken, xmin);
 	}
 
-	snapshot->imported_global_csn = false;
-	snapshot->global_csn = global_csn;
-	if (global_snapshot_defer_time > 0 && IsUnderPostmaster)
-		GlobalSnapshotMapXmin(snapshot->global_csn);
+	snapshot->imported_csn = false;
+	snapshot->csn = csn;
+	if (csn_snapshot_defer_time > 0 && IsUnderPostmaster)
+		CSNSnapshotMapXmin(snapshot->csn);
 
 	return snapshot;
 }
@@ -3198,20 +3198,20 @@ ProcArrayGetReplicationSlotXmin(TransactionId *xmin,
 }
 
 /*
- * ProcArraySetGlobalSnapshotXmin
+ * ProcArraySetCSNSnapshotXmin
  */
 void
-ProcArraySetGlobalSnapshotXmin(TransactionId xmin)
+ProcArraySetCSNSnapshotXmin(TransactionId xmin)
 {
 	/* We rely on atomic fetch/store of xid */
 	procArray->global_snapshot_xmin = xmin;
 }
 
 /*
- * ProcArrayGetGlobalSnapshotXmin
+ * ProcArrayGetCSNSnapshotXmin
  */
 TransactionId
-ProcArrayGetGlobalSnapshotXmin(void)
+ProcArrayGetCSNSnapshotXmin(void)
 {
 	return procArray->global_snapshot_xmin;
 }
@@ -3425,7 +3425,7 @@ RecordKnownAssignedTransactionIds(TransactionId xid)
 		while (TransactionIdPrecedes(next_expected_xid, xid))
 		{
 			TransactionIdAdvance(next_expected_xid);
-			ExtendGlobalCSNLog(next_expected_xid);
+			ExtendCSNLog(next_expected_xid);
 			ExtendSUBTRANS(next_expected_xid);
 		}
 		Assert(next_expected_xid == xid);
