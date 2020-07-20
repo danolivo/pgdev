@@ -2469,3 +2469,128 @@ PrepareRedoRemove(TransactionId xid, bool giveWarning)
 		RemoveTwoPhaseFile(xid, giveWarning);
 	RemoveGXact(gxact);
 }
+
+/*
+ * CSNSnapshotPrepareTwophase
+ *
+ * Set InDoubt state for currently active transaction and return commit's
+ * global snapshot.
+ */
+static SnapshotCSN
+CSNSnapshotPrepareTwophase(const char *gid)
+{
+	GlobalTransaction gxact;
+	PGXACT	   *pgxact;
+	char	   *buf;
+	TransactionId xid;
+	xl_xact_parsed_prepare parsed;
+
+	if (!enable_csn_snapshot)
+		ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("could not prepare transaction for global commit"),
+				errhint("Make sure the configuration parameter \"%s\" is enabled.",
+						"enable_csn_snapshot")));
+
+	/*
+	 * Validate the GID, and lock the GXACT to ensure that two backends do not
+	 * try to access the same GID at once.
+	 */
+	gxact = LockGXact(gid, GetUserId());
+	pgxact = &ProcGlobal->allPgXact[gxact->pgprocno];
+	xid = pgxact->xid;
+
+	if (gxact->ondisk)
+		buf = ReadTwoPhaseFile(xid, true);
+	else
+		XlogReadTwoPhaseData(gxact->prepare_start_lsn, &buf, NULL);
+
+	ParsePrepareRecord(0, (xl_xact_prepare *)buf, &parsed);
+
+	CSNLogSetCSN(xid, parsed.nsubxacts,
+					parsed.subxacts, InDoubtCSN, true);
+
+	/* Unlock our GXACT */
+	LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
+	gxact->locking_backend = InvalidBackendId;
+	LWLockRelease(TwoPhaseStateLock);
+
+	pfree(buf);
+
+	return GenerateCSN(false);
+}
+
+/*
+ * CSNSnapshotAssignTwoPhase
+ *
+ * Asign SnapshotCSN for currently active transaction. SnapshotCSN is supposedly
+ * maximal among of values returned by CSNSnapshotPrepareCurrent and
+ * pg_csn_snapshot_prepare.
+ *
+ * This function is a counterpart of CSNSnapshotAssignCurrent() for
+ * twophase transactions.
+ */
+static void
+CSNSnapshotAssignTwoPhase(const char *gid, SnapshotCSN snapshot_csn)
+{
+	GlobalTransaction gxact;
+	PGPROC	   *proc;
+
+	if (!enable_csn_snapshot)
+		ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("could not prepare transaction for global commit"),
+				errhint("Make sure the configuration parameter \"%s\" is enabled.",
+						"enable_csn_snapshot")));
+
+	if (!CSNIsNormal(snapshot_csn))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("pg_csn_snapshot_assign expects normal snapshot_csn")));
+
+	/*
+	 * Validate the GID, and lock the GXACT to ensure that two backends do not
+	 * try to access the same GID at once.
+	 */
+	gxact = LockGXact(gid, GetUserId());
+	proc = &ProcGlobal->allProcs[gxact->pgprocno];
+
+	/* Set snapshot_csn and defuse ProcArrayRemove from assigning one. */
+	pg_atomic_write_u64(&proc->assignedCSN, snapshot_csn);
+
+	/* Unlock our GXACT */
+	LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
+	gxact->locking_backend = InvalidBackendId;
+	LWLockRelease(TwoPhaseStateLock);
+}
+
+/*
+ * SQL interface to CSNSnapshotPrepareTwophase()
+ *
+ * TODO: Rewrite this as PREPARE TRANSACTION 'gid' RETURNING SNAPSHOT
+ */
+Datum
+pg_csn_snapshot_prepare(PG_FUNCTION_ARGS)
+{
+	const char 	*gid = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	SnapshotCSN	snapshot_csn;
+
+	snapshot_csn = CSNSnapshotPrepareTwophase(gid);
+
+	PG_RETURN_INT64(snapshot_csn);
+}
+
+/*
+ * SQL interface to CSNSnapshotAssignTwoPhase()
+ *
+ * TODO: Rewrite this as COMMIT PREPARED 'gid' SNAPSHOT 'csn'
+ */
+Datum
+pg_csn_snapshot_assign(PG_FUNCTION_ARGS)
+{
+	const char *gid = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	SnapshotCSN	snapshot_csn = PG_GETARG_INT64(1);
+
+	CSNSnapshotAssignTwoPhase(gid, snapshot_csn);
+	PG_RETURN_VOID();
+}

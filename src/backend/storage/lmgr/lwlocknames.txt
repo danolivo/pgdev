@@ -51,3 +51,4 @@ OldSnapshotTimeMapLock				42
 LogicalRepWorkerLock				43
 XactTruncationLock					44
 CSNLogControlLock				    45
+CSNSnapshotXidMapLock			    46

@@ -222,6 +222,8 @@ struct PGPROC
 	 */
 	CSN_atomic assignedCSN;
 
+	/* Original xmin of this backend before csn snapshot was imported */
+	TransactionId originalXmin;
 };
 
 /* NOTE: "typedef struct PGPROC PGPROC" appears in storage/lock.h. */

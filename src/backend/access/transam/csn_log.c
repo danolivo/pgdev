@@ -50,7 +50,7 @@ typedef struct CSNshapshotShared
 	bool		csnSnapshotActive;
 } CSNshapshotShared;
 
-CSNshapshotShared *csnShared = NULL;
+CSNshapshotShared *csnShared;
 
 /*
  * Defines for CSNLog page sizes.  A page is the same BLCKSZ as is used
@@ -188,7 +188,6 @@ CSNLogSetCSNInSlot(TransactionId xid, CSN csn, int slotno)
 
 	ptr = (CSN *) (CsnlogCtl->shared->page_buffer[slotno] +
 														entryno * sizeof(CSN));
-
 	*ptr = csn;
 }
 
@@ -211,7 +210,6 @@ CSNLogGetCSNByXid(TransactionId xid)
 	slotno = SimpleLruReadPage_ReadOnly(CsnlogCtl, pageno, xid);
 	csn = *(CSN *) (CsnlogCtl->shared->page_buffer[slotno] +
 														entryno * sizeof(CSN));
-
 	LWLockRelease(CSNLogControlLock);
 
 	return csn;
@@ -243,7 +241,6 @@ CSNLogShmemInit(void)
 {
 	bool		found;
 
-
 	CsnlogCtl->PagePrecedes = CSNLogPagePrecedes;
 	SimpleLruInit(CsnlogCtl, "CSNLog Ctl", CSNLogShmemBuffers(), 0,
 				  CSNLogControlLock, "pg_csn", LWTRANCHE_CSN_LOG_BUFFERS);
@@ -251,6 +248,8 @@ CSNLogShmemInit(void)
 	csnShared = ShmemInitStruct("CSNlog shared",
 									 sizeof(CSNshapshotShared),
 									 &found);
+	if (!found)
+		csnShared->csnSnapshotActive = false;
 }
 
 /*

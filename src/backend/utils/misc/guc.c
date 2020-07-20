@@ -3071,6 +3071,16 @@ static struct config_int ConfigureNamesInt[] =
 	},
 
 	{
+		{"csn_snapshot_defer_time", PGC_POSTMASTER, REPLICATION_PRIMARY,
+			gettext_noop("Minimal age of records which allowed to be vacuumed, in seconds."),
+			NULL
+		},
+		&csn_snapshot_defer_time,
+		5, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"block_size", PGC_INTERNAL, PRESET_OPTIONS,
 			gettext_noop("Shows the size of a disk block."),
 			NULL,

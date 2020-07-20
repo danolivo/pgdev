@@ -442,6 +442,7 @@ InitProcess(void)
 	MyProc->clogGroupMemberLsn = InvalidXLogRecPtr;
 	Assert(pg_atomic_read_u32(&MyProc->clogGroupNext) == INVALID_PGPROCNO);
 
+	MyProc->originalXmin = InvalidTransactionId;
 	pg_atomic_init_u64(&MyProc->assignedCSN, InProgressCSN);
 
 	/*
@@ -587,6 +588,7 @@ InitAuxiliaryProcess(void)
 	MyProc->lwWaitMode = 0;
 	MyProc->waitLock = NULL;
 	MyProc->waitProcLock = NULL;
+	MyProc->originalXmin = InvalidTransactionId;
 #ifdef USE_ASSERT_CHECKING
 	{
 		int			i;
