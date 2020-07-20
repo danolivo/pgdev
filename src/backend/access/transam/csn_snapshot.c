@@ -31,6 +31,8 @@
 /* Raise a warning if imported snapshot_csn exceeds ours by this value. */
 #define SNAP_DESYNC_COMPLAIN (1*NSECS_PER_SEC) /* 1 second */
 
+TransactionId 	 xmin_for_csn = InvalidTransactionId;
+
 /*
  * CSNSnapshotState
  *
@@ -40,7 +42,9 @@
  */
 typedef struct
 {
-	SnapshotCSN		 last_max_csn;
+	SnapshotCSN		 last_max_csn;		/* Record the max csn till now */
+	CSN			 last_csn_log_wal;	/* for interval we log the assign csn to wal */
+	TransactionId 	 xmin_for_csn; 		/*'xmin_for_csn' for when turn xid-snapshot to csn-snapshot*/
 	volatile slock_t lock;
 } CSNSnapshotState;
 
@@ -80,6 +84,7 @@ CSNSnapshotShmemInit()
 		if (!found)
 		{
 			csnState->last_max_csn = 0;
+			csnState->last_csn_log_wal = 0;
 			SpinLockInit(&csnState->lock);
 		}
 	}
@@ -116,6 +121,8 @@ GenerateCSN(bool locked)
 	else
 		csnState->last_max_csn = csn;
 
+	WriteAssignCSNXlogRec(csn);
+
 	if (!locked)
 		SpinLockRelease(&csnState->lock);
 
@@ -146,12 +153,34 @@ TransactionIdGetCSN(TransactionId xid)
 	}
 
 	/*
+	 * If we just switch a xid-snapsot to a csn_snapshot, we should handle a start
+	 * xid for csn base check. Just in case we have prepared transaction which
+	 * hold the TransactionXmin but without CSN.
+	 */
+	if(xmin_for_csn == InvalidTransactionId)
+	{
+		SpinLockAcquire(&csnState->lock);
+		if(csnState->xmin_for_csn != InvalidTransactionId)
+			xmin_for_csn = csnState->xmin_for_csn;
+		else
+			xmin_for_csn = FrozenTransactionId;
+
+		SpinLockRelease(&csnState->lock);
+	}
+
+	if (xmin_for_csn!= FrozenTransactionId ||
+		TransactionIdPrecedes(xmin_for_csn, TransactionXmin))
+	{
+		xmin_for_csn = TransactionXmin;
+	}
+
+	/*
 	 * For xids which less then TransactionXmin CSNLog can be already
 	 * trimmed but we know that such transaction is definetly not concurrently
 	 * running according to any snapshot including timetravel ones. Callers
 	 * should check TransactionDidCommit after.
 	 */
-	if (TransactionIdPrecedes(xid, TransactionXmin))
+	if (TransactionIdPrecedes(xid, xmin_for_csn))
 		return FrozenCSN;
 
 	/* Read CSN from SLRU */
@@ -251,7 +280,7 @@ CSNSnapshotAbort(PGPROC *proc, TransactionId xid,
 	if (!enable_csn_snapshot)
 		return;
 
-	CSNLogSetCSN(xid, nsubxids, subxids, AbortedCSN);
+	CSNLogSetCSN(xid, nsubxids, subxids, AbortedCSN, true);
 
 	/*
 	 * Clean assignedCSN anyway, as it was possibly set in
@@ -292,7 +321,7 @@ CSNSnapshotPrecommit(PGPROC *proc, TransactionId xid,
 	{
 		Assert(CSNIsInProgress(oldassignedCSN));
 		CSNLogSetCSN(xid, nsubxids,
-						   subxids, InDoubtCSN);
+						   subxids, InDoubtCSN, true);
 	}
 	else
 	{
@@ -333,8 +362,39 @@ CSNSnapshotCommit(PGPROC *proc, TransactionId xid,
 	assignedCSN = pg_atomic_read_u64(&proc->assignedCSN);
 	Assert(CSNIsNormal(assignedCSN));
 	CSNLogSetCSN(xid, nsubxids,
-						   subxids, assignedCSN);
+						   subxids, assignedCSN, true);
 
 	/* Reset for next transaction */
 	pg_atomic_write_u64(&proc->assignedCSN, InProgressCSN);
+}
+
+void
+set_last_max_csn(CSN csn)
+{
+	csnState->last_max_csn = csn;
+}
+
+void
+set_last_log_wal_csn(CSN csn)
+{
+	csnState->last_csn_log_wal = csn;
+}
+
+CSN
+get_last_log_wal_csn(void)
+{
+	CSN			 last_csn_log_wal;
+
+	last_csn_log_wal = csnState->last_csn_log_wal;
+
+	return last_csn_log_wal;
+}
+
+/*
+ * 'xmin_for_csn' for when turn xid-snapshot to csn-snapshot
+ */
+void
+set_xmin_for_csn(void)
+{
+	csnState->xmin_for_csn = XidFromFullTransactionId(ShmemVariableCache->nextFullXid);
 }
