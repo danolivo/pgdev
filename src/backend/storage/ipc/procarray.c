@@ -46,6 +46,8 @@
 #include <signal.h>
 
 #include "access/clog.h"
+#include "access/csn_log.h"
+#include "access/csn_snapshot.h"
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/twophase.h"
@@ -352,6 +354,14 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
 		if (TransactionIdPrecedes(ShmemVariableCache->latestCompletedXid,
 								  latestXid))
 			ShmemVariableCache->latestCompletedXid = latestXid;
+
+		/*
+		 * Assign xid csn while holding ProcArrayLock for
+		 * COMMIT PREPARED. After lock is released consequent
+		 * CSNSnapshotCommit() will write this value to CsnLog.
+		 */
+		if (CSNIsInDoubt(pg_atomic_read_u64(&proc->assignedCSN)))
+			pg_atomic_write_u64(&proc->assignedCSN, GenerateCSN(false));
 	}
 	else
 	{
@@ -467,6 +477,16 @@ ProcArrayEndTransactionInternal(PGPROC *proc, PGXACT *pgxact,
 	if (TransactionIdPrecedes(ShmemVariableCache->latestCompletedXid,
 							  latestXid))
 		ShmemVariableCache->latestCompletedXid = latestXid;
+
+	/*
+	 * Assign xid csn while holding ProcArrayLock for
+	 * COMMIT.
+	 *
+	 * TODO: in case of group commit we can generate one CSNSnapshot for
+	 * whole group to save time on timestamp aquisition.
+	 */
+	if (CSNIsInDoubt(pg_atomic_read_u64(&proc->assignedCSN)))
+		pg_atomic_write_u64(&proc->assignedCSN, GenerateCSN(false));
 }
 
 /*
@@ -833,6 +853,7 @@ ProcArrayApplyRecoveryInfo(RunningTransactions running)
 	while (TransactionIdPrecedes(latestObservedXid, running->nextXid))
 	{
 		ExtendSUBTRANS(latestObservedXid);
+		ExtendCSNLog(latestObservedXid);
 		TransactionIdAdvance(latestObservedXid);
 	}
 	TransactionIdRetreat(latestObservedXid);	/* = running->nextXid - 1 */
@@ -1511,6 +1532,7 @@ GetSnapshotData(Snapshot snapshot)
 	int			count = 0;
 	int			subcount = 0;
 	bool		suboverflowed = false;
+	CSN	csn = FrozenCSN;
 	TransactionId replication_slot_xmin = InvalidTransactionId;
 	TransactionId replication_slot_catalog_xmin = InvalidTransactionId;
 
@@ -1708,6 +1730,13 @@ GetSnapshotData(Snapshot snapshot)
 	if (!TransactionIdIsValid(MyPgXact->xmin))
 		MyPgXact->xmin = TransactionXmin = xmin;
 
+	/*
+	 * Take CSN under ProcArrayLock so the snapshot stays
+	 * synchronized.
+	 */
+	if (enable_csn_snapshot)
+		csn = GenerateCSN(false);
+
 	LWLockRelease(ProcArrayLock);
 
 	/*
@@ -1777,6 +1806,8 @@ GetSnapshotData(Snapshot snapshot)
 		snapshot->whenTaken = GetSnapshotCurrentTimestamp();
 		MaintainOldSnapshotTimeMapping(snapshot->whenTaken, xmin);
 	}
+
+	snapshot->snapshot_csn = csn;
 
 	return snapshot;
 }
@@ -3335,6 +3366,7 @@ RecordKnownAssignedTransactionIds(TransactionId xid)
 		while (TransactionIdPrecedes(next_expected_xid, xid))
 		{
 			TransactionIdAdvance(next_expected_xid);
+			ExtendCSNLog(next_expected_xid);
 			ExtendSUBTRANS(next_expected_xid);
 		}
 		Assert(next_expected_xid == xid);
