@@ -29,9 +29,28 @@
 #include "access/transam.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
+#include "storage/shmem.h"
 #include "utils/snapmgr.h"
 
 bool enable_csn_snapshot;
+
+/*
+ * We use csnSnapshotActive to judge if csn snapshot enabled instead of by
+ * enable_csn_snapshot, this design is similar to 'track_commit_timestamp'.
+ *
+ * Because in process of replication if master change 'enable_csn_snapshot'
+ * in a database restart, standby should apply wal record for GUC changed,
+ * then it's difficult to notice all backends about that. So they can get
+ * the message by 'csnSnapshotActive' which in share buffer. It will not
+ * acquire a lock, so without performance issue.
+ *
+ */
+typedef struct CSNshapshotShared
+{
+	bool		csnSnapshotActive;
+} CSNshapshotShared;
+
+CSNshapshotShared *csnShared = NULL;
 
 /*
  * Defines for CSNLog page sizes.  A page is the same BLCKSZ as is used
@@ -93,8 +112,6 @@ CSNLogSetCSN(TransactionId xid, int nsubxids, TransactionId *subxids, CSN csn,
 	int i = 0;
 	int offset = 0;
 
-	/* Callers of CSNLogSetCSN() must check GUC params */
-	Assert(enable_csn_snapshot);
 	Assert(TransactionIdIsValid(xid));
 
 	pageno = TransactionIdToPage(xid);		/* get page of parent */
@@ -190,9 +207,6 @@ CSNLogGetCSNByXid(TransactionId xid)
 	int slotno;
 	CSN csn;
 
-	/* Callers of CSNLogGetCSNByXid() must check GUC params */
-	Assert(enable_csn_snapshot);
-
 	/* lock is acquired by SimpleLruReadPage_ReadOnly */
 	slotno = SimpleLruReadPage_ReadOnly(CsnlogCtl, pageno, xid);
 	csn = *(CSN *) (CsnlogCtl->shared->page_buffer[slotno] +
@@ -218,9 +232,6 @@ CSNLogShmemBuffers(void)
 Size
 CSNLogShmemSize(void)
 {
-	if (!enable_csn_snapshot)
-		return 0;
-
 	return SimpleLruShmemSize(CSNLogShmemBuffers(), 0);
 }
 
@@ -230,37 +241,25 @@ CSNLogShmemSize(void)
 void
 CSNLogShmemInit(void)
 {
-	if (!enable_csn_snapshot)
-		return;
+	bool		found;
+
 
 	CsnlogCtl->PagePrecedes = CSNLogPagePrecedes;
 	SimpleLruInit(CsnlogCtl, "CSNLog Ctl", CSNLogShmemBuffers(), 0,
 				  CSNLogControlLock, "pg_csn", LWTRANCHE_CSN_LOG_BUFFERS);
+
+	csnShared = ShmemInitStruct("CSNlog shared",
+									 sizeof(CSNshapshotShared),
+									 &found);
 }
 
 /*
- * This func must be called ONCE on system install.  It creates the initial
- * CSNLog segment.  The pg_csn directory is assumed to have been
- * created by initdb, and CSNLogShmemInit must have been called already.
+ * See ActivateCSNlog
  */
 void
 BootStrapCSNLog(void)
 {
-	int			slotno;
-
-	if (!enable_csn_snapshot)
-		return;
-
-	LWLockAcquire(CSNLogControlLock, LW_EXCLUSIVE);
-
-	/* Create and zero the first page of the commit log */
-	slotno = ZeroCSNLogPage(0, false);
-
-	/* Make sure it's written out */
-	SimpleLruWritePage(CsnlogCtl, slotno);
-	Assert(!CsnlogCtl->shared->page_dirty[slotno]);
-
-	LWLockRelease(CSNLogControlLock);
+	return;
 }
 
 /*
@@ -288,13 +287,94 @@ ZeroTruncateCSNLogPage(int pageno, bool write_xlog)
 	SimpleLruTruncate(CsnlogCtl, pageno);
 }
 
+void
+ActivateCSNlog(void)
+{
+	int				startPage;
+	TransactionId	nextXid = InvalidTransactionId;
+
+	if (csnShared->csnSnapshotActive)
+		return;
+
+
+	nextXid = XidFromFullTransactionId(ShmemVariableCache->nextFullXid);
+	startPage = TransactionIdToPage(nextXid);
+
+	/* Create the current segment file, if necessary */
+	if (!SimpleLruDoesPhysicalPageExist(CsnlogCtl, startPage))
+	{
+		int			slotno;
+		LWLockAcquire(CSNLogControlLock, LW_EXCLUSIVE);
+		slotno = ZeroCSNLogPage(startPage, false);
+		SimpleLruWritePage(CsnlogCtl, slotno);
+		LWLockRelease(CSNLogControlLock);
+	}
+	csnShared->csnSnapshotActive = true;
+}
+
+bool
+get_csnlog_status(void)
+{
+	if(!csnShared)
+	{
+		/* Should not arrived */
+		elog(ERROR, "We do not have csnShared point");
+	}
+	return csnShared->csnSnapshotActive;
+}
+
+void
+DeactivateCSNlog(void)
+{
+	csnShared->csnSnapshotActive = false;
+	LWLockAcquire(CSNLogControlLock, LW_EXCLUSIVE);
+	(void) SlruScanDirectory(CsnlogCtl, SlruScanDirCbDeleteAll, NULL);
+	LWLockRelease(CSNLogControlLock);
+}
+
+void
+StartupCSN(void)
+{
+	ActivateCSNlog();
+}
+
+void
+CompleteCSNInitialization(void)
+{
+	/*
+	 * If the feature is not enabled, turn it off for good.  This also removes
+	 * any leftover data.
+	 *
+	 * Conversely, we activate the module if the feature is enabled.  This is
+	 * necessary for primary and standby as the activation depends on the
+	 * control file contents at the beginning of recovery or when a
+	 * XLOG_PARAMETER_CHANGE is replayed.
+	 */
+	if (!get_csnlog_status())
+		DeactivateCSNlog();
+	else
+		ActivateCSNlog();
+}
+
+void
+CSNlogParameterChange(bool newvalue, bool oldvalue)
+{
+	if (newvalue)
+	{
+		if (!csnShared->csnSnapshotActive)
+			ActivateCSNlog();
+	}
+	else if (csnShared->csnSnapshotActive)
+		DeactivateCSNlog();
+}
+
 /*
  * This must be called ONCE during postmaster or standalone-backend shutdown
  */
 void
 ShutdownCSNLog(void)
 {
-	if (!enable_csn_snapshot)
+	if (!get_csnlog_status())
 		return;
 
 	/*
@@ -314,7 +394,7 @@ ShutdownCSNLog(void)
 void
 CheckPointCSNLog(void)
 {
-	if (!enable_csn_snapshot)
+	if (!get_csnlog_status())
 		return;
 
 	/*
@@ -342,7 +422,7 @@ ExtendCSNLog(TransactionId newestXact)
 {
 	int			pageno;
 
-	if (!enable_csn_snapshot)
+	if (!get_csnlog_status())
 		return;
 
 	/*
@@ -373,9 +453,9 @@ ExtendCSNLog(TransactionId newestXact)
 void
 TruncateCSNLog(TransactionId oldestXact)
 {
-	int			cutoffPage;
+	int				cutoffPage;
 
-	if (!enable_csn_snapshot)
+	if (!get_csnlog_status())
 		return;
 
 	/*
@@ -388,7 +468,6 @@ TruncateCSNLog(TransactionId oldestXact)
 	 */
 	TransactionIdRetreat(oldestXact);
 	cutoffPage = TransactionIdToPage(oldestXact);
-
 	ZeroTruncateCSNLogPage(cutoffPage, true);
 }
 
@@ -437,7 +516,6 @@ WriteCSNXlogRec(TransactionId xid, int nsubxids,
 				TransactionId *subxids, CSN csn)
 {
 	xl_csn_set xlrec;
-	XLogRecPtr recptr;
 
 	xlrec.xtop = xid;
 	xlrec.nsubxacts = nsubxids;
@@ -446,8 +524,7 @@ WriteCSNXlogRec(TransactionId xid, int nsubxids,
 	XLogBeginInsert();
 	XLogRegisterData((char *) &xlrec, MinSizeOfCSNSet);
 	XLogRegisterData((char *) subxids, nsubxids * sizeof(TransactionId));
-	recptr = XLogInsert(RM_CSNLOG_ID, XLOG_CSN_SETCSN);
-	XLogFlush(recptr);
+	XLogInsert(RM_CSNLOG_ID, XLOG_CSN_SETCSN);
 }
 
 /*
@@ -467,12 +544,9 @@ WriteZeroCSNPageXlogRec(int pageno)
 static void
 WriteTruncateCSNXlogRec(int pageno)
 {
-	XLogRecPtr	recptr;
-	return;
 	XLogBeginInsert();
 	XLogRegisterData((char *) (&pageno), sizeof(int));
-	recptr = XLogInsert(RM_CSNLOG_ID, XLOG_CSN_TRUNCATE);
-	XLogFlush(recptr);
+	XLogInsert(RM_CSNLOG_ID, XLOG_CSN_TRUNCATE);
 }
 
 

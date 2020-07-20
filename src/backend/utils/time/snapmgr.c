@@ -52,6 +52,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "access/csn_log.h"
 #include "catalog/catalog.h"
 #include "lib/pairingheap.h"
 #include "miscadmin.h"
@@ -2244,7 +2245,7 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 
 	in_snapshot = XidInLocalMVCCSnapshot(xid, snapshot);
 
-	if (!enable_csn_snapshot)
+	if (!get_csnlog_status())
 	{
 		Assert(CSNIsFrozen(snapshot->snapshot_csn));
 		return in_snapshot;

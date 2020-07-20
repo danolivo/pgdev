@@ -62,10 +62,7 @@ CSNSnapshotShmemSize(void)
 {
 	Size	size = 0;
 
-	if (enable_csn_snapshot)
-	{
-		size += MAXALIGN(sizeof(CSNSnapshotState));
-	}
+	size += MAXALIGN(sizeof(CSNSnapshotState));
 
 	return size;
 }
@@ -76,17 +73,14 @@ CSNSnapshotShmemInit()
 {
 	bool found;
 
-	if (enable_csn_snapshot)
+	csnState = ShmemInitStruct("csnState",
+							sizeof(CSNSnapshotState),
+							&found);
+	if (!found)
 	{
-		csnState = ShmemInitStruct("csnState",
-								sizeof(CSNSnapshotState),
-								&found);
-		if (!found)
-		{
-			csnState->last_max_csn = 0;
-			csnState->last_csn_log_wal = 0;
-			SpinLockInit(&csnState->lock);
-		}
+		csnState->last_max_csn = 0;
+		csnState->last_csn_log_wal = 0;
+		SpinLockInit(&csnState->lock);
 	}
 }
 
@@ -104,7 +98,7 @@ GenerateCSN(bool locked)
 	instr_time	current_time;
 	SnapshotCSN	csn;
 
-	Assert(enable_csn_snapshot);
+	Assert(get_csnlog_status());
 
 	/*
 	 * TODO: create some macro that add small random shift to current time.
@@ -140,7 +134,7 @@ TransactionIdGetCSN(TransactionId xid)
 {
 	CSN csn;
 
-	Assert(enable_csn_snapshot);
+	Assert(get_csnlog_status());
 
 	/* Handle permanent TransactionId's for which we don't have mapping */
 	if (!TransactionIdIsNormal(xid))
@@ -222,7 +216,7 @@ XidInvisibleInCSNSnapshot(TransactionId xid, Snapshot snapshot)
 {
 	CSN csn;
 
-	Assert(enable_csn_snapshot);
+	Assert(get_csnlog_status());
 
 	csn = TransactionIdGetCSN(xid);
 
@@ -277,7 +271,7 @@ void
 CSNSnapshotAbort(PGPROC *proc, TransactionId xid,
 					int nsubxids, TransactionId *subxids)
 {
-	if (!enable_csn_snapshot)
+	if (!get_csnlog_status())
 		return;
 
 	CSNLogSetCSN(xid, nsubxids, subxids, AbortedCSN, true);
@@ -310,7 +304,7 @@ CSNSnapshotPrecommit(PGPROC *proc, TransactionId xid,
 	CSN oldassignedCSN = InProgressCSN;
 	bool in_progress;
 
-	if (!enable_csn_snapshot)
+	if (!get_csnlog_status())
 		return;
 
 	/* Set InDoubt status if it is local transaction */
@@ -348,7 +342,7 @@ CSNSnapshotCommit(PGPROC *proc, TransactionId xid,
 {
 	volatile CSN assignedCSN;
 
-	if (!enable_csn_snapshot)
+	if (!get_csnlog_status())
 		return;
 
 	if (!TransactionIdIsValid(xid))
@@ -391,10 +385,24 @@ get_last_log_wal_csn(void)
 }
 
 /*
- * 'xmin_for_csn' for when turn xid-snapshot to csn-snapshot
+ *
  */
 void
-set_xmin_for_csn(void)
+prepare_csn_env(bool enable)
 {
-	csnState->xmin_for_csn = XidFromFullTransactionId(ShmemVariableCache->nextFullXid);
+	TransactionId		nextxid = InvalidTransactionId;
+
+	if(enable)
+	{
+		nextxid = XidFromFullTransactionId(ShmemVariableCache->nextFullXid);
+		/* 'xmin_for_csn' for when turn xid-snapshot to csn-snapshot */
+		csnState->xmin_for_csn = nextxid;
+		/* produce the csnlog segment we want now and seek to current page */
+		ActivateCSNlog();
+	}
+	else
+	{
+		/* Try to drop all csnlog seg */
+		DeactivateCSNlog();
+	}
 }
