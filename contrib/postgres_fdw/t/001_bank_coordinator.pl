@@ -10,7 +10,7 @@ $master->init;
 $master->append_conf('postgresql.conf', qq(
 	max_prepared_transactions = 30
 	log_checkpoints = true
-	postgres_fdw.use_global_snapshots = on
+	postgres_fdw.use_csn_snapshots = on
 	enable_csn_snapshot = on
 	default_transaction_isolation = 'REPEATABLE READ'
 ));

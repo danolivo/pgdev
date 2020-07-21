@@ -97,7 +97,7 @@ typedef struct ProcArrayStruct
 	/* oldest catalog xmin of any replication slot */
 	TransactionId replication_slot_catalog_xmin;
 	/* xmin of oldest active global snapshot */
-	TransactionId global_snapshot_xmin;
+	TransactionId csn_snapshot_xmin;
 
 	/* indexes into allPgXact[], has PROCARRAY_MAXPROCS entries */
 	int			pgprocnos[FLEXIBLE_ARRAY_MEMBER];
@@ -253,7 +253,7 @@ CreateSharedProcArray(void)
 		procArray->lastOverflowedXid = InvalidTransactionId;
 		procArray->replication_slot_xmin = InvalidTransactionId;
 		procArray->replication_slot_catalog_xmin = InvalidTransactionId;
-		procArray->global_snapshot_xmin = InvalidTransactionId;
+		procArray->csn_snapshot_xmin = InvalidTransactionId;
 	}
 
 	allProcs = ProcGlobal->allProcs;
@@ -1347,7 +1347,7 @@ GetOldestXmin(Relation rel, int flags)
 
 	TransactionId replication_slot_xmin = InvalidTransactionId;
 	TransactionId replication_slot_catalog_xmin = InvalidTransactionId;
-	TransactionId global_snapshot_xmin = InvalidTransactionId;
+	TransactionId csn_snapshot_xmin = InvalidTransactionId;
 
 	/*
 	 * If we're not computing a relation specific limit, or if a shared
@@ -1423,7 +1423,7 @@ GetOldestXmin(Relation rel, int flags)
 	 */
 	replication_slot_xmin = procArray->replication_slot_xmin;
 	replication_slot_catalog_xmin = procArray->replication_slot_catalog_xmin;
-	global_snapshot_xmin = ProcArrayGetCSNSnapshotXmin();
+	csn_snapshot_xmin = ProcArrayGetCSNSnapshotXmin();
 
 	if (RecoveryInProgress())
 	{
@@ -1466,9 +1466,9 @@ GetOldestXmin(Relation rel, int flags)
 	}
 
 	if (!(flags & PROCARRAY_NON_IMPORTED_XMIN) &&
-		TransactionIdIsValid(global_snapshot_xmin) &&
-		NormalTransactionIdPrecedes(global_snapshot_xmin, result))
-		result = global_snapshot_xmin;
+		TransactionIdIsValid(csn_snapshot_xmin) &&
+		NormalTransactionIdPrecedes(csn_snapshot_xmin, result))
+		result = csn_snapshot_xmin;
 
 	/*
 	 * Check whether there are replication slots requiring an older xmin.
@@ -1567,7 +1567,7 @@ GetSnapshotData(Snapshot snapshot)
 	CSN_t	csn = FrozenCSN;
 	TransactionId replication_slot_xmin = InvalidTransactionId;
 	TransactionId replication_slot_catalog_xmin = InvalidTransactionId;
-	TransactionId global_snapshot_xmin = InvalidTransactionId;
+	TransactionId csn_snapshot_xmin = InvalidTransactionId;
 
 	Assert(snapshot != NULL);
 
@@ -1759,7 +1759,7 @@ GetSnapshotData(Snapshot snapshot)
 	 */
 	replication_slot_xmin = procArray->replication_slot_xmin;
 	replication_slot_catalog_xmin = procArray->replication_slot_catalog_xmin;
-	global_snapshot_xmin = ProcArrayGetCSNSnapshotXmin();
+	csn_snapshot_xmin = ProcArrayGetCSNSnapshotXmin();
 
 	if (!TransactionIdIsValid(MyPgXact->xmin))
 		MyPgXact->xmin = TransactionXmin = xmin;
@@ -1786,9 +1786,9 @@ GetSnapshotData(Snapshot snapshot)
 	if (!TransactionIdIsNormal(RecentGlobalXmin))
 		RecentGlobalXmin = FirstNormalTransactionId;
 
-	if (/*enable_csn_snapshot && */TransactionIdIsValid(global_snapshot_xmin) &&
-		TransactionIdPrecedes(global_snapshot_xmin, RecentGlobalXmin))
-		RecentGlobalXmin = global_snapshot_xmin;
+	if (/*enable_csn_snapshot && */TransactionIdIsValid(csn_snapshot_xmin) &&
+		TransactionIdPrecedes(csn_snapshot_xmin, RecentGlobalXmin))
+		RecentGlobalXmin = csn_snapshot_xmin;
 
 	/* Check whether there's a replication slot requiring an older xmin. */
 	if (TransactionIdIsValid(replication_slot_xmin) &&
@@ -3204,7 +3204,7 @@ void
 ProcArraySetCSNSnapshotXmin(TransactionId xmin)
 {
 	/* We rely on atomic fetch/store of xid */
-	procArray->global_snapshot_xmin = xmin;
+	procArray->csn_snapshot_xmin = xmin;
 }
 
 /*
@@ -3213,7 +3213,7 @@ ProcArraySetCSNSnapshotXmin(TransactionId xmin)
 TransactionId
 ProcArrayGetCSNSnapshotXmin(void)
 {
-	return procArray->global_snapshot_xmin;
+	return procArray->csn_snapshot_xmin;
 }
 
 #define XidCacheRemove(i) \

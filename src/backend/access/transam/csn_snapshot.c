@@ -1,12 +1,12 @@
 /*-------------------------------------------------------------------------
  *
- * global_snapshot.c
+ * csn_snapshot.c
  *		Support for cross-node snapshot isolation.
  *
  * Portions Copyright (c) 1996-2018, PostgreSQL  Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * src/backend/access/transam/global_snapshot.c
+ * src/backend/access/transam/csn_snapshot.c
  *
  *-------------------------------------------------------------------------
  */
@@ -316,7 +316,7 @@ CSNSnapshotMapXmin(CSN_t snapshot_csn)
 	LWLockRelease(CSNSnapshotXidMapLock);
 
 	/*
-	 * Advance procArray->global_snapshot_xmin after we released
+	 * Advance procArray->csn_snapshot_xmin after we released
 	 * CSNSnapshotXidMapLock. Since we gather not xmin but oldestXmin, it
 	 * never goes backwards regardless of how slow we can do that.
 	 */

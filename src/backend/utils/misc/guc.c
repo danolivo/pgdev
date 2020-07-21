@@ -2455,7 +2455,7 @@ static struct config_int ConfigureNamesInt[] =
 	},
 
 	{
-		{"csn_snapshot_defer_time", PGC_POSTMASTER, REPLICATION_MASTER,
+		{"csn_snapshot_defer_time", PGC_POSTMASTER, REPLICATION_PRIMARY,
 			gettext_noop("Minimal age of records which allowed to be vacuumed, in seconds."),
 			NULL
 		},

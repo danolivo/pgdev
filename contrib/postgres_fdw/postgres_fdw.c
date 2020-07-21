@@ -6591,7 +6591,7 @@ find_em_expr_for_input_target(PlannerInfo *root,
 void
 _PG_init(void)
 {
-	DefineCustomBoolVariable("postgres_fdw.use_global_snapshots",
+	DefineCustomBoolVariable("postgres_fdw.use_csn_snapshots",
 							 "Use global snapshots for FDW transactions", NULL,
 							 &UseCSNSnapshots, false, PGC_USERSET, 0, NULL,
 							 NULL, NULL);

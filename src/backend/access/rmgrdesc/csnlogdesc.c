@@ -93,4 +93,3 @@ csnlog_identify(uint8 info)
 
 	return id;
 }
-

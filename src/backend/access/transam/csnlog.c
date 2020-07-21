@@ -181,7 +181,7 @@ CSNLogSetCSNInSlot(TransactionId xid, CSN_t csn, int slotno)
  * Interrogate the state of a transaction in the log.
  *
  * NB: this is a low-level routine and is NOT the preferred entry point
- * for most uses; TransactionIdGetCSN() in global_snapshot.c is the
+ * for most uses; TransactionIdGetCSN() in csn_snapshot.c is the
  * intended caller.
  */
 CSN_t
