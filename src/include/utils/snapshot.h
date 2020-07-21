@@ -121,6 +121,9 @@ typedef enum SnapshotType
 typedef struct SnapshotData *Snapshot;
 
 #define InvalidSnapshot		((Snapshot) NULL)
+typedef uint64 XidCSN;
+typedef uint64 SnapshotCSN;
+extern bool enable_csn_snapshot;
 
 /*
  * Struct representing all kind of possible snapshots.
@@ -201,6 +204,12 @@ typedef struct SnapshotData
 
 	TimestampTz whenTaken;		/* timestamp when snapshot was taken */
 	XLogRecPtr	lsn;			/* position in the WAL stream when taken */
+
+	/*
+	 * SnapshotCSN for snapshot isolation support.
+	 * Will be used only if enable_csn_snapshot is enabled.
+	 */
+	SnapshotCSN	snapshot_csn;
 } SnapshotData;
 
 #endif							/* SNAPSHOT_H */
