@@ -79,6 +79,7 @@
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+#include "access/csn_log.h"
 
 extern uint32 bootstrap_data_checksum_version;
 
@@ -6805,6 +6806,9 @@ StartupXLOG(void)
 	if (ControlFile->track_commit_timestamp)
 		StartupCommitTs();
 
+	if(ControlFile->enable_csn_snapshot)
+		StartupCSN();
+
 	/*
 	 * Recover knowledge about replay progress of known replication partners.
 	 */
@@ -7921,6 +7925,7 @@ StartupXLOG(void)
 	 * commit timestamp.
 	 */
 	CompleteCommitTsInitialization();
+	CompleteCSNInitialization();
 
 	/*
 	 * All done with end-of-recovery actions.
@@ -9775,8 +9780,7 @@ XLogReportParameters(void)
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 
 		if (enable_csn_snapshot != ControlFile->enable_csn_snapshot)
-			set_xmin_for_csn();
-
+			prepare_csn_env(enable_csn_snapshot);
 		ControlFile->MaxConnections = MaxConnections;
 		ControlFile->max_worker_processes = max_worker_processes;
 		ControlFile->max_wal_senders = max_wal_senders;
@@ -10218,6 +10222,8 @@ xlog_redo(XLogReaderState *record)
 		CommitTsParameterChange(xlrec.track_commit_timestamp,
 								ControlFile->track_commit_timestamp);
 		ControlFile->track_commit_timestamp = xlrec.track_commit_timestamp;
+		CSNlogParameterChange(xlrec.enable_csn_snapshot,
+								ControlFile->enable_csn_snapshot);
 		ControlFile->enable_csn_snapshot = xlrec.enable_csn_snapshot;
 
 		UpdateControlFile();

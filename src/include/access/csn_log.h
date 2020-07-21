@@ -50,6 +50,13 @@ extern void WriteAssignCSNXlogRec(XidCSN xidcsn);
 extern void set_last_max_csn(XidCSN xidcsn);
 extern void set_last_log_wal_csn(XidCSN xidcsn);
 extern XidCSN get_last_log_wal_csn(void);
-extern void set_xmin_for_csn(void);
+extern void prepare_csn_env(bool enable_csn_snapshot);
+extern void CatchCSNLog(void);
+extern void ActivateCSNlog(void);
+extern void DeactivateCSNlog(void);
+extern void StartupCSN(void);
+extern void CompleteCSNInitialization(void);
+extern void CSNlogParameterChange(bool newvalue, bool oldvalue);
+extern bool get_csnlog_status(void);
 
 #endif   /* CSNLOG_H */
