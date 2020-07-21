@@ -37,10 +37,15 @@ typedef pg_atomic_uint64 CSN_atomic;
 #define XidCSNIsNormal(csn)		((csn) >= FirstNormalXidCSN)
 
 
+extern int csn_snapshot_defer_time;
 
 
 extern Size CSNSnapshotShmemSize(void);
 extern void CSNSnapshotShmemInit(void);
+extern void CSNSnapshotStartup(TransactionId oldestActiveXID);
+
+extern void CSNSnapshotMapXmin(SnapshotCSN snapshot_csn);
+extern TransactionId CSNSnapshotToXmin(SnapshotCSN snapshot_csn);
 
 extern SnapshotCSN GenerateCSN(bool locked);
 
@@ -54,5 +59,8 @@ extern void CSNSnapshotPrecommit(PGPROC *proc, TransactionId xid, int nsubxids,
 									TransactionId *subxids);
 extern void CSNSnapshotCommit(PGPROC *proc, TransactionId xid, int nsubxids,
 									TransactionId *subxids);
+extern void CSNSnapshotAssignCsnCurrent(SnapshotCSN snapshot_csn);
+extern SnapshotCSN CSNSnapshotPrepareCurrent(void);
+extern void CSNSnapshotSync(SnapshotCSN remote_csn);
 
 #endif							/* CSN_SNAPSHOT_H */

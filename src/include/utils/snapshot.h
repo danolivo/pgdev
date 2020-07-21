@@ -210,6 +210,8 @@ typedef struct SnapshotData
 	 * Will be used only if enable_csn_snapshot is enabled.
 	 */
 	SnapshotCSN	snapshot_csn;
+	/* Did we have our own snapshot_csn or imported one from different node */
+	bool		imported_snapshot_csn;
 } SnapshotData;
 
 #endif							/* SNAPSHOT_H */

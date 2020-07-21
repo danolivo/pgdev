@@ -10953,4 +10953,18 @@
   proname => 'is_normalized', prorettype => 'bool', proargtypes => 'text text',
   prosrc => 'unicode_is_normalized' },
 
+# csn shnapshot handling
+{ oid => '4179', descr => 'export csn snapshot',
+  proname => 'pg_csn_snapshot_export', provolatile => 'v', proparallel => 'u',
+  prorettype => 'int8', proargtypes => '', prosrc => 'pg_csn_snapshot_export' },
+{ oid => '4180', descr => 'import csn snapshot',
+  proname => 'pg_csn_snapshot_import', provolatile => 'v', proparallel => 'u',
+  prorettype => 'void', proargtypes => 'int8', prosrc => 'pg_csn_snapshot_import' },
+{ oid => '4198', descr => 'prepare distributed transaction for commit, get global_csn',
+  proname => 'pg_csn_snapshot_prepare', provolatile => 'v', proparallel => 'u',
+  prorettype => 'int8', proargtypes => 'text', prosrc => 'pg_csn_snapshot_prepare' },
+{ oid => '4199', descr => 'assign global_csn to distributed transaction',
+  proname => 'pg_csn_snapshot_assign', provolatile => 'v', proparallel => 'u',
+  prorettype => 'void', proargtypes => 'text int8', prosrc => 'pg_csn_snapshot_assign' },
+
 ]

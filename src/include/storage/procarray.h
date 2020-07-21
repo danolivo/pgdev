@@ -36,6 +36,9 @@
 
 #define		PROCARRAY_SLOTS_XMIN			0x20	/* replication slot xmin,
 													 * catalog_xmin */
+#define		PROCARRAY_NON_IMPORTED_XMIN		0x80	/* use originalXmin instead
+													 * of xmin to properly
+													 * maintain csnXidMap */
 /*
  * Only flags in PROCARRAY_PROC_FLAGS_MASK are considered when matching
  * PGXACT->vacuumFlags. Other flags are used for different purposes and
@@ -125,4 +128,6 @@ extern void ProcArraySetReplicationSlotXmin(TransactionId xmin,
 extern void ProcArrayGetReplicationSlotXmin(TransactionId *xmin,
 											TransactionId *catalog_xmin);
 
+extern void ProcArraySetCSNSnapshotXmin(TransactionId xmin);
+extern TransactionId ProcArrayGetCSNSnapshotXmin(void);
 #endif							/* PROCARRAY_H */
