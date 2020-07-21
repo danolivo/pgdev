@@ -53,7 +53,7 @@
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
-
+#include "access/csn_log.h"
 
 /*
  * GUC parameters
@@ -1632,6 +1632,7 @@ vac_truncate_clog(TransactionId frozenXID,
 	 */
 	TruncateCLOG(frozenXID, oldestxid_datoid);
 	TruncateCommitTs(frozenXID);
+	TruncateCSNLog(frozenXID);
 	TruncateMultiXact(minMulti, minmulti_datoid);
 
 	/*

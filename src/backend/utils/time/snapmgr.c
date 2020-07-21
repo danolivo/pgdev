@@ -2265,7 +2265,7 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 		if (XidInvisibleInCSNSnapshot(xid, snapshot))
 		{
 			XidCSN gcsn = TransactionIdGetXidCSN(xid);
-			Assert(XidCSNIsAborted(gcsn));
+			Assert(XidCSNIsAborted(gcsn) || XidCSNIsInProgress(gcsn));
 		}
 #endif
 		return false;
