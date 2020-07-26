@@ -2270,17 +2270,7 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 		return XidInvisibleInCSNSnapshot(xid, snapshot);
 	}
 	else
-	{
-#ifdef USE_ASSERT_CHECKING
-		/* Check that csn snapshot gives the same results as local one */
-		if (XidInvisibleInCSNSnapshot(xid, snapshot))
-		{
-			CSN gcsn = TransactionIdGetCSN(xid);
-			Assert(CSNIsAborted(gcsn) || CSNIsInProgress(gcsn));
-		}
-#endif
 		return false;
-	}
 }
 
 /*
@@ -2433,8 +2423,9 @@ ExportCSNSnapshot()
 Datum
 pg_csn_snapshot_export(PG_FUNCTION_ARGS)
 {
-	SnapshotCSN	export_csn = ExportCSNSnapshot();
-	PG_RETURN_UINT64(export_csn);
+	SnapshotCSN csn = ExportCSNSnapshot();
+
+	PG_RETURN_UINT64(csn);
 }
 
 /*
@@ -2495,7 +2486,8 @@ ImportCSNSnapshot(SnapshotCSN snapshot_csn)
 Datum
 pg_csn_snapshot_import(PG_FUNCTION_ARGS)
 {
-	SnapshotCSN	snapshot_csn = PG_GETARG_UINT64(0);
-	ImportCSNSnapshot(snapshot_csn);
+	SnapshotCSN csn = PG_GETARG_UINT64(0);
+
+	ImportCSNSnapshot(csn);
 	PG_RETURN_VOID();
 }

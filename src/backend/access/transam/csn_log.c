@@ -497,16 +497,13 @@ CSNLogPagePrecedes(int page1, int page2)
 void
 WriteAssignCSNXlogRec(CSN csn)
 {
-	CSN log_csn = 0;
-
 	if (csn <= get_last_log_wal_csn())
 		return;
 
-	log_csn = CSNAddByNanosec(csn, 20);
-	set_last_log_wal_csn(log_csn);
+	set_last_log_wal_csn(csn);
 
 	XLogBeginInsert();
-	XLogRegisterData((char *) (&log_csn), sizeof(CSN));
+	XLogRegisterData((char *) (&csn), sizeof(CSN));
 	XLogInsert(RM_CSNLOG_ID, XLOG_CSN_ASSIGNMENT);
 }
 
@@ -518,7 +515,7 @@ WriteCSNXlogRec(TransactionId xid, int nsubxids,
 
 	xlrec.xtop = xid;
 	xlrec.nsubxacts = nsubxids;
-	xlrec.CSN = csn;
+	xlrec.csn = csn;
 
 	XLogBeginInsert();
 	XLogRegisterData((char *) &xlrec, MinSizeOfCSNSet);
@@ -570,7 +567,7 @@ csnlog_redo(XLogReaderState *record)
 	else if (info == XLOG_CSN_SETCSN)
 	{
 		xl_csn_set *xlrec = (xl_csn_set *) XLogRecGetData(record);
-		CSNLogSetCSN(xlrec->xtop, xlrec->nsubxacts, xlrec->xsub, xlrec->CSN, false);
+		CSNLogSetCSN(xlrec->xtop, xlrec->nsubxacts, xlrec->xsub, xlrec->csn, false);
 	}
 	else if (info == XLOG_CSN_ZEROPAGE)
 	{

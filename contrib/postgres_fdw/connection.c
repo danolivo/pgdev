@@ -519,7 +519,7 @@ begin_remote_xact(ConnCacheEntry *entry)
 		elog(DEBUG3, "starting remote transaction on connection %p",
 			 entry->conn);
 
-		if (UseGlobalSnapshots && (!IsolationUsesXactSnapshot() ||
+		if (UseCSNSnapshots && (!IsolationUsesXactSnapshot() ||
 								   IsolationIsSerializable()))
 			elog(ERROR, "Global snapshots support only REPEATABLE READ");
 
@@ -532,7 +532,7 @@ begin_remote_xact(ConnCacheEntry *entry)
 		entry->xact_depth = 1;
 		entry->changing_xact_state = false;
 
-		if (UseGlobalSnapshots)
+		if (UseCSNSnapshots)
 		{
 			char import_sql[128];
 
@@ -758,7 +758,9 @@ pgfdw_report_error(int elevel, PGresult *res, PGconn *conn,
 /* Callback typedef for BroadcastStmt */
 typedef bool (*BroadcastCmdResHandler) (PGresult *result, void *arg);
 
-/* Broadcast sql in parallel to all ConnectionHash entries */
+/*
+ * Broadcast sql in parallel to all ConnectionHash entries
+ */
 static bool
 BroadcastStmt(char const * sql, unsigned expectedStatus,
 				BroadcastCmdResHandler handler, void *arg)
@@ -792,12 +794,14 @@ BroadcastStmt(char const * sql, unsigned expectedStatus,
 	{
 		if (entry->xact_depth > 0 && entry->conn != NULL)
 		{
-			PGresult   *result = PQgetResult(entry->conn);
+			PGresult *result = PQgetResult(entry->conn);
 
 			if (PQresultStatus(result) != expectedStatus ||
 				(handler && !handler(result, arg)))
 			{
-				elog(WARNING, "Failed command %s: status=%d, expected status=%d", sql, PQresultStatus(result), expectedStatus);
+				elog(WARNING,
+					 "Failed command %s: status=%d, expected status=%d",
+					 sql, PQresultStatus(result), expectedStatus);
 				pgfdw_report_error(ERROR, result, entry->conn, true, sql);
 				allOk = false;
 			}
@@ -869,15 +873,15 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 		}
 
 		/* Switch to 2PC mode there were more than one participant */
-		if (UseGlobalSnapshots && fdwTransState->nparticipants > 1)
+		if (UseCSNSnapshots && fdwTransState->nparticipants > 1)
 			fdwTransState->two_phase_commit = true;
 
 		if (fdwTransState->two_phase_commit)
 		{
-			CSN	max_csn = InProgressCSN,
-						my_csn = InProgressCSN;
-			bool	res;
-			char   *sql;
+			CSN max_csn = InProgressCSN;
+			CSN my_csn = InProgressCSN;
+			bool res;
+			char *sql;
 
 			fdwTransState->gid = psprintf("pgfdw:%lld:%llu:%d:%u:%d:%d",
 										  (long long) GetCurrentTimestamp(),
@@ -910,6 +914,7 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 			/* Broadcast pg_csn_snapshot_assign() */
 			if (include_local_tx)
 				CSNSnapshotAssignCurrent(max_csn);
+
 			sql = psprintf("SELECT pg_csn_snapshot_assign('%s',"UINT64_FORMAT")",
 							fdwTransState->gid, max_csn);
 			res = BroadcastFunc(sql);

@@ -389,8 +389,8 @@ GenerateCSN(bool locked)
 
 	if (csn <= csnState->last_max_csn)
 		csn = ++csnState->last_max_csn;
-	else
-		csnState->last_max_csn = csn;
+
+	set_last_max_csn(csn);
 
 	WriteAssignCSNXlogRec(csn);
 
@@ -425,7 +425,7 @@ CSNSnapshotPrepareCurrent(void)
 		CSNLogSetCSN(xid, nsubxids, subxids, InDoubtCSN, true);
 	}
 
-	/* Nothing to write if we don't heve xid */
+	/* Nothing to write if we don't have xid */
 
 	return GenerateCSN(false);
 }
