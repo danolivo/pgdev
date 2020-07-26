@@ -386,7 +386,7 @@ GenerateCSN(bool locked)
 	/* TODO: change to atomics? */
 	if (!locked)
 		SpinLockAcquire(&csnState->lock);
-
+elog(LOG, "GenerateCSN: %lu last_max: %lu", csn, csnState->last_max_csn);
 	if (csn <= csnState->last_max_csn)
 		csn = ++csnState->last_max_csn;
 	else
@@ -425,7 +425,7 @@ CSNSnapshotPrepareCurrent(void)
 		CSNLogSetCSN(xid, nsubxids, subxids, InDoubtCSN, true);
 	}
 
-	/* Nothing to write if we don't heve xid */
+	/* Nothing to write if we don't have xid */
 
 	return GenerateCSN(false);
 }

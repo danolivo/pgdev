@@ -2531,7 +2531,7 @@ CSNSnapshotPrepareTwophase(const char *gid)
  * twophase transactions.
  */
 static void
-CSNSnapshotAssignTwoPhase(const char *gid, SnapshotCSN snapshot_csn)
+CSNSnapshotAssignTwoPhase(const char *gid, SnapshotCSN csn)
 {
 	GlobalTransaction gxact;
 	PGPROC	   *proc;
@@ -2543,7 +2543,7 @@ CSNSnapshotAssignTwoPhase(const char *gid, SnapshotCSN snapshot_csn)
 				errhint("Make sure the configuration parameter \"%s\" is enabled.",
 						"enable_csn_snapshot")));
 
-	if (!CSNIsNormal(snapshot_csn))
+	if (!CSNIsNormal(csn))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("pg_csn_snapshot_assign expects normal snapshot_csn")));
@@ -2556,8 +2556,8 @@ CSNSnapshotAssignTwoPhase(const char *gid, SnapshotCSN snapshot_csn)
 	proc = &ProcGlobal->allProcs[gxact->pgprocno];
 
 	/* Set snapshot_csn and defuse ProcArrayRemove from assigning one. */
-	pg_atomic_write_u64(&proc->assignedCSN, snapshot_csn);
-
+	pg_atomic_write_u64(&proc->assignedCSN, csn);
+elog(LOG, "CSNSnapshotAssignTwoPhase. gid: %s, csn: %lu", gid, csn);
 	/* Unlock our GXACT */
 	LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
 	gxact->locking_backend = InvalidBackendId;
@@ -2573,11 +2573,11 @@ Datum
 pg_csn_snapshot_prepare(PG_FUNCTION_ARGS)
 {
 	const char 	*gid = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	SnapshotCSN	snapshot_csn;
+	SnapshotCSN	csn;
 
-	snapshot_csn = CSNSnapshotPrepareTwophase(gid);
-
-	PG_RETURN_INT64(snapshot_csn);
+	csn = CSNSnapshotPrepareTwophase(gid);
+elog(LOG, "pg_csn_snapshot_prepare. gid: %s, csn: %lu", gid, csn);
+	PG_RETURN_INT64(csn);
 }
 
 /*
@@ -2589,8 +2589,8 @@ Datum
 pg_csn_snapshot_assign(PG_FUNCTION_ARGS)
 {
 	const char *gid = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	SnapshotCSN	snapshot_csn = PG_GETARG_INT64(1);
-
-	CSNSnapshotAssignTwoPhase(gid, snapshot_csn);
+	SnapshotCSN	csn = PG_GETARG_INT64(1);
+elog(LOG, "pg_csn_snapshot_assign. gid: %s, csn: %lu", gid, csn);
+	CSNSnapshotAssignTwoPhase(gid, csn);
 	PG_RETURN_VOID();
 }

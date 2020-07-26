@@ -22,10 +22,10 @@
 
 typedef struct xl_csn_set
 {
-	CSN		  CSN;
-	TransactionId xtop;			/* XID's top-level XID */
-	int			nsubxacts;		/* number of subtransaction XIDs */
-	TransactionId xsub[FLEXIBLE_ARRAY_MEMBER];	/* assigned subxids */
+	CSN				csn;
+	TransactionId	xtop;			/* XID's top-level XID */
+	int				nsubxacts;		/* number of subtransaction XIDs */
+	TransactionId	xsub[FLEXIBLE_ARRAY_MEMBER];	/* assigned subxids */
 } xl_csn_set;
 
 #define MinSizeOfCSNSet offsetof(xl_csn_set, xsub)

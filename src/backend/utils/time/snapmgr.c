@@ -2276,6 +2276,7 @@ XidInMVCCSnapshot(TransactionId xid, Snapshot snapshot)
 		if (XidInvisibleInCSNSnapshot(xid, snapshot))
 		{
 			CSN gcsn = TransactionIdGetCSN(xid);
+			elog(LOG, "Xid Invisible in snapshot: %u %lu, snapshot_csn: %lu", xid, gcsn, snapshot->snapshot_csn);
 			Assert(CSNIsAborted(gcsn) || CSNIsInProgress(gcsn));
 		}
 #endif
@@ -2433,8 +2434,9 @@ ExportCSNSnapshot()
 Datum
 pg_csn_snapshot_export(PG_FUNCTION_ARGS)
 {
-	SnapshotCSN	export_csn = ExportCSNSnapshot();
-	PG_RETURN_UINT64(export_csn);
+	SnapshotCSN	csn = ExportCSNSnapshot();
+	elog(LOG, "--> pg_csn_snapshot_export: %lu", csn);
+	PG_RETURN_UINT64(csn);
 }
 
 /*
@@ -2495,7 +2497,8 @@ ImportCSNSnapshot(SnapshotCSN snapshot_csn)
 Datum
 pg_csn_snapshot_import(PG_FUNCTION_ARGS)
 {
-	SnapshotCSN	snapshot_csn = PG_GETARG_UINT64(0);
-	ImportCSNSnapshot(snapshot_csn);
+	SnapshotCSN	csn = PG_GETARG_UINT64(0);
+	elog(LOG, "--> pg_csn_snapshot_import: %lu", csn);
+	ImportCSNSnapshot(csn);
 	PG_RETURN_VOID();
 }

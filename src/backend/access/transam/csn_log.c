@@ -518,7 +518,7 @@ WriteCSNXlogRec(TransactionId xid, int nsubxids,
 
 	xlrec.xtop = xid;
 	xlrec.nsubxacts = nsubxids;
-	xlrec.CSN = csn;
+	xlrec.csn = csn;
 
 	XLogBeginInsert();
 	XLogRegisterData((char *) &xlrec, MinSizeOfCSNSet);
@@ -564,13 +564,15 @@ csnlog_redo(XLogReaderState *record)
 		memcpy(&csn, XLogRecGetData(record), sizeof(CSN));
 		LWLockAcquire(CSNLogControlLock, LW_EXCLUSIVE);
 		set_last_max_csn(csn);
+		elog(LOG, "XLOG_CSN_ASSIGNMENT: %lu", csn);
 		LWLockRelease(CSNLogControlLock);
 
 	}
 	else if (info == XLOG_CSN_SETCSN)
 	{
 		xl_csn_set *xlrec = (xl_csn_set *) XLogRecGetData(record);
-		CSNLogSetCSN(xlrec->xtop, xlrec->nsubxacts, xlrec->xsub, xlrec->CSN, false);
+		CSNLogSetCSN(xlrec->xtop, xlrec->nsubxacts, xlrec->xsub, xlrec->csn, false);
+		elog(LOG, "XLOG_CSN_SETCSN: %lu", xlrec->csn);
 	}
 	else if (info == XLOG_CSN_ZEROPAGE)
 	{

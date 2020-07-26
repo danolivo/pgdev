@@ -50,7 +50,7 @@ csnlog_desc(StringInfo buf, XLogReaderState *record)
 		int			  nsubxids;
 
 		appendStringInfo(buf, "set "INT64_FORMAT" for: %u",
-						 xlrec->CSN,
+						 xlrec->csn,
 						 xlrec->xtop);
 		nsubxids = ((XLogRecGetDataLen(record) - MinSizeOfCSNSet) /
 					sizeof(TransactionId));
