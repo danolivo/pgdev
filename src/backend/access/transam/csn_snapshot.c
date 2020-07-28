@@ -392,10 +392,10 @@ GenerateCSN(bool locked)
 
 	set_last_max_csn(csn);
 
-	WriteAssignCSNXlogRec(csn);
-
 	if (!locked)
 		SpinLockRelease(&csnState->lock);
+
+	WriteAssignCSNXlogRec(csn);
 
 	return csn;
 }

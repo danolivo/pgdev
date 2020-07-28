@@ -15,10 +15,27 @@
 #include "utils/snapshot.h"
 
 /* XLOG stuff */
-#define XLOG_CSN_ASSIGNMENT         0x00
-#define XLOG_CSN_SETCSN       0x10
-#define XLOG_CSN_ZEROPAGE           0x20
-#define XLOG_CSN_TRUNCATE           0x30
+#define XLOG_CSN_ASSIGNMENT			0x00
+#define XLOG_CSN_SETCSN				0x10
+#define XLOG_CSN_ZEROPAGE			0x20
+#define XLOG_CSN_TRUNCATE			0x30
+
+/*
+ * We should log MAX generated CSN to wal, so that database will not generate
+ * a historical CSN after database restart. This may appear when system time
+ * turned back.
+ * 
+ * However we can not log the MAX CSN every time it generated, if so it will
+ * cause too many wal expend, so we log it 5s more in the future.
+ * 
+ * As a trade off, when this database restart, there will be 5s bad performance
+ * for time synchronization among sharding nodes.
+ * 
+ * It looks like we can redefine this as a configure parameter, and the user
+ * can decide which way they prefer.
+ * 
+ */
+#define	CSN_ASSIGN_TIME_INTERVAL	5
 
 typedef struct xl_csn_set
 {

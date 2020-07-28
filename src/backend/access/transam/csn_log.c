@@ -497,13 +497,20 @@ CSNLogPagePrecedes(int page1, int page2)
 void
 WriteAssignCSNXlogRec(CSN csn)
 {
+	CSN log_csn;
+
 	if (csn <= get_last_log_wal_csn())
 		return;
 
-	set_last_log_wal_csn(csn);
+	/*
+	 * We log the CSN 5s greater than generated, you can see comments on
+	 * CSN_ASSIGN_TIME_INTERVAL define.
+	 */
+	log_csn = CSNAddByNanosec(csn, CSN_ASSIGN_TIME_INTERVAL);
+	set_last_log_wal_csn(log_csn);
 
 	XLogBeginInsert();
-	XLogRegisterData((char *) (&csn), sizeof(CSN));
+	XLogRegisterData((char *) (&log_csn), sizeof(CSN));
 	XLogInsert(RM_CSNLOG_ID, XLOG_CSN_ASSIGNMENT);
 }
 
