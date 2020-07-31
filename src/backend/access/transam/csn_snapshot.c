@@ -141,6 +141,7 @@ CSNSnapshotShmemInit()
 		{
 			csnState->last_max_csn = 0;
 			csnState->last_csn_log_wal = 0;
+			csnState->xmin_for_csn = InvalidTransactionId;
 			SpinLockInit(&csnState->lock);
 		}
 	}
@@ -558,12 +559,19 @@ TransactionIdGetCSN(TransactionId xid)
 		SpinLockRelease(&csnState->lock);
 	}
 
-	if (xmin_for_csn!= FrozenTransactionId ||
+	if (xmin_for_csn == FrozenTransactionId ||
 		TransactionIdPrecedes(xmin_for_csn, TransactionXmin))
 	{
 		xmin_for_csn = TransactionXmin;
 	}
 
+	/*
+	 * For the xid with 'xid >= TransactionXmin and xid < xmin_for_csn',
+	 * it defined as unclear csn which follow xid-snapshot result.
+	 */
+	if(!TransactionIdPrecedes(xid, TransactionXmin) &&
+							TransactionIdPrecedes(xid, xmin_for_csn))
+		return UnclearCSN;
 	/*
 	 * For xids which less then TransactionXmin CSNLog can be already
 	 * trimmed but we know that such transaction is definetly not concurrently
@@ -575,7 +583,6 @@ TransactionIdGetCSN(TransactionId xid)
 
 	/* Read CSN from SLRU */
 	csn = CSNLogGetCSNByXid(xid);
-
 	/*
 	 * If we faced InDoubt state then transaction is beeing committed and we
 	 * should wait until CSN will be assigned so that visibility check
@@ -590,6 +597,7 @@ TransactionIdGetCSN(TransactionId xid)
 	}
 
 	Assert(CSNIsNormal(csn) || CSNIsInProgress(csn) || CSNIsAborted(csn));
+
 	return csn;
 }
 
@@ -623,6 +631,14 @@ XidInvisibleInCSNSnapshot(TransactionId xid, Snapshot snapshot)
 	{
 		/* It is bootstrap or frozen transaction */
 		return false;
+	}
+	else if(CSNIsUnclear(csn))
+	{
+		/*
+		 * Some xid can not figure out csn because of snapshot switch,
+		 * and we can follow xid-base result.
+		 */
+		return true;
 	}
 	else
 	{
@@ -777,24 +793,42 @@ get_last_log_wal_csn(void)
 }
 
 /*
- *
+ * Rely on different value of enable and same we have different action.
  */
 void
-prepare_csn_env(bool enable)
+prepare_csn_env(bool enable, bool same, TransactionId *xmin_for_csn_in_control)
 {
 	TransactionId		nextxid = InvalidTransactionId;
 
 	if(enable)
 	{
-		nextxid = XidFromFullTransactionId(ShmemVariableCache->nextFullXid);
-		/* 'xmin_for_csn' for when turn xid-snapshot to csn-snapshot */
-		csnState->xmin_for_csn = nextxid;
-		/* produce the csnlog segment we want now and seek to current page */
-		ActivateCSNlog();
+		if(same)
+		{
+			/*
+			 * Database startup with no enable_csn_snapshot change and value is true,
+			 * it can just transmit xmin_for_csn from pg_control to csnState->xmin_for_csn.
+			 */
+			csnState->xmin_for_csn = *xmin_for_csn_in_control;
+		}
+		else
+		{
+			/*
+			 * Last time database is xid-base snapshot, and now startup as csn-base snapshot,
+			 * we should redifine a xmin_for_csn, and store it in both pg_control and
+			 * csnState->xmin_for_csn.
+			 */
+			nextxid = XidFromFullTransactionId(ShmemVariableCache->nextFullXid);
+			csnState->xmin_for_csn = nextxid;
+			*xmin_for_csn_in_control = nextxid;
+			/* produce the csnlog segment we want now and seek to current page */
+			ActivateCSNlog();
+		}
 	}
 	else
 	{
 		/* Try to drop all csnlog seg */
 		DeactivateCSNlog();
+		/* Clear xmin_for_csn in pg_control because we are xid-base snaposhot now. */
+		*xmin_for_csn_in_control = InvalidTransactionId;
 	}
 }

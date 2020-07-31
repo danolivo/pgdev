@@ -67,7 +67,7 @@ extern void WriteAssignCSNXlogRec(CSN csn);
 extern void set_last_max_csn(CSN csn);
 extern void set_last_log_wal_csn(CSN csn);
 extern CSN get_last_log_wal_csn(void);
-extern void prepare_csn_env(bool enable_csn_snapshot);
+extern void prepare_csn_env(bool enable, bool same, TransactionId *xmin_for_csn_in_control);
 extern void CatchCSNLog(void);
 extern void ActivateCSNlog(void);
 extern void DeactivateCSNlog(void);

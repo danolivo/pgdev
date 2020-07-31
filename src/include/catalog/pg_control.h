@@ -184,6 +184,12 @@ typedef struct ControlFileData
 	bool		enable_csn_snapshot;
 
 	/*
+	 * Used to record a xmin when database startup with a snapshot-switch to csn snapshot,
+	 * and will hold the value until it switch to xid-snapshot.
+	 */
+	TransactionId xmin_for_csn;
+
+	/*
 	 * This data is used to check for hardware-architecture compatibility of
 	 * the database and the backend executable.  We need not check endianness
 	 * explicitly, since the pg_control version will surely look wrong to a
