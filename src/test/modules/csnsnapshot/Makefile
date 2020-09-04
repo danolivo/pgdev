@@ -5,6 +5,7 @@ REGRESS_OPTS = --temp-config=$(top_srcdir)/src/test/modules/csnsnapshot/csn_snap
 NO_INSTALLCHECK = 1
 
 TAP_TESTS = 1
+EXTENSION = postgres_fdw
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config

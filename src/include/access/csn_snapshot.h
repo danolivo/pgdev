@@ -40,6 +40,7 @@ typedef pg_atomic_uint64 CSN_atomic;
 
 
 extern int csn_snapshot_defer_time;
+extern int csn_time_shift;
 
 
 extern Size CSNSnapshotShmemSize(void);

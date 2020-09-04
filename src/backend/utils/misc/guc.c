@@ -3079,7 +3079,15 @@ static struct config_int ConfigureNamesInt[] =
 		5, 0, INT_MAX,
 		NULL, NULL, NULL
 	},
-
+	{
+		{"csn_time_shift", PGC_USERSET, RESOURCES_MEM,
+			gettext_noop("Do the time shift in the CSN generator."),
+			gettext_noop("Used for debug purposes.")
+		},
+		&csn_time_shift,
+		0, INT_MIN, INT_MAX,
+		NULL, NULL, NULL
+	},
 	{
 		{"block_size", PGC_INTERNAL, PRESET_OPTIONS,
 			gettext_noop("Shows the size of a disk block."),

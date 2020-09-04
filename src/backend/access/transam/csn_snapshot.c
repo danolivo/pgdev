@@ -57,6 +57,7 @@ static CSNSnapshotState *csnState;
  */
 int csn_snapshot_defer_time;
 
+int csn_time_shift;
 
 /*
  * CSNSnapshotXidMap
@@ -382,7 +383,7 @@ GenerateCSN(bool locked)
 	 * TODO: create some macro that add small random shift to current time.
 	 */
 	INSTR_TIME_SET_CURRENT(current_time);
-	csn = (SnapshotCSN) INSTR_TIME_GET_NANOSEC(current_time);
+	csn = (SnapshotCSN) INSTR_TIME_GET_NANOSEC(current_time) + csn_time_shift*1E9;
 
 	/* TODO: change to atomics? */
 	if (!locked)

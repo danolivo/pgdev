@@ -98,5 +98,7 @@ $node->safe_psql('postgres', "
 						insert into t1 values(9,2);
 						");
 $node->safe_psql('postgres', "commit prepared 'pt6';");
+
 $count1 = $node->safe_psql('postgres', "select count(*) from t1");
-is($count1, '16', 'Get right number in nomal query');
+is($count1, '16', 'Get right number in normal query');
+
