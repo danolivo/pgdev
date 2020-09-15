@@ -519,7 +519,7 @@ begin_remote_xact(ConnCacheEntry *entry)
 		elog(DEBUG3, "starting remote transaction on connection %p",
 			 entry->conn);
 
-		if (UseCSNSnapshots && (!IsolationUsesXactSnapshot() ||
+		if (UseCSNSnapshots && (/*!IsolationUsesXactSnapshot() ||*/
 								   IsolationIsSerializable()))
 			elog(ERROR, "Global snapshots support only REPEATABLE READ");
 
