@@ -130,10 +130,10 @@ $node2->safe_psql('postgres', "ALTER SYSTEM SET csn_time_shift = 5");
 $node1->restart();
 $node2->restart();
 
-$node2->safe_psql('postgres', "UPDATE summary SET ntrans = 1");
+$node2->safe_psql('postgres', "UPDATE summary SET ntrans = 2");
 $ntrans = $node1->safe_psql('postgres', "SELECT ntrans FROM summary");
 note("$ntrans");
-is( $ntrans, 0, 'Do not see values, committed in the future, step 2');
+is( ($ntrans != 2), 1, 'Do not see values, committed in the future, step 2');
 
 $node1->stop();
 $node2->stop();
