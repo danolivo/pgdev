@@ -2,7 +2,7 @@ use strict;
 use warnings;
 
 use TestLib;
-use Test::More tests => 5;
+use Test::More tests => 6;
 use PostgresNode;
 
 my $node1 = get_new_node('csn1');
@@ -133,7 +133,30 @@ $node2->restart();
 $node2->safe_psql('postgres', "UPDATE summary SET ntrans = 2");
 $ntrans = $node1->safe_psql('postgres', "SELECT ntrans FROM summary");
 note("$ntrans");
-is( ($ntrans != 2), 1, 'Do not see values, committed in the future, step 2');
+is( ($ntrans == 2), 1, 'Do not see values, committed in the future, step 2');
+
+$node1->safe_psql('postgres', "UPDATE summary SET ntrans = 0, value = 0");
+$q1 = File::Temp->new();
+append_to_file($q1, q{
+	UPDATE summary SET value = value + 1, ntrans = ntrans + 1;
+});
+$q2 = File::Temp->new();
+append_to_file($q2, q{
+	START TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+	UPDATE summary SET value = value + (SELECT SUM(value) FROM summary);
+	UPDATE summary SET value = value - (SELECT SUM(value) FROM summary);
+	COMMIT;
+});
+$seconds = 3;
+$pgb_handle1 = $node1->pgbench_async(-n, -c => 1, -T => $seconds, -f => $q1, 'postgres' );
+$pgb_handle2 = $node2->pgbench_async(-n, -c => 1, -T => $seconds, -f => $q2, 'postgres' );
+$node1->pgbench_await($pgb_handle1);
+$node2->pgbench_await($pgb_handle2);
+
+$count1 = $node1->safe_psql('postgres', "SELECT SUM(value) FROM summary");
+$count2 = $node1->safe_psql('postgres', "SELECT SUM(ntrans) FROM summary");
+note("$count1, $count2");
+is( ( ($count1 > 0) and ($count1 == $count2)), 1, 'Skew test');
 
 $node1->stop();
 $node2->stop();
