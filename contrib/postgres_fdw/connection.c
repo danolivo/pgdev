@@ -532,7 +532,7 @@ begin_remote_xact(ConnCacheEntry *entry)
 		entry->xact_depth = 1;
 		entry->changing_xact_state = false;
 
-		if (UseCSNSnapshots)
+		if (UseCSNSnapshots && IsolationUsesXactSnapshot())
 		{
 			char import_sql[128];
 
@@ -894,6 +894,9 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 			/* Broadcast PREPARE */
 			sql = psprintf("PREPARE TRANSACTION '%s'", fdwTransState->gid);
 			res = BroadcastCmd(sql);
+
+			if (IsolationUsesXactSnapshot())
+			{
 			if (!res)
 				goto error;
 
@@ -918,7 +921,7 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 			sql = psprintf("SELECT pg_csn_snapshot_assign('%s',"UINT64_FORMAT")",
 							fdwTransState->gid, max_csn);
 			res = BroadcastFunc(sql);
-
+			}
 error:
 			if (!res)
 			{

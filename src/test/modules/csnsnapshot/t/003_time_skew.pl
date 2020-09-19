@@ -2,7 +2,7 @@ use strict;
 use warnings;
 
 use TestLib;
-use Test::More tests => 6;
+use Test::More tests => 10;
 use PostgresNode;
 
 my $node1 = get_new_node('csn1');
@@ -104,10 +104,18 @@ $node1->safe_psql('postgres', "UPDATE summary SET ntrans = 0;");
 $node2->safe_psql('postgres', "ALTER SYSTEM SET csn_time_shift = -100");
 $node2->restart();
 
+# READ COMMITTED transactions ignores the time skew.
 $node2->psql('postgres', "UPDATE summary SET ntrans = 1");
 $ntrans = $node1->safe_psql('postgres', "SELECT ntrans FROM summary");
 note("$ntrans");
-is( $ntrans, 0, 'Do not update if snapshot turn sour');
+is( $ntrans, 1, 'Read committed behavior if snapshot turn sour');
+
+# But REPEATABLE READ transactions isn't
+my $err = '';
+$node2->psql('postgres', "START TRANSACTION ISOLATION LEVEL REPEATABLE READ; UPDATE summary SET ntrans = 2; COMMIT;", stderr => \$err);
+$ntrans = $node1->safe_psql('postgres', "SELECT ntrans FROM summary");
+note("$ntrans");
+is( (($ntrans == 1) and (index($err, 'csn snapshot too old') != -1)), 1, 'Read committed can\'t update if snapshot turn sour');
 
 # ##############################################################################
 #
@@ -120,9 +128,20 @@ $node2->safe_psql('postgres', "ALTER SYSTEM SET csn_time_shift = 0");
 $node1->restart();
 $node2->restart();
 
+my $st_sec; my $end_sec;
+my $time_diff;
+
+# READ COMMITED mode ignores the time skew.
 $node1->safe_psql('postgres', "UPDATE summary SET ntrans = 1");
 $ntrans = $node2->safe_psql('postgres', "SELECT ntrans FROM summary");
-is( $ntrans, 0, 'Do not see values, committed in the future, step 1');
+note("ntrans: $ntrans\n");
+is( $ntrans, 1, 'See committed values in the READ COMMITTED mode');
+
+# Access from the future
+$node1->safe_psql('postgres', "START TRANSACTION ISOLATION LEVEL REPEATABLE READ; UPDATE summary SET ntrans = ntrans + 1; COMMIT;");
+$ntrans = $node2->safe_psql('postgres', "START TRANSACTION ISOLATION LEVEL REPEATABLE READ; SELECT ntrans FROM summary; COMMIT;");
+note("ntrans: $ntrans\n");
+is( $ntrans, 1, 'Do not see values, committed in the future at the REPEATABLE READ mode');
 
 # But...
 $node1->safe_psql('postgres', "ALTER SYSTEM SET csn_time_shift = 0");
@@ -130,10 +149,27 @@ $node2->safe_psql('postgres', "ALTER SYSTEM SET csn_time_shift = 5");
 $node1->restart();
 $node2->restart();
 
+# Check READ COMMITED mode
 $node2->safe_psql('postgres', "UPDATE summary SET ntrans = 2");
 $ntrans = $node1->safe_psql('postgres', "SELECT ntrans FROM summary");
-note("$ntrans");
-is( ($ntrans == 2), 1, 'Do not see values, committed in the future, step 2');
+note("ntrans: $ntrans\n");
+is( $ntrans, 2, 'See committed values in the READ COMMITTED mode, step 2');
+
+# Node from the future will wait for a time before UPDATE table.
+($st_sec) = localtime();
+$node2->safe_psql('postgres', "START TRANSACTION ISOLATION LEVEL REPEATABLE READ; UPDATE summary SET ntrans = 3; COMMIT;");
+($end_sec) = localtime(); $time_diff = $end_sec - $st_sec;
+$ntrans = $node1->safe_psql('postgres', "START TRANSACTION ISOLATION LEVEL REPEATABLE READ; SELECT ntrans FROM summary; COMMIT;");
+note("ntrans: $ntrans, Test time: $time_diff seconds");
+is( (($ntrans == 3) and ($time_diff > 4)), 1, 'The test execution time correlates with the time offset.');
+
+# Node from the future will wait for a time before SELECT from a table.
+$node1->safe_psql('postgres', "START TRANSACTION ISOLATION LEVEL REPEATABLE READ; UPDATE summary SET ntrans = 4; COMMIT;");
+($st_sec) = localtime();
+$ntrans = $node2->safe_psql('postgres', "START TRANSACTION ISOLATION LEVEL REPEATABLE READ; SELECT ntrans FROM summary; COMMIT;");
+($end_sec) = localtime(); $time_diff = $end_sec - $st_sec;
+note("ntrans: $ntrans, Test time: $time_diff seconds");
+is( (($ntrans == 4) and ($time_diff > 4)), 1, 'See values, committed in the past. The test execution time correlates with the time offset.');
 
 $node1->safe_psql('postgres', "UPDATE summary SET ntrans = 0, value = 0");
 $q1 = File::Temp->new();
@@ -143,8 +179,8 @@ append_to_file($q1, q{
 $q2 = File::Temp->new();
 append_to_file($q2, q{
 	START TRANSACTION ISOLATION LEVEL REPEATABLE READ;
-	UPDATE summary SET value = value + (SELECT SUM(value) FROM summary);
-	UPDATE summary SET value = value - (SELECT SUM(value) FROM summary);
+	UPDATE summary SET value = value + (SELECT SUM(ntrans) FROM summary);
+	UPDATE summary SET value = value - (SELECT SUM(ntrans) FROM summary);
 	COMMIT;
 });
 $seconds = 3;
