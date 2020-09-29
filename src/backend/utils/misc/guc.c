@@ -1169,6 +1169,15 @@ static struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"enable_csn_wal", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Enable csn-wal record."),
+			gettext_noop("Used to enable csn-wal record")
+		},
+		&enable_csn_wal,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"ssl", PGC_SIGHUP, CONN_AUTH_SSL,
 			gettext_noop("Enables SSL connections."),
 			NULL

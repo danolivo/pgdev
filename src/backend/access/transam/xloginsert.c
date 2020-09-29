@@ -36,6 +36,8 @@
 /* Buffer size required to store a compressed version of backup block image */
 #define PGLZ_MAX_BLCKSZ PGLZ_MAX_OUTPUT(BLCKSZ)
 
+bool enable_csn_wal = true;
+
 /*
  * For each block reference registered with XLogRegisterBuffer, we fill in
  * a registered_buffer struct.
@@ -426,7 +428,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 	/* XLogBeginInsert() must have been called. */
 	if (!begininsert_called)
 		elog(ERROR, "XLogBeginInsert was not called");
-
+		
 	/*
 	 * The caller can set rmgr bits, XLR_SPECIAL_REL_UPDATE and
 	 * XLR_CHECK_CONSISTENCY; the rest are reserved for use by me.

@@ -31,6 +31,7 @@
 #include "pg_trace.h"
 #include "storage/shmem.h"
 #include "utils/snapmgr.h"
+#include "access/xlog_internal.h"
 
 bool enable_csn_snapshot;
 
@@ -501,6 +502,11 @@ WriteAssignCSNXlogRec(CSN csn)
 
 	if (csn <= get_last_log_wal_csn())
 		return;
+	
+	if(!enable_csn_wal)
+	{
+		return;
+	}
 
 	/*
 	 * We log the CSN 5s greater than generated, you can see comments on
@@ -520,6 +526,11 @@ WriteCSNXlogRec(TransactionId xid, int nsubxids,
 {
 	xl_csn_set xlrec;
 
+	if(!enable_csn_wal)
+	{
+		return;
+	}
+
 	xlrec.xtop = xid;
 	xlrec.nsubxacts = nsubxids;
 	xlrec.csn = csn;
@@ -536,6 +547,10 @@ WriteCSNXlogRec(TransactionId xid, int nsubxids,
 static void
 WriteZeroCSNPageXlogRec(int pageno)
 {
+	if(!enable_csn_wal)
+	{
+		return;
+	}
 	XLogBeginInsert();
 	XLogRegisterData((char *) (&pageno), sizeof(int));
 	(void) XLogInsert(RM_CSNLOG_ID, XLOG_CSN_ZEROPAGE);
@@ -547,6 +562,10 @@ WriteZeroCSNPageXlogRec(int pageno)
 static void
 WriteTruncateCSNXlogRec(int pageno)
 {
+	if(!enable_csn_wal)
+	{
+		return;
+	}
 	XLogBeginInsert();
 	XLogRegisterData((char *) (&pageno), sizeof(int));
 	XLogInsert(RM_CSNLOG_ID, XLOG_CSN_TRUNCATE);
