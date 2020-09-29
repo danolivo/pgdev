@@ -50,7 +50,7 @@ extern void CSNSnapshotStartup(TransactionId oldestActiveXID);
 extern void CSNSnapshotMapXmin(SnapshotCSN snapshot_csn);
 extern TransactionId CSNSnapshotToXmin(SnapshotCSN snapshot_csn);
 
-extern SnapshotCSN GenerateCSN(bool locked);
+extern SnapshotCSN GenerateCSN(bool locked, CSN assign);
 
 extern bool XidInvisibleInCSNSnapshot(TransactionId xid, Snapshot snapshot);
 

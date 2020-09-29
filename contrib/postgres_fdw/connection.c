@@ -875,7 +875,10 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 		/* Switch to 2PC mode there were more than one participant */
 		if (UseCSNSnapshots && fdwTransState->nparticipants > 1)
 			fdwTransState->two_phase_commit = true;
-
+		/*
+		 * Data change to fast node on slow node, and slow node can see data change.
+		 * In order to implement above we should change code here.
+		 */
 		if (fdwTransState->two_phase_commit)
 		{
 			CSN max_csn = InProgressCSN;
@@ -914,9 +917,11 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 			if (include_local_tx && my_csn > max_csn)
 				max_csn = my_csn;
 
-			/* Broadcast pg_csn_snapshot_assign() */
-			if (include_local_tx)
-				CSNSnapshotAssignCurrent(max_csn);
+			/*
+			 * We should always notice local node to update the csn, so local can see the
+			 * change next transaction.
+			 */
+			CSNSnapshotAssignCurrent(max_csn);
 
 			sql = psprintf("SELECT pg_csn_snapshot_assign('%s',"UINT64_FORMAT")",
 							fdwTransState->gid, max_csn);

@@ -2,7 +2,7 @@ use strict;
 use warnings;
 
 use TestLib;
-use Test::More tests => 10;
+use Test::More tests => 13;
 use PostgresNode;
 
 my $node1 = get_new_node('csn1');
@@ -123,6 +123,7 @@ is( (($ntrans == 1) and (index($err, 'csn snapshot too old') != -1)), 1, 'Read c
 # 'xact confirmed as committed, so any following xact must see its effects'.
 #
 # ##############################################################################
+$node1->safe_psql('postgres', "delete from t");
 $node1->safe_psql('postgres', "ALTER SYSTEM SET csn_time_shift = 5");
 $node2->safe_psql('postgres', "ALTER SYSTEM SET csn_time_shift = 0");
 $node1->restart();
@@ -130,6 +131,16 @@ $node2->restart();
 
 my $st_sec; my $end_sec;
 my $time_diff;
+
+$node2->safe_psql('postgres', "START TRANSACTION ISOLATION LEVEL REPEATABLE READ; INSERT INTO t VALUES(1,1), (3,1); COMMIT;");
+$ntrans = $node2->safe_psql('postgres', "START TRANSACTION ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM t; COMMIT;");
+is( $ntrans, 2, 'Slow node can see mix node data change');
+$ntrans = $node1->safe_psql('postgres', "START TRANSACTION ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM t; COMMIT;");
+is( $ntrans, 2, 'Fast node can see mix node data change');
+
+$node2->safe_psql('postgres', "START TRANSACTION ISOLATION LEVEL REPEATABLE READ; INSERT INTO t VALUES(1,1); COMMIT;");
+$ntrans = $node2->safe_psql('postgres', "START TRANSACTION ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM t; COMMIT;");
+is( $ntrans, 3, 'CURRENT FAILD:Data change to fast node on slow node, and slow node can see data change');
 
 # READ COMMITED mode ignores the time skew.
 $node1->safe_psql('postgres', "UPDATE summary SET ntrans = 1");

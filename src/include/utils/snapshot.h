@@ -121,6 +121,7 @@ typedef enum SnapshotType
 typedef struct SnapshotData *Snapshot;
 
 #define InvalidSnapshot		((Snapshot) NULL)
+#define InvalidCSN			((CSN) 0)
 typedef uint64 CSN;
 typedef uint64 SnapshotCSN;
 extern bool enable_csn_snapshot;

@@ -364,7 +364,7 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
 		 * CSNSnapshotCommit() will write this value to CsnLog.
 		 */
 		if (CSNIsInDoubt(pg_atomic_read_u64(&proc->assignedCSN)))
-			pg_atomic_write_u64(&proc->assignedCSN, GenerateCSN(false));
+			pg_atomic_write_u64(&proc->assignedCSN, GenerateCSN(false, InvalidCSN));
 	}
 	else
 	{
@@ -493,7 +493,7 @@ ProcArrayEndTransactionInternal(PGPROC *proc, PGXACT *pgxact,
 	 * whole group to save time on timestamp aquisition.
 	 */
 	if (CSNIsInDoubt(pg_atomic_read_u64(&proc->assignedCSN)))
-		pg_atomic_write_u64(&proc->assignedCSN, GenerateCSN(false));
+		pg_atomic_write_u64(&proc->assignedCSN, GenerateCSN(false, InvalidCSN));
 }
 
 /*
@@ -1762,7 +1762,7 @@ GetSnapshotData(Snapshot snapshot)
 	 * synchronized.
 	 */
 	if (!snapshot->takenDuringRecovery && get_csnlog_status())
-		csn = GenerateCSN(false);
+		csn = GenerateCSN(false, InvalidCSN);
 
 	LWLockRelease(ProcArrayLock);
 

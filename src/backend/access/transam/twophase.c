@@ -2517,7 +2517,7 @@ CSNSnapshotPrepareTwophase(const char *gid)
 
 	pfree(buf);
 
-	return GenerateCSN(false);
+	return GenerateCSN(false, InvalidCSN);
 }
 
 /*
@@ -2555,6 +2555,11 @@ CSNSnapshotAssignTwoPhase(const char *gid, SnapshotCSN csn)
 	gxact = LockGXact(gid, GetUserId());
 	proc = &ProcGlobal->allProcs[gxact->pgprocno];
 
+	Assert(0 != csn);
+	/* We do not care the Generate result, we just want to make sure max
+	 * csnState->last_max_csn value.
+	 */
+	GenerateCSN(false, csn);
 	/* Set snapshot_csn and defuse ProcArrayRemove from assigning one. */
 	pg_atomic_write_u64(&proc->assignedCSN, csn);
 

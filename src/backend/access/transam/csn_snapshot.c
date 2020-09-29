@@ -42,10 +42,10 @@ TransactionId 	 xmin_for_csn = InvalidTransactionId;
  */
 typedef struct
 {
-	SnapshotCSN		 last_max_csn;		/* Record the max csn till now */
-	CSN			 last_csn_log_wal;	/* for interval we log the assign csn to wal */
-	TransactionId 	 xmin_for_csn; 		/*'xmin_for_csn' for when turn xid-snapshot to csn-snapshot*/
-	volatile slock_t lock;
+	pg_atomic_uint64	last_max_csn;		/* Record the max csn till now */
+	CSN					last_csn_log_wal;	/* for interval we log the assign csn to wal */
+	TransactionId		xmin_for_csn; 		/*'xmin_for_csn' for when turn xid-snapshot to csn-snapshot*/
+	volatile slock_t	lock;
 } CSNSnapshotState;
 
 static CSNSnapshotState *csnState;
@@ -140,7 +140,7 @@ CSNSnapshotShmemInit()
 								&found);
 		if (!found)
 		{
-			csnState->last_max_csn = 0;
+			pg_atomic_write_u64(&csnState->last_max_csn, 0);
 			csnState->last_csn_log_wal = 0;
 			csnState->xmin_for_csn = InvalidTransactionId;
 			SpinLockInit(&csnState->lock);
@@ -372,28 +372,40 @@ CSNSnapshotToXmin(SnapshotCSN snapshot_csn)
  * if such time resolution is available.
  */
 SnapshotCSN
-GenerateCSN(bool locked)
+GenerateCSN(bool locked, CSN assign)
 {
 	instr_time	current_time;
 	SnapshotCSN	csn;
 
 	Assert(get_csnlog_status() || csn_snapshot_defer_time > 0);
+	if(InvalidCSN != assign && assign < pg_atomic_read_u64(&csnState->last_max_csn))
+	{
+		/*
+		* While assign not 0, we just want to make sure we log the max csn
+		* in csnState->last_max_csn. So we not care about the return value.
+		*
+		* We can return an Invalid value.
+		*/
+		return InvalidCSN;
+	}
+
 
 	/*
 	 * TODO: create some macro that add small random shift to current time.
 	 */
 	INSTR_TIME_SET_CURRENT(current_time);
 	csn = (SnapshotCSN) INSTR_TIME_GET_NANOSEC(current_time) + (int64) (csn_time_shift * 1E9);
+	if(csn < assign)
+	{
+		csn = assign;
+	}
 
 	/* TODO: change to atomics? */
 	if (!locked)
 		SpinLockAcquire(&csnState->lock);
-
-	if (csn <= csnState->last_max_csn)
-		csn = ++csnState->last_max_csn;
-
+	if (csn <= pg_atomic_read_u64(&csnState->last_max_csn))
+		csn = pg_atomic_add_fetch_u64(&csnState->last_max_csn, 1);
 	set_last_max_csn(csn);
-
 	if (!locked)
 		SpinLockRelease(&csnState->lock);
 
@@ -429,7 +441,7 @@ CSNSnapshotPrepareCurrent(void)
 
 	/* Nothing to write if we don't have xid */
 
-	return GenerateCSN(false);
+	return GenerateCSN(false, InvalidCSN);
 }
 
 
@@ -455,10 +467,11 @@ CSNSnapshotAssignCurrent(SnapshotCSN snapshot_csn)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("pg_csn_snapshot_assign expects normal snapshot_csn")));
 
-	/* Skip emtpty transactions */
-	if (!TransactionIdIsValid(GetCurrentTransactionIdIfAny()))
-		return;
-
+	Assert(0 != snapshot_csn);
+	/* We do not care the Generate result, we just want to make sure max
+	 * csnState->last_max_csn value.
+	 */
+	GenerateCSN(false, snapshot_csn);
 	/* Set csn and defuse ProcArrayEndTransaction from assigning one */
 	pg_atomic_write_u64(&MyProc->assignedCSN, snapshot_csn);
 }
@@ -484,13 +497,13 @@ CSNSnapshotSync(SnapshotCSN remote_csn)
 	for(;;)
 	{
 		SpinLockAcquire(&csnState->lock);
-		if (csnState->last_max_csn > remote_csn)
+		if (pg_atomic_read_u64(&csnState->last_max_csn) > remote_csn)
 		{
 			/* Everything is fine */
 			SpinLockRelease(&csnState->lock);
 			return;
 		}
-		else if ((local_csn = GenerateCSN(true)) >= remote_csn)
+		else if ((local_csn = GenerateCSN(true, InvalidCSN)) >= remote_csn)
 		{
 			/*
 			 * Everything is fine too, but last_max_csn wasn't updated for
@@ -774,7 +787,7 @@ CSNSnapshotCommit(PGPROC *proc, TransactionId xid,
 void
 set_last_max_csn(CSN csn)
 {
-	csnState->last_max_csn = csn;
+	pg_atomic_write_u64(&csnState->last_max_csn, csn);
 }
 
 void
