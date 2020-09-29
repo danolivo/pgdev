@@ -2555,7 +2555,7 @@ CSNSnapshotAssignTwoPhase(const char *gid, SnapshotCSN csn)
 	gxact = LockGXact(gid, GetUserId());
 	proc = &ProcGlobal->allProcs[gxact->pgprocno];
 
-	Assert(0 != csn);
+	Assert(csn != InvalidCSN);
 	/* We do not care the Generate result, we just want to make sure max
 	 * csnState->last_max_csn value.
 	 */

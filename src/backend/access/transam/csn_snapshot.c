@@ -378,7 +378,7 @@ GenerateCSN(bool locked, CSN assign)
 	SnapshotCSN	csn;
 
 	Assert(get_csnlog_status() || csn_snapshot_defer_time > 0);
-	if(InvalidCSN != assign && assign < pg_atomic_read_u64(&csnState->last_max_csn))
+	if(assign != InvalidCSN && assign < pg_atomic_read_u64(&csnState->last_max_csn))
 	{
 		/*
 		* While assign not 0, we just want to make sure we log the max csn
@@ -395,10 +395,9 @@ GenerateCSN(bool locked, CSN assign)
 	 */
 	INSTR_TIME_SET_CURRENT(current_time);
 	csn = (SnapshotCSN) INSTR_TIME_GET_NANOSEC(current_time) + (int64) (csn_time_shift * 1E9);
-	if(csn < assign)
-	{
+
+	if(assign != InvalidCSN && csn < assign)
 		csn = assign;
-	}
 
 	/* TODO: change to atomics? */
 	if (!locked)
@@ -448,7 +447,7 @@ CSNSnapshotPrepareCurrent(void)
 /*
  * CSNSnapshotAssignCurrent
  *
- * Asign SnapshotCSN for currently active transaction. SnapshotCSN is supposedly
+ * Assign SnapshotCSN to the currently active transaction. SnapshotCSN is supposedly
  * maximal among of values returned by CSNSnapshotPrepareCurrent and
  * pg_csn_snapshot_prepare.
  */
@@ -467,11 +466,12 @@ CSNSnapshotAssignCurrent(SnapshotCSN snapshot_csn)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("pg_csn_snapshot_assign expects normal snapshot_csn")));
 
-	Assert(0 != snapshot_csn);
+	Assert(snapshot_csn != InvalidCSN);
 	/* We do not care the Generate result, we just want to make sure max
 	 * csnState->last_max_csn value.
 	 */
 	GenerateCSN(false, snapshot_csn);
+
 	/* Set csn and defuse ProcArrayEndTransaction from assigning one */
 	pg_atomic_write_u64(&MyProc->assignedCSN, snapshot_csn);
 }

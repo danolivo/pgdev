@@ -502,11 +502,9 @@ WriteAssignCSNXlogRec(CSN csn)
 
 	if (csn <= get_last_log_wal_csn())
 		return;
-	
+
 	if(!enable_csn_wal)
-	{
 		return;
-	}
 
 	/*
 	 * We log the CSN 5s greater than generated, you can see comments on
@@ -527,9 +525,7 @@ WriteCSNXlogRec(TransactionId xid, int nsubxids,
 	xl_csn_set xlrec;
 
 	if(!enable_csn_wal)
-	{
 		return;
-	}
 
 	xlrec.xtop = xid;
 	xlrec.nsubxacts = nsubxids;

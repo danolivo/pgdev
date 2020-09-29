@@ -140,7 +140,7 @@ is( $ntrans, 2, 'Fast node can see mix node data change');
 
 $node2->safe_psql('postgres', "START TRANSACTION ISOLATION LEVEL REPEATABLE READ; INSERT INTO t VALUES(1,1); COMMIT;");
 $ntrans = $node2->safe_psql('postgres', "START TRANSACTION ISOLATION LEVEL REPEATABLE READ; SELECT count(*) FROM t; COMMIT;");
-is( $ntrans, 3, 'CURRENT FAILD:Data change to fast node on slow node, and slow node can see data change');
+is( $ntrans, 3, 'CURRENTLY FAILED:Data change to fast node on slow node, and slow node can see data change');
 
 # READ COMMITED mode ignores the time skew.
 $node1->safe_psql('postgres', "UPDATE summary SET ntrans = 1");
