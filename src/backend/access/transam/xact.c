@@ -2054,6 +2054,13 @@ StartTransaction(void)
 	ShowTransactionState("StartTransaction");
 }
 
+Datum
+pg_current_csn(PG_FUNCTION_ARGS)
+{
+	SnapshotCSN	csn = GenerateCSN(false, InvalidCSN);
+
+	PG_RETURN_INT64(csn);
+}
 
 /*
  *	CommitTransaction

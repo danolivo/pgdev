@@ -918,8 +918,8 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 				max_csn = my_csn;
 
 			/*
-			 * We should always notice local node to update the csn, so local can see the
-			 * change next transaction.
+			 * We should always notice local node to update the csn, so local can
+			 * see the change next transaction.
 			 */
 			CSNSnapshotAssignCurrent(max_csn);
 
@@ -984,6 +984,21 @@ error:
 					entry->changing_xact_state = true;
 					do_sql_command(entry->conn, "COMMIT TRANSACTION");
 					entry->changing_xact_state = false;
+
+					if (UseCSNSnapshots)
+					{
+						CSN			csn = InvalidCSN;
+						PGresult	*res;
+
+						res = pgfdw_exec_query(entry->conn, "SELECT pg_current_csn()");
+						if (PQresultStatus(res) == PGRES_TUPLES_OK)
+						{
+							sscanf(PQgetvalue(res, 0, 0), "%lu", &csn);
+
+							if (csn != InvalidCSN)
+								GenerateCSN(false, csn);
+						}
+					}
 
 					deallocate_prepared_stmts(entry);
 					break;

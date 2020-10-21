@@ -111,6 +111,8 @@ note("$ntrans");
 is( $ntrans, 1, 'Read committed behavior if snapshot turn sour');
 
 # But REPEATABLE READ transactions isn't
+$node1->safe_psql('postgres', "ALTER SYSTEM SET csn_time_shift = +100");
+$node1->restart();
 my $err = '';
 $node2->psql('postgres', "START TRANSACTION ISOLATION LEVEL REPEATABLE READ; UPDATE summary SET ntrans = 2; COMMIT;", stderr => \$err);
 $ntrans = $node1->safe_psql('postgres', "SELECT ntrans FROM summary");
@@ -179,7 +181,7 @@ $node1->safe_psql('postgres', "START TRANSACTION ISOLATION LEVEL REPEATABLE READ
 ($st_sec) = localtime();
 $ntrans = $node2->safe_psql('postgres', "START TRANSACTION ISOLATION LEVEL REPEATABLE READ; SELECT ntrans FROM summary; COMMIT;");
 ($end_sec) = localtime(); $time_diff = $end_sec - $st_sec;
-note("ntrans: $ntrans, Test time: $time_diff seconds");
+note("ntrans: $ntrans, Test time: $time_diff seconds ($end_sec, $st_sec)");
 is( (($ntrans == 4) and ($time_diff > 4)), 1, 'See values, committed in the past. The test execution time correlates with the time offset.');
 
 $node1->safe_psql('postgres', "UPDATE summary SET ntrans = 0, value = 0");

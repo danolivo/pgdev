@@ -10966,5 +10966,8 @@
 { oid => '4199', descr => 'assign csn to distributed transaction',
   proname => 'pg_csn_snapshot_assign', provolatile => 'v', proparallel => 'u',
   prorettype => 'void', proargtypes => 'text int8', prosrc => 'pg_csn_snapshot_assign' },
+{ oid => '4225', descr => 'get current CSN',
+  proname => 'pg_current_csn', provolatile => 'v', proparallel => 'u',
+  prorettype => 'int8', proargtypes => '', prosrc => 'pg_current_csn' },
 
 ]
