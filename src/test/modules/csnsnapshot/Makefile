@@ -7,6 +7,10 @@ NO_INSTALLCHECK = 1
 TAP_TESTS = 1
 EXTRA_INSTALL=contrib/postgres_fdw
 
+ifndef CSN_ALL
+PROVE_TESTS=t/001_base.pl t/002_standby.pl t/003_time_skew.pl
+endif
+
 ifdef USE_PGXS
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

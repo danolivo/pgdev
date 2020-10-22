@@ -921,7 +921,14 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 			 * We should always notice local node to update the csn, so local can
 			 * see the change next transaction.
 			 */
-			CSNSnapshotAssignCurrent(max_csn);
+			if (include_local_tx)
+				CSNSnapshotAssignCurrent(max_csn);
+			else
+				/*
+				 * Read-only transactions haven't assigned xid csn. We only
+				 * increase the last csn value.
+				 */
+				GenerateCSN(false, max_csn);
 
 			sql = psprintf("SELECT pg_csn_snapshot_assign('%s',"UINT64_FORMAT")",
 							fdwTransState->gid, max_csn);
