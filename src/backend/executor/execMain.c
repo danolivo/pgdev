@@ -2714,10 +2714,12 @@ EvalPlanQualStart(EPQState *epqstate, Plan *planTree)
 	rcestate->es_output_cid = parentestate->es_output_cid;
 
 	/*
-	 * ResultRelInfos needed by subplans are initialized from scratch when the
-	 * subplans themselves are initialized.
+	 * Share the parent's copy of ResultRelInfos needed by subplans.
+	 * We must do this before initializing the subplan, because direct-modify
+	 * FDWs expect their ResultRelInfos to be available.
 	 */
-	rcestate->es_result_relations = NULL;
+	rcestate->es_result_relations = parentestate->es_result_relations;
+
 	/* es_trig_target_relations must NOT be copied */
 	rcestate->es_top_eflags = parentestate->es_top_eflags;
 	rcestate->es_instrument = parentestate->es_instrument;

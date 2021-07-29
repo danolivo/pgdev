@@ -41,10 +41,11 @@
   && !RelationIsAccessibleInLogicalDecoding(rel) \
 )
 
-#define EarlyPruningEnabled(rel) (old_snapshot_threshold >= 0 && RelationAllowsEarlyPruning(rel))
+#define EarlyPruningEnabled(rel) (old_snapshot_threshold >= 0 && !enable_csn_snapshot && RelationAllowsEarlyPruning(rel))
 
 /* GUC variables */
 extern PGDLLIMPORT int old_snapshot_threshold;
+extern PGDLLIMPORT bool enable_csn_snapshot;
 
 
 extern Size SnapMgrShmemSize(void);
@@ -100,7 +101,7 @@ extern PGDLLIMPORT SnapshotData CatalogSnapshotData;
 static inline bool
 OldSnapshotThresholdActive(void)
 {
-	return old_snapshot_threshold >= 0;
+	return (old_snapshot_threshold >= 0) && (!enable_csn_snapshot);
 }
 
 extern Snapshot GetTransactionSnapshot(void);
@@ -130,6 +131,8 @@ extern void AtSubCommit_Snapshot(int level);
 extern void AtSubAbort_Snapshot(int level);
 extern void AtEOXact_Snapshot(bool isCommit, bool resetXmin);
 
+extern SnapshotCSN ExportCSNSnapshot(void);
+extern void ImportCSNSnapshot(SnapshotCSN snapshot_csn);
 extern void ImportSnapshot(const char *idstr);
 extern bool XactHasExportedSnapshots(void);
 extern void DeleteAllExportedSnapshotFiles(void);

@@ -314,6 +314,8 @@ typedef struct
 	List	   *already_used;	/* expressions already dealt with */
 } ec_member_foreign_arg;
 
+bool		UseCSNSnapshots;
+
 /*
  * SQL functions
  */
