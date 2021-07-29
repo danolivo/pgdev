@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include "access/commit_ts.h"
+#include "access/csn_snapshot.h"
 #include "access/multixact.h"
 #include "access/parallel.h"
 #include "access/subtrans.h"
@@ -1367,6 +1368,12 @@ RecordTransactionCommit(void)
 		TransactionTreeSetCommitTsData(xid, nchildren, children,
 									   replorigin_session_origin_timestamp,
 									   replorigin_session_origin);
+
+		/*
+		 * Mark our transaction as InDoubt in CsnLog and get ready for
+		 * commit.
+		 */
+		CSNSnapshotPrecommit(MyProc, xid, nchildren, children);
 	}
 
 	/*
@@ -1460,6 +1467,7 @@ RecordTransactionCommit(void)
 
 	/* Reset XactLastRecEnd until the next transaction writes something */
 	XactLastRecEnd = 0;
+
 cleanup:
 	/* Clean up local data */
 	if (rels)
@@ -1720,6 +1728,11 @@ RecordTransactionAbort(bool isSubXact)
 	 * we'd be assumed to have aborted anyway.
 	 */
 	TransactionIdAbortTree(xid, nchildren, children);
+
+	/*
+	 * Mark our transaction as Aborted in CsnLog.
+	 */
+	CSNSnapshotAbort(MyProc, xid, nchildren, children);
 
 	END_CRIT_SECTION();
 
@@ -2063,6 +2076,13 @@ StartTransaction(void)
 	ShowTransactionState("StartTransaction");
 }
 
+Datum
+pg_current_csn(PG_FUNCTION_ARGS)
+{
+	SnapshotCSN	csn = GenerateCSN(false, InvalidCSN);
+
+	PG_RETURN_INT64(csn);
+}
 
 /*
  *	CommitTransaction
@@ -2210,6 +2230,21 @@ CommitTransaction(void)
 	 * RecordTransactionCommit.
 	 */
 	ProcArrayEndTransaction(MyProc, latestXid);
+
+	/*
+	 * Stamp our transaction with CSN in CsnLog.
+	 * Should be called after ProcArrayEndTransaction, but before releasing
+	 * transaction locks.
+	 */
+	if (!is_parallel_worker)
+	{
+		TransactionId xid = GetTopTransactionIdIfAny();
+		TransactionId *subxids;
+		int nsubxids;
+
+		nsubxids = xactGetCommittedChildren(&subxids);
+		CSNSnapshotCommit(MyProc, xid, nsubxids, subxids);
+	}
 
 	/*
 	 * This is all post-commit cleanup.  Note that if an error is raised here,

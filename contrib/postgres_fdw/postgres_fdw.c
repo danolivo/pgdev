@@ -313,6 +313,9 @@ typedef struct
 	List	   *already_used;	/* expressions already dealt with */
 } ec_member_foreign_arg;
 
+bool		Use2PC;
+void		_PG_init(void);
+
 /*
  * SQL functions
  */
@@ -7395,6 +7398,15 @@ find_em_expr_for_input_target(PlannerInfo *root,
 
 	elog(ERROR, "could not find pathkey item to sort");
 	return NULL;				/* keep compiler quiet */
+}
+
+void
+_PG_init(void)
+{
+	DefineCustomBoolVariable("postgres_fdw.use_csn_snapshots",
+							 "Use global snapshots for FDW transactions", NULL,
+							 &Use2PC, false, PGC_USERSET, 0, NULL,
+							 NULL, NULL);
 }
 
 /*

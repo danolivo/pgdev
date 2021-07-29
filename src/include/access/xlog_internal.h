@@ -240,6 +240,7 @@ typedef struct xl_parameter_change
 	int			wal_level;
 	bool		wal_log_hints;
 	bool		track_commit_timestamp;
+	bool		enable_csn_snapshot;
 } xl_parameter_change;
 
 /* logs restore point */
@@ -323,5 +324,6 @@ extern bool ArchiveRecoveryRequested;
 extern bool InArchiveRecovery;
 extern bool StandbyMode;
 extern char *recoveryRestoreCommand;
+extern bool enable_csn_wal;
 
 #endif							/* XLOG_INTERNAL_H */
