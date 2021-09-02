@@ -302,7 +302,12 @@ ActivateCSNlog(void)
 	TransactionId	nextXid = InvalidTransactionId;
 	TransactionId	oldest_xid = InvalidTransactionId;
 
-	if (csnShared->csnSnapshotActive)
+	/*
+	 * Do not activate CSN log in standalone mode, without deferred time gap or
+	 * repeatedly.
+	 */
+	if (!IsUnderPostmaster || csn_snapshot_defer_time <= 0 ||
+		csnShared->csnSnapshotActive)
 		return;
 
 	nextXid = XidFromFullTransactionId(ShmemVariableCache->nextXid);
@@ -331,7 +336,6 @@ ActivateCSNlog(void)
 		 */
 		if (TransactionIdToPgIndex(nextXid) > 0)
 		{
-//			slotno = SimpleLruReadPage(CsnlogCtl, pageno, true, nextXid);
 			/* Cleaning procedure. Can be optimized. */
 			do
 			{
@@ -691,7 +695,7 @@ GenerateCSN(bool locked, CSN assign)
 	instr_time	current_time;
 	CSN	csn;
 
-	Assert(get_csnlog_status() || csn_snapshot_defer_time > 0);
+	Assert(get_csnlog_status());
 
 	/* TODO: create some macro that add small random shift to current time. */
 	INSTR_TIME_SET_CURRENT(current_time);

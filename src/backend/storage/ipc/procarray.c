@@ -1871,7 +1871,7 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h)
 		kaxmin = KnownAssignedXidsGetOldestXmin();
 
 	/* Get value of xmin, delayed by a CSN snapshot settings. */
-	if (get_csnlog_status() && csn_snapshot_defer_time > 0 && IsUnderPostmaster)
+	if (get_csnlog_status())
 		csn_snapshot_xmin = ProcArrayGetCSNSnapshotXmin();
 
 	/*
@@ -2491,19 +2491,20 @@ GetSnapshotData(Snapshot snapshot)
 
 	/* Take CSN under ProcArrayLock so the snapshot stays synchronized. */
 	if (!snapshot->takenDuringRecovery && get_csnlog_status())
-		csn = GenerateCSN(false, InvalidCSN);
-
-	if (get_csnlog_status() && csn_snapshot_defer_time > 0 && IsUnderPostmaster)
 	{
-		CSNSnapshotMapXmin(snapshot->snapshot_csn);
+		csn = GenerateCSN(false, InvalidCSN);
 
 		/* Get value of xmin, delayed by a CSN snapshot settings. */
 		csn_snapshot_xmin = ProcArrayGetCSNSnapshotXmin();
+
 		/* Adjust an oldest xid value with a xmin, delayed by CSN options. */
 		oldestxid = TransactionIdOlder(oldestxid, csn_snapshot_xmin);
 	}
 
 	LWLockRelease(ProcArrayLock);
+
+	if (get_csnlog_status())
+		CSNSnapshotMapXmin(snapshot->snapshot_csn);
 
 	/* maintain state for GlobalVis* */
 	{
