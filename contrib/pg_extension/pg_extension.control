@@ -1,0 +1,4 @@
+# pg_extension extension
+comment = 'Template for new extensions'
+module_pathname = '$libdir/pg_extension'
+relocatable = true
