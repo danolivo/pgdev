@@ -930,6 +930,40 @@ try_partial_mergejoin_path(PlannerInfo *root,
 										   innersortkeys));
 }
 
+static NestPath *
+get_nestloop_path(RelOptInfo *joinrel, Relids required_outer,
+				 Path *hj_outerpath, List *hashclauses)
+{
+	NestPath *nl_path = NULL;
+	ListCell *lc;
+
+	Assert(hashclauses);
+
+	/* look for the most optimal NL path */
+	foreach(lc, joinrel->pathlist)
+	{
+		Path *path = (Path *) lfirst(lc);
+		Path *outer_path;
+
+		if (!IsA(path, NestPath))
+			continue;
+
+		outer_path = ((NestPath *) path)->jpath.outerjoinpath;
+
+		if (hj_outerpath != outer_path)
+			continue;
+
+		if (bms_equal(required_outer, PATH_REQ_OUTER(((NestPath *) path)->jpath.innerjoinpath)))
+			/* Combination not found. */
+			continue;
+
+		nl_path = (NestPath *) path;
+		break;
+	}
+
+	return nl_path;
+}
+
 /*
  * try_hashjoin_path
  *	  Consider a hash join path; if it appears useful, push it into
@@ -946,6 +980,7 @@ try_hashjoin_path(PlannerInfo *root,
 {
 	Relids		required_outer;
 	JoinCostWorkspace workspace;
+	NestPath *nl_path;
 
 	/*
 	 * Check to see if proposed path is still parameterized, and reject if the
@@ -972,18 +1007,35 @@ try_hashjoin_path(PlannerInfo *root,
 						  workspace.startup_cost, workspace.total_cost,
 						  NIL, required_outer))
 	{
-		add_path(joinrel, (Path *)
-				 create_hashjoin_path(root,
-									  joinrel,
-									  jointype,
-									  &workspace,
-									  extra,
-									  outer_path,
-									  inner_path,
-									  false,	/* parallel_hash */
-									  extra->restrictlist,
-									  required_outer,
-									  hashclauses));
+		if ((nl_path = get_nestloop_path(joinrel, required_outer,
+											outer_path, hashclauses)) != NULL)
+		{
+			add_path(joinrel, (Path *) create_hashjoin_path(root,
+								   joinrel,
+								   jointype,
+								   &workspace,
+								   extra,
+								   outer_path,
+								   inner_path,
+								   false,	/* parallel_hash */
+								   extra->restrictlist,
+								   required_outer,
+								   hashclauses,
+								   nl_path->jpath.innerjoinpath));
+			elog(DEBUG5, "Try a Hybrid Hash Join node");
+		}
+		add_path(joinrel, (Path *) create_hashjoin_path(root,
+								   joinrel,
+								   jointype,
+								   &workspace,
+								   extra,
+								   outer_path,
+								   inner_path,
+								   false,	/* parallel_hash */
+								   extra->restrictlist,
+								   required_outer,
+								   hashclauses,
+								   NULL));
 	}
 	else
 	{
@@ -1049,7 +1101,8 @@ try_partial_hashjoin_path(PlannerInfo *root,
 										  parallel_hash,
 										  extra->restrictlist,
 										  NULL,
-										  hashclauses));
+										  hashclauses,
+										  NULL));
 }
 
 /*

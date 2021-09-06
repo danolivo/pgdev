@@ -4260,7 +4260,7 @@ create_nestloop_plan(PlannerInfo *root,
 		otherclauses = NIL;
 	}
 
-	/* Replace any outer-relation variables with nestloop params */
+	/* Replace any outer-relation variables with nestlfoop params */
 	if (best_path->jpath.path.param_info)
 	{
 		joinclauses = (List *)

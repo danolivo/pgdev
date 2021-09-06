@@ -2567,7 +2567,8 @@ create_hashjoin_path(PlannerInfo *root,
 					 bool parallel_hash,
 					 List *restrict_clauses,
 					 Relids required_outer,
-					 List *hashclauses)
+					 List *hashclauses,
+					 Path *nl_inner)
 {
 	HashPath   *pathnode = makeNode(HashPath);
 
@@ -2582,12 +2583,23 @@ create_hashjoin_path(PlannerInfo *root,
 								  extra->sjinfo,
 								  required_outer,
 								  &restrict_clauses);
-	pathnode->jpath.path.parallel_aware =
-		joinrel->consider_parallel && parallel_hash;
-	pathnode->jpath.path.parallel_safe = joinrel->consider_parallel &&
-		outer_path->parallel_safe && inner_path->parallel_safe;
-	/* This is a foolish way to estimate parallel_workers, but for now... */
-	pathnode->jpath.path.parallel_workers = outer_path->parallel_workers;
+	pathnode->nl_inner = nl_inner;
+	if (nl_inner)
+	{
+		/* Suppress parallel feature for hybrid join. */
+		pathnode->jpath.path.parallel_aware = false;
+		pathnode->jpath.path.parallel_safe =false;
+		pathnode->jpath.path.parallel_workers = 0;
+	}
+	else
+	{
+		pathnode->jpath.path.parallel_aware =
+			joinrel->consider_parallel && parallel_hash;
+		pathnode->jpath.path.parallel_safe = joinrel->consider_parallel &&
+			outer_path->parallel_safe && inner_path->parallel_safe;
+		/* This is a foolish way to estimate parallel_workers, but for now... */
+		pathnode->jpath.path.parallel_workers = outer_path->parallel_workers;
+	}
 
 	/*
 	 * A hashjoin never has pathkeys, since its output ordering is
