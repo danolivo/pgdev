@@ -772,6 +772,8 @@ typedef struct HashJoin
 	 * perform lookups in the hashtable over the inner plan.
 	 */
 	List	   *hashkeys;
+
+	Plan	   *subplan;
 } HashJoin;
 
 /* ----------------

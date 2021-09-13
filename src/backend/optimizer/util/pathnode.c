@@ -2568,7 +2568,7 @@ create_hashjoin_path(PlannerInfo *root,
 					 List *restrict_clauses,
 					 Relids required_outer,
 					 List *hashclauses,
-					 Path *nl_inner)
+					 NestPath *nl_path)
 {
 	HashPath   *pathnode = makeNode(HashPath);
 
@@ -2583,8 +2583,8 @@ create_hashjoin_path(PlannerInfo *root,
 								  extra->sjinfo,
 								  required_outer,
 								  &restrict_clauses);
-	pathnode->nl_inner = nl_inner;
-	if (nl_inner)
+	pathnode->nl_path = nl_path;
+	if (nl_path)
 	{
 		/* Suppress parallel feature for hybrid join. */
 		pathnode->jpath.path.parallel_aware = false;

@@ -1210,8 +1210,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			sname = "Merge Join";
 			break;
 		case T_HashJoin:
-			pname = "Hash";		/* "Join" gets added by jointype switch */
-			sname = "Hash Join";
+			pname = (((HashJoin *)plan)->subplan) ? "Hybrid Hash" : "Hash"; /* "Join" gets added by jointype switch */
+			sname = (((HashJoin *)plan)->subplan) ? "Hybrid Hash Join" :
+													"Hash Join";
 			break;
 		case T_SeqScan:
 			pname = sname = "Seq Scan";
@@ -1963,7 +1964,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 							"Hash Cond", planstate, ancestors, es);
 			show_upper_qual(((HashJoin *) plan)->join.joinqual,
 							"Join Filter", planstate, ancestors, es);
-			if (((HashJoin *) plan)->join.joinqual)
+			if (((HashJoin *) plan)->subplan)
+				ExplainNode(((HashJoinState *)planstate)->hj_AlterPlanState, ancestors,
+					"Sub", NULL, es);
 				show_instrumentation_count("Rows Removed by Join Filter", 1,
 										   planstate, es);
 			show_upper_qual(plan->qual, "Filter", planstate, ancestors, es);

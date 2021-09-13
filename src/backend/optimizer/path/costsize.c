@@ -4087,6 +4087,17 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path,
 	startup_cost += path->jpath.path.pathtarget->cost.startup;
 	run_cost += path->jpath.path.pathtarget->cost.per_tuple * path->jpath.path.rows;
 
+	if (path->nl_path)
+	{
+		/* HHJ have the same cost estimation as NL. */
+		startup_cost = path->nl_path->jpath.path.startup_cost;
+		run_cost = path->nl_path->jpath.path.total_cost - 1;
+
+		/* For debug purposes only! */
+//		startup_cost = 1;
+//		run_cost = 1;
+	}
+
 	path->jpath.path.startup_cost = startup_cost;
 	path->jpath.path.total_cost = startup_cost + run_cost;
 }

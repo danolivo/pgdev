@@ -181,7 +181,7 @@ extern HashPath *create_hashjoin_path(PlannerInfo *root,
 									  List *restrict_clauses,
 									  Relids required_outer,
 									  List *hashclauses,
-									  Path *nl_inner);
+									  NestPath *nl_path);
 
 extern ProjectionPath *create_projection_path(PlannerInfo *root,
 											  RelOptInfo *rel,

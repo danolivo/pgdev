@@ -237,6 +237,7 @@ static HashJoin *make_hashjoin(List *tlist,
 							   List *hashoperators, List *hashcollations,
 							   List *hashkeys,
 							   Plan *lefttree, Plan *righttree,
+							   Plan *subplan,
 							   JoinType jointype, bool inner_unique);
 static Hash *make_hash(Plan *lefttree,
 					   List *hashkeys,
@@ -4260,7 +4261,7 @@ create_nestloop_plan(PlannerInfo *root,
 		otherclauses = NIL;
 	}
 
-	/* Replace any outer-relation variables with nestlfoop params */
+	/* Replace any outer-relation variables with nestloop params */
 	if (best_path->jpath.path.param_info)
 	{
 		joinclauses = (List *)
@@ -4605,6 +4606,7 @@ create_hashjoin_plan(PlannerInfo *root,
 	Hash	   *hash_plan;
 	Plan	   *outer_plan;
 	Plan	   *inner_plan;
+	Plan	   *alt_inner_plan = NULL;
 	List	   *tlist = build_path_tlist(root, &best_path->jpath.path);
 	List	   *joinclauses;
 	List	   *otherclauses;
@@ -4648,6 +4650,41 @@ create_hashjoin_plan(PlannerInfo *root,
 		/* We can treat all clauses alike for an inner join */
 		joinclauses = extract_actual_clauses(joinclauses, false);
 		otherclauses = NIL;
+	}
+
+	if (best_path->nl_path)
+	{
+		Relids	saveOuterRels = root->curOuterRels;
+		Relids	outerrelids;
+		List   *nestParams;
+
+		Assert(IsA(best_path->nl_path, NestPath));
+		Assert(best_path->nl_path->jpath.jointype == best_path->jpath.jointype);
+
+		/* For a nestloop, include outer relids in curOuterRels for inner side */
+		root->curOuterRels = bms_union(root->curOuterRels,
+									   best_path->jpath.outerjoinpath->parent->relids);
+
+		alt_inner_plan = create_plan_recurse(root,
+						((NestPath *)best_path->nl_path)->jpath.innerjoinpath,
+						CP_SMALL_TLIST);
+
+		/* Restore curOuterRels */
+		bms_free(root->curOuterRels);
+		root->curOuterRels = saveOuterRels;
+
+		/* Replace any outer-relation variables with nestloop params */
+		if (best_path->nl_path->jpath.path.param_info)
+		{
+			joinclauses = (List *)
+				replace_nestloop_params(root, (Node *) copyObject(joinclauses));
+			otherclauses = (List *)
+				replace_nestloop_params(root, (Node *) copyObject(otherclauses));
+		}
+
+		outerrelids = best_path->jpath.outerjoinpath->parent->relids;
+		nestParams = identify_current_nestloop_params(root, outerrelids);
+		Assert(equal(inner_plan->targetlist, alt_inner_plan->targetlist));
 	}
 
 	/*
@@ -4762,6 +4799,7 @@ create_hashjoin_plan(PlannerInfo *root,
 							  outer_hashkeys,
 							  outer_plan,
 							  (Plan *) hash_plan,
+							  alt_inner_plan,
 							  best_path->jpath.jointype,
 							  best_path->jpath.inner_unique);
 
@@ -5833,6 +5871,7 @@ make_hashjoin(List *tlist,
 			  List *hashkeys,
 			  Plan *lefttree,
 			  Plan *righttree,
+			  Plan *subplan,
 			  JoinType jointype,
 			  bool inner_unique)
 {
@@ -5843,6 +5882,7 @@ make_hashjoin(List *tlist,
 	plan->qual = otherclauses;
 	plan->lefttree = lefttree;
 	plan->righttree = righttree;
+	node->subplan = subplan;
 	node->hashclauses = hashclauses;
 	node->hashoperators = hashoperators;
 	node->hashcollations = hashcollations;

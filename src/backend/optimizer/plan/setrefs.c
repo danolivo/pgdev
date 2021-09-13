@@ -2050,6 +2050,12 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 											   OUTER_VAR,
 											   rtoffset,
 											   NUM_EXEC_QUAL((Plan *) join));
+
+		if (hj->subplan)
+		{
+			elog(DEBUG1, "Set plan references for hybrid hash join");
+			hj->subplan = set_plan_refs(root, hj->subplan, rtoffset);
+		}
 	}
 
 	/*
@@ -2806,6 +2812,7 @@ fix_upper_expr_mutator(Node *node, fix_upper_expr_context *context)
 											  context->newvarno,
 											  context->rtoffset);
 		if (!newvar)
+//			Assert(0);
 			elog(ERROR, "variable not found in subplan target list");
 		return (Node *) newvar;
 	}

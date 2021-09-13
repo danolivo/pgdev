@@ -2021,6 +2021,8 @@ typedef struct HashJoinState
 	int			hj_JoinState;
 	bool		hj_MatchedOuter;
 	bool		hj_OuterNotEmpty;
+
+	PlanState  *hj_AlterPlanState;
 } HashJoinState;
 
 

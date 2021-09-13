@@ -924,6 +924,7 @@ _copyHashJoin(const HashJoin *from)
 	COPY_NODE_FIELD(hashoperators);
 	COPY_NODE_FIELD(hashcollations);
 	COPY_NODE_FIELD(hashkeys);
+	COPY_NODE_FIELD(subplan);
 
 	return newnode;
 }

@@ -1665,7 +1665,7 @@ typedef struct HashPath
 	int			num_batches;	/* number of batches expected */
 	double		inner_rows_total;	/* total inner rows expected */
 
-	Path	   *nl_inner; /* Inner path for nested loops logic. */
+	NestPath   *nl_path; /* NL alternative path. */
 } HashPath;
 
 /*

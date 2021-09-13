@@ -932,15 +932,17 @@ try_partial_mergejoin_path(PlannerInfo *root,
 
 static NestPath *
 get_nestloop_path(RelOptInfo *joinrel, Relids required_outer,
-				 Path *hj_outerpath, List *hashclauses)
+				  Path *hj_outerpath, List *hashclauses)
 {
 	NestPath *nl_path = NULL;
 	ListCell *lc;
 
 	Assert(hashclauses);
 
+	set_cheapest(joinrel);
+
 	/* look for the most optimal NL path */
-	foreach(lc, joinrel->pathlist)
+	foreach(lc, joinrel->cheapest_parameterized_paths)
 	{
 		Path *path = (Path *) lfirst(lc);
 		Path *outer_path;
@@ -951,13 +953,20 @@ get_nestloop_path(RelOptInfo *joinrel, Relids required_outer,
 		outer_path = ((NestPath *) path)->jpath.outerjoinpath;
 
 		if (hj_outerpath != outer_path)
+			/* Must have the same outer path. */
 			continue;
 
-		if (bms_equal(required_outer, PATH_REQ_OUTER(((NestPath *) path)->jpath.innerjoinpath)))
+		/* Must have the same target list. */
+
+
+		if (bms_equal(required_outer,
+					PATH_REQ_OUTER(((NestPath *) path)->jpath.innerjoinpath)))
 			/* Combination not found. */
 			continue;
 
-		nl_path = (NestPath *) path;
+		nl_path = makeNode(NestPath);
+		memcpy(nl_path, path, sizeof(NestPath));
+//		foreach_delete_current(joinrel->pathlist, lc);
 		break;
 	}
 
@@ -1003,27 +1012,28 @@ try_hashjoin_path(PlannerInfo *root,
 	initial_cost_hashjoin(root, &workspace, jointype, hashclauses,
 						  outer_path, inner_path, extra, false);
 
+	if ((nl_path = get_nestloop_path(joinrel, required_outer,
+										outer_path, hashclauses)) != NULL)
+	{
+		add_path(joinrel, (Path *) create_hashjoin_path(root,
+							   joinrel,
+							   jointype,
+							   &workspace,
+							   extra,
+							   outer_path,
+							   inner_path,
+							   false,	/* parallel_hash */
+							   extra->restrictlist,
+							   bms_copy(required_outer),
+							   hashclauses,
+							   nl_path));
+			elog(WARNING, "Try a Hybrid Hash Join node");
+	}
+
 	if (add_path_precheck(joinrel,
 						  workspace.startup_cost, workspace.total_cost,
 						  NIL, required_outer))
 	{
-		if ((nl_path = get_nestloop_path(joinrel, required_outer,
-											outer_path, hashclauses)) != NULL)
-		{
-			add_path(joinrel, (Path *) create_hashjoin_path(root,
-								   joinrel,
-								   jointype,
-								   &workspace,
-								   extra,
-								   outer_path,
-								   inner_path,
-								   false,	/* parallel_hash */
-								   extra->restrictlist,
-								   required_outer,
-								   hashclauses,
-								   nl_path->jpath.innerjoinpath));
-			elog(DEBUG5, "Try a Hybrid Hash Join node");
-		}
 		add_path(joinrel, (Path *) create_hashjoin_path(root,
 								   joinrel,
 								   jointype,

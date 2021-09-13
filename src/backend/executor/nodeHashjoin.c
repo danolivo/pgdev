@@ -663,6 +663,7 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 	innerPlanState(hjstate) = ExecInitNode((Plan *) hashNode, estate, eflags);
 	innerDesc = ExecGetResultType(innerPlanState(hjstate));
 
+	hjstate->hj_AlterPlanState = ExecInitNode(node->subplan, estate, eflags);
 	/*
 	 * Initialize result slot, type and projection.
 	 */
@@ -790,6 +791,7 @@ ExecEndHashJoin(HashJoinState *node)
 	 */
 	ExecEndNode(outerPlanState(node));
 	ExecEndNode(innerPlanState(node));
+	ExecEndNode(node->hj_AlterPlanState);
 }
 
 /*
