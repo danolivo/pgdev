@@ -1003,20 +1003,16 @@ to_regclass(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 }
 
-/*
- * regclassout		- converts class OID to "class_name"
- */
-Datum
-regclassout(PG_FUNCTION_ARGS)
+char *
+regclassout_ext(Oid classid, bool forceQualify)
 {
-	Oid			classid = PG_GETARG_OID(0);
 	char	   *result;
 	HeapTuple	classtup;
 
 	if (classid == InvalidOid)
 	{
 		result = pstrdup("-");
-		PG_RETURN_CSTRING(result);
+		return result;
 	}
 
 	classtup = SearchSysCache1(RELOID, ObjectIdGetDatum(classid));
@@ -1040,7 +1036,7 @@ regclassout(PG_FUNCTION_ARGS)
 			/*
 			 * Would this class be found by regclassin? If not, qualify it.
 			 */
-			if (RelationIsVisible(classid))
+			if (!forceQualify && RelationIsVisible(classid))
 				nspname = NULL;
 			else
 				nspname = get_namespace_name(classform->relnamespace);
@@ -1057,6 +1053,19 @@ regclassout(PG_FUNCTION_ARGS)
 		snprintf(result, NAMEDATALEN, "%u", classid);
 	}
 
+	return result;
+}
+
+/*
+ * regclassout		- converts class OID to "class_name"
+ */
+Datum
+regclassout(PG_FUNCTION_ARGS)
+{
+	Oid			classid = PG_GETARG_OID(0);
+	char	   *result;
+
+	result = regclassout_ext(classid, false);
 	PG_RETURN_CSTRING(result);
 }
 

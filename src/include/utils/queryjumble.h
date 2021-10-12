@@ -33,12 +33,6 @@ typedef struct LocationLen
  */
 typedef struct JumbleState
 {
-	/* Jumble of current query tree */
-	unsigned char *jumble;
-
-	/* Number of bytes used in jumble[] */
-	Size		jumble_len;
-
 	/* Array of locations of constants that should be removed */
 	LocationLen *clocations;
 
@@ -50,7 +44,21 @@ typedef struct JumbleState
 
 	/* highest Param id we've seen, in order to start normalization correctly */
 	int			highest_extern_param_id;
+
 } JumbleState;
+
+typedef struct JumbleContext
+{
+	/* Jumble of current query tree */
+	unsigned char *jumble;
+
+	/* Number of bytes used in jumble[] */
+	Size		jumble_len;
+
+	/* Array of a range table entry hashes */
+	uint64	   *rte_hashes;
+	int			nhashes;
+} JumbleContext;
 
 /* Values for the compute_query_id GUC */
 enum ComputeQueryIdType

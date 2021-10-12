@@ -35,5 +35,6 @@ extern char *format_operator(Oid operator_oid);
 extern char *format_operator_qualified(Oid operator_oid);
 extern void format_operator_parts(Oid operator_oid, List **objnames,
 								  List **objargs, bool missing_ok);
+extern char *regclassout_ext(Oid classid, bool forceQualify);
 
 #endif
