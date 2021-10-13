@@ -685,7 +685,7 @@ pg_analyze_and_rewrite_params(RawStmt *parsetree,
 	ParseState *pstate;
 	Query	   *query;
 	List	   *querytree_list;
-	JumbleState *jstate = NULL;
+	JumbleState jstate;
 
 	Assert(query_string != NULL);	/* required as of 8.4 */
 
@@ -705,10 +705,10 @@ pg_analyze_and_rewrite_params(RawStmt *parsetree,
 	query = transformTopLevelStmt(pstate, parsetree);
 
 	if (IsQueryIdEnabled())
-		jstate = JumbleQuery(query, query_string);
+		query->queryId = JumbleQuery(query, query_string, NULL, &jstate);
 
 	if (post_parse_analyze_hook)
-		(*post_parse_analyze_hook) (pstate, query, jstate);
+		(*post_parse_analyze_hook) (pstate, query, &jstate);
 
 	free_parsestate(pstate);
 

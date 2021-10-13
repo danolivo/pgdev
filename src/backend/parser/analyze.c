@@ -113,7 +113,7 @@ parse_analyze(RawStmt *parseTree, const char *sourceText,
 {
 	ParseState *pstate = make_parsestate(NULL);
 	Query	   *query;
-	JumbleState *jstate = NULL;
+	JumbleState jstate;
 
 	Assert(sourceText != NULL); /* required as of 8.4 */
 
@@ -127,10 +127,10 @@ parse_analyze(RawStmt *parseTree, const char *sourceText,
 	query = transformTopLevelStmt(pstate, parseTree);
 
 	if (IsQueryIdEnabled())
-		jstate = JumbleQuery(query, sourceText);
+		query->queryId = JumbleQuery(query, sourceText, NULL, &jstate);
 
 	if (post_parse_analyze_hook)
-		(*post_parse_analyze_hook) (pstate, query, jstate);
+		(*post_parse_analyze_hook) (pstate, query, &jstate);
 
 	free_parsestate(pstate);
 
@@ -152,7 +152,7 @@ parse_analyze_varparams(RawStmt *parseTree, const char *sourceText,
 {
 	ParseState *pstate = make_parsestate(NULL);
 	Query	   *query;
-	JumbleState *jstate = NULL;
+	JumbleState jstate;
 
 	Assert(sourceText != NULL); /* required as of 8.4 */
 
@@ -166,10 +166,10 @@ parse_analyze_varparams(RawStmt *parseTree, const char *sourceText,
 	check_variable_parameters(pstate, query);
 
 	if (IsQueryIdEnabled())
-		jstate = JumbleQuery(query, sourceText);
+		query->queryId = JumbleQuery(query, sourceText, NULL, &jstate);
 
 	if (post_parse_analyze_hook)
-		(*post_parse_analyze_hook) (pstate, query, jstate);
+		(*post_parse_analyze_hook) (pstate, query, &jstate);
 
 	free_parsestate(pstate);
 

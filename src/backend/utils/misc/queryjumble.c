@@ -36,6 +36,7 @@
 #include "miscadmin.h"
 #include "parser/scansup.h"
 #include "utils/queryjumble.h"
+#include "utils/syscache.h"
 
 #define JUMBLE_SIZE				1024	/* query serialization buffer size */
 
@@ -46,8 +47,6 @@ int			compute_query_id = COMPUTE_QUERY_ID_AUTO;
 bool		query_id_enabled = false;
 
 static uint64 compute_utility_query_id(const char *str, int query_location, int query_len);
-static void AppendJumble(JumbleState *jstate,
-						 const unsigned char *item, Size size);
 static void JumbleQueryInternal(JumbleState *jstate, Query *query);
 static void JumbleRangeTable(JumbleState *jstate, List *rtable);
 static void JumbleRowMarks(JumbleState *jstate, List *rowMarks);
@@ -97,23 +96,21 @@ CleanQuerytext(const char *query, int *location, int *len)
 	return query;
 }
 
-JumbleState *
-JumbleQuery(Query *query, const char *querytext)
+uint64
+JumbleQuery(Query *query, const char *querytext,
+			ObjectJumbleCallbackFn callback, JumbleState *jstate)
 {
-	JumbleState *jstate = NULL;
-
+	uint64 query_hash;
 	Assert(IsQueryIdEnabled());
 
 	if (query->utilityStmt)
 	{
-		query->queryId = compute_utility_query_id(querytext,
+		query_hash = compute_utility_query_id(querytext,
 												  query->stmt_location,
 												  query->stmt_len);
 	}
 	else
 	{
-		jstate = (JumbleState *) palloc(sizeof(JumbleState));
-
 		/* Set up workspace for query jumbling */
 		jstate->jumble = (unsigned char *) palloc(JUMBLE_SIZE);
 		jstate->jumble_len = 0;
@@ -122,10 +119,11 @@ JumbleQuery(Query *query, const char *querytext)
 			palloc(jstate->clocations_buf_size * sizeof(LocationLen));
 		jstate->clocations_count = 0;
 		jstate->highest_extern_param_id = 0;
+		jstate->oid_jumble_callback = callback;
 
 		/* Compute query ID and mark the Query node with it */
 		JumbleQueryInternal(jstate, query);
-		query->queryId = DatumGetUInt64(hash_any_extended(jstate->jumble,
+		query_hash = DatumGetUInt64(hash_any_extended(jstate->jumble,
 														  jstate->jumble_len,
 														  0));
 
@@ -133,11 +131,11 @@ JumbleQuery(Query *query, const char *querytext)
 		 * If we are unlucky enough to get a hash of zero, use 1 instead, to
 		 * prevent confusion with the utility-statement case.
 		 */
-		if (query->queryId == UINT64CONST(0))
-			query->queryId = UINT64CONST(1);
+		if (query_hash == UINT64CONST(0))
+			query_hash = UINT64CONST(1);
 	}
 
-	return jstate;
+	return query_hash;
 }
 
 /*
@@ -185,7 +183,7 @@ compute_utility_query_id(const char *query_text, int query_location, int query_l
  * AppendJumble: Append a value that is substantive in a given query to
  * the current jumble.
  */
-static void
+void
 AppendJumble(JumbleState *jstate, const unsigned char *item, Size size)
 {
 	unsigned char *jumble = jstate->jumble;
@@ -226,6 +224,11 @@ AppendJumble(JumbleState *jstate, const unsigned char *item, Size size)
 	AppendJumble(jstate, (const unsigned char *) &(item), sizeof(item))
 #define APP_JUMB_STRING(str) \
 	AppendJumble(jstate, (const unsigned char *) (str), strlen(str) + 1)
+#define APP_JUMB_OBJECT(cacheId, oid) \
+	if (jstate->oid_jumble_callback) \
+		(jstate->oid_jumble_callback)(jstate, cacheId, oid); \
+	else \
+		AppendJumble(jstate, (const unsigned char *) &(oid), sizeof(Oid));
 
 /*
  * JumbleQueryInternal: Selectively serialize the query tree, appending
@@ -280,7 +283,7 @@ JumbleRangeTable(JumbleState *jstate, List *rtable)
 		switch (rte->rtekind)
 		{
 			case RTE_RELATION:
-				APP_JUMB(rte->relid);
+				APP_JUMB_OBJECT(RELOID, rte->relid);
 				JumbleExpr(jstate, (Node *) rte->tablesample);
 				APP_JUMB(rte->inh);
 				break;
@@ -388,7 +391,7 @@ JumbleExpr(JumbleState *jstate, Node *node)
 				Const	   *c = (Const *) node;
 
 				/* We jumble only the constant's type, not its value */
-				APP_JUMB(c->consttype);
+				APP_JUMB_OBJECT(TYPEOID, c->consttype);
 				/* Also, record its parse location for query normalization */
 				RecordConstLocation(jstate, c->location);
 			}
@@ -399,7 +402,7 @@ JumbleExpr(JumbleState *jstate, Node *node)
 
 				APP_JUMB(p->paramkind);
 				APP_JUMB(p->paramid);
-				APP_JUMB(p->paramtype);
+				APP_JUMB_OBJECT(TYPEOID, p->paramtype);
 				/* Also, track the highest external Param id */
 				if (p->paramkind == PARAM_EXTERN &&
 					p->paramid > jstate->highest_extern_param_id)
@@ -410,7 +413,7 @@ JumbleExpr(JumbleState *jstate, Node *node)
 			{
 				Aggref	   *expr = (Aggref *) node;
 
-				APP_JUMB(expr->aggfnoid);
+				APP_JUMB_OBJECT(AGGFNOID, expr->aggfnoid);
 				JumbleExpr(jstate, (Node *) expr->aggdirectargs);
 				JumbleExpr(jstate, (Node *) expr->args);
 				JumbleExpr(jstate, (Node *) expr->aggorder);
@@ -430,7 +433,7 @@ JumbleExpr(JumbleState *jstate, Node *node)
 			{
 				WindowFunc *expr = (WindowFunc *) node;
 
-				APP_JUMB(expr->winfnoid);
+				APP_JUMB_OBJECT(PROCOID, expr->winfnoid);
 				APP_JUMB(expr->winref);
 				JumbleExpr(jstate, (Node *) expr->args);
 				JumbleExpr(jstate, (Node *) expr->aggfilter);
@@ -450,7 +453,7 @@ JumbleExpr(JumbleState *jstate, Node *node)
 			{
 				FuncExpr   *expr = (FuncExpr *) node;
 
-				APP_JUMB(expr->funcid);
+				APP_JUMB_OBJECT(PROCOID, expr->funcid);
 				JumbleExpr(jstate, (Node *) expr->args);
 			}
 			break;
@@ -468,7 +471,7 @@ JumbleExpr(JumbleState *jstate, Node *node)
 			{
 				OpExpr	   *expr = (OpExpr *) node;
 
-				APP_JUMB(expr->opno);
+				APP_JUMB_OBJECT(OPEROID, expr->opno);
 				JumbleExpr(jstate, (Node *) expr->args);
 			}
 			break;
@@ -476,7 +479,7 @@ JumbleExpr(JumbleState *jstate, Node *node)
 			{
 				ScalarArrayOpExpr *expr = (ScalarArrayOpExpr *) node;
 
-				APP_JUMB(expr->opno);
+				APP_JUMB_OBJECT(OPEROID, expr->opno);
 				APP_JUMB(expr->useOr);
 				JumbleExpr(jstate, (Node *) expr->args);
 			}
@@ -519,7 +522,7 @@ JumbleExpr(JumbleState *jstate, Node *node)
 			{
 				RelabelType *rt = (RelabelType *) node;
 
-				APP_JUMB(rt->resulttype);
+				APP_JUMB_OBJECT(TYPEOID, rt->resulttype);
 				JumbleExpr(jstate, (Node *) rt->arg);
 			}
 			break;
@@ -527,7 +530,7 @@ JumbleExpr(JumbleState *jstate, Node *node)
 			{
 				CoerceViaIO *cio = (CoerceViaIO *) node;
 
-				APP_JUMB(cio->resulttype);
+				APP_JUMB_OBJECT(TYPEOID, cio->resulttype);
 				JumbleExpr(jstate, (Node *) cio->arg);
 			}
 			break;
@@ -535,7 +538,7 @@ JumbleExpr(JumbleState *jstate, Node *node)
 			{
 				ArrayCoerceExpr *acexpr = (ArrayCoerceExpr *) node;
 
-				APP_JUMB(acexpr->resulttype);
+				APP_JUMB_OBJECT(TYPEOID, acexpr->resulttype);
 				JumbleExpr(jstate, (Node *) acexpr->arg);
 				JumbleExpr(jstate, (Node *) acexpr->elemexpr);
 			}
@@ -544,7 +547,7 @@ JumbleExpr(JumbleState *jstate, Node *node)
 			{
 				ConvertRowtypeExpr *crexpr = (ConvertRowtypeExpr *) node;
 
-				APP_JUMB(crexpr->resulttype);
+				APP_JUMB_OBJECT(TYPEOID, crexpr->resulttype);
 				JumbleExpr(jstate, (Node *) crexpr->arg);
 			}
 			break;
@@ -552,7 +555,7 @@ JumbleExpr(JumbleState *jstate, Node *node)
 			{
 				CollateExpr *ce = (CollateExpr *) node;
 
-				APP_JUMB(ce->collOid);
+				APP_JUMB_OBJECT(COLLOID, ce->collOid);
 				JumbleExpr(jstate, (Node *) ce->arg);
 			}
 			break;
@@ -575,7 +578,7 @@ JumbleExpr(JumbleState *jstate, Node *node)
 			{
 				CaseTestExpr *ct = (CaseTestExpr *) node;
 
-				APP_JUMB(ct->typeId);
+				APP_JUMB_OBJECT(TYPEOID, ct->typeId);
 			}
 			break;
 		case T_ArrayExpr:
@@ -642,7 +645,7 @@ JumbleExpr(JumbleState *jstate, Node *node)
 			{
 				CoerceToDomain *cd = (CoerceToDomain *) node;
 
-				APP_JUMB(cd->resulttype);
+				APP_JUMB_OBJECT(TYPEOID, cd->resulttype);
 				JumbleExpr(jstate, (Node *) cd->arg);
 			}
 			break;
@@ -650,14 +653,14 @@ JumbleExpr(JumbleState *jstate, Node *node)
 			{
 				CoerceToDomainValue *cdv = (CoerceToDomainValue *) node;
 
-				APP_JUMB(cdv->typeId);
+				APP_JUMB_OBJECT(TYPEOID, cdv->typeId);
 			}
 			break;
 		case T_SetToDefault:
 			{
 				SetToDefault *sd = (SetToDefault *) node;
 
-				APP_JUMB(sd->typeId);
+				APP_JUMB_OBJECT(TYPEOID, sd->typeId);
 			}
 			break;
 		case T_CurrentOfExpr:
@@ -674,16 +677,16 @@ JumbleExpr(JumbleState *jstate, Node *node)
 			{
 				NextValueExpr *nve = (NextValueExpr *) node;
 
-				APP_JUMB(nve->seqid);
-				APP_JUMB(nve->typeId);
+				APP_JUMB_OBJECT(SEQRELID, nve->seqid);
+				APP_JUMB_OBJECT(TYPEOID, nve->typeId);
 			}
 			break;
 		case T_InferenceElem:
 			{
 				InferenceElem *ie = (InferenceElem *) node;
 
-				APP_JUMB(ie->infercollid);
-				APP_JUMB(ie->inferopclass);
+				APP_JUMB_OBJECT(COLLOID, ie->infercollid);
+				APP_JUMB_OBJECT(CLAOID, ie->inferopclass);
 				JumbleExpr(jstate, ie->expr);
 			}
 			break;
@@ -732,7 +735,7 @@ JumbleExpr(JumbleState *jstate, Node *node)
 				JumbleExpr(jstate, conf->arbiterWhere);
 				JumbleExpr(jstate, (Node *) conf->onConflictSet);
 				JumbleExpr(jstate, conf->onConflictWhere);
-				APP_JUMB(conf->constraint);
+				APP_JUMB_OBJECT(CONSTROID, conf->constraint);
 				APP_JUMB(conf->exclRelIndex);
 				JumbleExpr(jstate, (Node *) conf->exclRelTlist);
 			}
@@ -754,8 +757,8 @@ JumbleExpr(JumbleState *jstate, Node *node)
 				SortGroupClause *sgc = (SortGroupClause *) node;
 
 				APP_JUMB(sgc->tleSortGroupRef);
-				APP_JUMB(sgc->eqop);
-				APP_JUMB(sgc->sortop);
+				APP_JUMB_OBJECT(OPEROID, sgc->eqop);
+				APP_JUMB_OBJECT(OPEROID, sgc->sortop);
 				APP_JUMB(sgc->nulls_first);
 			}
 			break;
@@ -818,7 +821,7 @@ JumbleExpr(JumbleState *jstate, Node *node)
 			{
 				TableSampleClause *tsc = (TableSampleClause *) node;
 
-				APP_JUMB(tsc->tsmhandler);
+				APP_JUMB_OBJECT(PROCOID, tsc->tsmhandler);
 				JumbleExpr(jstate, (Node *) tsc->args);
 				JumbleExpr(jstate, (Node *) tsc->repeatable);
 			}

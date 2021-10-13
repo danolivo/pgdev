@@ -27,6 +27,12 @@ typedef struct LocationLen
 	int			length;			/* length in bytes, or -1 to ignore */
 } LocationLen;
 
+struct JumbleState;
+
+typedef void (*ObjectJumbleCallbackFn) (struct JumbleState *jstate,
+										int cacheId,
+										Oid oid);
+
 /*
  * Working state for computing a query jumble and producing a normalized
  * query string
@@ -50,6 +56,8 @@ typedef struct JumbleState
 
 	/* highest Param id we've seen, in order to start normalization correctly */
 	int			highest_extern_param_id;
+
+	ObjectJumbleCallbackFn oid_jumble_callback;
 } JumbleState;
 
 /* Values for the compute_query_id GUC */
@@ -65,7 +73,11 @@ extern int	compute_query_id;
 
 
 extern const char *CleanQuerytext(const char *query, int *location, int *len);
-extern JumbleState *JumbleQuery(Query *query, const char *querytext);
+extern uint64 JumbleQuery(Query *query, const char *querytext,
+						  ObjectJumbleCallbackFn callback,
+						  JumbleState *jstate);
+extern void AppendJumble(JumbleState *jstate, const unsigned char *item,
+						 Size size);
 extern void EnableQueryId(void);
 
 extern bool query_id_enabled;

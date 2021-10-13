@@ -166,7 +166,7 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 {
 	ExplainState *es = NewExplainState();
 	TupOutputState *tstate;
-	JumbleState *jstate = NULL;
+	JumbleState jstate;
 	Query	   *query;
 	List	   *rewritten;
 	ListCell   *lc;
@@ -246,10 +246,10 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 
 	query = castNode(Query, stmt->query);
 	if (IsQueryIdEnabled())
-		jstate = JumbleQuery(query, pstate->p_sourcetext);
+		query->queryId = JumbleQuery(query, pstate->p_sourcetext, NULL, &jstate);
 
 	if (post_parse_analyze_hook)
-		(*post_parse_analyze_hook) (pstate, query, jstate);
+		(*post_parse_analyze_hook) (pstate, query, &jstate);
 
 	/*
 	 * Parse analysis was done already, but we still have to run the rule
