@@ -52,6 +52,11 @@ typedef struct JumbleState
 	int			highest_extern_param_id;
 } JumbleState;
 
+typedef void (*get_object_hash_hook_type) (JumbleState *jstate,
+											 int cacheId,
+											 Oid oid);
+extern PGDLLIMPORT get_object_hash_hook_type get_object_hash_hook;
+
 /* Values for the compute_query_id GUC */
 enum ComputeQueryIdType
 {
@@ -66,6 +71,8 @@ extern int	compute_query_id;
 
 extern const char *CleanQuerytext(const char *query, int *location, int *len);
 extern JumbleState *JumbleQuery(Query *query, const char *querytext);
+extern void AppendJumble(JumbleState *jstate, const unsigned char *item,
+						 Size size);
 extern void EnableQueryId(void);
 
 extern bool query_id_enabled;
