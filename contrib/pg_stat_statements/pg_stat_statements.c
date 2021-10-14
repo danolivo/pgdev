@@ -70,6 +70,7 @@
 #include "utils/builtins.h"
 #include "utils/queryjumble.h"
 #include "utils/memutils.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 
 PG_MODULE_MAGIC;
@@ -242,6 +243,7 @@ static int	plan_nested_level = 0;
 
 /* Saved hook values in case of unload */
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+static get_object_hash_hook_type prev_get_object_hash_hook = NULL;
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
 static planner_hook_type prev_planner_hook = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
@@ -276,6 +278,7 @@ static int	pgss_track;			/* tracking level */
 static bool pgss_track_utility; /* whether to track utility commands */
 static bool pgss_track_planning;	/* whether to track planning duration */
 static bool pgss_save;			/* whether to save stats across shutdown */
+static bool pgss_schema_based_queryid; /* Use hook on jumbling OIDs */
 
 
 #define pgss_enabled(level) \
@@ -307,6 +310,7 @@ PG_FUNCTION_INFO_V1(pg_stat_statements_info);
 
 static void pgss_shmem_startup(void);
 static void pgss_shmem_shutdown(int code, Datum arg);
+static void test_oid_jumble(JumbleState *jstate, int cacheId, Oid oid);
 static void pgss_post_parse_analyze(ParseState *pstate, Query *query,
 									JumbleState *jstate);
 static PlannedStmt *pgss_planner(Query *parse,
@@ -437,6 +441,17 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
+	DefineCustomBoolVariable("pg_stat_statements.schema_based_queryid",
+							 "Generate Query IDs based on names of objects, not oids.",
+							 "It guarantees equalence of query ids at two instances with the same pg version and database schema",
+							 &pgss_schema_based_queryid,
+							 false,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	EmitWarningsOnPlaceholders("pg_stat_statements");
 
 	/*
@@ -452,6 +467,8 @@ _PG_init(void)
 	 */
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pgss_shmem_startup;
+	prev_get_object_hash_hook = get_object_hash_hook;
+	get_object_hash_hook = test_oid_jumble;
 	prev_post_parse_analyze_hook = post_parse_analyze_hook;
 	post_parse_analyze_hook = pgss_post_parse_analyze;
 	prev_planner_hook = planner_hook;
@@ -476,6 +493,7 @@ _PG_fini(void)
 {
 	/* Uninstall hooks. */
 	shmem_startup_hook = prev_shmem_startup_hook;
+	get_object_hash_hook = prev_get_object_hash_hook;
 	post_parse_analyze_hook = prev_post_parse_analyze_hook;
 	planner_hook = prev_planner_hook;
 	ExecutorStart_hook = prev_ExecutorStart;
@@ -810,6 +828,26 @@ error:
 		FreeFile(file);
 	unlink(PGSS_DUMP_FILE ".tmp");
 	unlink(PGSS_TEXT_FILE);
+}
+
+static void
+test_oid_jumble(JumbleState *jstate, int cacheId, Oid oid)
+{
+	HeapTuple	tup;
+
+//	if (prev_get_object_hash_hook)
+	if (!OidIsValid(oid))
+	{
+		AppendJumble(jstate, (const unsigned char *) &(oid), sizeof(Oid));
+		return;
+	}
+
+	tup = SearchSysCache1(cacheId, ObjectIdGetDatum(oid));
+	if (!HeapTupleIsValid(tup))
+		elog(PANIC, "cache %d lookup failed for oid %u", cacheId, oid);
+	ReleaseSysCache(tup);
+
+	AppendJumble(jstate, (const unsigned char *) &(oid), sizeof(Oid));
 }
 
 /*
