@@ -190,6 +190,15 @@ typedef enum
 
 extern PathKeysComparison compare_pathkeys(List *keys1, List *keys2);
 extern bool pathkeys_contained_in(List *keys1, List *keys2);
+extern int group_keys_reorder_by_pathkeys(List *pathkeys,
+										  List **group_pathkeys,
+										  List **group_clauses);
+extern void sort_group_key_by_distinct(PlannerInfo *root,
+									   double nrows,
+									   List *targetList,
+									   List **groupPathkeys,
+									   List **groupClauses,
+									   int	startNum);
 extern Path *get_cheapest_path_for_pathkeys(List *paths, List *pathkeys,
 							   Relids required_outer,
 							   CostSelector cost_criterion,
