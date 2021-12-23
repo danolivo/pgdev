@@ -1,0 +1,60 @@
+#!/bin/bash
+
+ulimit -c unlimited
+
+INSTDIR=`pwd`/tmp_install
+export LD_LIBRARY_PATH=$INSTDIR/lib:$LD_LIBRARY_PATH
+export PATH=$INSTDIR/bin:$PATH
+export PGPORT=5432
+export PGUSER=`whoami`
+
+# Kill all processes
+unamestr=`uname`
+if [[ "$unamestr" == 'Linux' ]]; then
+    pkill -U `whoami` -9 -e postgres
+	pkill -U `whoami` -9 -e pgbench
+	pkill -U `whoami` -9 -e psql
+elif [[ "$OSTYPE" == "darwin"* ]]; then
+    killall -u `whoami` -vz -9 postgres
+    killall -u `whoami` -vz -9 pgbench
+    killall -u `whoami` -vz -9 psql
+else
+    echo "Unintended OS."
+fi
+sleep 1
+
+mk
+
+M=`pwd`/PGDATA
+U=`whoami`
+
+rm -rf $M || true
+mkdir $M
+rm -rf logfile.log || true
+
+export LC_ALL=C
+export LANGUAGE="en_US:en"
+initdb -D $M --locale=C
+
+echo "shared_preload_libraries = 'pg_prewarm'" >> $M/postgresql.conf
+echo "fsync = 'off'" >> $M/postgresql.conf
+echo "autovacuum = 'off'" >> $M/postgresql.conf
+echo "shared_buffers = 32GB" >> $M/postgresql.conf
+echo "work_mem = 256MB" >> $M/postgresql.conf
+
+echo "max_worker_processes = 256" >> $M/postgresql.conf
+echo "max_parallel_workers_per_gather = 16" >> $M/postgresql.conf
+echo "max_parallel_workers = 32" >> $M/postgresql.conf
+echo "min_parallel_table_scan_size = 0" >> $M/postgresql.conf
+echo "min_parallel_index_scan_size = 0" >> $M/postgresql.conf
+
+#echo "parallel_setup_cost = 0.00001" >> $M/postgresql.conf
+#echo "parallel_tuple_cost = 0.00001" >> $M/postgresql.conf
+
+#echo "force_parallel_mode = 'on'" >> $M/postgresql.conf
+#echo "log_error_verbosity = VERBOSE" >> $M/postgresql.conf
+#echo "log_statement = all" >> $M/postgresql.conf
+
+pg_ctl -w -D $M -l logfile.log start
+createdb $U
+psql -c 'CREATE EXTENSION pg_prewarm'

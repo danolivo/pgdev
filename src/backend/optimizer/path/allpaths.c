@@ -3794,6 +3794,7 @@ compute_parallel_worker(RelOptInfo *rel, double heap_pages, double index_pages,
 			}
 
 			parallel_workers = heap_parallel_workers;
+			parallel_workers = max_parallel_workers_per_gather;
 		}
 
 		if (index_pages >= 0)

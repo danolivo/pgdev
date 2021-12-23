@@ -1,0 +1,9 @@
+#!/bin/bash
+
+CFLAGS="$CFLAGS -O3"
+CXXFLAGS="$CXXFLAGS -O3"
+
+export CFLAGS=$CFLAGS
+export CXXFLAGS=$CXXFLAGS
+
+./configure --prefix=`pwd`/tmp_install --with-icu --with-perl --with-tcl
