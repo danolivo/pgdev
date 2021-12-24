@@ -6158,7 +6158,6 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 		{
 			ListCell   *lc2;
 			Path	   *path = (Path *) lfirst(lc);
-			Path	   *path_save = path;
 			Path	   *path_original = path;
 
 			List	   *pathkey_orderings = NIL;
@@ -6181,9 +6180,6 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 				bool		is_sorted;
 				int			presorted_keys = 0;
 				PathKeyInfo *info = (PathKeyInfo *) lfirst(lc2);
-
-				/* restore the path (we replace it in the loop) */
-				path = path_save;
 
 				is_sorted = pathkeys_count_contained_in(info->pathkeys,
 														path->pathkeys,
@@ -6653,7 +6649,6 @@ create_partial_grouping_paths(PlannerInfo *root,
 		{
 			ListCell   *lc2;
 			Path	   *path = (Path *) lfirst(lc);
-			Path	   *path_save = path;
 
 			List	   *pathkey_orderings = NIL;
 
@@ -6675,9 +6670,6 @@ create_partial_grouping_paths(PlannerInfo *root,
 				bool		is_sorted;
 				int			presorted_keys = 0;
 				PathKeyInfo *info = (PathKeyInfo *) lfirst(lc2);
-
-				/* restore the path (we replace it in the loop) */
-				path = path_save;
 
 				is_sorted = pathkeys_count_contained_in(info->pathkeys,
 														path->pathkeys,

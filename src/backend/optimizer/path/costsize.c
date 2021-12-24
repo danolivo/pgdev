@@ -1845,19 +1845,17 @@ get_width_cost_multiplier(PlannerInfo *root, Expr *expr)
  * groups in the current pathkey prefix and the new pathkey), and the comparison
  * costs (which is data type specific).
  *
- * Estimation of the number of comparisons is based on ideas from two sources:
+ * Estimation of the number of comparisons is based on ideas from:
  *
- * 1) "Algorithms" (course), Robert Sedgewick, Kevin Wayne [https://algs4.cs.princeton.edu/home/]
+ * "Quicksort Is Optimal", Robert Sedgewick, Jon Bentley, 2002
+ * [https://www.cs.princeton.edu/~rs/talks/QuicksortIsOptimal.pdf]
  *
- * 2) "Quicksort Is Optimal For Many Equal Keys" (paper), Sebastian Wild,
- * arXiv:1608.04906v4 [cs.DS] 1 Nov 2017. [https://arxiv.org/abs/1608.04906]
- *
- * In term of that paper, let N - number of tuples, Xi - number of tuples with
- * key Ki, then the estimate of number of comparisons is:
+ * In term of that paper, let N - number of tuples, Xi - number of identical
+ * tuples with value Ki, then the estimate of number of comparisons is:
  *
  *	log(N! / (X1! * X2! * ..))  ~  sum(Xi * log(N/Xi))
  *
- * In our case all Xi are the same because now we don't have any estimation of
+ * We assume all Xi the same because now we don't have any estimation of
  * group sizes, we have only know the estimate of number of groups (distinct
  * values). In that case, formula becomes:
  *
@@ -1865,7 +1863,7 @@ get_width_cost_multiplier(PlannerInfo *root, Expr *expr)
  *
  * For multi-column sorts we need to estimate the number of comparisons for
  * each individual column - for example with columns (c1, c2, ..., ck) we
- * can estimate that number of comparions on ck is roughly
+ * can estimate that number of comparisons on ck is roughly
  *
  *	ncomparisons(c1, c2, ..., ck) / ncomparisons(c1, c2, ..., c(k-1))
  *
@@ -1874,10 +1872,10 @@ get_width_cost_multiplier(PlannerInfo *root, Expr *expr)
  *
  *	N * sum( Fk * log(Gk) )
  *
- * Note: We also consider column witdth, not just the comparator cost.
+ * Note: We also consider column width, not just the comparator cost.
  *
  * NOTE: some callers currently pass NIL for pathkeys because they
- * can't conveniently supply the sort keys.  In this case, it will fallback to
+ * can't conveniently supply the sort keys. In this case, it will fallback to
  * simple comparison cost estimate.
  */
 static Cost
@@ -1925,13 +1923,13 @@ compute_cpu_sort_cost(PlannerInfo *root, List *pathkeys, int nPresortedKeys,
 	 */
 	foreach(lc, pathkeys)
 	{
-		PathKey				*pathkey = (PathKey*)lfirst(lc);
+		PathKey				*pathkey = (PathKey*) lfirst(lc);
 		EquivalenceMember	*em;
 		double				 nGroups,
 							 correctedNGroups;
 
 		/*
-		 * We believe than equivalence members aren't very  different, so, to
+		 * We believe that equivalence members aren't very different, so, to
 		 * estimate cost we take just first member
 		 */
 		em = (EquivalenceMember *) linitial(pathkey->pk_eclass->ec_members);
@@ -1964,7 +1962,7 @@ compute_cpu_sort_cost(PlannerInfo *root, List *pathkeys, int nPresortedKeys,
 
 		totalFuncCost += funcCost;
 
-		/* remeber if we have a fake var in pathkeys */
+		/* Remember if we have a fake var in pathkeys */
 		has_fake_var |= is_fake_var(em->em_expr);
 		pathkeyExprs = lappend(pathkeyExprs, em->em_expr);
 
@@ -1974,7 +1972,7 @@ compute_cpu_sort_cost(PlannerInfo *root, List *pathkeys, int nPresortedKeys,
 		 */
 		if (has_fake_var == false)
 			/*
-			 * Recursively compute number of group in group from previous step
+			 * Recursively compute number of groups in a group from previous step
 			 */
 			nGroups = estimate_num_groups_incremental(root, pathkeyExprs,
 													  tuplesPerPrevGroup, NULL, NULL,
@@ -1992,8 +1990,7 @@ compute_cpu_sort_cost(PlannerInfo *root, List *pathkeys, int nPresortedKeys,
 			 *
 			 * XXX What's the logic of the following formula?
 			 */
-			nGroups = ceil(2.0 + sqrt(tuples) *
-				list_length(pathkeyExprs) / list_length(pathkeys));
+			nGroups = ceil(2.0 + sqrt(tuples) * (i + 1) / list_length(pathkeys));
 		else
 			nGroups = tuples;
 
@@ -2033,7 +2030,7 @@ compute_cpu_sort_cost(PlannerInfo *root, List *pathkeys, int nPresortedKeys,
 
 		/*
 		 * We could skip all following columns for cost estimation, because we
-		 * believe that tuples are unique by set ot previous columns
+		 * believe that tuples are unique by the set of previous columns
 		 */
 		if (tuplesPerPrevGroup <= 1.0)
 			break;

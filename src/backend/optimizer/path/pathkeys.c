@@ -544,9 +544,10 @@ PathkeyMutatorNext(PathkeyMutatorState *state)
 	return state->elemsList;
 }
 
-typedef struct {
-	Cost cost;
-	PathKey *pathkey;
+typedef struct PathkeySortCost
+{
+	Cost		cost;
+	PathKey	   *pathkey;
 } PathkeySortCost;
 
 static int
@@ -793,7 +794,7 @@ get_useful_group_keys_orderings(PlannerInfo *root, double nrows,
 	 * more complex logic to decide the ordering.
 	 *
 	 * XXX Isn't this somewhat redundant with presorted_keys? Actually, it's
-	 * more a complement, because it allows benefinting from incremental sort
+	 * more a complement, because it allows benefiting from incremental sort
 	 * as much as possible.
 	 *
 	 * XXX This does nothing if (n_preordered == 0). We shouldn't create the
