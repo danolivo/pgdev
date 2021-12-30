@@ -280,6 +280,70 @@ analyze_rel(Oid relid, RangeVar *relation,
 	pgstat_progress_end_command();
 }
 
+static VacAttrStats **
+determine_analyzable_columns(Relation onerel, List *va_cols, int *nattrs)
+{
+	VacAttrStats **vacattrstats;
+	int			attr_cnt,
+				tcnt,
+				i;
+
+	/*
+	 * Determine which columns to analyze
+	 *
+	 * Note that system attributes are never analyzed, so we just reject them
+	 * at the lookup stage.  We also reject duplicate column mentions.  (We
+	 * could alternatively ignore duplicates, but analyzing a column twice
+	 * won't work; we'd end up making a conflicting update in pg_statistic.)
+	 */
+	if (va_cols != NIL)
+	{
+		Bitmapset  *unique_cols = NULL;
+		ListCell   *le;
+
+		vacattrstats = (VacAttrStats **) palloc(list_length(va_cols) *
+												sizeof(VacAttrStats *));
+		tcnt = 0;
+		foreach(le, va_cols)
+		{
+			char	   *col = strVal(lfirst(le));
+
+			i = attnameAttNum(onerel, col, false);
+			if (i == InvalidAttrNumber)
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_COLUMN),
+						 errmsg("column \"%s\" of relation \"%s\" does not exist",
+								col, RelationGetRelationName(onerel))));
+			if (bms_is_member(i, unique_cols))
+				ereport(ERROR,
+						(errcode(ERRCODE_DUPLICATE_COLUMN),
+						 errmsg("column \"%s\" of relation \"%s\" appears more than once",
+								col, RelationGetRelationName(onerel))));
+			unique_cols = bms_add_member(unique_cols, i);
+
+			vacattrstats[tcnt] = examine_attribute(onerel, i, NULL);
+			if (vacattrstats[tcnt] != NULL)
+				tcnt++;
+		}
+	}
+	else
+	{
+		attr_cnt = onerel->rd_att->natts;
+		vacattrstats = (VacAttrStats **)
+			palloc(attr_cnt * sizeof(VacAttrStats *));
+		tcnt = 0;
+		for (i = 1; i <= attr_cnt; i++)
+		{
+			vacattrstats[tcnt] = examine_attribute(onerel, i, NULL);
+			if (vacattrstats[tcnt] != NULL)
+				tcnt++;
+		}
+	}
+
+	*nattrs = tcnt;
+	return vacattrstats;
+}
+
 /*
  *	do_analyze_rel() -- analyze one relation, recursively or not
  *
@@ -364,59 +428,7 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 			starttime = GetCurrentTimestamp();
 	}
 
-	/*
-	 * Determine which columns to analyze
-	 *
-	 * Note that system attributes are never analyzed, so we just reject them
-	 * at the lookup stage.  We also reject duplicate column mentions.  (We
-	 * could alternatively ignore duplicates, but analyzing a column twice
-	 * won't work; we'd end up making a conflicting update in pg_statistic.)
-	 */
-	if (va_cols != NIL)
-	{
-		Bitmapset  *unique_cols = NULL;
-		ListCell   *le;
-
-		vacattrstats = (VacAttrStats **) palloc(list_length(va_cols) *
-												sizeof(VacAttrStats *));
-		tcnt = 0;
-		foreach(le, va_cols)
-		{
-			char	   *col = strVal(lfirst(le));
-
-			i = attnameAttNum(onerel, col, false);
-			if (i == InvalidAttrNumber)
-				ereport(ERROR,
-						(errcode(ERRCODE_UNDEFINED_COLUMN),
-						 errmsg("column \"%s\" of relation \"%s\" does not exist",
-								col, RelationGetRelationName(onerel))));
-			if (bms_is_member(i, unique_cols))
-				ereport(ERROR,
-						(errcode(ERRCODE_DUPLICATE_COLUMN),
-						 errmsg("column \"%s\" of relation \"%s\" appears more than once",
-								col, RelationGetRelationName(onerel))));
-			unique_cols = bms_add_member(unique_cols, i);
-
-			vacattrstats[tcnt] = examine_attribute(onerel, i, NULL);
-			if (vacattrstats[tcnt] != NULL)
-				tcnt++;
-		}
-		attr_cnt = tcnt;
-	}
-	else
-	{
-		attr_cnt = onerel->rd_att->natts;
-		vacattrstats = (VacAttrStats **)
-			palloc(attr_cnt * sizeof(VacAttrStats *));
-		tcnt = 0;
-		for (i = 1; i <= attr_cnt; i++)
-		{
-			vacattrstats[tcnt] = examine_attribute(onerel, i, NULL);
-			if (vacattrstats[tcnt] != NULL)
-				tcnt++;
-		}
-		attr_cnt = tcnt;
-	}
+	vacattrstats = determine_analyzable_columns(onerel, va_cols, &attr_cnt);
 
 	/*
 	 * Open all indexes of the relation, and see if there are any analyzable
