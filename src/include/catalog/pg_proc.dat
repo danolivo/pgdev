@@ -11714,5 +11714,8 @@
   proname => 'brin_minmax_multi_summary_send', provolatile => 's',
   prorettype => 'bytea', proargtypes => 'pg_brin_minmax_multi_summary',
   prosrc => 'brin_minmax_multi_summary_send' },
+{ oid => '10001', descr => 'map relation statistics to json',
+  proname => 'extract_relation_statistics', provolatile => 's', prorettype => 'json',
+  proargtypes => 'text bool', prosrc => 'extract_relation_statistics' },
 
 ]

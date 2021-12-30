@@ -125,6 +125,7 @@ CATALOG(pg_statistic,2619,StatisticRelationId)
 } FormData_pg_statistic;
 
 #define STATISTIC_NUM_SLOTS  5
+#define STATISTIC_VERSION	 1
 
 
 /* ----------------

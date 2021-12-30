@@ -59,6 +59,7 @@
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
+#include "utils/json.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
@@ -109,6 +110,10 @@ static void update_attstats(Oid relid, bool inh,
 static Datum std_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull);
 static Datum ind_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull);
 
+static VacAttrStats **determine_analyzable_columns(Relation onerel,
+												   List *va_cols,
+												   int *nattrs);
+static const char *extract_relation_statistics_int(Relation rel);
 
 /*
  *	analyze_rel() -- analyze one relation
@@ -825,6 +830,42 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 			pfree(buf.data);
 		}
 	}
+
+#define DUMP_STAT_TEST
+#ifdef DUMP_STAT_TEST
+	if (IsNormalProcessingMode() && !IsSystemRelation(onerel))
+	{
+		const char *ptr;
+		MemoryContext old_mcxt = CurrentMemoryContext;
+//		bool result;
+//		text *json;
+
+		CommandCounterIncrement();
+
+		PG_TRY();
+		{
+			ptr = extract_relation_statistics_int(onerel);
+			elog(LOG, "DUMPSTAT json: \n%s\n\n", ptr);
+/*			json = cstring_to_text(ptr);
+			result = store_relation_statistics_int(onerel, json);
+			Assert(result);
+*/
+		}
+		PG_CATCH();
+		{
+			ErrorData  *error;
+
+			/* Switch to the original context & copy edata */
+			MemoryContextSwitchTo(old_mcxt);
+			error = CopyErrorData();
+			FlushErrorState();
+
+			elog(PANIC, "Error during stat conversion: %s %s.", error->message, error->detail);
+		}
+		PG_END_TRY();
+	}
+	/* TODO: Think on stat for index relations. */
+#endif
 
 	/* Roll back any GUC changes executed by index functions */
 	AtEOXact_GUC(false, save_nestlevel);
@@ -3068,4 +3109,269 @@ analyze_mcv_list(int *mcv_counts,
 		}
 	}
 	return num_mcv;
+}
+
+/*
+ * *******************************************************************************
+ *
+ * Dump/restore statistics machinery
+ *
+ * *******************************************************************************
+ */
+
+/*
+ * Get stat tuples for the attributes of relation
+ * See row_to_json()
+ * Use the third parameter with true value for nowait's attempt to acquire
+ * a shared lock on the relation.
+ * This routine used in the vacuum process and should work at foreign server as
+ * gently as local vacuuming.
+ */
+Datum
+extract_relation_statistics(PG_FUNCTION_ARGS)
+{
+	const char	   *relname = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	Datum			datum = CStringGetDatum(relname);
+	const bool		nowait = PG_GETARG_BOOL(1);
+	const char	   *json_stat = NULL;
+	Relation		rel;
+	RangeTblEntry  *rte;
+	int				attnum;
+	Oid				reloid;
+	LOCKMODE		lmode = AccessShareLock;
+
+	/* Get OID of the table. */
+	reloid = DatumGetObjectId(DirectFunctionCall1(regclassin, datum));
+
+	if (!OidIsValid(reloid))
+	{
+		elog(WARNING, "Relation '%s' not found", relname);
+		PG_RETURN_TEXT_P(cstring_to_text("{}"));
+	}
+
+	/*
+	 * Open the relation and get the appropriate lock on it.
+	 * If we've been asked not to wait for the relation lock, acquire it first
+	 * in non-blocking mode, before calling table_open().
+	 */
+	if (!nowait)
+		rel = table_open(reloid, lmode);
+	else if (ConditionalLockRelationOid(reloid, lmode))
+		rel = table_open(reloid, NoLock);
+	else
+	{
+		elog(WARNING, "No. 2");
+		PG_RETURN_TEXT_P(cstring_to_text("{}"));
+	}
+
+	/*
+	 * Use only for plain relation. Additional efforts and analysis needed to
+	 * prove that nothing happened for other relations.
+	*/
+	if (rel->rd_rel->relkind != RELKIND_RELATION)
+	{
+		table_close(rel, lmode);
+		elog(WARNING,
+			 "Can be used for ordinary relation only. Reltype: %c.",
+			 rel->rd_rel->relkind);
+		PG_RETURN_TEXT_P(cstring_to_text("{}"));
+	}
+
+	/* Check SELECT permission on the table. */
+	rte = makeNode(RangeTblEntry);
+	rte->rtekind = RTE_RELATION;
+	rte->relid = rel->rd_id;
+	rte->relkind = rel->rd_rel->relkind;
+	rte->rellockmode = lmode;
+	rte->requiredPerms = ACL_SELECT;
+
+	for (attnum = 1; attnum <= rel->rd_att->natts; attnum++)
+		rte->selectedCols = bms_add_member(rte->selectedCols,
+								attnum - FirstLowInvalidHeapAttributeNumber);
+
+	ExecCheckRTPerms(list_make1(rte), true);
+	json_stat = extract_relation_statistics_int(rel);
+
+	table_close(rel, lmode);
+	PG_RETURN_TEXT_P(cstring_to_text(json_stat));
+}
+
+/*
+ * extract_relation_statistics_int
+ *
+ */
+static const char *
+extract_relation_statistics_int(Relation rel)
+{
+	Relation	sd;
+	int			attno;
+	StringInfo	str = makeStringInfo();
+	int			attnum = 0;
+	StringInfo	json_relname, json_namespace;
+
+	json_relname = makeStringInfo();
+	json_namespace = makeStringInfo();
+
+	escape_json(json_relname, NameStr(rel->rd_rel->relname));
+	escape_json(json_namespace, get_namespace_name(rel->rd_rel->relnamespace));
+
+	/* JSON header of overall relation statistics. */
+	appendStringInfoString(str, "{");
+	appendStringInfo(str, "\"version\" : %u, ", STATISTIC_VERSION);
+
+	/* XXX: namespace really needed? */
+	appendStringInfo(str, "\"namespace\" : %s, \"relname\" : %s, \"sta_num_slots\" : %d, ",
+					 json_namespace->data,
+					 json_relname->data, STATISTIC_NUM_SLOTS);
+	pfree(json_namespace);
+	pfree(json_relname);
+
+	appendStringInfo(str, "\"relpages\" : %u, \"reltuples\" : %.0f, ",
+					 rel->rd_rel->relpages,
+					 rel->rd_rel->reltuples);
+
+	appendStringInfo(str, "\"attrs\" : [");
+	sd = table_open(StatisticRelationId, RowExclusiveLock);
+
+	for (attno = 0; attno < rel->rd_att->natts; attno++)
+	{
+		HeapTuple	stup;
+		Datum		values[Natts_pg_statistic];
+		bool		nulls[Natts_pg_statistic];
+		int			i, k;
+		StringInfo	json_attname;
+
+		/* Find statistic data for the attnum. */
+		stup = SearchSysCache3(STATRELATTINH,
+							   ObjectIdGetDatum(RelationGetRelid(rel)),
+							   Int16GetDatum(rel->rd_att->attrs[attno].attnum),
+							   BoolGetDatum(rel->rd_rel->relhassubclass));
+
+		if (!HeapTupleIsValid(stup))
+			/* Go to the next attribute, if we haven't statistics for. */
+			continue;
+
+		if (attnum++ > 0)
+			appendStringInfoString(str, ", ");
+
+		heap_deform_tuple(stup, RelationGetDescr(sd), values, nulls);
+
+		json_attname = makeStringInfo();
+		escape_json(json_attname, NameStr(*attnumAttName(rel, rel->rd_att->attrs[attno].attnum)));
+
+		/* JSON header of attrribute statistics. */
+		appendStringInfo(str, "{\"attname\" : %s, \"inh\" : \"%s\", \"nullfrac\" : %f, \"width\" : %d, \"distinct\" : %f, ",
+			json_attname->data,
+			DatumGetBool(values[Anum_pg_statistic_stainherit - 1]) ? "true" : "false",
+			DatumGetFloat4(values[Anum_pg_statistic_stanullfrac - 1]),
+			DatumGetInt32(values[Anum_pg_statistic_stawidth - 1]),
+			DatumGetFloat4(values[Anum_pg_statistic_stadistinct - 1]));
+		pfree(json_attname);
+
+		appendStringInfoString(str, "\"stakind\" : [");
+		i = Anum_pg_statistic_stakind1 - 1;
+		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+		{
+			appendStringInfo(str, "%d", DatumGetInt16(values[i++]));
+			if (k < STATISTIC_NUM_SLOTS - 1)
+				appendStringInfo(str, ",");
+		}
+		appendStringInfoString(str, "], \"staop\" : [");
+
+		i = Anum_pg_statistic_staop1 - 1;
+		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+		{
+			char *soper;
+			StringInfo	json_val = makeStringInfo();
+
+			/* Prepare portable representation of the oid */
+			soper = DatumGetCString(DirectFunctionCall1(regoperout, values[i++]));
+			escape_json(json_val, soper);
+			appendStringInfoString(str, json_val->data);
+			pfree(soper);
+			pfree(json_val);
+
+			if (k < STATISTIC_NUM_SLOTS - 1)
+				appendStringInfoChar(str, ',');
+		}
+
+		appendStringInfoString(str, "], \"stacoll\" : [");
+		i = Anum_pg_statistic_stacoll1 - 1;
+		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+		{
+			char *scoll;
+			StringInfo	json_val = makeStringInfo();
+
+			/* Prepare portable representation of the oid */
+			scoll = DatumGetCString(DirectFunctionCall1(regcollationout, values[i++]));
+			escape_json(json_val, scoll);
+			appendStringInfoString(str, json_val->data);
+			pfree(scoll);
+			pfree(json_val);
+
+			if (k < STATISTIC_NUM_SLOTS - 1)
+				appendStringInfoChar(str, ',');
+		}
+
+		appendStringInfoString(str, "], ");
+
+		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+		{
+			bool		isnull;
+			Datum		val;
+
+			val = SysCacheGetAttr(STATRELATTINH, stup,
+							  Anum_pg_statistic_stavalues1 + k,
+							  &isnull);
+
+			if (isnull)
+				appendStringInfo(str, "\"nn\" : 0, \"values%d\" : [ ]", k+1);
+			else
+			{
+				Datum		json;
+
+				appendStringInfo(str, "\"values%d\" : ", k+1);
+				json = DirectFunctionCall1(array_to_json, val);
+				appendStringInfoString(str, TextDatumGetCString(json));
+			}
+			appendStringInfoString(str, ", ");
+		}
+
+		/* --- Extract numbers --- */
+		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+		{
+			bool		isnull;
+			Datum		val;
+
+			if (k > 0)
+				appendStringInfoString(str, ", ");
+
+			val = SysCacheGetAttr(STATRELATTINH, stup,
+								  Anum_pg_statistic_stanumbers1 + k,
+								  &isnull);
+			if (isnull)
+				appendStringInfo(str, "\"numbers%d\" : [ ]", k+1);
+			else
+			{
+				Datum		json;
+
+				appendStringInfo(str, "\"numbers%d\" : ", k+1);
+				json = DirectFunctionCall1(array_to_json, val);
+				appendStringInfoString(str, TextDatumGetCString(json));
+			}
+		}
+
+		appendStringInfoString(str, "}");
+		ReleaseSysCache(stup);
+	}
+
+	if (attnum == 0)
+		appendStringInfoString(str, " ]");
+	else
+		appendStringInfoChar(str, ']');
+	appendStringInfoString(str, "}");
+
+	table_close(sd, RowExclusiveLock);
+
+	return str->data;
 }
