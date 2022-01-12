@@ -3205,32 +3205,27 @@ extract_relation_statistics_int(Relation rel)
 {
 	Relation	sd;
 	int			attno;
-	StringInfo	str = makeStringInfo();
 	int			attnum = 0;
-	StringInfo	json_relname, json_namespace;
+	StringInfoData	dst;
 
-	json_relname = makeStringInfo();
-	json_namespace = makeStringInfo();
-
-	escape_json(json_relname, NameStr(rel->rd_rel->relname));
-	escape_json(json_namespace, get_namespace_name(rel->rd_rel->relnamespace));
+	initStringInfo(&dst);
 
 	/* JSON header of overall relation statistics. */
-	appendStringInfoString(str, "{");
-	appendStringInfo(str, "\"version\" : %u, ", STATISTIC_VERSION);
+	appendStringInfoChar(&dst, '{');
+	appendStringInfo(&dst, "\"version\": %u, ", STATISTIC_VERSION);
 
 	/* XXX: namespace really needed? */
-	appendStringInfo(str, "\"namespace\" : %s, \"relname\" : %s, \"sta_num_slots\" : %d, ",
-					 json_namespace->data,
-					 json_relname->data, STATISTIC_NUM_SLOTS);
-	pfree(json_namespace);
-	pfree(json_relname);
+	appendStringInfoString(&dst, "\"namespace\": ");
+	escape_json(&dst, get_namespace_name(rel->rd_rel->relnamespace));
+	appendStringInfoString(&dst, ", \"relname\": ");
+	escape_json(&dst, NameStr(rel->rd_rel->relname));
+	appendStringInfo(&dst, ", \"sta_num_slots\": %d", STATISTIC_NUM_SLOTS);
 
-	appendStringInfo(str, "\"relpages\" : %u, \"reltuples\" : %.0f, ",
+	appendStringInfo(&dst, ", \"relpages\": %u, \"reltuples\": %.0f",
 					 rel->rd_rel->relpages,
 					 rel->rd_rel->reltuples);
 
-	appendStringInfo(str, "\"attrs\" : [");
+	appendStringInfo(&dst, ", \"attrs\": [");
 	sd = table_open(StatisticRelationId, RowExclusiveLock);
 
 	for (attno = 0; attno < rel->rd_att->natts; attno++)
@@ -3239,7 +3234,6 @@ extract_relation_statistics_int(Relation rel)
 		Datum		values[Natts_pg_statistic];
 		bool		nulls[Natts_pg_statistic];
 		int			i, k;
-		StringInfo	json_attname;
 
 		/* Find statistic data for the attnum. */
 		stup = SearchSysCache3(STATRELATTINH,
@@ -3252,68 +3246,59 @@ extract_relation_statistics_int(Relation rel)
 			continue;
 
 		if (attnum++ > 0)
-			appendStringInfoString(str, ", ");
+			appendStringInfoString(&dst, ", ");
+
+		/* JSON header of statistics for an attrribute. */
+		appendStringInfoString(&dst, "{\"attname\": ");
+		escape_json(&dst, NameStr(*attnumAttName(rel, rel->rd_att->attrs[attno].attnum)));
 
 		heap_deform_tuple(stup, RelationGetDescr(sd), values, nulls);
-
-		json_attname = makeStringInfo();
-		escape_json(json_attname, NameStr(*attnumAttName(rel, rel->rd_att->attrs[attno].attnum)));
-
-		/* JSON header of attrribute statistics. */
-		appendStringInfo(str, "{\"attname\" : %s, \"inh\" : \"%s\", \"nullfrac\" : %f, \"width\" : %d, \"distinct\" : %f, ",
-			json_attname->data,
+		appendStringInfo(&dst, ", \"inh\": \"%s\", \"nullfrac\": %f, \"width\": %d, \"distinct\": %f, ",
 			DatumGetBool(values[Anum_pg_statistic_stainherit - 1]) ? "true" : "false",
 			DatumGetFloat4(values[Anum_pg_statistic_stanullfrac - 1]),
 			DatumGetInt32(values[Anum_pg_statistic_stawidth - 1]),
 			DatumGetFloat4(values[Anum_pg_statistic_stadistinct - 1]));
-		pfree(json_attname);
 
-		appendStringInfoString(str, "\"stakind\" : [");
+		appendStringInfoString(&dst, "\"stakind\": [");
 		i = Anum_pg_statistic_stakind1 - 1;
 		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
 		{
-			appendStringInfo(str, "%d", DatumGetInt16(values[i++]));
+			appendStringInfo(&dst, "%d", DatumGetInt16(values[i++]));
 			if (k < STATISTIC_NUM_SLOTS - 1)
-				appendStringInfo(str, ",");
+				appendStringInfoChar(&dst, ',');
 		}
-		appendStringInfoString(str, "], \"staop\" : [");
 
+		appendStringInfoString(&dst, "], \"staop\": [");
 		i = Anum_pg_statistic_staop1 - 1;
 		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
 		{
 			char *soper;
-			StringInfo	json_val = makeStringInfo();
 
 			/* Prepare portable representation of the oid */
 			soper = DatumGetCString(DirectFunctionCall1(regoperout, values[i++]));
-			escape_json(json_val, soper);
-			appendStringInfoString(str, json_val->data);
+			escape_json(&dst, soper);
 			pfree(soper);
-			pfree(json_val);
 
 			if (k < STATISTIC_NUM_SLOTS - 1)
-				appendStringInfoChar(str, ',');
+				appendStringInfoChar(&dst, ',');
 		}
 
-		appendStringInfoString(str, "], \"stacoll\" : [");
+		appendStringInfoString(&dst, "], \"stacoll\": [");
 		i = Anum_pg_statistic_stacoll1 - 1;
 		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
 		{
 			char *scoll;
-			StringInfo	json_val = makeStringInfo();
 
 			/* Prepare portable representation of the oid */
 			scoll = DatumGetCString(DirectFunctionCall1(regcollationout, values[i++]));
-			escape_json(json_val, scoll);
-			appendStringInfoString(str, json_val->data);
+			escape_json(&dst, scoll);
 			pfree(scoll);
-			pfree(json_val);
 
 			if (k < STATISTIC_NUM_SLOTS - 1)
-				appendStringInfoChar(str, ',');
+				appendStringInfoChar(&dst, ',');
 		}
 
-		appendStringInfoString(str, "], ");
+		appendStringInfoString(&dst, "], ");
 
 		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
 		{
@@ -3325,16 +3310,16 @@ extract_relation_statistics_int(Relation rel)
 							  &isnull);
 
 			if (isnull)
-				appendStringInfo(str, "\"nn\" : 0, \"values%d\" : [ ]", k+1);
+				appendStringInfo(&dst, "\"nn\": 0, \"values%d\": [ ]", k+1);
 			else
 			{
 				Datum		json;
 
-				appendStringInfo(str, "\"values%d\" : ", k+1);
+				appendStringInfo(&dst, "\"values%d\": ", k+1);
 				json = DirectFunctionCall1(array_to_json, val);
-				appendStringInfoString(str, TextDatumGetCString(json));
+				appendStringInfoString(&dst, TextDatumGetCString(json));
 			}
-			appendStringInfoString(str, ", ");
+			appendStringInfoString(&dst, ", ");
 		}
 
 		/* --- Extract numbers --- */
@@ -3344,34 +3329,34 @@ extract_relation_statistics_int(Relation rel)
 			Datum		val;
 
 			if (k > 0)
-				appendStringInfoString(str, ", ");
+				appendStringInfoString(&dst, ", ");
 
 			val = SysCacheGetAttr(STATRELATTINH, stup,
 								  Anum_pg_statistic_stanumbers1 + k,
 								  &isnull);
 			if (isnull)
-				appendStringInfo(str, "\"numbers%d\" : [ ]", k+1);
+				appendStringInfo(&dst, "\"numbers%d\": [ ]", k+1);
 			else
 			{
 				Datum		json;
 
-				appendStringInfo(str, "\"numbers%d\" : ", k+1);
+				appendStringInfo(&dst, "\"numbers%d\": ", k+1);
 				json = DirectFunctionCall1(array_to_json, val);
-				appendStringInfoString(str, TextDatumGetCString(json));
+				appendStringInfoString(&dst, TextDatumGetCString(json));
 			}
 		}
 
-		appendStringInfoString(str, "}");
+		appendStringInfoChar(&dst, '}');
 		ReleaseSysCache(stup);
 	}
 
 	if (attnum == 0)
-		appendStringInfoString(str, " ]");
+		appendStringInfoString(&dst, " ]");
 	else
-		appendStringInfoChar(str, ']');
-	appendStringInfoString(str, "}");
+		appendStringInfoChar(&dst, ']');
+	appendStringInfoChar(&dst, '}');
 
 	table_close(sd, RowExclusiveLock);
 
-	return str->data;
+	return dst.data;
 }
