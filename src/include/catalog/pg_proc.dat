@@ -11717,5 +11717,8 @@
 { oid => '10001', descr => 'map relation statistics to json',
   proname => 'extract_relation_statistics', provolatile => 's', prorettype => 'json',
   proargtypes => 'text bool', prosrc => 'extract_relation_statistics' },
+{ oid => '10002', descr => 'store relation statistics into the pg_statistic',
+  proname => 'store_relation_statistics', provolatile => 's', prorettype => 'bool',
+  proargtypes => 'text json', prosrc => 'store_relation_statistics' },
 
 ]

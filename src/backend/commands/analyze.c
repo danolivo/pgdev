@@ -114,6 +114,7 @@ static VacAttrStats **determine_analyzable_columns(Relation onerel,
 												   List *va_cols,
 												   int *nattrs);
 static const char *extract_relation_statistics_int(Relation rel);
+static bool store_relation_statistics_int(Relation rel, const char *json);
 
 /*
  *	analyze_rel() -- analyze one relation
@@ -837,19 +838,16 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 	{
 		const char *ptr;
 		MemoryContext old_mcxt = CurrentMemoryContext;
-//		bool result;
-//		text *json;
+		bool ret;
 
 		CommandCounterIncrement();
 
 		PG_TRY();
 		{
 			ptr = extract_relation_statistics_int(onerel);
-			elog(LOG, "DUMPSTAT json: \n%s\n\n", ptr);
-/*			json = cstring_to_text(ptr);
-			result = store_relation_statistics_int(onerel, json);
-			Assert(result);
-*/
+			ret = store_relation_statistics_int(onerel, ptr);
+			Assert(ret);
+//			elog(LOG, "DUMPSTAT json: \n%s\n\n", ptr);
 		}
 		PG_CATCH();
 		{
@@ -3197,6 +3195,43 @@ extract_relation_statistics(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Store stat info for the relation into the pg_statistic
+ */
+Datum
+store_relation_statistics(PG_FUNCTION_ARGS)
+{
+	const char	   *relname = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	Datum			datum = CStringGetDatum(relname);
+	Oid				reloid;
+	Relation		rel;
+	RangeTblEntry  *rte;
+	int				attnum;
+	bool			result;
+	char		   *json = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+	/* Get OID of the table. */
+	reloid = DatumGetObjectId(DirectFunctionCall1(regclassin, datum));
+	rel = table_open(reloid, AccessShareLock);
+
+	rte = makeNode(RangeTblEntry);
+	rte->rtekind = RTE_RELATION;
+	rte->relid = rel->rd_id;
+	rte->relkind = rel->rd_rel->relkind;
+	rte->rellockmode = AccessShareLock;
+	rte->requiredPerms = ACL_SELECT;
+
+	for (attnum = 1; attnum <= rel->rd_att->natts; attnum++)
+		rte->selectedCols = bms_add_member(rte->selectedCols,
+								attnum - FirstLowInvalidHeapAttributeNumber);
+
+	ExecCheckRTPerms(list_make1(rte), true);
+
+	result = store_relation_statistics_int(rel, json);
+	table_close(rel, AccessShareLock);
+	PG_RETURN_BOOL(result);
+}
+
+/*
  * extract_relation_statistics_int
  *
  */
@@ -3221,9 +3256,10 @@ extract_relation_statistics_int(Relation rel)
 	escape_json(&dst, NameStr(rel->rd_rel->relname));
 	appendStringInfo(&dst, ", \"sta_num_slots\": %d", STATISTIC_NUM_SLOTS);
 
-	appendStringInfo(&dst, ", \"relpages\": %u, \"reltuples\": %.0f",
+	appendStringInfo(&dst, ", \"relpages\": %d, \"reltuples\": %.0f, \"relallvisible\": %d",
 					 rel->rd_rel->relpages,
-					 rel->rd_rel->reltuples);
+					 rel->rd_rel->reltuples,
+					 rel->rd_rel->relallvisible);
 
 	appendStringInfo(&dst, ", \"attrs\": [");
 	sd = table_open(StatisticRelationId, RowExclusiveLock);
@@ -3359,4 +3395,67 @@ extract_relation_statistics_int(Relation rel)
 	table_close(sd, RowExclusiveLock);
 
 	return dst.data;
+}
+
+static int
+get_int_value(const char *json, const char *key)
+{
+	char *str;
+
+	str = TextDatumGetCString(
+				DirectFunctionCall2(json_object_field,
+									CStringGetTextDatum(json),
+									CStringGetTextDatum(key)));
+
+	return pg_atoi(str, sizeof(int), 0);
+}
+
+static float
+get_float_value(const char *json, const char *key)
+{
+	char *str;
+	float value;
+
+	str = TextDatumGetCString(
+				DirectFunctionCall2(json_object_field,
+									CStringGetTextDatum(json),
+									CStringGetTextDatum(key)));
+	(void) sscanf(str, "%f", &value);
+	return value;
+}
+
+static bool
+store_relation_statistics_int(Relation rel, const char *json)
+{
+	VacAttrStats **vacattrstats;
+	int32 relpages;
+	float4 reltuples;
+	BlockNumber relallvisible;
+	int nattrs;
+
+	/* Check statistics compatibility. */
+	if (get_int_value(json, "version") != STATISTIC_VERSION ||
+		get_int_value(json, "sta_num_slots") != STATISTIC_NUM_SLOTS)
+		return false;
+
+	/* Extract general info about relation for pg_class. */
+	relpages = get_int_value(json, "relpages");
+	reltuples = get_float_value(json, "reltuples");
+	relallvisible = get_int_value(json, "relallvisible");
+//	elog(WARNING, "relpages: %d, reltuples: %f, relallvisible: %u", relpages, reltuples, relallvisible);
+
+	/*
+	 * Detect analyzable columns. We should extract only these attributes from
+	 * overall JSON.
+	 */
+	vacattrstats = determine_analyzable_columns(rel, NIL, &nattrs);
+
+/*	update_attstats(RelationGetRelid(rel), false, nattrs, vacattrstats);
+*/
+	vac_update_relstats(rel, relpages, reltuples, relallvisible, true,
+						InvalidTransactionId, InvalidMultiXactId, true);
+
+	pfree(vacattrstats);
+
+	return true;
 }
