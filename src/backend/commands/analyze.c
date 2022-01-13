@@ -3406,39 +3406,77 @@ get_int_value(const char *json, const char *key)
 				DirectFunctionCall2(json_object_field,
 									CStringGetTextDatum(json),
 									CStringGetTextDatum(key)));
-
-	return pg_atoi(str, sizeof(int), 0);
+	return DatumGetInt32(DirectFunctionCall1(int4in, CStringGetDatum(str)));
 }
 
 static float
 get_float_value(const char *json, const char *key)
 {
 	char *str;
-	float value;
 
 	str = TextDatumGetCString(
 				DirectFunctionCall2(json_object_field,
 									CStringGetTextDatum(json),
 									CStringGetTextDatum(key)));
-	(void) sscanf(str, "%f", &value);
-	return value;
+	return DatumGetFloat4(DirectFunctionCall1(float4in, CStringGetDatum(str)));
+}
+
+static char *
+get_text_pointer(const char *json, const char *key)
+{
+	char *str;
+
+	str = TextDatumGetCString(
+				DirectFunctionCall2(json_object_field,
+									CStringGetTextDatum(json),
+									CStringGetTextDatum(key)));
+	return str;
+}
+
+static char *
+get_cstring_value(const char *json, const char *key)
+{
+	return TextDatumGetCString(
+				DirectFunctionCall2(json_object_field_text,
+									CStringGetTextDatum(json),
+									CStringGetTextDatum(key)));
+}
+
+static bool
+get_bool_value(const char *json, const char *key)
+{
+	char *str;
+
+	str = TextDatumGetCString(
+				DirectFunctionCall2(json_object_field_text,
+									CStringGetTextDatum(json),
+									CStringGetTextDatum(key)));
+	return DatumGetBool(DirectFunctionCall1(boolin, CStringGetDatum(str)));
 }
 
 static bool
 store_relation_statistics_int(Relation rel, const char *json)
 {
 	VacAttrStats **vacattrstats;
+	VacAttrStats **vas;
 	int32 relpages;
 	float4 reltuples;
 	BlockNumber relallvisible;
 	int nattrs;
+	int i;
+	char *js_attrs;
+	int js_nattrs;
+	int nmatchedatts = 0;
 
 	/* Check statistics compatibility. */
 	if (get_int_value(json, "version") != STATISTIC_VERSION ||
 		get_int_value(json, "sta_num_slots") != STATISTIC_NUM_SLOTS)
 		return false;
 
-	/* Extract general info about relation for pg_class. */
+	/*
+	 * Extract general info about relation for pg_class.
+	 * XXX: it may be optional part?
+	 */
 	relpages = get_int_value(json, "relpages");
 	reltuples = get_float_value(json, "reltuples");
 	relallvisible = get_int_value(json, "relallvisible");
@@ -3450,7 +3488,60 @@ store_relation_statistics_int(Relation rel, const char *json)
 	 */
 	vacattrstats = determine_analyzable_columns(rel, NIL, &nattrs);
 
-/*	update_attstats(RelationGetRelid(rel), false, nattrs, vacattrstats);
+	/* Get array of serialized statistic on attributes. */
+	js_attrs = get_text_pointer(json, "attrs");
+	js_nattrs = DatumGetInt32(DirectFunctionCall1(
+											json_array_length,
+											CStringGetTextDatum(js_attrs)));
+
+	/* Is used for pointing only to VacStat of attributes, matched in JSON. */
+	vas = (VacAttrStats **) palloc(
+		((js_nattrs < nattrs) ? js_nattrs : nattrs) * sizeof(VacAttrStats *));
+
+	/*
+	 * Now, for each piece of serialized statistics we should try to find
+	 * a corresponding attribute in the table.
+	 */
+	for  (i = 0; i < js_nattrs; i++)
+	{
+		char *s_attr;
+		char *attname;
+		int j;
+		bool inh;
+
+		/* Get a statistic for an attribute. */
+		s_attr = TextDatumGetCString(DirectFunctionCall2(json_array_element, CStringGetTextDatum(js_attrs), Int32GetDatum(i)));
+
+		attname = get_cstring_value(s_attr, "attname");
+
+		for (j = 0; j < nattrs; j++)
+		{
+			if (strcmp(attname, NameStr(vacattrstats[j]->attr->attname)) == 0)
+				break;
+		}
+
+		Assert(j >=0 && j <= nattrs);
+
+		if (j == nattrs)
+		{
+			int k;
+
+			elog(WARNING, "Serialized value '%s' doesn't correspond to any attr.", attname);
+
+			for (k = 0; k < nattrs; k++)
+				elog(WARNING, "-- attrs: %s.", NameStr(vacattrstats[k]->attr->attname));
+			continue;
+		}
+
+		/* statistic matched. Try to apply it. */
+		vacattrstats[j]->stanullfrac = get_float_value(s_attr, "nullfrac");
+		inh = get_bool_value(s_attr, "inh");
+		vacattrstats[j]->stawidth = get_int_value(s_attr, "width");
+		vacattrstats[j]->stadistinct = get_float_value(s_attr, "distinct");
+
+//		elog(WARNING, "str:");
+	}
+/*	update_attstats(RelationGetRelid(rel), inh, nmatchedatts, fvacattrstats);
 */
 	vac_update_relstats(rel, relpages, reltuples, relallvisible, true,
 						InvalidTransactionId, InvalidMultiXactId, true);
