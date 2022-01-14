@@ -3311,7 +3311,7 @@ extract_relation_statistics_int(Relation rel)
 			char *soper;
 
 			/* Prepare portable representation of the oid */
-			soper = DatumGetCString(DirectFunctionCall1(regoperout, values[i++]));
+			soper = DatumGetCString(DirectFunctionCall1(regoperatorout, values[i++]));
 			escape_json(&dst, soper);
 			pfree(soper);
 
@@ -3336,36 +3336,11 @@ extract_relation_statistics_int(Relation rel)
 
 		appendStringInfoString(&dst, "], ");
 
-		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
-		{
-			bool		isnull;
-			Datum		val;
-
-			val = SysCacheGetAttr(STATRELATTINH, stup,
-							  Anum_pg_statistic_stavalues1 + k,
-							  &isnull);
-
-			if (isnull)
-				appendStringInfo(&dst, "\"nn\": 0, \"values%d\": [ ]", k+1);
-			else
-			{
-				Datum		json;
-
-				appendStringInfo(&dst, "\"values%d\": ", k+1);
-				json = DirectFunctionCall1(array_to_json, val);
-				appendStringInfoString(&dst, TextDatumGetCString(json));
-			}
-			appendStringInfoString(&dst, ", ");
-		}
-
 		/* --- Extract numbers --- */
 		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
 		{
 			bool		isnull;
 			Datum		val;
-
-			if (k > 0)
-				appendStringInfoString(&dst, ", ");
 
 			val = SysCacheGetAttr(STATRELATTINH, stup,
 								  Anum_pg_statistic_stanumbers1 + k,
@@ -3377,6 +3352,31 @@ extract_relation_statistics_int(Relation rel)
 				Datum		json;
 
 				appendStringInfo(&dst, "\"numbers%d\": ", k+1);
+				json = DirectFunctionCall1(array_to_json, val);
+				appendStringInfoString(&dst, TextDatumGetCString(json));
+			}
+			appendStringInfoString(&dst, ", ");
+		}
+
+		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+		{
+			bool		isnull;
+			Datum		val;
+
+			if (k > 0)
+				appendStringInfoString(&dst, ", ");
+
+			val = SysCacheGetAttr(STATRELATTINH, stup,
+							  Anum_pg_statistic_stavalues1 + k,
+							  &isnull);
+
+			if (isnull)
+				appendStringInfo(&dst, "\"values%d\": [ ]", k+1);
+			else
+			{
+				Datum		json;
+
+				appendStringInfo(&dst, "\"values%d\": ", k+1);
 				json = DirectFunctionCall1(array_to_json, val);
 				appendStringInfoString(&dst, TextDatumGetCString(json));
 			}
@@ -3480,7 +3480,6 @@ store_relation_statistics_int(Relation rel, const char *json)
 	relpages = get_int_value(json, "relpages");
 	reltuples = get_float_value(json, "reltuples");
 	relallvisible = get_int_value(json, "relallvisible");
-//	elog(WARNING, "relpages: %d, reltuples: %f, relallvisible: %u", relpages, reltuples, relallvisible);
 
 	/*
 	 * Detect analyzable columns. We should extract only these attributes from
@@ -3504,10 +3503,13 @@ store_relation_statistics_int(Relation rel, const char *json)
 	 */
 	for  (i = 0; i < js_nattrs; i++)
 	{
-		char *s_attr;
-		char *attname;
-		int j;
-		bool inh;
+		char   *s_attr;
+		char   *stakind;
+		char   *staop;
+		char   *array;
+		char   *attname;
+		int		j, k;
+		bool	inh;
 
 		/* Get a statistic for an attribute. */
 		s_attr = TextDatumGetCString(DirectFunctionCall2(json_array_element, CStringGetTextDatum(js_attrs), Int32GetDatum(i)));
@@ -3534,14 +3536,151 @@ store_relation_statistics_int(Relation rel, const char *json)
 		}
 
 		/* statistic matched. Try to apply it. */
+
+		/* common parameters */
 		vacattrstats[j]->stanullfrac = get_float_value(s_attr, "nullfrac");
 		inh = get_bool_value(s_attr, "inh");
 		vacattrstats[j]->stawidth = get_int_value(s_attr, "width");
 		vacattrstats[j]->stadistinct = get_float_value(s_attr, "distinct");
 
-//		elog(WARNING, "str:");
+		/* stakind */
+		stakind = get_text_pointer(s_attr, "stakind");
+		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+		{
+			char *elem;
+
+			elem = TextDatumGetCString(DirectFunctionCall2(
+										json_array_element,
+										CStringGetTextDatum(stakind),
+										Int32GetDatum(k)));
+
+			vacattrstats[j]->stakind[k] =
+				DatumGetInt32(DirectFunctionCall1(int2in,
+												  CStringGetDatum(elem)));
+			pfree(elem);
+		}
+
+		/* staop */
+		staop = get_text_pointer(s_attr, "staop");
+		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+		{
+			char *elem;
+
+			elem = TextDatumGetCString(DirectFunctionCall2(
+										json_array_element_text,
+										CStringGetTextDatum(staop),
+										Int32GetDatum(k)));
+
+			vacattrstats[j]->staop[k] =
+				DatumGetObjectId(DirectFunctionCall1(regoperatorin,
+													 CStringGetDatum(elem)));
+			pfree(elem);
+		}
+
+		/* stacoll */
+		array = get_text_pointer(s_attr, "stacoll");
+		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+		{
+			char *elem;
+
+			elem = TextDatumGetCString(DirectFunctionCall2(
+										json_array_element_text,
+										CStringGetTextDatum(array),
+										Int32GetDatum(k)));
+
+			vacattrstats[j]->stacoll[k] =
+				DatumGetObjectId(DirectFunctionCall1(regcollationin,
+													 CStringGetDatum(elem)));
+			pfree(elem);
+		}
+
+		/* stanumbers */
+		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+		{
+			char	name[9];
+			int		nelem;
+			int		l;
+
+			sprintf(name, "numbers%1d", k + 1);
+			array = get_text_pointer(s_attr, name);
+			nelem = DatumGetInt32(DirectFunctionCall1(
+											json_array_length,
+											CStringGetTextDatum(array)));
+			vacattrstats[j]->stanumbers[k] = palloc(nelem * sizeof(float4));
+			for (l = 0; l < nelem; l++)
+			{
+				char *elem;
+
+				elem = TextDatumGetCString(DirectFunctionCall2(
+											json_array_element,
+											CStringGetTextDatum(array),
+											Int32GetDatum(l)));
+				vacattrstats[j]->stanumbers[k][l] =
+					DatumGetFloat4(DirectFunctionCall1(float4in,
+													   CStringGetDatum(elem)));
+			}
+		}
+
+		/* stavalues */
+		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+		{
+			char	name[9];
+			int		nelem;
+			int		l;
+			Form_pg_attribute att = vacattrstats[j]->attr;
+			int			stakind = vacattrstats[j]->stakind[k];
+			Oid			typid;
+			Oid			typinput;
+			Oid			typioparam;
+
+			sprintf(name, "values%1d", k + 1);
+			array = get_text_pointer(s_attr, name);
+			nelem = DatumGetInt32(DirectFunctionCall1(
+											json_array_length,
+											CStringGetTextDatum(array)));
+			vacattrstats[j]->stavalues[k] = palloc(nelem * sizeof(Datum));
+
+			if (stakind == STATISTIC_KIND_RANGE_LENGTH_HISTOGRAM)
+				typid = FLOAT8OID;
+			else
+				typid = att->atttypid;
+
+			getTypeInputInfo(typid, &typinput, &typioparam);
+
+			for (l = 0; l < nelem; l++)
+			{
+				char *elem;
+				MemoryContext old_mcxt = CurrentMemoryContext;
+
+				PG_TRY();
+				{
+					elem = TextDatumGetCString(
+						DirectFunctionCall2(json_array_element_text,
+											CStringGetTextDatum(array),
+											Int32GetDatum(l)));
+
+					vacattrstats[j]->stavalues[k][l] =
+						OidInputFunctionCall(typinput, elem,
+											 typioparam, att->atttypmod);
+				}
+				PG_CATCH();
+				{
+					ErrorData  *error;
+
+					MemoryContextSwitchTo(old_mcxt);
+					error = CopyErrorData();
+					FlushErrorState();
+
+					elog(PANIC, "DEBUG error: %s %s.", error->message, error->detail);
+				}
+				PG_END_TRY();
+			}
+		}
+
+		vas[nmatchedatts] = vacattrstats[j];
+		nmatchedatts++;
 	}
-/*	update_attstats(RelationGetRelid(rel), inh, nmatchedatts, fvacattrstats);
+/*	update_attstats(RelationGetRelid(rel), inh, nmatchedatts, vas);
 */
 	vac_update_relstats(rel, relpages, reltuples, relallvisible, true,
 						InvalidTransactionId, InvalidMultiXactId, true);

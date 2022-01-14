@@ -293,7 +293,7 @@ array_in(PG_FUNCTION_ARGS)
 		if (*q != ']')
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("malformed array literal: \"%s\"", string),
+					 errmsg("malformed array literal: \"%s\" %c", string, *q),
 					 errdetail("Missing \"%s\" after array dimensions.",
 							   "]")));
 
@@ -330,7 +330,7 @@ array_in(PG_FUNCTION_ARGS)
 		if (strncmp(p, ASSGN, strlen(ASSGN)) != 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("malformed array literal: \"%s\"", string),
+					 errmsg("malformed array literal1: \"%s\" %s", string, p),
 					 errdetail("Missing \"%s\" after array dimensions.",
 							   ASSGN)));
 		p += strlen(ASSGN);

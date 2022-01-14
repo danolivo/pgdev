@@ -143,7 +143,7 @@ multirange_in(PG_FUNCTION_ARGS)
 	if (*ptr == '{')
 		ptr++;
 	else
-		ereport(ERROR,
+		ereport(PANIC,
 				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 				 errmsg("malformed multirange literal: \"%s\"",
 						input_str),
