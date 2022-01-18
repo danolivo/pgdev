@@ -845,8 +845,8 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 		PG_TRY();
 		{
 			ptr = extract_relation_statistics_int(onerel);
-			ret = store_relation_statistics_int(onerel, ptr);
-			Assert(ret);
+//			ret = store_relation_statistics_int(onerel, ptr);
+//			Assert(ret);
 //			elog(LOG, "DUMPSTAT json: \n%s\n\n", ptr);
 		}
 		PG_CATCH();
@@ -3374,11 +3374,22 @@ extract_relation_statistics_int(Relation rel)
 				appendStringInfo(&dst, "\"values%d\": [ ]", k+1);
 			else
 			{
-				Datum		json;
+				char *sarr;
+				Oid typoutput;
+				bool typIsVarlena;
 
 				appendStringInfo(&dst, "\"values%d\": ", k+1);
-				json = DirectFunctionCall1(array_to_json, val);
-				appendStringInfoString(&dst, TextDatumGetCString(json));
+				getTypeOutputInfo(rel->rd_att->attrs[attno].atttypid, &typoutput, &typIsVarlena);
+				if (!typIsVarlena)
+					sarr = OidOutputFunctionCall(typoutput, val);
+				else
+				{
+					Datum		val1;	/* definitely detoasted Datum */
+
+					val1 = PointerGetDatum(PG_DETOAST_DATUM(val));
+					sarr = OidOutputFunctionCall(typoutput, val1);
+				}
+				escape_json(&dst, sarr);
 			}
 		}
 
@@ -3634,11 +3645,11 @@ store_relation_statistics_int(Relation rel, const char *json)
 			Oid			typioparam;
 
 			sprintf(name, "values%1d", k + 1);
-			array = get_text_pointer(s_attr, name);
-			nelem = DatumGetInt32(DirectFunctionCall1(
-											json_array_length,
-											CStringGetTextDatum(array)));
-			vacattrstats[j]->stavalues[k] = palloc(nelem * sizeof(Datum));
+			array = get_cstring_value(s_attr, name);
+	//		nelem = DatumGetInt32(DirectFunctionCall1(
+	//										json_array_length,
+	//										CStringGetTextDatum(array)));
+//			vacattrstats[j]->stavalues[k] = palloc(nelem * sizeof(Datum));
 
 			if (stakind == STATISTIC_KIND_RANGE_LENGTH_HISTOGRAM)
 				typid = FLOAT8OID;
@@ -3647,22 +3658,23 @@ store_relation_statistics_int(Relation rel, const char *json)
 
 			getTypeInputInfo(typid, &typinput, &typioparam);
 
-			for (l = 0; l < nelem; l++)
 			{
-				char *elem;
 				MemoryContext old_mcxt = CurrentMemoryContext;
 
 				PG_TRY();
 				{
-					elem = TextDatumGetCString(
-						DirectFunctionCall2(json_array_element_text,
-											CStringGetTextDatum(array),
-											Int32GetDatum(l)));
+					bool *nulls;
+					int nelem;
+					ArrayType *dat = (ArrayType *)(
+						OidInputFunctionCall(typinput, array, typioparam, att->atttypmod));
 
-					vacattrstats[j]->stavalues[k][l] =
-						OidInputFunctionCall(typinput, elem,
-											 typioparam, att->atttypmod);
+					deconstruct_array(dat, typid,
+						att->attlen, att->attbyval, att->attalign,
+						&vacattrstats[j]->stavalues[k], &nulls, &nelem);
 				}
+//					vacattrstats[j]->stavalues[k][l] =
+//						OidInputFunctionCall(typinput, elem,
+//											 typioparam, att->atttypmod);
 				PG_CATCH();
 				{
 					ErrorData  *error;
