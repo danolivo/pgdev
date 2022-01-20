@@ -305,7 +305,7 @@ _outPlannedStmt(StringInfo str, const PlannedStmt *node)
 	WRITE_NODE_TYPE("PLANNEDSTMT");
 
 	WRITE_ENUM_FIELD(commandType, CmdType);
-	WRITE_UINT64_FIELD(queryId);
+	WRITE_NODE_FIELD(queryIds);
 	WRITE_BOOL_FIELD(hasReturning);
 	WRITE_BOOL_FIELD(hasModifyingCTE);
 	WRITE_BOOL_FIELD(canSetTag);
@@ -3030,6 +3030,16 @@ _outStatsElem(StringInfo str, const StatsElem *node)
 	WRITE_NODE_FIELD(expr);
 }
 
+/* Needed for dump of a PlannedStmt node */
+static void
+_outQueryLabel(StringInfo str, const QueryLabel *node)
+{
+	WRITE_NODE_TYPE("QUERYLABEL");
+
+	WRITE_INT_FIELD(kind);
+	WRITE_UINT64_FIELD(hash);
+}
+
 static void
 _outQuery(StringInfo str, const Query *node)
 {
@@ -3037,7 +3047,7 @@ _outQuery(StringInfo str, const Query *node)
 
 	WRITE_ENUM_FIELD(commandType, CmdType);
 	WRITE_ENUM_FIELD(querySource, QuerySource);
-	/* we intentionally do not print the queryId field */
+	/* we intentionally do not print the queryId fields */
 	WRITE_BOOL_FIELD(canSetTag);
 
 	/*
@@ -4402,6 +4412,9 @@ outNode(StringInfo str, const void *obj)
 				break;
 			case T_StatsElem:
 				_outStatsElem(str, obj);
+				break;
+			case T_QueryLabel:
+				_outQueryLabel(str, obj);
 				break;
 			case T_Query:
 				_outQuery(str, obj);

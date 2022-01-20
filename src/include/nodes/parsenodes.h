@@ -70,6 +70,14 @@ typedef enum SetQuantifier
 	SET_QUANTIFIER_DISTINCT
 } SetQuantifier;
 
+typedef struct QueryLabel
+{
+	NodeTag type;
+	int16	kind; /* unique ID of generator. 0 reserved for in-core jumbling routine. */
+	int64	hash; /* generated stamp. */
+	void   *context; /* internal generator-related data. */
+} QueryLabel;
+
 /*
  * Grantable rights are encoded so that we can OR them together in a bitmask.
  * The present representation of AclItem limits us to 16 distinct rights,
@@ -121,7 +129,7 @@ typedef struct Query
 
 	QuerySource querySource;	/* where did I come from? */
 
-	uint64		queryId;		/* query identifier (can be set by plugins) */
+	List	   *queryIds;		/* query identifiers (can be added by plugins) */
 
 	bool		canSetTag;		/* do I set the command result tag? */
 

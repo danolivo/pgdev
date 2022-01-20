@@ -314,6 +314,7 @@ typedef enum NodeTag
 	T_RawStmt,
 	T_Query,
 	T_PlannedStmt,
+	T_QueryLabel,
 	T_InsertStmt,
 	T_DeleteStmt,
 	T_UpdateStmt,

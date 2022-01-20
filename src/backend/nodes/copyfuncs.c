@@ -87,7 +87,7 @@ _copyPlannedStmt(const PlannedStmt *from)
 	PlannedStmt *newnode = makeNode(PlannedStmt);
 
 	COPY_SCALAR_FIELD(commandType);
-	COPY_SCALAR_FIELD(queryId);
+	COPY_NODE_FIELD(queryIds);
 	COPY_SCALAR_FIELD(hasReturning);
 	COPY_SCALAR_FIELD(hasModifyingCTE);
 	COPY_SCALAR_FIELD(canSetTag);
@@ -3159,6 +3159,20 @@ _copyTriggerTransition(const TriggerTransition *from)
 	return newnode;
 }
 
+static QueryLabel *
+_copyQueryLabel(const QueryLabel *from)
+{
+	QueryLabel *newnode = makeNode(QueryLabel);
+
+	COPY_SCALAR_FIELD(kind);
+	COPY_SCALAR_FIELD(hash);
+
+	/* Caller should re-generate labels if it want to use it. */
+	newnode->context = NULL;
+
+	return newnode;
+}
+
 static Query *
 _copyQuery(const Query *from)
 {
@@ -3166,7 +3180,7 @@ _copyQuery(const Query *from)
 
 	COPY_SCALAR_FIELD(commandType);
 	COPY_SCALAR_FIELD(querySource);
-	COPY_SCALAR_FIELD(queryId);
+	COPY_NODE_FIELD(queryIds);
 	COPY_SCALAR_FIELD(canSetTag);
 	COPY_NODE_FIELD(utilityStmt);
 	COPY_SCALAR_FIELD(resultRelation);
@@ -5405,6 +5419,9 @@ copyObjectImpl(const void *from)
 			/*
 			 * PARSE NODES
 			 */
+		case T_QueryLabel:
+			retval = _copyQueryLabel(from);
+			break;
 		case T_Query:
 			retval = _copyQuery(from);
 			break;

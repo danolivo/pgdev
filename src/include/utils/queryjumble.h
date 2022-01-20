@@ -65,7 +65,7 @@ extern int	compute_query_id;
 
 
 extern const char *CleanQuerytext(const char *query, int *location, int *len);
-extern JumbleState *JumbleQuery(Query *query, const char *querytext);
+extern int64 JumbleQuery(Query *query, const char *querytext, void **context);
 extern void EnableQueryId(void);
 
 extern bool query_id_enabled;
@@ -83,5 +83,15 @@ IsQueryIdEnabled(void)
 		return true;
 	return query_id_enabled;
 }
+
+typedef int64 (*query_generator_type) (Query *query, const char *querytext,
+									   void **context);
+
+extern void assign_query_id(int newval, void *extra);
+extern bool RegisterQueryIdGen(const int16 kind, query_generator_type callback);
+extern void GenerateQueryLabels(Query *query, const char *querytext);
+extern int64 get_query_label_hash(List *queryIds, const int16 kind);
+extern QueryLabel *get_query_label(List *queryIds, const int16 kind);
+extern bool add_custom_query_label(List **queryIds, int16 kind, int64 hash);
 
 #endif							/* QUERYJUMBLE_H */

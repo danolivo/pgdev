@@ -166,7 +166,6 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 {
 	ExplainState *es = NewExplainState();
 	TupOutputState *tstate;
-	JumbleState *jstate = NULL;
 	Query	   *query;
 	List	   *rewritten;
 	ListCell   *lc;
@@ -246,10 +245,10 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 
 	query = castNode(Query, stmt->query);
 	if (IsQueryIdEnabled())
-		jstate = JumbleQuery(query, pstate->p_sourcetext);
+		GenerateQueryLabels(query, pstate->p_sourcetext);
 
 	if (post_parse_analyze_hook)
-		(*post_parse_analyze_hook) (pstate, query, jstate);
+		(*post_parse_analyze_hook) (pstate, query);
 
 	/*
 	 * Parse analysis was done already, but we still have to run the rule
@@ -604,14 +603,14 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 	/* Create textual dump of plan tree */
 	ExplainPrintPlan(es, queryDesc);
 
-	if (es->verbose && plannedstmt->queryId != UINT64CONST(0))
+	if (es->verbose && plannedstmt->queryIds != NIL)
 	{
 		/*
 		 * Output the queryid as an int64 rather than a uint64 so we match
 		 * what would be seen in the BIGINT pg_stat_statements.queryid column.
 		 */
-		ExplainPropertyInteger("Query Identifier", NULL, (int64)
-							   plannedstmt->queryId, es);
+		ExplainPropertyInteger("Query Identifier", NULL,
+							   get_query_label_hash(plannedstmt->queryIds, 0), es);
 	}
 
 	/* Show buffer usage in planning */

@@ -686,7 +686,6 @@ pg_analyze_and_rewrite_params(RawStmt *parsetree,
 	ParseState *pstate;
 	Query	   *query;
 	List	   *querytree_list;
-	JumbleState *jstate = NULL;
 
 	Assert(query_string != NULL);	/* required as of 8.4 */
 
@@ -706,14 +705,14 @@ pg_analyze_and_rewrite_params(RawStmt *parsetree,
 	query = transformTopLevelStmt(pstate, parsetree);
 
 	if (IsQueryIdEnabled())
-		jstate = JumbleQuery(query, query_string);
+		GenerateQueryLabels(query, query_string);
 
 	if (post_parse_analyze_hook)
-		(*post_parse_analyze_hook) (pstate, query, jstate);
+		(*post_parse_analyze_hook) (pstate, query);
 
 	free_parsestate(pstate);
 
-	pgstat_report_query_id(query->queryId, false);
+	pgstat_report_query_id(get_query_label_hash(query->queryIds, 0), false);
 
 	if (log_parser_stats)
 		ShowUsage("PARSE ANALYSIS STATISTICS");
@@ -797,7 +796,7 @@ pg_rewrite_query(Query *query)
 				 * queryId is not saved in stored rules, but we must preserve
 				 * it here to avoid breaking pg_stat_statements.
 				 */
-				new_query->queryId = query->queryId;
+				new_query->queryIds = list_copy(query->queryIds);
 
 				new_list = lappend(new_list, new_query);
 				pfree(str);
@@ -933,7 +932,7 @@ pg_plan_queries(List *querytrees, const char *query_string, int cursorOptions,
 			stmt->utilityStmt = query->utilityStmt;
 			stmt->stmt_location = query->stmt_location;
 			stmt->stmt_len = query->stmt_len;
-			stmt->queryId = query->queryId;
+			stmt->queryIds = list_copy(query->queryIds);
 		}
 		else
 		{

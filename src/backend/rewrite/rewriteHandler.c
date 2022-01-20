@@ -4079,7 +4079,7 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 List *
 QueryRewrite(Query *parsetree)
 {
-	uint64		input_query_id = parsetree->queryId;
+	List	   *input_query_ids = parsetree->queryIds;
 	List	   *querylist;
 	List	   *results;
 	ListCell   *l;
@@ -4114,7 +4114,7 @@ QueryRewrite(Query *parsetree)
 
 		query = fireRIRrules(query, NIL);
 
-		query->queryId = input_query_id;
+		query->queryIds = input_query_ids;
 
 		results = lappend(results, query);
 	}

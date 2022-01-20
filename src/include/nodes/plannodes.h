@@ -45,7 +45,7 @@ typedef struct PlannedStmt
 
 	CmdType		commandType;	/* select|insert|update|delete|utility */
 
-	uint64		queryId;		/* query identifier (copied from Query) */
+	List	   *queryIds;		/* query identifiers (copied from Query) */
 
 	bool		hasReturning;	/* is it insert|update|delete RETURNING? */
 

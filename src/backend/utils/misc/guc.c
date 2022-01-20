@@ -4695,7 +4695,7 @@ static struct config_enum ConfigureNamesEnum[] =
 		},
 		&compute_query_id,
 		COMPUTE_QUERY_ID_AUTO, compute_query_id_options,
-		NULL, NULL, NULL
+		NULL, assign_query_id, NULL
 	},
 
 	{

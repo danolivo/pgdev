@@ -62,6 +62,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/partcache.h"
+#include "utils/queryjumble.h"
 #include "utils/rls.h"
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
@@ -135,7 +136,8 @@ ExecutorStart(QueryDesc *queryDesc, int eflags)
 	 * that it's harmless to report the query_id multiple time, as the call
 	 * will be ignored if the top level query_id has already been reported.
 	 */
-	pgstat_report_query_id(queryDesc->plannedstmt->queryId, false);
+	pgstat_report_query_id(
+				get_query_label_hash(queryDesc->plannedstmt->queryIds, 0), false);
 
 	if (ExecutorStart_hook)
 		(*ExecutorStart_hook) (queryDesc, eflags);

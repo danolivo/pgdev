@@ -49,6 +49,7 @@
 #include "utils/dsa.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/queryjumble.h"
 #include "utils/snapmgr.h"
 
 /*
@@ -175,7 +176,7 @@ ExecSerializePlan(Plan *plan, EState *estate)
 	 */
 	pstmt = makeNode(PlannedStmt);
 	pstmt->commandType = CMD_SELECT;
-	pstmt->queryId = pgstat_get_my_query_id();
+	add_custom_query_label(&pstmt->queryIds, 0, pgstat_get_my_query_id());
 	pstmt->hasReturning = false;
 	pstmt->hasModifyingCTE = false;
 	pstmt->canSetTag = true;

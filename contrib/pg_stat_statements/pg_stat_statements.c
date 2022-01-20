@@ -307,8 +307,7 @@ PG_FUNCTION_INFO_V1(pg_stat_statements_info);
 
 static void pgss_shmem_startup(void);
 static void pgss_shmem_shutdown(int code, Datum arg);
-static void pgss_post_parse_analyze(ParseState *pstate, Query *query,
-									JumbleState *jstate);
+static void pgss_post_parse_analyze(ParseState *pstate, Query *query);
 static PlannedStmt *pgss_planner(Query *parse,
 								 const char *query_string,
 								 int cursorOptions,
@@ -813,13 +812,29 @@ error:
 }
 
 /*
- * Post-parse-analysis hook: mark query with a queryId
+ * Post-parse-analysis hook: create a label for the query.
  */
 static void
-pgss_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
+pgss_post_parse_analyze(ParseState *pstate, Query *query)
 {
+	JumbleState	   *jstate;
+	QueryLabel	   *label = get_query_label(query->queryIds, 0);
+
 	if (prev_post_parse_analyze_hook)
-		prev_post_parse_analyze_hook(pstate, query, jstate);
+		prev_post_parse_analyze_hook(pstate, query);
+
+	if (label)
+	{
+		add_custom_query_label(&query->queryIds, -1, label->hash);
+		jstate = (JumbleState *) label->context;
+	}
+	else
+	{
+		add_custom_query_label(&query->queryIds, -1, UINT64CONST(0));
+		jstate = NULL;
+	}
+
+	label = get_query_label(query->queryIds, -1);
 
 	/* Safety check... */
 	if (!pgss || !pgss_hash || !pgss_enabled(exec_nested_level))
@@ -833,7 +848,7 @@ pgss_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
 	if (query->utilityStmt)
 	{
 		if (pgss_track_utility && !PGSS_HANDLED_UTILITY(query->utilityStmt))
-			query->queryId = UINT64CONST(0);
+			label->hash = UINT64CONST(0);
 		return;
 	}
 
@@ -846,7 +861,7 @@ pgss_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
 	 */
 	if (jstate && jstate->clocations_count > 0)
 		pgss_store(pstate->p_sourcetext,
-				   query->queryId,
+				   label->hash,
 				   query->stmt_location,
 				   query->stmt_len,
 				   PGSS_INVALID,
@@ -868,6 +883,9 @@ pgss_planner(Query *parse,
 			 ParamListInfo boundParams)
 {
 	PlannedStmt *result;
+	int64 queryId;
+
+	queryId = get_query_label_hash(parse->queryIds, -1);
 
 	/*
 	 * We can't process the query if no query_string is provided, as
@@ -883,7 +901,7 @@ pgss_planner(Query *parse,
 	 */
 	if (pgss_enabled(plan_nested_level + exec_nested_level)
 		&& pgss_track_planning && query_string
-		&& parse->queryId != UINT64CONST(0))
+		&& queryId != UINT64CONST(0))
 	{
 		instr_time	start;
 		instr_time	duration;
@@ -930,7 +948,7 @@ pgss_planner(Query *parse,
 		WalUsageAccumDiff(&walusage, &pgWalUsage, &walusage_start);
 
 		pgss_store(query_string,
-				   parse->queryId,
+				   queryId,
 				   parse->stmt_location,
 				   parse->stmt_len,
 				   PGSS_PLAN,
@@ -959,17 +977,21 @@ pgss_planner(Query *parse,
 static void
 pgss_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
+	int64 queryId;
+
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
 		standard_ExecutorStart(queryDesc, eflags);
+
+	queryId = get_query_label_hash(queryDesc->plannedstmt->queryIds, -1);
 
 	/*
 	 * If query has queryId zero, don't track it.  This prevents double
 	 * counting of optimizable statements that are directly contained in
 	 * utility statements.
 	 */
-	if (pgss_enabled(exec_nested_level) && queryDesc->plannedstmt->queryId != UINT64CONST(0))
+	if (pgss_enabled(exec_nested_level) && queryId != UINT64CONST(0))
 	{
 		/*
 		 * Set up to track total elapsed time in ExecutorRun.  Make sure the
@@ -1036,7 +1058,7 @@ pgss_ExecutorFinish(QueryDesc *queryDesc)
 static void
 pgss_ExecutorEnd(QueryDesc *queryDesc)
 {
-	uint64		queryId = queryDesc->plannedstmt->queryId;
+	uint64		queryId = get_query_label_hash(queryDesc->plannedstmt->queryIds, -1);
 
 	if (queryId != UINT64CONST(0) && queryDesc->totaltime &&
 		pgss_enabled(exec_nested_level))
@@ -1076,7 +1098,16 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 					DestReceiver *dest, QueryCompletion *qc)
 {
 	Node	   *parsetree = pstmt->utilityStmt;
-	uint64		saved_queryId = pstmt->queryId;
+	QueryLabel *label = get_query_label(pstmt->queryIds, -1);
+	uint64		saved_queryId;
+
+	if (!label)
+	{
+		add_custom_query_label(&pstmt->queryIds, -1, UINT64CONST(0));
+		label = get_query_label(pstmt->queryIds, -1);
+	}
+
+	saved_queryId = label->hash;
 
 	/*
 	 * Force utility statements to get queryId zero.  We do this even in cases
@@ -1093,7 +1124,7 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 	 * only.
 	 */
 	if (pgss_enabled(exec_nested_level) && pgss_track_utility)
-		pstmt->queryId = UINT64CONST(0);
+		label->hash = UINT64CONST(0);
 
 	/*
 	 * If it's an EXECUTE statement, we don't track it and don't increment the

@@ -97,18 +97,18 @@ CleanQuerytext(const char *query, int *location, int *len)
 	return query;
 }
 
-JumbleState *
-JumbleQuery(Query *query, const char *querytext)
+int64
+JumbleQuery(Query *query, const char *querytext, void **context)
 {
-	JumbleState *jstate = NULL;
+	JumbleState	   *jstate = NULL;
+	int64			queryId;
 
 	Assert(IsQueryIdEnabled());
 
 	if (query->utilityStmt)
 	{
-		query->queryId = compute_utility_query_id(querytext,
-												  query->stmt_location,
-												  query->stmt_len);
+		queryId = compute_utility_query_id(querytext, query->stmt_location,
+										   query->stmt_len);
 	}
 	else
 	{
@@ -125,19 +125,20 @@ JumbleQuery(Query *query, const char *querytext)
 
 		/* Compute query ID and mark the Query node with it */
 		JumbleQueryInternal(jstate, query);
-		query->queryId = DatumGetUInt64(hash_any_extended(jstate->jumble,
-														  jstate->jumble_len,
-														  0));
+		queryId = DatumGetUInt64(hash_any_extended(jstate->jumble,
+												   jstate->jumble_len,
+												   0));
 
 		/*
 		 * If we are unlucky enough to get a hash of zero, use 1 instead, to
 		 * prevent confusion with the utility-statement case.
 		 */
-		if (query->queryId == UINT64CONST(0))
-			query->queryId = UINT64CONST(1);
+		if (queryId == UINT64CONST(0))
+			queryId = UINT64CONST(1);
 	}
 
-	return jstate;
+	*context = jstate;
+	return queryId;
 }
 
 /*
@@ -150,7 +151,29 @@ void
 EnableQueryId(void)
 {
 	if (compute_query_id != COMPUTE_QUERY_ID_OFF)
+	{
+		(void) RegisterQueryIdGen(0, JumbleQuery);
 		query_id_enabled = true;
+	}
+}
+
+void
+assign_query_id(int newval, void *extra)
+{
+	switch (newval)
+	{
+		case COMPUTE_QUERY_ID_OFF:
+			/* De-register routine should be implemented */
+			break;
+		case COMPUTE_QUERY_ID_AUTO:
+			break;
+		case COMPUTE_QUERY_ID_ON:
+			(void) RegisterQueryIdGen(0, JumbleQuery);
+			break;
+		default:
+			elog(ERROR, "Unknown value");
+			break;
+	}
 }
 
 /*
@@ -855,4 +878,121 @@ RecordConstLocation(JumbleState *jstate, int location)
 		jstate->clocations[jstate->clocations_count].length = -1;
 		jstate->clocations_count++;
 	}
+}
+
+/* *******************************************************************************
+ *
+ * Query label custom generation machinery.
+ *
+ * ******************************************************************************/
+
+#include "utils/hsearch.h"
+
+static HTAB *QueryLabelGens = NULL;
+
+typedef struct QLGeneratorEntry
+{
+	int16 kind;
+	query_generator_type callback;
+} QLGeneratorEntry;
+
+/*
+ * An internal function to register a new callback structure
+ * Use a positive value for the 'kind' field to register an query label generator.
+ * Caller should worry about intersections by this value with other extensions.
+ */
+bool
+RegisterQueryIdGen(const int16 kind, query_generator_type callback)
+{
+	QLGeneratorEntry   *entry;
+	bool				found;
+
+	if (QueryLabelGens == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(int16);
+		ctl.entrysize = sizeof(QLGeneratorEntry);
+
+		QueryLabelGens = hash_create("Query Label Generators", 8, &ctl,
+									 HASH_ELEM | HASH_BLOBS);
+	}
+
+	if (kind < 0)
+		elog(ERROR, "Can't use value %d as an query generator kind.", kind);
+
+	entry = (QLGeneratorEntry *) hash_search(QueryLabelGens, (void *) &kind,
+											 HASH_ENTER, &found);
+	if (found)
+		/* Give caller a chance to process the problem. */
+		return false;
+
+	entry->callback = callback;
+	return true;
+}
+
+/*
+ * Create QueryLabel entry for each registered generator.
+ * All memory allocations is made in current memory context.
+ */
+void
+GenerateQueryLabels(Query *query, const char *querytext)
+{
+	HASH_SEQ_STATUS		hash_seq;
+	QLGeneratorEntry   *entry;
+
+	/* Newly generated query haven't any labels. */
+	Assert(query->queryIds == NIL);
+
+	if (QueryLabelGens == NULL || hash_get_num_entries(QueryLabelGens) == 0)
+		return;
+
+	hash_seq_init(&hash_seq, QueryLabelGens);
+	while ((entry = hash_seq_search(&hash_seq)) != NULL)
+	{
+		QueryLabel *qlabel = makeNode(QueryLabel);
+
+		qlabel->kind = entry->kind;
+		qlabel->hash = entry->callback(query, querytext, &qlabel->context);
+		query->queryIds = lappend(query->queryIds, qlabel);
+	}
+}
+
+int64
+get_query_label_hash(List *queryIds, const int16 kind)
+{
+	QueryLabel *label;
+
+	label = get_query_label(queryIds, kind);
+	return (label) ? label->hash : 0;
+}
+
+QueryLabel *
+get_query_label(List *queryIds, const int16 kind)
+{
+	ListCell *lc;
+
+	foreach(lc, queryIds)
+	{
+		QueryLabel *label = lfirst_node(QueryLabel, lc);
+		if (label->kind == kind)
+			return label;
+	}
+	return NULL;
+}
+
+bool
+add_custom_query_label(List **queryIds, int16 kind, int64 hash)
+{
+	QueryLabel *label;
+
+	if (get_query_label_hash(*queryIds, kind) != 0)
+		elog(ERROR, "Duplicated custom label %ld for the kind %d.", hash, kind);
+
+	label = makeNode(QueryLabel);
+	label->kind = kind;
+	label->hash = hash;
+	label->context = NULL;
+	*queryIds = lappend(*queryIds, label);
+	return true;
 }

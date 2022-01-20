@@ -238,6 +238,17 @@ readBitmapset(void)
 	return _readBitmapset();
 }
 
+static QueryLabel *
+_readQueryLabel(void)
+{
+	READ_LOCALS(QueryLabel);
+	READ_INT_FIELD(kind);
+	READ_UINT64_FIELD(hash);
+	local_node->context = NULL;
+
+	READ_DONE();
+}
+
 /*
  * _readQuery
  */
@@ -248,7 +259,7 @@ _readQuery(void)
 
 	READ_ENUM_FIELD(commandType, CmdType);
 	READ_ENUM_FIELD(querySource, QuerySource);
-	local_node->queryId = UINT64CONST(0);	/* not saved in output format */
+	local_node->queryIds = NIL;	/* not saved in output format */
 	READ_BOOL_FIELD(canSetTag);
 	READ_NODE_FIELD(utilityStmt);
 	READ_INT_FIELD(resultRelation);
@@ -1578,7 +1589,7 @@ _readPlannedStmt(void)
 	READ_LOCALS(PlannedStmt);
 
 	READ_ENUM_FIELD(commandType, CmdType);
-	READ_UINT64_FIELD(queryId);
+	READ_NODE_FIELD(queryIds);
 	READ_BOOL_FIELD(hasReturning);
 	READ_BOOL_FIELD(hasModifyingCTE);
 	READ_BOOL_FIELD(canSetTag);
@@ -2728,6 +2739,8 @@ parseNodeString(void)
 
 	if (MATCH("QUERY", 5))
 		return_value = _readQuery();
+	else if (MATCH("QUERYLABEL", 10))
+		return_value = _readQueryLabel();
 	else if (MATCH("WITHCHECKOPTION", 15))
 		return_value = _readWithCheckOption();
 	else if (MATCH("SORTGROUPCLAUSE", 15))
