@@ -2025,8 +2025,10 @@ compute_cpu_sort_cost(PlannerInfo *root, List *pathkeys, int nPresortedKeys,
 		/*
 		 * Real-world distribution isn't uniform but now we don't have a way to
 		 * determine that, so, add multiplier to get closer to worst case.
+		 * Guard this value against irrational decisions.
 		 */
-		tuplesPerPrevGroup = ceil(1.5 * tuplesPerPrevGroup / nGroups);
+		tuplesPerPrevGroup = Min(tuplesPerPrevGroup,
+								 ceil(1.5 * tuplesPerPrevGroup / nGroups));
 
 		/*
 		 * We could skip all following columns for cost estimation, because we
