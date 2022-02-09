@@ -1872,6 +1872,15 @@ get_width_cost_multiplier(PlannerInfo *root, Expr *expr)
  *
  *	N * sum( Fk * log(Gk) )
  *
+ * For bounded heap sort we haven't such a duplicates-related research. So invent
+ * it based on a simple logic (M - number of output tuples):
+ * For one column we can estimate number of comparisons as:
+ * N * log(min{N,M})
+ * For the case of many columns we can natively estimate number of comparisons by
+ * the formula:
+ * sum(max{n_i,M} * log(min{N,M})),
+ * where n_0 == N, n_i - number of tuples per group, estimated on previous step.
+ *
  * Note: We also consider column width, not just the comparator cost.
  *
  * NOTE: some callers currently pass NIL for pathkeys because they
@@ -1881,7 +1890,7 @@ get_width_cost_multiplier(PlannerInfo *root, Expr *expr)
 static Cost
 compute_cpu_sort_cost(PlannerInfo *root, List *pathkeys, int nPresortedKeys,
 					  Cost comparison_cost, double tuples, double output_tuples,
-					  bool heapSort)
+					  bool bounded_sort)
 {
 	Cost		per_tuple_cost = 0.0;
 	ListCell	*lc;
@@ -1907,7 +1916,7 @@ compute_cpu_sort_cost(PlannerInfo *root, List *pathkeys, int nPresortedKeys,
 		 * of this function, but I'm not sure. I suggest we introduce some simple
 		 * constants for that, instead of magic values.
 		 */
-		output_tuples = (heapSort) ? 2.0 * output_tuples : tuples;
+		output_tuples = (bounded_sort) ? 2.0 * output_tuples : tuples;
 		per_tuple_cost += 2.0 * cpu_operator_cost * LOG2(output_tuples);
 
 		/* add cost provided by caller */
@@ -1925,8 +1934,7 @@ compute_cpu_sort_cost(PlannerInfo *root, List *pathkeys, int nPresortedKeys,
 	{
 		PathKey				*pathkey = (PathKey*) lfirst(lc);
 		EquivalenceMember	*em;
-		double				 nGroups,
-							 correctedNGroups;
+		double				 nGroups;
 
 		/*
 		 * We believe that equivalence members aren't very different, so, to
@@ -2000,24 +2008,16 @@ compute_cpu_sort_cost(PlannerInfo *root, List *pathkeys, int nPresortedKeys,
 		 */
 		if (i >= nPresortedKeys)
 		{
-			if (heapSort)
-			{
-				double heap_tuples;
-
-				/* have to keep at least one group, and a multiple of group size */
-				heap_tuples = Max(ceil(output_tuples / tuplesPerPrevGroup) * tuplesPerPrevGroup,
-								  tuplesPerPrevGroup);
-
-				/* so how many (whole) groups is that? */
-				correctedNGroups = ceil(heap_tuples / tuplesPerPrevGroup);
-			}
+			/*
+			 * Quick sort and 'top-N' sorting (bounded heap sort) algorithms
+			 * have different formulas for time complexity estimation.
+			 */
+			if (bounded_sort)
+				per_tuple_cost += totalFuncCost *
+								  (Max(tuplesPerPrevGroup, output_tuples) / tuples) *
+								  LOG2(2.0 * Min(tuplesPerPrevGroup, output_tuples));
 			else
-				/* all groups in the input */
-				correctedNGroups = nGroups;
-
-			correctedNGroups = Max(1.0, ceil(correctedNGroups));
-
-			per_tuple_cost += totalFuncCost * LOG2(correctedNGroups);
+				per_tuple_cost += totalFuncCost * LOG2(nGroups);
 		}
 
 		i++;
