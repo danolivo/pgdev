@@ -5002,6 +5002,10 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 	else
 		basenode = node;
 
+	/* Fast path for a fake Var */
+	if (IsA(basenode, Var) && ((Var *) basenode)->varno == 0)
+		return;
+
 	/* Fast path for a simple Var */
 
 	if (IsA(basenode, Var) &&

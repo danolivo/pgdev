@@ -1978,7 +1978,7 @@ compute_cpu_sort_cost(PlannerInfo *root, List *pathkeys, int nPresortedKeys,
 		 * Prevent call estimate_num_groups() with fake Var. Note,
 		 * pathkeyExprs contains only previous columns
 		 */
-		if (has_fake_var == false)
+//		if (has_fake_var == false)
 			/*
 			 * Recursively compute number of groups in a group from previous step
 			 */
@@ -1986,7 +1986,7 @@ compute_cpu_sort_cost(PlannerInfo *root, List *pathkeys, int nPresortedKeys,
 													  tuplesPerPrevGroup, NULL, NULL,
 													  &cache_varinfos,
 													  list_length(pathkeyExprs) - 1);
-		else if (tuples > 4.0)
+//		else if (tuples > 4.0)
 			/*
 			 * Use geometric mean as estimation if there is no any stats.
 			 * Don't use DEFAULT_NUM_DISTINCT because it used for only one
@@ -1998,9 +1998,9 @@ compute_cpu_sort_cost(PlannerInfo *root, List *pathkeys, int nPresortedKeys,
 			 *
 			 * XXX What's the logic of the following formula?
 			 */
-			nGroups = ceil(2.0 + sqrt(tuples) * (i + 1) / list_length(pathkeys));
-		else
-			nGroups = tuples;
+//			nGroups = ceil(2.0 + sqrt(tuples) * (i + 1) / list_length(pathkeys));
+//		else
+//			nGroups = tuples;
 
 		/*
 		 * Presorted keys aren't participated in comparison but still checked
