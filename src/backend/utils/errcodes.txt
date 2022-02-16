@@ -222,6 +222,7 @@ Section: Class 22 - Data Exception
 2203D    E    ERRCODE_TOO_MANY_JSON_ARRAY_ELEMENTS                           too_many_json_array_elements
 2203E    E    ERRCODE_TOO_MANY_JSON_OBJECT_MEMBERS                           too_many_json_object_members
 2203F    E    ERRCODE_SQL_JSON_SCALAR_REQUIRED                               sql_json_scalar_required
+22040    E    ERRCODE_FOR_IGNORE_ERRORS                                      extra_data_after_last_expected_column
 
 Section: Class 23 - Integrity Constraint Violation
 

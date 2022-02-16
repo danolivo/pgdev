@@ -34,6 +34,7 @@ COPY { <replaceable class="parameter">table_name</replaceable> [ ( <replaceable 
 
     FORMAT <replaceable class="parameter">format_name</replaceable>
     FREEZE [ <replaceable class="parameter">boolean</replaceable> ]
+    IGNORE_ERRORS [ <replaceable class="parameter">boolean</replaceable> ]
     DELIMITER '<replaceable class="parameter">delimiter_character</replaceable>'
     NULL '<replaceable class="parameter">null_string</replaceable>'
     HEADER [ <replaceable class="parameter">boolean</replaceable> ]
@@ -229,6 +230,18 @@ COPY { <replaceable class="parameter">table_name</replaceable> [ ( <replaceable 
       once it has been successfully loaded. This violates the normal rules
       of MVCC visibility and users specifying should be aware of the
       potential problems this might cause.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><literal>IGNORE_ERRORS</literal></term>
+    <listitem>
+     <para>
+      Drop rows that contain malformed data while copying. That is rows
+      containing syntax errors in data, rows with too many or too few columns,
+      rows that result in constraint violations, rows containing columns where
+      the data type's input function raises an error.
      </para>
     </listitem>
    </varlistentry>

@@ -454,6 +454,31 @@ test1
 SELECT * FROM instead_of_insert_tbl;
 COMMIT;
 
+-- test IGNORE_ERRORS option
+CREATE TABLE check_ign_err (n int, m int, k int);
+COPY check_ign_err FROM STDIN WITH IGNORE_ERRORS;
+1	1	1
+2	2	2	2
+3	3	3
+\.
+SELECT * FROM check_ign_err;
+
+TRUNCATE check_ign_err;
+COPY check_ign_err FROM STDIN WITH IGNORE_ERRORS;
+1	1	1
+2	2
+3	3	3
+\.
+SELECT * FROM check_ign_err;
+
+TRUNCATE check_ign_err;
+COPY check_ign_err FROM STDIN WITH IGNORE_ERRORS;
+1	1	1
+2	a	2
+3	3	3
+\.
+SELECT * FROM check_ign_err;
+
 -- clean up
 DROP TABLE forcetest;
 DROP TABLE vistest;
@@ -468,3 +493,4 @@ DROP TABLE instead_of_insert_tbl;
 DROP VIEW instead_of_insert_tbl_view;
 DROP VIEW instead_of_insert_tbl_view_2;
 DROP FUNCTION fun_instead_of_insert_tbl();
+DROP TABLE check_ign_err;

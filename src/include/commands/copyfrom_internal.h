@@ -68,6 +68,7 @@ typedef struct CopyFromStateData
 	/* parameters from the COPY command */
 	Relation	rel;			/* relation to copy from */
 	List	   *attnumlist;		/* integer list of attnums to copy */
+	int			attr_count;		/* length of attnumlist */
 	char	   *filename;		/* filename, or NULL for STDIN */
 	bool		is_program;		/* is 'filename' a program to popen? */
 	copy_data_source_cb data_source_cb; /* function for reading data */

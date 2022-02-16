@@ -337,6 +337,7 @@ ProcessCopyOptions(ParseState *pstate,
 {
 	bool		format_specified = false;
 	bool		freeze_specified = false;
+	bool		ignore_errors_specified = false;
 	bool		header_specified = false;
 	ListCell   *option;
 
@@ -376,6 +377,13 @@ ProcessCopyOptions(ParseState *pstate,
 				errorConflictingDefElem(defel, pstate);
 			freeze_specified = true;
 			opts_out->freeze = defGetBoolean(defel);
+		}
+		else if (strcmp(defel->defname, "ignore_errors") == 0)
+		{
+			if (ignore_errors_specified)
+				errorConflictingDefElem(defel, pstate);
+			ignore_errors_specified = true;
+			opts_out->ignore_errors = defGetBoolean(defel);
 		}
 		else if (strcmp(defel->defname, "delimiter") == 0)
 		{

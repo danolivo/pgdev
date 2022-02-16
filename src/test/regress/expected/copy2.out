@@ -649,6 +649,34 @@ SELECT * FROM instead_of_insert_tbl;
 (2 rows)
 
 COMMIT;
+-- test IGNORE_ERRORS option
+CREATE TABLE check_ign_err (n int, m int, k int);
+COPY check_ign_err FROM STDIN WITH IGNORE_ERRORS;
+ERROR:  extra data after last expected column
+CONTEXT:  COPY check_ign_err, line 2: "2	2	2	2"
+SELECT * FROM check_ign_err;
+ n | m | k 
+---+---+---
+(0 rows)
+
+TRUNCATE check_ign_err;
+COPY check_ign_err FROM STDIN WITH IGNORE_ERRORS;
+ERROR:  missing data for column "k"
+CONTEXT:  COPY check_ign_err, line 2: "2	2"
+SELECT * FROM check_ign_err;
+ n | m | k 
+---+---+---
+(0 rows)
+
+TRUNCATE check_ign_err;
+COPY check_ign_err FROM STDIN WITH IGNORE_ERRORS;
+ERROR:  invalid input syntax for type integer: "a"
+CONTEXT:  COPY check_ign_err, line 2, column m: "a"
+SELECT * FROM check_ign_err;
+ n | m | k 
+---+---+---
+(0 rows)
+
 -- clean up
 DROP TABLE forcetest;
 DROP TABLE vistest;
@@ -663,3 +691,4 @@ DROP TABLE instead_of_insert_tbl;
 DROP VIEW instead_of_insert_tbl_view;
 DROP VIEW instead_of_insert_tbl_view_2;
 DROP FUNCTION fun_instead_of_insert_tbl();
+DROP TABLE check_ign_err;
