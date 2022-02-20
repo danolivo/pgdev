@@ -1767,3 +1767,100 @@ create function table_fail(i anyelement) returns table(i anyelement, r anyrange)
   as $$ select $1, '[1,10]' $$ language sql;
 ERROR:  cannot determine result data type
 DETAIL:  A result of type anyrange requires at least one input of type anyrange or anymultirange.
+-- test range join operators
+create table test_range_join_1(ir1 int4range);
+create table test_range_join_2(ir2 int4range);
+insert into test_range_join_1 select int4range(g, g+10) from generate_series(1,200) g;
+insert into test_range_join_1 select int4range(g, g+10000) from generate_series(1,100) g;
+insert into test_range_join_1 select int4range(NULL,g*10,'(]') from generate_series(1,10) g;
+insert into test_range_join_1 select int4range(g*10,NULL,'(]') from generate_series(1,10) g;
+insert into test_range_join_1 select int4range(g, g+10) from generate_series(1,200) g;
+insert into test_range_join_1 select 'empty'::int4range from generate_series(1,20) g;
+insert into test_range_join_1 select NULL from generate_series(1,50) g;
+insert into test_range_join_2 select int4range(g+10, g+20) from generate_series(1,20) g;
+insert into test_range_join_2 select int4range(g+5000, g+15000) from generate_series(1,10) g;
+insert into test_range_join_2 select int4range(NULL,g*5,'(]') from generate_series(1,10) g;
+insert into test_range_join_2 select int4range(g*5,NULL,'(]') from generate_series(1,10) g;
+insert into test_range_join_2 select int4range(g, g+10) from generate_series(1,20) g;
+insert into test_range_join_2 select 'empty'::int4range from generate_series(1,5) g;
+insert into test_range_join_2 select NULL from generate_series(1,5) g;
+select count(*) from test_range_join_1, test_range_join_2 where ir1 = ir2;
+ count 
+-------
+   190
+(1 row)
+
+select count(*) from test_range_join_1, test_range_join_2 where ir1 < ir2;
+ count 
+-------
+  9772
+(1 row)
+
+select count(*) from test_range_join_1, test_range_join_2 where ir1 <= ir2;
+ count 
+-------
+  9962
+(1 row)
+
+select count(*) from test_range_join_1, test_range_join_2 where ir1 > ir2;
+ count 
+-------
+ 30538
+(1 row)
+
+select count(*) from test_range_join_1, test_range_join_2 where ir1 >= ir2;
+ count 
+-------
+ 30728
+(1 row)
+
+select count(*) from test_range_join_1, test_range_join_2 where ir1 && ir2;
+ count 
+-------
+  9688
+(1 row)
+
+select count(*) from test_range_join_1, test_range_join_2 where ir1 <@ ir2;
+ count 
+-------
+  6238
+(1 row)
+
+select count(*) from test_range_join_1, test_range_join_2 where ir1 @> ir2;
+ count 
+-------
+  3969
+(1 row)
+
+select count(*) from test_range_join_1, test_range_join_2 where ir1 << ir2;
+ count 
+-------
+  5073
+(1 row)
+
+select count(*) from test_range_join_1, test_range_join_2 where ir1 >> ir2;
+ count 
+-------
+ 21639
+(1 row)
+
+select count(*) from test_range_join_1, test_range_join_2 where ir1 &< ir2;
+ count 
+-------
+ 12023
+(1 row)
+
+select count(*) from test_range_join_1, test_range_join_2 where ir1 &> ir2;
+ count 
+-------
+ 28078
+(1 row)
+
+select count(*) from test_range_join_1, test_range_join_2 where ir1 -|- ir2;
+ count 
+-------
+   245
+(1 row)
+
+drop table test_range_join_1;
+drop table test_range_join_2;

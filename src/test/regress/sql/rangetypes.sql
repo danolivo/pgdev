@@ -616,3 +616,40 @@ create function inoutparam_fail(inout i anyelement, out r anyrange)
 --should fail
 create function table_fail(i anyelement) returns table(i anyelement, r anyrange)
   as $$ select $1, '[1,10]' $$ language sql;
+
+-- test range join operators
+create table test_range_join_1(ir1 int4range);
+create table test_range_join_2(ir2 int4range);
+
+insert into test_range_join_1 select int4range(g, g+10) from generate_series(1,200) g;
+insert into test_range_join_1 select int4range(g, g+10000) from generate_series(1,100) g;
+insert into test_range_join_1 select int4range(NULL,g*10,'(]') from generate_series(1,10) g;
+insert into test_range_join_1 select int4range(g*10,NULL,'(]') from generate_series(1,10) g;
+insert into test_range_join_1 select int4range(g, g+10) from generate_series(1,200) g;
+insert into test_range_join_1 select 'empty'::int4range from generate_series(1,20) g;
+insert into test_range_join_1 select NULL from generate_series(1,50) g;
+
+insert into test_range_join_2 select int4range(g+10, g+20) from generate_series(1,20) g;
+insert into test_range_join_2 select int4range(g+5000, g+15000) from generate_series(1,10) g;
+insert into test_range_join_2 select int4range(NULL,g*5,'(]') from generate_series(1,10) g;
+insert into test_range_join_2 select int4range(g*5,NULL,'(]') from generate_series(1,10) g;
+insert into test_range_join_2 select int4range(g, g+10) from generate_series(1,20) g;
+insert into test_range_join_2 select 'empty'::int4range from generate_series(1,5) g;
+insert into test_range_join_2 select NULL from generate_series(1,5) g;
+
+select count(*) from test_range_join_1, test_range_join_2 where ir1 = ir2;
+select count(*) from test_range_join_1, test_range_join_2 where ir1 < ir2;
+select count(*) from test_range_join_1, test_range_join_2 where ir1 <= ir2;
+select count(*) from test_range_join_1, test_range_join_2 where ir1 > ir2;
+select count(*) from test_range_join_1, test_range_join_2 where ir1 >= ir2;
+select count(*) from test_range_join_1, test_range_join_2 where ir1 && ir2;
+select count(*) from test_range_join_1, test_range_join_2 where ir1 <@ ir2;
+select count(*) from test_range_join_1, test_range_join_2 where ir1 @> ir2;
+select count(*) from test_range_join_1, test_range_join_2 where ir1 << ir2;
+select count(*) from test_range_join_1, test_range_join_2 where ir1 >> ir2;
+select count(*) from test_range_join_1, test_range_join_2 where ir1 &< ir2;
+select count(*) from test_range_join_1, test_range_join_2 where ir1 &> ir2;
+select count(*) from test_range_join_1, test_range_join_2 where ir1 -|- ir2;
+
+drop table test_range_join_1;
+drop table test_range_join_2;
