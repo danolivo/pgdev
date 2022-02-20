@@ -817,7 +817,6 @@ NextCopyFrom(CopyFromState cstate, ExprContext *econtext,
 	tupDesc = RelationGetDescr(cstate->rel);
 	num_phys_attrs = tupDesc->natts;
 	attr_count = list_length(cstate->attnumlist);
-	cstate->attr_count = attr_count;
 
 	/* Initialize all values for row to NULL */
 	MemSet(values, 0, num_phys_attrs * sizeof(Datum));

@@ -518,6 +518,8 @@ CopyMultiInsertInfoStore(CopyMultiInsertInfo *miinfo, ResultRelInfo *rri,
 	miinfo->bufferedBytes += tuplen;
 }
 
+#define REPLAY_BUFFER_SIZE (1000)
+
 /*
  * Copy FROM file to relation.
  */
@@ -545,6 +547,18 @@ CopyFrom(CopyFromState cstate)
 	bool		has_before_insert_row_trig;
 	bool		has_instead_insert_row_trig;
 	bool		leafpart_use_multi_insert = false;
+
+	bool replay_mode = false;
+	HeapTuple replay_buffer[REPLAY_BUFFER_SIZE];
+	int replay_buffer_num = 0;
+	int replay_buffer_count;
+	int64		replay_processed;
+	MemoryContext RepBufMemoryContext = AllocSetContextCreate(
+											CurrentMemoryContext,
+											"Replay buffer context",
+											ALLOCSET_DEFAULT_MINSIZE,
+											ALLOCSET_DEFAULT_INITSIZE,
+											ALLOCSET_DEFAULT_MAXSIZE);;
 
 	Assert(cstate->rel);
 	Assert(list_length(cstate->range_table) == 1);
@@ -851,10 +865,36 @@ CopyFrom(CopyFromState cstate)
 		MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 
 		ExecClearTuple(myslot);
-
+PG_TRY();
+{
 		/* Directly store the values/nulls array in the slot */
-		if (!NextCopyFrom(cstate, econtext, myslot->tts_values, myslot->tts_isnull))
+		if (replay_mode)
+		{
+			/* Get tuple from the replay_buffer. */
+			heap_deform_tuple(replay_buffer[replay_buffer_count++],
+							  myslot->tts_tupleDescriptor,
+							  myslot->tts_values, myslot->tts_isnull);
+		}
+		/* Get tuple from the stream. */
+		else if (!NextCopyFrom(cstate, econtext, myslot->tts_values, myslot->tts_isnull))
 			break;
+
+		if (!replay_mode && cstate->opts.ignore_errors)
+		{
+			MemoryContext oldctx;
+
+			if (replay_buffer_num == 0)
+			{
+				/* Start new subtransaction. */
+				replay_processed = processed;
+				BeginInternalSubTransaction(NULL);
+			}
+
+			/* Store the tuple in the replay_buffer. */
+			oldctx = MemoryContextSwitchTo(RepBufMemoryContext);
+			replay_buffer[replay_buffer_num++] = ExecCopySlotHeapTuple(myslot);
+			MemoryContextSwitchTo(oldctx);
+		}
 
 		ExecStoreVirtualTuple(myslot);
 
@@ -1121,6 +1161,14 @@ CopyFrom(CopyFromState cstate)
 			pgstat_progress_update_param(PROGRESS_COPY_TUPLES_PROCESSED,
 										 ++processed);
 		}
+}
+PG_CATCH();
+{
+	replay_mode = true;
+	replay_buffer_count = 0;
+	processed = replay_processed;
+}
+PG_END_TRY();
 	}
 
 	/* Flush any remaining buffered tuples */
