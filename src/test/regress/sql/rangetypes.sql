@@ -637,19 +637,65 @@ insert into test_range_join_2 select int4range(g, g+10) from generate_series(1,2
 insert into test_range_join_2 select 'empty'::int4range from generate_series(1,5) g;
 insert into test_range_join_2 select NULL from generate_series(1,5) g;
 
-select count(*) from test_range_join_1, test_range_join_2 where ir1 = ir2;
-select count(*) from test_range_join_1, test_range_join_2 where ir1 < ir2;
-select count(*) from test_range_join_1, test_range_join_2 where ir1 <= ir2;
-select count(*) from test_range_join_1, test_range_join_2 where ir1 > ir2;
-select count(*) from test_range_join_1, test_range_join_2 where ir1 >= ir2;
-select count(*) from test_range_join_1, test_range_join_2 where ir1 && ir2;
-select count(*) from test_range_join_1, test_range_join_2 where ir1 <@ ir2;
-select count(*) from test_range_join_1, test_range_join_2 where ir1 @> ir2;
-select count(*) from test_range_join_1, test_range_join_2 where ir1 << ir2;
-select count(*) from test_range_join_1, test_range_join_2 where ir1 >> ir2;
-select count(*) from test_range_join_1, test_range_join_2 where ir1 &< ir2;
-select count(*) from test_range_join_1, test_range_join_2 where ir1 &> ir2;
-select count(*) from test_range_join_1, test_range_join_2 where ir1 -|- ir2;
+create function check_estimated_rows(text) returns table (estimated int, actual int)
+language plpgsql as
+$$
+declare
+    ln text;
+    tmp text[];
+    first_row bool := true;
+begin
+    for ln in
+        execute format('explain analyze %s', $1)
+    loop
+        if first_row then
+            first_row := false;
+            tmp := regexp_match(ln, 'rows=(\d*) .* rows=(\d*)');
+            return query select tmp[1]::int, tmp[2]::int;
+        end if;
+    end loop;
+end;
+$$;
 
+SELECT * FROM check_estimated_rows('
+select * from test_range_join_1, test_range_join_2 where ir1 = ir2');
+
+SELECT * FROM check_estimated_rows('
+select * from test_range_join_1, test_range_join_2 where ir1 < ir2');
+
+SELECT * FROM check_estimated_rows('
+select * from test_range_join_1, test_range_join_2 where ir1 <= ir2');
+
+SELECT * FROM check_estimated_rows('
+select * from test_range_join_1, test_range_join_2 where ir1 > ir2');
+
+SELECT * FROM check_estimated_rows('
+select * from test_range_join_1, test_range_join_2 where ir1 >= ir2');
+
+SELECT * FROM check_estimated_rows('
+select * from test_range_join_1, test_range_join_2 where ir1 && ir2');
+
+SELECT * FROM check_estimated_rows('
+select * from test_range_join_1, test_range_join_2 where ir1 <@ ir2');
+
+SELECT * FROM check_estimated_rows('
+select * from test_range_join_1, test_range_join_2 where ir1 @> ir2');
+
+SELECT * FROM check_estimated_rows('
+select * from test_range_join_1, test_range_join_2 where ir1 << ir2');
+
+SELECT * FROM check_estimated_rows('
+select * from test_range_join_1, test_range_join_2 where ir1 >> ir2');
+
+SELECT * FROM check_estimated_rows('
+select * from test_range_join_1, test_range_join_2 where ir1 &< ir2');
+
+SELECT * FROM check_estimated_rows('
+select * from test_range_join_1, test_range_join_2 where ir1 &> ir2');
+
+SELECT * FROM check_estimated_rows('
+select * from test_range_join_1, test_range_join_2 where ir1 -|- ir2');
+
+drop function check_estimated_rows;
 drop table test_range_join_1;
 drop table test_range_join_2;
