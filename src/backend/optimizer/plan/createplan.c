@@ -71,6 +71,7 @@
 #define CP_LABEL_TLIST		0x0004	/* tlist must contain sortgrouprefs */
 #define CP_IGNORE_TLIST		0x0008	/* caller will replace tlist */
 
+create_plan_hook_type create_plan_hook = NULL;
 
 static Plan *create_plan_recurse(PlannerInfo *root, Path *best_path,
 								 int flags);
@@ -544,6 +545,10 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 			plan = NULL;		/* keep compiler quiet */
 			break;
 	}
+
+	if (create_plan_hook)
+		/* Give an extension a chance to do something */
+		(*create_plan_hook)(root, best_path, &plan);
 
 	return plan;
 }
@@ -5316,6 +5321,7 @@ copy_generic_path_info(Plan *dest, Path *src)
 	dest->plan_width = src->pathtarget->width;
 	dest->parallel_aware = src->parallel_aware;
 	dest->parallel_safe = src->parallel_safe;
+	dest->private = NIL;
 }
 
 /*

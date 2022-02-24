@@ -143,6 +143,7 @@
 /* Hooks for plugins to get control when we ask for stats */
 get_relation_stats_hook_type get_relation_stats_hook = NULL;
 get_index_stats_hook_type get_index_stats_hook = NULL;
+estimate_num_groups_hook_type estimate_num_groups_hook = NULL;
 
 static double eqsel_internal(PG_FUNCTION_ARGS, bool negate);
 static double eqjoinsel_inner(Oid opfuncoid, Oid collation,
@@ -3291,6 +3292,20 @@ add_unique_group_var(PlannerInfo *root, List *varinfos,
 	varinfo->isdefault = isdefault;
 	varinfos = lappend(varinfos, varinfo);
 	return varinfos;
+}
+
+double
+estimate_num_groups_ext(PlannerInfo *root, List *groupExprs, Path *subpath,
+						RelOptInfo *grouped_rel, List **pgset,
+						EstimationInfo *estinfo)
+{
+	double input_rows = subpath->rows;
+
+	if (estimate_num_groups_hook != NULL)
+		return (*estimate_num_groups_hook)(root, groupExprs, subpath, grouped_rel,
+										   pgset, estinfo);
+
+	return estimate_num_groups(root, groupExprs, input_rows, pgset, estinfo);
 }
 
 /*

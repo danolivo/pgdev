@@ -158,6 +158,9 @@ typedef struct Plan
 	 */
 	Bitmapset  *extParam;
 	Bitmapset  *allParam;
+
+	/* Additional field for an extension purposes. */
+	List		*private;
 } Plan;
 
 /* ----------------

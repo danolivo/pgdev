@@ -349,6 +349,7 @@ _outPlanInfo(StringInfo str, const Plan *node)
 	WRITE_NODE_FIELD(initPlan);
 	WRITE_BITMAPSET_FIELD(extParam);
 	WRITE_BITMAPSET_FIELD(allParam);
+	/*WRITE_NODE_FIELD(private); */
 }
 
 /*

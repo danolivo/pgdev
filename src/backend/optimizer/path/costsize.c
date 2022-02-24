@@ -98,6 +98,11 @@
 #include "utils/spccache.h"
 #include "utils/tuplesort.h"
 
+set_baserel_rows_estimate_hook_type set_baserel_rows_estimate_hook = NULL;
+set_foreign_rows_estimate_hook_type set_foreign_rows_estimate_hook = NULL;
+get_parameterized_baserel_size_hook_type get_parameterized_baserel_size_hook = NULL;
+get_parameterized_joinrel_size_hook_type get_parameterized_joinrel_size_hook = NULL;
+set_joinrel_size_estimates_hook_type set_joinrel_size_estimates_hook = NULL;
 
 #define LOG2(x)  (log(x) / 0.693147180559945)
 
@@ -188,7 +193,6 @@ static Cost append_nonpartial_cost(List *subpaths, int numpaths,
 static void set_rel_width(PlannerInfo *root, RelOptInfo *rel);
 static double relation_byte_size(double tuples, int width);
 static double page_size(double tuples, int width);
-static double get_parallel_divisor(Path *path);
 
 
 /*
@@ -4906,6 +4910,58 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
 }
 
 
+void
+set_foreign_rows_estimate(PlannerInfo *root, RelOptInfo *rel)
+{
+	if (set_foreign_rows_estimate_hook)
+		(*set_foreign_rows_estimate_hook) (root, rel);
+	else
+		rel->rows = 1000;			/* entirely bogus default estimate */
+}
+
+/*
+ * set_baserel_rows_estimate
+ *		Set the rows estimate for the given base relation.
+ *
+ * Rows is the estimated number of output tuples after applying
+ * restriction clauses.
+ *
+ * To support loadable plugins that monitor or modify cardinality estimation,
+ * we provide a hook variable that lets a plugin get control before and
+ * after the cardinality estimation.
+ * The hook must set rel->rows.
+ */
+void
+set_baserel_rows_estimate(PlannerInfo *root, RelOptInfo *rel)
+{
+	if (set_baserel_rows_estimate_hook)
+		(*set_baserel_rows_estimate_hook) (root, rel);
+	else
+		set_baserel_rows_estimate_standard(root, rel);
+}
+
+/*
+ * set_baserel_rows_estimate
+ *		Set the rows estimate for the given base relation.
+ *
+ * Rows is the estimated number of output tuples after applying
+ * restriction clauses.
+ */
+void
+set_baserel_rows_estimate_standard(PlannerInfo *root, RelOptInfo *rel)
+{
+	double		nrows;
+
+	nrows = rel->tuples *
+		clauselist_selectivity(root,
+							   rel->baserestrictinfo,
+							   0,
+							   JOIN_INNER,
+							   NULL);
+
+	rel->rows = clamp_row_est(nrows);
+}
+
 /*
  * set_baserel_size_estimates
  *		Set the size estimates for the given base relation.
@@ -4922,19 +4978,10 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
 void
 set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 {
-	double		nrows;
-
 	/* Should only be applied to base relations */
 	Assert(rel->relid > 0);
 
-	nrows = rel->tuples *
-		clauselist_selectivity(root,
-							   rel->baserestrictinfo,
-							   0,
-							   JOIN_INNER,
-							   NULL);
-
-	rel->rows = clamp_row_est(nrows);
+	set_baserel_rows_estimate(root, rel);
 
 	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
 
@@ -4945,13 +4992,33 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
  * get_parameterized_baserel_size
  *		Make a size estimate for a parameterized scan of a base relation.
  *
+ * To support loadable plugins that monitor or modify cardinality estimation,
+ * we provide a hook variable that lets a plugin get control before and
+ * after the cardinality estimation.
+ */
+double
+get_parameterized_baserel_size(PlannerInfo *root, RelOptInfo *rel,
+							   List *param_clauses)
+{
+	if (get_parameterized_baserel_size_hook)
+		return (*get_parameterized_baserel_size_hook) (root, rel,
+													   param_clauses);
+	else
+		return get_parameterized_baserel_size_standard(root, rel,
+													   param_clauses);
+}
+
+/*
+ * get_parameterized_baserel_size_standard
+ *		Make a size estimate for a parameterized scan of a base relation.
+ *
  * 'param_clauses' lists the additional join clauses to be used.
  *
  * set_baserel_size_estimates must have been applied already.
  */
 double
-get_parameterized_baserel_size(PlannerInfo *root, RelOptInfo *rel,
-							   List *param_clauses)
+get_parameterized_baserel_size_standard(PlannerInfo *root, RelOptInfo *rel,
+										List *param_clauses)
 {
 	List	   *allclauses;
 	double		nrows;
@@ -4980,6 +5047,36 @@ get_parameterized_baserel_size(PlannerInfo *root, RelOptInfo *rel,
  * set_joinrel_size_estimates
  *		Set the size estimates for the given join relation.
  *
+ * To support loadable plugins that monitor or modify cardinality estimation,
+ * we provide a hook variable that lets a plugin get control before and
+ * after the cardinality estimation.
+ * The hook must set rel->rows value.
+ */
+void
+set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
+						   RelOptInfo *outer_rel,
+						   RelOptInfo *inner_rel,
+						   SpecialJoinInfo *sjinfo,
+						   List *restrictlist)
+{
+	if (set_joinrel_size_estimates_hook)
+		(*set_joinrel_size_estimates_hook) (root, rel,
+											outer_rel,
+											inner_rel,
+											sjinfo,
+											restrictlist);
+	else
+		set_joinrel_size_estimates_standard(root, rel,
+											outer_rel,
+											inner_rel,
+											sjinfo,
+											restrictlist);
+}
+
+/*
+ * set_joinrel_size_estimates_standard
+ *		Set the size estimates for the given join relation.
+ *
  * The rel's targetlist must have been constructed already, and a
  * restriction clause list that matches the given component rels must
  * be provided.
@@ -4999,11 +5096,11 @@ get_parameterized_baserel_size(PlannerInfo *root, RelOptInfo *rel,
  * build_joinrel_tlist, and baserestrictcost is not used for join rels.
  */
 void
-set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
-						   RelOptInfo *outer_rel,
-						   RelOptInfo *inner_rel,
-						   SpecialJoinInfo *sjinfo,
-						   List *restrictlist)
+set_joinrel_size_estimates_standard(PlannerInfo *root, RelOptInfo *rel,
+									RelOptInfo *outer_rel,
+									RelOptInfo *inner_rel,
+									SpecialJoinInfo *sjinfo,
+									List *restrictlist)
 {
 	rel->rows = calc_joinrel_size_estimate(root,
 										   rel,
@@ -5019,6 +5116,35 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
  * get_parameterized_joinrel_size
  *		Make a size estimate for a parameterized scan of a join relation.
  *
+ * To support loadable plugins that monitor or modify cardinality estimation,
+ * we provide a hook variable that lets a plugin get control before and
+ * after the cardinality estimation.
+ */
+double
+get_parameterized_joinrel_size(PlannerInfo *root, RelOptInfo *rel,
+							   Path *outer_path,
+							   Path *inner_path,
+							   SpecialJoinInfo *sjinfo,
+							   List *restrict_clauses)
+{
+	if (get_parameterized_joinrel_size_hook)
+		return (*get_parameterized_joinrel_size_hook) (root, rel,
+													   outer_path,
+													   inner_path,
+													   sjinfo,
+													   restrict_clauses);
+	else
+		return get_parameterized_joinrel_size_standard(root, rel,
+													   outer_path,
+													   inner_path,
+													   sjinfo,
+													   restrict_clauses);
+}
+
+/*
+ * get_parameterized_joinrel_size_standard
+ *		Make a size estimate for a parameterized scan of a join relation.
+ *
  * 'rel' is the joinrel under consideration.
  * 'outer_path', 'inner_path' are (probably also parameterized) Paths that
  *		produce the relations being joined.
@@ -5031,11 +5157,11 @@ set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
  * set_joinrel_size_estimates must have been applied already.
  */
 double
-get_parameterized_joinrel_size(PlannerInfo *root, RelOptInfo *rel,
-							   Path *outer_path,
-							   Path *inner_path,
-							   SpecialJoinInfo *sjinfo,
-							   List *restrict_clauses)
+get_parameterized_joinrel_size_standard(PlannerInfo *root, RelOptInfo *rel,
+										Path *outer_path,
+										Path *inner_path,
+										SpecialJoinInfo *sjinfo,
+										List *restrict_clauses)
 {
 	double		nrows;
 
@@ -5751,7 +5877,7 @@ set_foreign_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 	/* Should only be applied to base relations */
 	Assert(rel->relid > 0);
 
-	rel->rows = 1000;			/* entirely bogus default estimate */
+	set_foreign_rows_estimate(root, rel);
 
 	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
 
@@ -6038,7 +6164,7 @@ page_size(double tuples, int width)
  * Estimate the fraction of the work that each worker will do given the
  * number of workers budgeted for the path.
  */
-static double
+double
 get_parallel_divisor(Path *path)
 {
 	double		parallel_divisor = path->parallel_workers;
