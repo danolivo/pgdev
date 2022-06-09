@@ -3054,3 +3054,29 @@ analyze_mcv_list(int *mcv_counts,
 	}
 	return num_mcv;
 }
+
+#include "utils/regproc.h"
+#include "catalog/namespace.h"
+
+Datum
+dump_stat(PG_FUNCTION_ARGS)
+{
+	const char		*relname = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	RangeVar		*relvar;
+	Relation		rel;
+
+	relvar = makeRangeVarFromNameList(stringToQualifiedNameList(relname));
+	rel = relation_openrv(relvar, AccessShareLock);
+
+	if (rel->rd_rel->relkind != RELKIND_RELATION)
+	{
+		relation_close(rel, AccessShareLock);
+		elog(WARNING,
+			 "Can be used for ordinary relation only. Reltype: %c.",
+			 rel->rd_rel->relkind);
+		PG_RETURN_NULL();
+	}
+
+	PG_RETURN_NULL();
+//	PG_RETURN_TEXT_P(x)
+}
