@@ -55,6 +55,8 @@ range_typanalyze(PG_FUNCTION_ARGS)
 		attr->attstattarget = default_statistics_target;
 
 	stats->compute_stats = compute_range_stats;
+	stats->serialize_stats = NULL;
+	stats->deserialize_stats = NULL;
 	stats->extra_data = typcache;
 	/* same as in std_typanalyze */
 	stats->minrows = 300 * attr->attstattarget;
@@ -82,6 +84,8 @@ multirange_typanalyze(PG_FUNCTION_ARGS)
 		attr->attstattarget = default_statistics_target;
 
 	stats->compute_stats = compute_range_stats;
+	stats->serialize_stats = NULL;
+	stats->deserialize_stats = NULL;
 	stats->extra_data = typcache;
 	/* same as in std_typanalyze */
 	stats->minrows = 300 * attr->attstattarget;

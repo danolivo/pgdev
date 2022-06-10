@@ -63,6 +63,8 @@ ts_typanalyze(PG_FUNCTION_ARGS)
 		attr->attstattarget = default_statistics_target;
 
 	stats->compute_stats = compute_tsvector_stats;
+	stats->serialize_stats = NULL;
+	stats->deserialize_stats = NULL;
 	/* see comment about the choice of minrows in commands/analyze.c */
 	stats->minrows = 300 * attr->attstattarget;
 

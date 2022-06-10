@@ -111,6 +111,10 @@ typedef void (*AnalyzeAttrComputeStatsFunc) (VacAttrStatsP stats,
 											 AnalyzeAttrFetchFunc fetchfunc,
 											 int samplerows,
 											 double totalrows);
+typedef void (*AnalyzeAttrSerializeStatsFunc) (VacAttrStatsP stats,
+											   double totalrows);
+typedef bool (*AnalyzeAttrDeserializeStatsFunc) (VacAttrStatsP stats,
+												 double totalrows);
 
 typedef struct VacAttrStats
 {
@@ -137,6 +141,8 @@ typedef struct VacAttrStats
 	 * returns false.
 	 */
 	AnalyzeAttrComputeStatsFunc compute_stats;	/* function pointer */
+	AnalyzeAttrSerializeStatsFunc serialize_stats;
+	AnalyzeAttrDeserializeStatsFunc deserialize_stats;
 	int			minrows;		/* Minimum # of rows wanted for stats */
 	void	   *extra_data;		/* for extra type-specific data */
 

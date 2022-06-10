@@ -53,6 +53,8 @@ typedef struct
 
 	/* Saved state from std_typanalyze() */
 	AnalyzeAttrComputeStatsFunc std_compute_stats;
+	AnalyzeAttrSerializeStatsFunc std_serialize_stats;
+	AnalyzeAttrDeserializeStatsFunc std_deserialize_stats;
 	void	   *std_extra_data;
 } ArrayAnalyzeExtraData;
 
@@ -144,10 +146,14 @@ array_typanalyze(PG_FUNCTION_ARGS)
 
 	/* Save old compute_stats and extra_data for scalar statistics ... */
 	extra_data->std_compute_stats = stats->compute_stats;
+	extra_data->std_serialize_stats = stats->serialize_stats;
+	extra_data->std_deserialize_stats = stats->deserialize_stats;
 	extra_data->std_extra_data = stats->extra_data;
 
 	/* ... and replace with our info */
 	stats->compute_stats = compute_array_stats;
+	stats->serialize_stats = NULL;
+	stats->deserialize_stats = NULL;
 	stats->extra_data = extra_data;
 
 	/*

@@ -90,7 +90,8 @@ static BufferAccessStrategy vac_strategy;
 static void do_analyze_rel(Relation onerel,
 						   VacuumParams *params, List *va_cols,
 						   AcquireSampleRowsFunc acquirefunc, BlockNumber relpages,
-						   bool inh, bool in_outer_xact, int elevel);
+						   bool inh, bool in_outer_xact, int elevel,
+						   char *serializedstat);
 static void compute_index_stats(Relation onerel, double totalrows,
 								AnlIndexData *indexdata, int nindexes,
 								HeapTuple *rows, int numrows,
@@ -260,14 +261,14 @@ analyze_rel(Oid relid, RangeVar *relation,
 	 */
 	if (onerel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
 		do_analyze_rel(onerel, params, va_cols, acquirefunc,
-					   relpages, false, in_outer_xact, elevel);
+					   relpages, false, in_outer_xact, elevel, NULL);
 
 	/*
 	 * If there are child tables, do recursive ANALYZE.
 	 */
 	if (onerel->rd_rel->relhassubclass)
 		do_analyze_rel(onerel, params, va_cols, acquirefunc, relpages,
-					   true, in_outer_xact, elevel);
+					   true, in_outer_xact, elevel, NULL);
 
 	/*
 	 * Close source relation now, but keep lock so that no one deletes it
@@ -286,12 +287,14 @@ analyze_rel(Oid relid, RangeVar *relation,
  * Note that "acquirefunc" is only relevant for the non-inherited case.
  * For the inherited case, acquire_inherited_sample_rows() determines the
  * appropriate acquirefunc for each child table.
+ * serializedstat should contain stat data on columns of the relation, indexes
+ * and extensded stat. If something is absent, throw a warning and go further.
  */
 static void
 do_analyze_rel(Relation onerel, VacuumParams *params,
 			   List *va_cols, AcquireSampleRowsFunc acquirefunc,
 			   BlockNumber relpages, bool inh, bool in_outer_xact,
-			   int elevel)
+			   int elevel, char *serializedstat)
 {
 	int			attr_cnt,
 				tcnt,
@@ -303,7 +306,7 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 	VacAttrStats **vacattrstats;
 	AnlIndexData *indexdata;
 	int			targrows,
-				numrows,
+				numrows = 0,
 				minrows;
 	double		totalrows,
 				totaldeadrows;
@@ -490,6 +493,8 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 		}
 	}
 
+if (!serializedstat)
+{
 	/*
 	 * Determine how many rows we need to sample, using the worst case from
 	 * all analyzable columns.  We use a lower bound of 100 rows to avoid
@@ -538,6 +543,7 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 		numrows = (*acquirefunc) (onerel, elevel,
 								  rows, targrows,
 								  &totalrows, &totaldeadrows);
+}
 
 	/*
 	 * Compute the statistics.  Temporary results during the calculations for
@@ -615,6 +621,33 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 		/* Build extended statistics (if there are any). */
 		BuildRelationExtStatistics(onerel, inh, totalrows, numrows, rows,
 								   attr_cnt, vacattrstats);
+	}
+	else if (serializedstat)
+	{
+		/* Extract statistics from a serialized representation */
+		Assert(!acquirefunc);
+
+		for (i = 0; i < attr_cnt; i++)
+		{
+			VacAttrStats *stats = vacattrstats[i];
+
+			stats->tupDesc = onerel->rd_att;
+
+			if (!stats->deserialize_stats ||
+				!stats->deserialize_stats(stats, totalrows))
+			{
+				Form_pg_attribute attr = TupleDescAttr(onerel->rd_att, stats->tupattnum - 1);
+
+				elog(WARNING,
+					 "Column %s is analyzable but can't be restored from a serialized source.",
+					 NameStr(attr->attname));
+				stats->stats_valid = false; /* Position is absent */
+				continue;
+			}
+		}
+
+		update_attstats(RelationGetRelid(onerel), inh, attr_cnt, vacattrstats);
+		/* Remember about indexes and extended statistics */
 	}
 
 	pgstat_progress_update_param(PROGRESS_ANALYZE_PHASE,
@@ -1884,6 +1917,8 @@ std_typanalyze(VacAttrStats *stats)
 	{
 		/* Seems to be a scalar datatype */
 		stats->compute_stats = compute_scalar_stats;
+		stats->serialize_stats = NULL;
+		stats->deserialize_stats = NULL;
 		/*--------------------
 		 * The following choice of minrows is based on the paper
 		 * "Random sampling for histogram construction: how much is enough?"
@@ -1909,6 +1944,8 @@ std_typanalyze(VacAttrStats *stats)
 	{
 		/* We can still recognize distinct values */
 		stats->compute_stats = compute_distinct_stats;
+		stats->serialize_stats = NULL;
+		stats->deserialize_stats = NULL;
 		/* Might as well use the same minrows as above */
 		stats->minrows = 300 * attr->attstattarget;
 	}
@@ -1916,6 +1953,8 @@ std_typanalyze(VacAttrStats *stats)
 	{
 		/* Can't do much but the trivial stuff */
 		stats->compute_stats = compute_trivial_stats;
+		stats->serialize_stats = NULL;
+		stats->deserialize_stats = NULL;
 		/* Might as well use the same minrows as above */
 		stats->minrows = 300 * attr->attstattarget;
 	}
