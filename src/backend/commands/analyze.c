@@ -59,6 +59,7 @@
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
+#include "utils/jsonb.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
@@ -109,7 +110,8 @@ static void update_attstats(Oid relid, bool inh,
 							int natts, VacAttrStats **vacattrstats);
 static Datum std_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull);
 static Datum ind_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull);
-
+static Jsonb *_dump_stat(Relation onerel);
+static void _restore_stat(Jsonb *js);
 
 /*
  *	analyze_rel() -- analyze one relation
@@ -843,6 +845,9 @@ if (!serializedstat)
 			pfree(buf.data);
 		}
 	}
+
+	/* For DEBUG purposes */
+	_restore_stat(_dump_stat(onerel));
 
 	/* Roll back any GUC changes executed by index functions */
 	AtEOXact_GUC(false, save_nestlevel);
@@ -1871,6 +1876,7 @@ static void compute_scalar_stats(VacAttrStatsP stats,
 								 AnalyzeAttrFetchFunc fetchfunc,
 								 int samplerows,
 								 double totalrows);
+static Datum serialize_scalar_stats(HeapTuple htup, TupleDesc tupDesc);
 static int	compare_scalars(const void *a, const void *b, void *arg);
 static int	compare_mcvs(const void *a, const void *b);
 static int	analyze_mcv_list(int *mcv_counts,
@@ -1917,7 +1923,7 @@ std_typanalyze(VacAttrStats *stats)
 	{
 		/* Seems to be a scalar datatype */
 		stats->compute_stats = compute_scalar_stats;
-		stats->serialize_stats = NULL;
+		stats->serialize_stats = serialize_scalar_stats;
 		stats->deserialize_stats = NULL;
 		/*--------------------
 		 * The following choice of minrows is based on the paper
@@ -2923,6 +2929,12 @@ compute_scalar_stats(VacAttrStatsP stats,
 	/* We don't need to bother cleaning up any of our temporary palloc's */
 }
 
+static Datum
+serialize_scalar_stats(HeapTuple htup, TupleDesc tupDesc)
+{
+	return (Datum) 0;
+}
+
 /*
  * qsort_arg comparator for sorting ScalarItems
  *
@@ -3097,25 +3109,137 @@ analyze_mcv_list(int *mcv_counts,
 #include "utils/regproc.h"
 #include "catalog/namespace.h"
 
+/*
+ * For each stat slot, serialize pg_statistic tuple (if existed).
+ * Return Jsonb object like [{attname: value, data: blob}, ... ]
+ */
+static Jsonb *
+stat_serialize_relation(Relation rel, bool inh, VacAttrStats **stats, int nstats)
+{
+	Relation	sd;
+	HeapTuple	statsTuple;
+	int			i;
+	Datum	   *args;
+	bool	   *nulls;
+	Oid		   *types;
+	int			nargs = 0;
+	HeapTuple	htup;
+	TupleDesc	tupDesc;
+	Jsonb	   *serializedstat = NULL;
+
+	types = (Oid *) palloc(nstats * sizeof(Oid));
+	args = (Datum *) palloc(nstats * sizeof(Datum));
+	nulls = (bool *) palloc(nstats * sizeof(bool));
+	memset(nulls, 0, nstats * sizeof(bool));
+
+	sd = table_open(StatisticRelationId, RowShareLock);
+	tupDesc = CreateTupleDescCopy(RelationGetDescr(sd));
+	table_close(sd, RowShareLock);
+
+	for (i = 0; i < nstats; i++)
+	{
+		/* Is there already a pg_statistic tuple for this attribute? */
+		statsTuple = SearchSysCache3(STATRELATTINH,
+								 ObjectIdGetDatum(rel->rd_rel->oid),
+								 Int16GetDatum(stats[i]->attr->attnum),
+								 BoolGetDatum(inh));
+
+		if (!HeapTupleIsValid(statsTuple))
+		{
+			stats[i]->stats_valid = false;
+			continue;
+		}
+
+		htup = heap_copytuple(statsTuple);
+		ReleaseSysCache(statsTuple);
+//		heap_deform_tuple(htup, tupDesc, values, nulls);
+		args[nargs] = stats[i]->serialize_stats(htup, tupDesc);
+		if (DatumGetPointer(args[nargs]) == NULL)
+		{
+			stats[i]->stats_valid = false;
+			continue;
+		}
+
+		types[nargs] = JSONBOID;
+		nargs++;
+	}
+
+	/*
+	 * Make array of serialized attributes like
+	 * [{attname: value, data: string}, ...] */
+	jsonb_build_array_worker(nargs, args, nulls, types, true);
+
+	//jsonb_build_object_worker(int nargs, Datum *args, bool *nulls, Oid *types, false, true)
+	//jsonb_from_cstring
+	return serializedstat;
+}
+
+static Jsonb *
+_dump_stat(Relation onerel)
+{
+	VacAttrStats  **vacattrstats;
+	int				i,
+					attr_cnt,
+					tcnt;
+
+	/* Find analyzable attributes */
+	attr_cnt = onerel->rd_att->natts;
+	vacattrstats = (VacAttrStats **) palloc(attr_cnt * sizeof(VacAttrStats *));
+	tcnt = 0;
+	for (i = 1; i <= attr_cnt; i++)
+	{
+		vacattrstats[tcnt] = examine_attribute(onerel, i, NULL);
+		if (vacattrstats[tcnt] != NULL)
+			tcnt++;
+	}
+	attr_cnt = tcnt;
+
+	/* Form json array from the attributes, existed in pg_statistic */
+	if (onerel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+		stat_serialize_relation(onerel, false, vacattrstats, tcnt);
+	else
+		/* Copy statistics whether the relation has childs or not */
+		stat_serialize_relation(onerel, true, vacattrstats, tcnt);
+	return NULL;
+}
+
 Datum
 dump_stat(PG_FUNCTION_ARGS)
 {
-	const char		*relname = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	RangeVar		*relvar;
-	Relation		rel;
+	const char *relname = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	RangeVar   *relvar;
+	Relation	onerel;
+	Jsonb	   *result = NULL;
 
 	relvar = makeRangeVarFromNameList(stringToQualifiedNameList(relname));
-	rel = relation_openrv(relvar, AccessShareLock);
+	onerel = relation_openrv(relvar, AccessShareLock);
 
-	if (rel->rd_rel->relkind != RELKIND_RELATION)
-	{
-		relation_close(rel, AccessShareLock);
+	if (!onerel)
+		elog(WARNING, "Relation %s not found.", relname);
+	else if (onerel->rd_rel->relkind != RELKIND_RELATION)
 		elog(WARNING,
 			 "Can be used for ordinary relation only. Reltype: %c.",
-			 rel->rd_rel->relkind);
-		PG_RETURN_NULL();
-	}
+			 onerel->rd_rel->relkind);
+	else
+		result = _dump_stat(onerel);
+	relation_close(onerel, AccessShareLock);
 
+	if (result == NULL)
+		PG_RETURN_NULL();
+	else
+		PG_RETURN_JSONB_P(result);
+}
+
+static void
+_restore_stat(Jsonb *js)
+{
+}
+
+Datum
+restore_stat(PG_FUNCTION_ARGS)
+{
+	Jsonb *js = PG_GETARG_JSONB_P(0);
+
+	_restore_stat(js);
 	PG_RETURN_NULL();
-//	PG_RETURN_TEXT_P(x)
 }

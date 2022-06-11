@@ -11886,7 +11886,11 @@
   prosrc => 'brin_minmax_multi_summary_send' },
 { oid => '10000', descr => 'I/O',
   proname => 'dump_stat', provolatile => 's',
-  prorettype => 'text', proargtypes => 'text',
+  prorettype => 'jsonb', proargtypes => 'text',
   prosrc => 'dump_stat' },
+{ oid => '10001', descr => 'I/O',
+  proname => 'restore_stat', provolatile => 's',
+  prorettype => 'void', proargtypes => 'jsonb',
+  prosrc => 'restore_stat' },
 
 ]

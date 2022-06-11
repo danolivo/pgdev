@@ -111,8 +111,8 @@ typedef void (*AnalyzeAttrComputeStatsFunc) (VacAttrStatsP stats,
 											 AnalyzeAttrFetchFunc fetchfunc,
 											 int samplerows,
 											 double totalrows);
-typedef void (*AnalyzeAttrSerializeStatsFunc) (VacAttrStatsP stats,
-											   double totalrows);
+typedef Datum (*AnalyzeAttrSerializeStatsFunc) (HeapTuple htup,
+											   TupleDesc tupDesc);
 typedef bool (*AnalyzeAttrDeserializeStatsFunc) (VacAttrStatsP stats,
 												 double totalrows);
 
