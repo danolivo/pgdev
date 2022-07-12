@@ -2929,12 +2929,63 @@ compute_scalar_stats(VacAttrStatsP stats,
 	/* We don't need to bother cleaning up any of our temporary palloc's */
 }
 
+/*
+ * Serialize method-dependent fields.
+ */
 static Datum
 serialize_scalar_stats(HeapTuple htup, TupleDesc tupDesc)
 {
+	Datum		values[Natts_pg_statistic];
+	bool		nulls[Natts_pg_statistic];
+	TupleDesc	s_tupDesc;
+	int			natts = 5;
+	int			i = 1;
+	AttStatsSlot sslot;
+
+	heap_deform_tuple(htup, tupDesc, values, nulls);
+
+	/* Create tuple descriptor on-the-fly */
+	s_tupDesc = CreateTemplateTupleDesc(natts);
+
+	TupleDescCopyEntry(s_tupDesc, i++, tupDesc, Anum_pg_statistic_stainherit);
+	TupleDescCopyEntry(s_tupDesc, i++, tupDesc, Anum_pg_statistic_stanullfrac);
+	TupleDescCopyEntry(s_tupDesc, i++, tupDesc, Anum_pg_statistic_stawidth);
+	TupleDescCopyEntry(s_tupDesc, i++, tupDesc, Anum_pg_statistic_stadistinct);
+	TupleDescInitEntry(s_tupDesc,
+				   AttrNumber attributeNumber,
+				   const char *attributeName,
+				   Oid oidtypeid,
+				   int32 typmod,
+				   int attdim)
+
+	get_attstatsslot(&sslot, htup, STATISTIC_KIND_MCV, InvalidOid,
+							 ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS);
+
 	return (Datum) 0;
 }
 
+/*
+		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+		{
+			if (stats->numvalues[k] > 0)
+			{
+				ArrayType  *arry;
+
+				arry = construct_array(stats->stavalues[k],
+									   stats->numvalues[k],
+									   stats->statypid[k],
+									   stats->statyplen[k],
+									   stats->statypbyval[k],
+									   stats->statypalign[k]);
+				values[i++] = PointerGetDatum(arry);
+			}
+			else
+			{
+				nulls[i] = true;
+				values[i++] = (Datum) 0;
+			}
+		}
+ */
 /*
  * qsort_arg comparator for sorting ScalarItems
  *
