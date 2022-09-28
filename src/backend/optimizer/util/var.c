@@ -461,6 +461,14 @@ contain_vars_of_level_walker(Node *node, int *sublevels_up)
 			return true;		/* abort the tree traversal and return true */
 		/* else fall through to check the contained expr */
 	}
+	if (IsA(node, RangeTblEntry))
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) node;
+
+		/* Someone can call the routine on a field of Query struct */
+		return range_table_entry_walker(rte, contain_vars_of_level_walker,
+										(void *) sublevels_up, 0);
+	}
 	if (IsA(node, Query))
 	{
 		/* Recurse into subselects */

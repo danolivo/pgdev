@@ -67,10 +67,172 @@ SELECT f1 AS "Correlated Field", f2 AS "Second Field"
   FROM SUBSELECT_TBL upper
   WHERE f1 IN (SELECT f2 FROM SUBSELECT_TBL WHERE f1 = upper.f1);
 
+EXPLAIN (COSTS OFF) SELECT f1 AS "Correlated Field", f3 AS "Second Field"
+  FROM SUBSELECT_TBL upper
+  WHERE f1 IN
+    (SELECT f2 FROM SUBSELECT_TBL WHERE CAST(upper.f2 AS float) = f3);
+-- Still doesn't work for NOT IN
+EXPLAIN (COSTS OFF) SELECT f1 AS "Correlated Field", f3 AS "Second Field"
+  FROM SUBSELECT_TBL upper
+  WHERE f1 NOT IN
+    (SELECT f2 FROM SUBSELECT_TBL WHERE CAST(upper.f2 AS float) = f3);
+
 SELECT f1 AS "Correlated Field", f3 AS "Second Field"
   FROM SUBSELECT_TBL upper
   WHERE f1 IN
     (SELECT f2 FROM SUBSELECT_TBL WHERE CAST(upper.f2 AS float) = f3);
+
+-- Constraints, imposed by LATERAL references, prohibit flattening of underlying
+-- Sublink.
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM SUBSELECT_TBL a
+  WHERE EXISTS (SELECT f2 FROM SUBSELECT_TBL b WHERE f3 IN (
+      SELECT f3 FROM SUBSELECT_TBL c WHERE c.f1 = a.f2));
+SELECT count(*) FROM SUBSELECT_TBL a
+  WHERE EXISTS (SELECT f2 FROM SUBSELECT_TBL b WHERE f3 IN (
+      SELECT f3 FROM SUBSELECT_TBL c WHERE c.f1 = a.f2));
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM SUBSELECT_TBL a
+  WHERE NOT EXISTS (SELECT f2 FROM SUBSELECT_TBL b WHERE f3 IN (
+      SELECT f3 FROM SUBSELECT_TBL c WHERE c.f1 = a.f2));
+
+-- Prohibit to unnest subquery - quals contain lateral references to rels
+-- outside a higher outer join.
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM SUBSELECT_TBL a LEFT JOIN SUBSELECT_TBL b ON b.f1 IN (
+  SELECT c.f2 FROM SUBSELECT_TBL c WHERE c.f3 = a.f2);
+SELECT count(*) FROM SUBSELECT_TBL a LEFT JOIN SUBSELECT_TBL b ON b.f1 IN (
+  SELECT c.f2 FROM SUBSELECT_TBL c WHERE c.f3 = a.f2);
+
+EXPLAIN (COSTS OFF)
+  SELECT * FROM subselect_tbl a
+  WHERE a.f1 IN
+    (SELECT b.f2 FROM subselect_tbl b WHERE b.f2 = a.f1)
+; -- Optimizer removes excess clause
+EXPLAIN (COSTS OFF)
+SELECT * FROM subselect_tbl a
+WHERE a.f1 IN (SELECT b.f2*b.f1/b.f3+2 FROM subselect_tbl b WHERE b.f3 = a.f2)
+; -- a bit more complex targetlist expression shouldn't cut off the optimization
+EXPLAIN (COSTS OFF)
+SELECT * FROM subselect_tbl a
+WHERE (a.f1,a.f3) IN (SELECT b.f2,b.f1 FROM subselect_tbl b WHERE b.f3 = a.f2)
+; -- Two variables in a target list
+EXPLAIN (COSTS OFF)
+SELECT * FROM subselect_tbl a
+WHERE (a.f1,a.f3) IN (SELECT b.f2,b.f1*2 FROM subselect_tbl b WHERE b.f3 = a.f2)
+; -- Expression as an element of composite type shouldn't cut off the optimization
+EXPLAIN (COSTS OFF)
+SELECT * FROM subselect_tbl a
+WHERE a.f1 IN (SELECT b.f2 FROM subselect_tbl b WHERE b.f3 = a.f2 AND a.f1 = b.f3 AND b.f3 <> 12)
+; -- Two expressions with correlated variables
+EXPLAIN (COSTS OFF)
+SELECT * FROM subselect_tbl a
+WHERE a.f1 IN (SELECT b.f2 FROM subselect_tbl b WHERE b.f3 = a.f2 AND a.f2 = b.f3 AND b.f1 < 12)
+; -- Two expressions with correlated variables relates on one upper variable.
+EXPLAIN (COSTS OFF)
+  SELECT * FROM subselect_tbl a
+  WHERE a.f1 IN (
+    SELECT b.f2 FROM subselect_tbl b WHERE b.f2 = a.f2 AND b.f2 < 12
+    GROUP BY (b.f2)
+  )
+; -- Pull clauses without unnesting the query. XXX: It reduces performance in most use cases, doesn't it?
+
+EXPLAIN (COSTS OFF)
+  SELECT * FROM subselect_tbl a
+  WHERE a.f1 IN (
+    SELECT b.f2 FROM (
+      SELECT x AS f1, x+1 AS f2, x+2 AS f3 FROM generate_series(1,10) x
+    ) b WHERE b.f2 = a.f2 AND b.f1 BETWEEN 12 AND 14
+      UNION ALL
+    SELECT c.f1 FROM subselect_tbl c
+    WHERE c.f2 = a.f2 AND c.f1 BETWEEN 12 AND 14
+  )
+; -- Disallow flattening of union all
+EXPLAIN (COSTS OFF)
+  SELECT * FROM subselect_tbl a
+  WHERE a.f1 IN (
+    SELECT b.f1 FROM subselect_tbl b JOIN subselect_tbl c ON (b.f1 = c.f2)
+    WHERE c.f2 = a.f2 AND c.f1 BETWEEN 12 AND 14
+  )
+; -- XXX: Could we flatten such subquery?
+EXPLAIN (COSTS OFF)
+  SELECT * FROM subselect_tbl a
+  WHERE a.f1 IN (
+    SELECT b.f1 FROM subselect_tbl b, subselect_tbl c
+    WHERE b.f1 = c.f2 AND c.f2 = a.f2 AND c.f1 IS NOT NULL
+  )
+; -- TODO: Could we flatten such subquery?
+EXPLAIN (COSTS OFF)
+  SELECT * FROM subselect_tbl a
+  WHERE (a.f1,f2) IN (
+    SELECT b.f2, avg(f3) FROM subselect_tbl b WHERE b.f2 = a.f2 AND b.f2 < 12
+    GROUP BY (b.f2)
+  )
+; -- Doesn't support unnesting with aggregate functions
+EXPLAIN (COSTS OFF)
+  SELECT * FROM subselect_tbl a
+  WHERE a.f1 IN (
+    WITH cte AS (
+      SELECT * FROM subselect_tbl c WHERE f1 < 42 AND f2 = a.f1
+    )
+    SELECT b.f2 FROM cte b WHERE b.f2 = a.f2 AND b.f2 < 12
+  )
+; -- Give up optimization if CTE in subquery contains links to upper relation.
+EXPLAIN (COSTS OFF)
+  SELECT * FROM subselect_tbl a
+  WHERE a.f1 IN (
+    WITH cte AS (
+      SELECT * FROM subselect_tbl c WHERE f1 < 42
+    )
+    SELECT b.f2 FROM cte b WHERE b.f2 = a.f2 AND b.f2 < 12
+  )
+; -- Correlated subquery with trivial CTE can be pulled up
+EXPLAIN (COSTS OFF)
+  SELECT * FROM subselect_tbl a
+  WHERE (a.f1,a.f3) IN (
+    SELECT b.f2, avg(b.f3) OVER (PARTITION BY b.f2)
+    FROM subselect_tbl b WHERE b.f2 = a.f2 AND b.f2 < 12
+  )
+; -- Doesn't support unnesting with window functions in target list
+
+-- A having qual, group clause and so on, with links to upper relation variable
+-- cut off the optimization because another case we must rewrite the subquery
+-- as a lateral TargetEntry and arrange these links.
+-- But now, machinery of convert_ANY_sublink_to_join() isn't prepared for such
+-- complex work and it would induce additional complex code.
+EXPLAIN (COSTS OFF)
+  SELECT * FROM subselect_tbl a
+  WHERE a.f1 IN (
+    SELECT b.f2
+    FROM subselect_tbl b WHERE b.f2 = a.f2 AND b.f2 < 12
+    GROUP BY (b.f2) HAVING b.f2 > a.f3
+  )
+;
+EXPLAIN (COSTS OFF)
+  SELECT * FROM subselect_tbl a
+  WHERE a.f1 IN (
+    SELECT b.f2 FROM (
+      SELECT x AS f1, x+1 AS f2, x+2 AS f3 FROM generate_series(1,a.f1) x
+    ) b WHERE b.f2 = a.f2 AND b.f1 < 12
+  )
+; -- Don't allow links to upper query in FROM section of subquery
+EXPLAIN (COSTS OFF)
+  SELECT * FROM subselect_tbl a
+  WHERE a.f1 IN (
+    SELECT a.f1 FROM subselect_tbl b WHERE b.f2 = a.f2 AND b.f2 < 12
+    GROUP BY (a.f1)
+  )
+; -- GROUP BY contains link to upper relation
+
+-- Flatten subquery with not-correlated clauses. The same result set returned
+EXPLAIN (COSTS OFF) SELECT f1 AS "Correlated Field", f3 AS "Second Field"
+  FROM SUBSELECT_TBL upper
+  WHERE f1 IN
+    (SELECT f2 FROM SUBSELECT_TBL WHERE CAST(upper.f2 AS float) = f3 AND f2 <> 42);
+SELECT f1 AS "Correlated Field", f3 AS "Second Field"
+  FROM SUBSELECT_TBL upper
+  WHERE f1 IN
+    (SELECT f2 FROM SUBSELECT_TBL WHERE CAST(upper.f2 AS float) = f3 AND f2 <> 42);
 
 SELECT f1 AS "Correlated Field", f3 AS "Second Field"
   FROM SUBSELECT_TBL upper

@@ -88,6 +88,7 @@ extern PGDLLIMPORT double parallel_tuple_cost;
 extern PGDLLIMPORT double parallel_setup_cost;
 extern PGDLLIMPORT double recursive_worktable_factor;
 extern PGDLLIMPORT int effective_cache_size;
+extern PGDLLIMPORT bool optimize_correlated_subqueries;
 
 extern double clamp_row_est(double nrows);
 extern long clamp_cardinality_to_long(Cardinality x);

@@ -18,6 +18,7 @@
 
 
 extern TargetEntry *tlist_member(Expr *node, List *targetlist);
+extern TargetEntry *tlist_member_match_var(Var *var, List *targetlist);
 
 extern List *add_to_flat_tlist(List *tlist, List *exprs);
 

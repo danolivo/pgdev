@@ -766,6 +766,16 @@ StaticAssertDecl(lengthof(config_type_names) == (PGC_ENUM + 1),
 struct config_bool ConfigureNamesBool[] =
 {
 	{
+		{"optimize_correlated_subqueries", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("optimize_correlated_subqueries."),
+			NULL,
+			GUC_EXPLAIN | GUC_NOT_IN_SAMPLE
+		},
+		&optimize_correlated_subqueries,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"enable_seqscan", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of sequential-scan plans."),
 			NULL,

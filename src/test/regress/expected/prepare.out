@@ -184,6 +184,24 @@ SELECT name, statement, parameter_types, result_types FROM pg_prepared_statement
       |     UPDATE tenk1 SET stringu1 = $2 WHERE unique1 = $1;           |                                                    | 
 (6 rows)
 
+-- The optimization on unnesting of correlated subqueries should work
+PREPARE q9(name,int) AS
+    SELECT * FROM tenk1 upper WHERE unique1 IN (
+        SELECT sub.unique2 FROM tenk1 sub
+        WHERE sub.stringu1 = $1 AND sub.unique1 = upper.unique2 + $2);
+EXPLAIN (COSTS OFF) EXECUTE q9('abc',2);
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Nested Loop
+   ->  HashAggregate
+         Group Key: sub.unique2, sub.unique1
+         ->  Seq Scan on tenk1 sub
+               Filter: (stringu1 = 'abc'::name)
+   ->  Index Scan using tenk1_unique1 on tenk1 upper
+         Index Cond: (unique1 = sub.unique2)
+         Filter: (sub.unique1 = (unique2 + 2))
+(8 rows)
+
 -- test DEALLOCATE ALL;
 DEALLOCATE ALL;
 SELECT name, statement, parameter_types FROM pg_prepared_statements

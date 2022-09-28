@@ -32,6 +32,7 @@
 #include "optimizer/planner.h"
 #include "optimizer/prep.h"
 #include "optimizer/subselect.h"
+#include "optimizer/tlist.h"
 #include "parser/parse_relation.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/builtins.h"
@@ -64,6 +65,8 @@ typedef struct inline_cte_walker_context
 	Query	   *ctequery;		/* query to substitute */
 } inline_cte_walker_context;
 
+
+bool optimize_correlated_subqueries = true;
 
 static Node *build_subplan(PlannerInfo *root, Plan *plan, PlannerInfo *subroot,
 						   List *plan_params,
@@ -1229,6 +1232,288 @@ inline_cte_walker(Node *node, inline_cte_walker_context *context)
 	return expression_tree_walker(node, inline_cte_walker, context);
 }
 
+static bool
+contain_placeholders(Node *node, inline_cte_walker_context *context)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, contain_placeholders, context, 0);
+	else if (IsA(node, PlaceHolderVar))
+	{
+		return true;
+	}
+
+	return expression_tree_walker(node, contain_placeholders, context);
+}
+
+/*
+ * To be pullable all clauses of flattening correlated subquery should be
+ * anded and mergejoinable (XXX: really necessary?)
+ */
+static bool
+quals_is_pullable(Node *quals)
+{
+	if (!contain_vars_of_level(quals, 1))
+		return true;
+
+	if (quals && IsA(quals, OpExpr))
+	{
+		OpExpr *expr = (OpExpr *) quals;
+		Node   *leftarg;
+
+		/* Contains only one expression */
+		leftarg = linitial(expr->args);
+		if (!op_mergejoinable(expr->opno, exprType(leftarg))) /* Is it really necessary ? */
+			return false;
+
+		if (contain_placeholders(quals, NULL))
+			return false;
+
+		return true;
+	}
+	else if (is_andclause(quals))
+	{
+		ListCell   *l;
+
+		foreach(l, ((BoolExpr *) quals)->args)
+		{
+			Node *andarg = (Node *) lfirst(l);
+
+			if (!IsA(andarg, OpExpr))
+				return false;
+			if (!quals_is_pullable(andarg))
+				return false;
+		}
+
+		return true;
+	}
+
+	return false;
+}
+
+typedef struct
+{
+	Query  *subquery;
+	int		newvarno;
+	List   *pulling_quals;
+	bool	varlevel_up;
+} correlated_t;
+
+static Node *
+pull_subquery_clauses_mutator(Node *node, correlated_t *ctx)
+{
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, OpExpr) && !ctx->varlevel_up)
+	{
+		if (!contain_vars_of_level(node, 1))
+			return node;
+
+		/*
+		 * The expression contains links to upper relation. It will be pulled to
+		 * uplevel. All links into vars of upper levels must be changed.
+		 */
+
+		ctx->varlevel_up = true;
+		ctx->pulling_quals =
+			lappend(ctx->pulling_quals,
+					expression_tree_mutator(node,
+											pull_subquery_clauses_mutator,
+											(void *) ctx));
+		ctx->varlevel_up = false;
+
+		/* Replace position of pulled expression by the 'true' value */
+		return makeBoolConst(true, false);
+	}
+	if (IsA(node, PlaceHolderVar))
+	{
+		PlaceHolderVar *phv = (PlaceHolderVar *) node;
+
+		if (ctx->varlevel_up && phv->phlevelsup > 0)
+			phv->phlevelsup--;
+		/* fall through to recurse into argument */
+	}
+	else if (IsA(node, RangeTblEntry))
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) node;
+
+		if (rte->rtekind == RTE_CTE)
+		{
+			if (rte->ctelevelsup > 0 && ctx->varlevel_up)
+				rte->ctelevelsup--;
+		}
+		return node;
+	}
+	else if (IsA(node, Aggref))
+	{
+		if (((Aggref *) node)->agglevelsup > 0 && ctx->varlevel_up)
+			((Aggref *) node)->agglevelsup--;
+		return node;
+	}
+	else if (IsA(node, GroupingFunc))
+	{
+		if (((GroupingFunc *) node)->agglevelsup > 0 && ctx->varlevel_up)
+			((GroupingFunc *) node)->agglevelsup--;
+		return node;
+	}
+	else if (IsA(node, Var))
+	{
+		Var *var = (Var *) node;
+
+		Assert(ctx->varlevel_up);
+
+		/* An upper relation variable */
+		if (var->varlevelsup > 0)
+		{
+			/*
+			 * Isn't needed to copy node or change varno because it correctly
+			 * refers to Table Entry of a parent and already removed from
+			 * the subquery clauses list.
+			 */
+			var->varlevelsup--;
+
+			return (Node *) var;
+		}
+		else
+		{
+			Var			  *newvar;
+			TargetEntry   *tle;
+
+			/*
+			 * The var refers to subquery table entry. Include a copy the var
+			 * into the target list, if necessary. Arrange varattno of the
+			 * new var of upper relation with a link to this entry.
+			 */
+
+			/* Create a var for usage in upper relation */
+			newvar = (Var *) copyObject(node);
+
+			/* Does the var already exists in the target list? */
+			tle = tlist_member_match_var(var, ctx->subquery->targetList);
+
+			if (tle == NULL)
+			{
+				int resno = list_length(ctx->subquery->targetList) + 1;
+
+				/*
+				 * Target list of the subquery doesn't contain this var. Add it
+				 * into the end of the target list and correct the link
+				 * XXX: Maybe choose real colname here?
+				 */
+				tle = makeTargetEntry((Expr *) var, resno, "rescol", false);
+				ctx->subquery->targetList = lappend(ctx->subquery->targetList,
+													tle);
+			}
+			else
+			{
+				if (tle->resjunk)
+				{
+					/*
+					 * Target entry exists but used as an utility entry
+					 * (for grouping, as an example). So, revert its status to
+					 * a full valued entry.
+					 */
+					tle->resjunk = false;
+					tle->resname = pstrdup("resjunkcol");
+				}
+			}
+
+			/*
+			 * Set the new var to refer newly created RangeTblEntry in the upper
+			 * query and varattno to refer at specific position in the target
+			 * list.
+			 */
+			newvar->varno = ctx->newvarno;
+			newvar->varattno = tle->resno;
+
+			return (Node *) newvar;
+		}
+	}
+	if (IsA(node, Query))
+		return (Node *) query_tree_mutator((Query *) node,
+										   pull_subquery_clauses_mutator,
+										   (void *) ctx, 0);
+
+	return expression_tree_mutator(node, pull_subquery_clauses_mutator,
+								   (void *) ctx);
+}
+
+static List *
+pull_correlated_clauses(PlannerInfo *root, SubLink *sublink,
+						JoinExpr *lowest_outer_join)
+{
+	Query		   *parse = root->parse;
+	Query		   *subselect = (Query *) sublink->subselect;
+	FromExpr	   *f;
+	correlated_t	ctx = {.subquery = subselect,
+						   .newvarno = list_length(parse->rtable) + 1, /* Looks like a hack */
+						   .pulling_quals = NIL,
+						   .varlevel_up = false};
+	Relids		safe_upper_varnos = NULL;
+
+	Assert(IsA(subselect, Query));
+
+	/* Use only for correlated candidates, just for optimal usage */
+	Assert(contain_vars_of_level((Node *) subselect, 1));
+
+	if (!optimize_correlated_subqueries ||
+		subselect->hasAggs ||
+		subselect->hasWindowFuncs ||
+		subselect->hasForUpdate || /* Pulling of clauses can change a number of tuples which subselect returns. */
+		subselect->hasRowSecurity /* Just because of paranoid safety */
+		)
+		/* The feature is switched off. */
+		return NULL;
+
+	/*
+	 * We pull up quals and arrange variable levels for expressions in WHERE
+	 * section only. So, cut the optimization off if an upper relation links
+	 * from another parts of the subquery are detected.
+	 */
+	if (contain_vars_of_level((Node *) subselect->cteList, 1) ||
+		/* see comments in subselect.sql */
+		contain_vars_of_level((Node *) subselect->rtable, 1) ||
+		contain_vars_of_level((Node *) subselect->targetList, 1) ||
+		contain_vars_of_level((Node *) subselect->returningList, 1) ||
+		contain_vars_of_level((Node *) subselect->groupingSets, 1) ||
+		contain_vars_of_level((Node *) subselect->distinctClause, 1) ||
+		contain_vars_of_level((Node *) subselect->sortClause, 1) ||
+		contain_vars_of_level((Node *) subselect->limitOffset, 1) ||
+		contain_vars_of_level((Node *) subselect->limitCount, 1) ||
+		contain_vars_of_level((Node *) subselect->rowMarks, 1) ||
+		contain_vars_of_level((Node *) subselect->havingQual, 1) ||
+		contain_vars_of_level((Node *) subselect->groupClause, 1))
+		return NULL;
+
+	f = subselect->jointree;
+
+	if (!f || !f->quals || !quals_is_pullable(f->quals))
+		return NULL;
+
+	if (lowest_outer_join)
+		safe_upper_varnos = get_relids_in_jointree(
+				(lowest_outer_join->jointype == JOIN_RIGHT) ?
+					lowest_outer_join->larg : lowest_outer_join->rarg, true);
+
+	if (safe_upper_varnos &&
+		!bms_is_subset(pull_varnos_of_level(root, f->quals, 1),
+					   safe_upper_varnos))
+		return NULL;
+
+	/*
+	 * Now, is proved that it is possible to pull up expressions with variables
+	 * from the upper query.
+	 * Pull up quals, containing correlated expressions. Replace its
+	 * positions with a true boolean expression.
+	 * It would be removed on a next planning stage.
+	 */
+	f->quals = pull_subquery_clauses_mutator(f->quals, (void *) &ctx);
+
+	return ctx.pulling_quals;
+}
 
 /*
  * convert_ANY_sublink_to_join: try to convert an ANY SubLink to a join
@@ -1266,7 +1551,7 @@ inline_cte_walker(Node *node, inline_cte_walker_context *context)
  */
 JoinExpr *
 convert_ANY_sublink_to_join(PlannerInfo *root, SubLink *sublink,
-							Relids available_rels)
+							Relids available_rels, JoinExpr *lowest_outer_join)
 {
 	JoinExpr   *result;
 	Query	   *parse = root->parse;
@@ -1279,15 +1564,9 @@ convert_ANY_sublink_to_join(PlannerInfo *root, SubLink *sublink,
 	List	   *subquery_vars;
 	Node	   *quals;
 	ParseState *pstate;
+	List	   *pclauses = NIL;
 
 	Assert(sublink->subLinkType == ANY_SUBLINK);
-
-	/*
-	 * The sub-select must not refer to any Vars of the parent query. (Vars of
-	 * higher levels should be okay, though.)
-	 */
-	if (contain_vars_of_level((Node *) subselect, 1))
-		return NULL;
 
 	/*
 	 * The test expression must contain some Vars of the parent query, else
@@ -1308,6 +1587,17 @@ convert_ANY_sublink_to_join(PlannerInfo *root, SubLink *sublink,
 	 * The combining operators and left-hand expressions mustn't be volatile.
 	 */
 	if (contain_volatile_functions(sublink->testexpr))
+		return NULL;
+
+	/*
+	 * The sub-select must not refer to any Vars of the parent query. (Vars of
+	 * higher levels should be okay, though.)
+	 * In the case of correlated subquery, jointree quals structure will be
+	 * modified: expressions with variables from upper query moves to the
+	 * pulled_clauses list, their places in the quals replaces by "true" value.
+	 */
+	if (contain_vars_of_level((Node *) subselect, 1) &&
+		(pclauses = pull_correlated_clauses(root, sublink, lowest_outer_join)) == NIL)
 		return NULL;
 
 	/* Create a dummy ParseState for addRangeTableEntryForSubquery */
@@ -1347,6 +1637,20 @@ convert_ANY_sublink_to_join(PlannerInfo *root, SubLink *sublink,
 	 * Build the new join's qual expression, replacing Params with these Vars.
 	 */
 	quals = convert_testexpr(root, sublink->testexpr, subquery_vars);
+
+	/* Nested subquery with references to upper level relation. */
+	if (pclauses != NIL)
+	{
+		/* Add clauses, pulled from subquery into WHERE section of the parent. */
+		if (IsA(quals, BoolExpr))
+		{
+			BoolExpr *b = (BoolExpr *) quals;
+			b->args = list_concat(b->args, pclauses);
+		}
+		else
+			quals = (Node *) make_andclause(
+									list_concat(list_make1(quals), pclauses));
+	}
 
 	/*
 	 * And finally, build the JoinExpr node.

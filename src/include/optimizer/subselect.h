@@ -19,7 +19,8 @@
 extern void SS_process_ctes(PlannerInfo *root);
 extern JoinExpr *convert_ANY_sublink_to_join(PlannerInfo *root,
 											 SubLink *sublink,
-											 Relids available_rels);
+											 Relids available_rels,
+											 JoinExpr *lowest_outer_join);
 extern JoinExpr *convert_EXISTS_sublink_to_join(PlannerInfo *root,
 												SubLink *sublink,
 												bool under_not,

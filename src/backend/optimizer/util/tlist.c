@@ -98,7 +98,7 @@ tlist_member(Expr *node, List *targetlist)
  * This is needed in some cases where we can't be sure of an exact typmod
  * match.  For safety, though, we insist on vartype match.
  */
-static TargetEntry *
+TargetEntry *
 tlist_member_match_var(Var *var, List *targetlist)
 {
 	ListCell   *temp;

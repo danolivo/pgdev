@@ -78,6 +78,13 @@ PREPARE q8 AS
 SELECT name, statement, parameter_types, result_types FROM pg_prepared_statements
     ORDER BY name;
 
+-- The optimization on unnesting of correlated subqueries should work
+PREPARE q9(name,int) AS
+    SELECT * FROM tenk1 upper WHERE unique1 IN (
+        SELECT sub.unique2 FROM tenk1 sub
+        WHERE sub.stringu1 = $1 AND sub.unique1 = upper.unique2 + $2);
+EXPLAIN (COSTS OFF) EXECUTE q9('abc',2);
+
 -- test DEALLOCATE ALL;
 DEALLOCATE ALL;
 SELECT name, statement, parameter_types FROM pg_prepared_statements
