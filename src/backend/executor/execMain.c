@@ -253,6 +253,12 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	estate->es_instrument = queryDesc->instrument_options;
 	estate->es_jit_flags = queryDesc->plannedstmt->jitFlags;
 
+	if ((eflags | EXEC_FLAG_REPLAN) && queryDesc->plannedstmt->can_replan)
+	{
+		queryDesc->instrument_options |= INSTRUMENT_TIMER;
+		estate->replan = palloc(sizeof(ReplanContext));
+	}
+
 	/*
 	 * Set up an AFTER-trigger statement context, unless told not to, or
 	 * unless it's EXPLAIN-only mode (when ExecutorFinish won't be called).

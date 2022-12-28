@@ -594,6 +594,12 @@ typedef struct AsyncRequest
 								 * tuples) */
 } AsyncRequest;
 
+typedef struct ReplanContext
+{
+	bool use_replan;
+	instr_time starttime;
+} ReplanContext;
+
 /* ----------------
  *	  EState information
  *
@@ -705,6 +711,8 @@ typedef struct EState
 	 */
 	List	   *es_insert_pending_result_relations;
 	List	   *es_insert_pending_modifytables;
+
+	ReplanContext *replan;
 } EState;
 
 

@@ -464,7 +464,7 @@ ExecProcNodeFirst(PlanState *node)
 	return node->ExecProcNode(node);
 }
 
-
+#include "tcop/replan.h"
 /*
  * ExecProcNode wrapper that performs instrumentation calls.  By keeping
  * this a separate function, we avoid overhead in the normal case where
@@ -480,6 +480,9 @@ ExecProcNodeInstr(PlanState *node)
 	result = node->ExecProcNodeReal(node);
 
 	InstrStopNode(node->instrument, TupIsNull(result) ? 0.0 : 1.0);
+
+	if (node->instrument && node->state->replan)
+		trigger_node_state(node);
 
 	return result;
 }

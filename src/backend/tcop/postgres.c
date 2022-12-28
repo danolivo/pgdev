@@ -65,6 +65,7 @@
 #include "storage/sinval.h"
 #include "tcop/fastpath.h"
 #include "tcop/pquery.h"
+#include "tcop/replan.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/guc_hooks.h"
@@ -924,6 +925,8 @@ pg_plan_query(Query *querytree, const char *query_string, int cursorOptions,
 
 	TRACE_POSTGRESQL_QUERY_PLAN_DONE();
 
+	if (QueryInadequateExecutionTime > 0)
+		plan->can_replan = true;
 	return plan;
 }
 
@@ -1173,6 +1176,8 @@ exec_simple_query(const char *query_string)
 		/* If we got a cancel signal in analysis or planning, quit */
 		CHECK_FOR_INTERRUPTS();
 
+//PG_TRY();
+{
 		/*
 		 * Create unnamed portal to run the query or queries in. If there
 		 * already is one, silently drop it.
@@ -1196,7 +1201,7 @@ exec_simple_query(const char *query_string)
 		/*
 		 * Start the portal.  No parameters here.
 		 */
-		PortalStart(portal, NULL, 0, InvalidSnapshot);
+		PortalStart(portal, NULL, EXEC_FLAG_REPLAN, InvalidSnapshot);
 
 		/*
 		 * Select the appropriate output format: text unless we are doing a
@@ -1246,6 +1251,11 @@ exec_simple_query(const char *query_string)
 		receiver->rDestroy(receiver);
 
 		PortalDrop(portal, false);
+}
+//PG_CATCH();
+{
+}
+//PG_END_TRY();
 
 		if (lnext(parsetree_list, parsetree_item) == NULL)
 		{
