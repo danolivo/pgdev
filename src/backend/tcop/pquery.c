@@ -738,6 +738,7 @@ PortalRun(Portal portal, long count, bool isTopLevel, bool run_once,
 	saveResourceOwner = CurrentResourceOwner;
 	savePortalContext = PortalContext;
 	saveMemoryContext = CurrentMemoryContext;
+restart:
 	PG_TRY();
 	{
 		ActivePortal = portal;
@@ -807,6 +808,28 @@ PortalRun(Portal portal, long count, bool isTopLevel, bool run_once,
 	}
 	PG_CATCH();
 	{
+		/* Switch back to transaction context */
+		MemoryContext ecxt = MemoryContextSwitchTo(saveMemoryContext);
+		ErrorData 	 *errdata = CopyErrorData();
+
+		if (/*IsSubTransaction() &&*/ errdata->sqlerrcode == ERRCODE_INADEQUATE_QUERY_EXECUTION_TIME)
+		{
+			int eflags = portal->queryDesc->estate->es_top_eflags;
+//		RollbackAndReleaseCurrentSubTransaction();
+			FlushErrorState();
+			FreeErrorData(errdata);
+			errdata = NULL;
+			eflags = eflags & ~(EXEC_FLAG_REPLAN);
+			FreeExecutorState(portal->queryDesc->estate);
+			portal->queryDesc->estate = NULL;
+			ExecutorStart(portal->queryDesc, eflags);
+//		MemoryContextSwitchTo(ecxt);
+			elog(WARNING, "Restart the query");
+			goto restart;
+		}
+		FreeErrorData(errdata);
+		MemoryContextSwitchTo(ecxt);
+
 		/* Uncaught error while executing portal: mark it dead */
 		MarkPortalFailed(portal);
 

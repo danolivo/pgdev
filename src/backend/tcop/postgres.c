@@ -1176,8 +1176,6 @@ exec_simple_query(const char *query_string)
 		/* If we got a cancel signal in analysis or planning, quit */
 		CHECK_FOR_INTERRUPTS();
 
-//PG_TRY();
-{
 		/*
 		 * Create unnamed portal to run the query or queries in. If there
 		 * already is one, silently drop it.
@@ -1251,11 +1249,6 @@ exec_simple_query(const char *query_string)
 		receiver->rDestroy(receiver);
 
 		PortalDrop(portal, false);
-}
-//PG_CATCH();
-{
-}
-//PG_END_TRY();
 
 		if (lnext(parsetree_list, parsetree_item) == NULL)
 		{

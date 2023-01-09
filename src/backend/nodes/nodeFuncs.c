@@ -2335,7 +2335,7 @@ expression_tree_walker_impl(Node *node,
 			}
 			break;
 		default:
-			elog(ERROR, "unrecognized node type: %d",
+			elog(PANIC, "unrecognized node type: %d",
 				 (int) nodeTag(node));
 			break;
 	}
