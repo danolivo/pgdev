@@ -64,6 +64,7 @@
 #include "storage/sinval.h"
 #include "tcop/fastpath.h"
 #include "tcop/pquery.h"
+#include "tcop/replan.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/guc_hooks.h"
@@ -923,6 +924,11 @@ pg_plan_query(Query *querytree, const char *query_string, int cursorOptions,
 
 	TRACE_POSTGRESQL_QUERY_PLAN_DONE();
 
+	if (QueryInadequateExecutionTime > 0)
+	{
+		elog(WARNING, "Can replan");
+		plan->can_replan = true;
+	}
 	return plan;
 }
 
@@ -1195,7 +1201,7 @@ exec_simple_query(const char *query_string)
 		/*
 		 * Start the portal.  No parameters here.
 		 */
-		PortalStart(portal, NULL, 0, InvalidSnapshot);
+		PortalStart(portal, NULL, EXEC_FLAG_REPLAN, InvalidSnapshot);
 
 		/*
 		 * Select the appropriate output format: text unless we are doing a

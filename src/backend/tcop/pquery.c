@@ -732,6 +732,7 @@ PortalRun(Portal portal, long count, bool isTopLevel, bool run_once,
 	 * CurrentMemoryContext has a similar problem, but the other pointers we
 	 * save here will be NULL or pointing to longer-lived objects.
 	 */
+restart:
 	saveTopTransactionResourceOwner = TopTransactionResourceOwner;
 	saveTopTransactionContext = TopTransactionContext;
 	saveActivePortal = ActivePortal;
@@ -761,12 +762,12 @@ PortalRun(Portal portal, long count, bool isTopLevel, bool run_once,
 				 */
 				if (portal->strategy != PORTAL_ONE_SELECT && !portal->holdStore)
 					FillPortalStore(portal, isTopLevel);
-
+elog(WARNING, "Run sElect");
 				/*
 				 * Now fetch desired portion of results.
 				 */
 				nprocessed = PortalRunSelect(portal, true, count, dest);
-
+elog(WARNING, "Run sElect1");
 				/*
 				 * If the portal result contains a command tag and the caller
 				 * gave us a pointer to store it, copy it and update the
@@ -780,7 +781,7 @@ PortalRun(Portal portal, long count, bool isTopLevel, bool run_once,
 
 				/* Mark portal not active */
 				portal->status = PORTAL_READY;
-
+elog(WARNING, "Run sElect2");
 				/*
 				 * Since it's a forward fetch, say DONE iff atEnd is now true.
 				 */
@@ -807,6 +808,50 @@ PortalRun(Portal portal, long count, bool isTopLevel, bool run_once,
 	}
 	PG_CATCH();
 	{
+		/* Switch back to transaction context */
+		MemoryContext ecxt = MemoryContextSwitchTo(saveMemoryContext);
+		ErrorData 	 *errdata = CopyErrorData();
+
+		if (errdata->sqlerrcode == ERRCODE_INADEQUATE_QUERY_EXECUTION_TIME)
+		{
+			int eflags = portal->queryDesc->estate->es_top_eflags;
+
+			FlushErrorState();
+			FreeErrorData(errdata);
+			errdata = NULL;
+			eflags = eflags & ~(EXEC_FLAG_REPLAN);
+
+			ExecutorFinish(portal->queryDesc);
+			ExecutorEnd(portal->queryDesc);
+			PopActiveSnapshot();
+//			UnregisterSnapshot(portal->queryDesc->snapshot);
+//			UnregisterSnapshot(portal->queryDesc->crosscheck_snapshot);
+//			FreeQueryDesc(portal->queryDesc);
+//			FreeExecutorState(portal->queryDesc->estate);
+//			portal->queryDesc->estate = NULL;
+			Assert(portal->queryDesc->estate == NULL);
+
+			ExecutorStart(portal->queryDesc, eflags);
+
+
+		/* Restore global vars and propagate error */
+		if (saveMemoryContext == saveTopTransactionContext)
+			MemoryContextSwitchTo(TopTransactionContext);
+		else
+			MemoryContextSwitchTo(saveMemoryContext);
+		ActivePortal = saveActivePortal;
+		if (saveResourceOwner == saveTopTransactionResourceOwner)
+			CurrentResourceOwner = TopTransactionResourceOwner;
+		else
+			CurrentResourceOwner = saveResourceOwner;
+		PortalContext = savePortalContext;
+
+			elog(WARNING, "Restart the query");
+			goto restart;
+		}
+		FreeErrorData(errdata);
+		MemoryContextSwitchTo(ecxt);
+
 		/* Uncaught error while executing portal: mark it dead */
 		MarkPortalFailed(portal);
 
@@ -825,7 +870,7 @@ PortalRun(Portal portal, long count, bool isTopLevel, bool run_once,
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-
+elog(WARNING, "Run sElect3");
 	if (saveMemoryContext == saveTopTransactionContext)
 		MemoryContextSwitchTo(TopTransactionContext);
 	else

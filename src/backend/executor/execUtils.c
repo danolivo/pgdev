@@ -135,6 +135,7 @@ CreateExecutorState(void)
 
 	estate->es_insert_pending_result_relations = NIL;
 	estate->es_insert_pending_modifytables = NIL;
+	estate->replan = NULL;
 
 	estate->es_param_list_info = NULL;
 	estate->es_param_exec_vals = NULL;

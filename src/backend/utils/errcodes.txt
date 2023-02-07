@@ -430,6 +430,7 @@ Section: Class 57 - Operator Intervention
 57P03    E    ERRCODE_CANNOT_CONNECT_NOW                                     cannot_connect_now
 57P04    E    ERRCODE_DATABASE_DROPPED                                       database_dropped
 57P05    E    ERRCODE_IDLE_SESSION_TIMEOUT                                   idle_session_timeout
+57P06    E    ERRCODE_INADEQUATE_QUERY_EXECUTION_TIME                        query_inadequate_execution_time
 
 Section: Class 58 - System Error (errors external to PostgreSQL itself)
 

@@ -244,6 +244,14 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 			break;
 	}
 
+	if (!IsBootstrapProcessingMode() &&
+		(eflags & EXEC_FLAG_REPLAN) && queryDesc->plannedstmt->can_replan)
+	{
+		elog(WARNING, "Start replan");
+		queryDesc->instrument_options |= INSTRUMENT_TIMER;
+		estate->replan = palloc(sizeof(ReplanContext));
+	}
+
 	/*
 	 * Copy other important information into the EState
 	 */
@@ -357,7 +365,7 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 	 */
 	if (!ScanDirectionIsNoMovement(direction))
 	{
-		if (execute_once && queryDesc->already_executed)
+		if (execute_once && queryDesc->already_executed && !queryDesc->plannedstmt->can_replan)
 			elog(ERROR, "can't re-execute query flagged for single execution");
 		queryDesc->already_executed = true;
 
