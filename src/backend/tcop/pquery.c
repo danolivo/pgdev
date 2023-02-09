@@ -762,12 +762,12 @@ restart:
 				 */
 				if (portal->strategy != PORTAL_ONE_SELECT && !portal->holdStore)
 					FillPortalStore(portal, isTopLevel);
-elog(WARNING, "Run sElect");
+//elog(WARNING, "Run sElect");
 				/*
 				 * Now fetch desired portion of results.
 				 */
 				nprocessed = PortalRunSelect(portal, true, count, dest);
-elog(WARNING, "Run sElect1");
+//elog(WARNING, "Run sElect1");
 				/*
 				 * If the portal result contains a command tag and the caller
 				 * gave us a pointer to store it, copy it and update the
@@ -781,7 +781,7 @@ elog(WARNING, "Run sElect1");
 
 				/* Mark portal not active */
 				portal->status = PORTAL_READY;
-elog(WARNING, "Run sElect2");
+//elog(WARNING, "Run sElect2");
 				/*
 				 * Since it's a forward fetch, say DONE iff atEnd is now true.
 				 */
@@ -870,7 +870,7 @@ elog(WARNING, "Run sElect2");
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-elog(WARNING, "Run sElect3");
+//elog(WARNING, "Run sElect3");
 	if (saveMemoryContext == saveTopTransactionContext)
 		MemoryContextSwitchTo(TopTransactionContext);
 	else

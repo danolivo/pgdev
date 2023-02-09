@@ -216,7 +216,7 @@ GetMemoryChunkHeader(const void *pointer)
 static void
 BogusFree(void *pointer)
 {
-	elog(ERROR, "pfree called with invalid pointer %p (header 0x%016llx)",
+	elog(PANIC, "pfree called with invalid pointer %p (header 0x%016llx)",
 		 pointer, (long long) GetMemoryChunkHeader(pointer));
 }
 

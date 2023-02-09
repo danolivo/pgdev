@@ -77,7 +77,7 @@ printtup_create_DR(CommandDest dest)
 	self->pub.rShutdown = printtup_shutdown;
 	self->pub.rDestroy = printtup_destroy;
 	self->pub.mydest = dest;
-
+elog(WARNING, "-> Create DR");
 	/*
 	 * Send T message automatically if DestRemote, but not if
 	 * DestRemoteExecute
@@ -112,7 +112,7 @@ printtup_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 {
 	DR_printtup *myState = (DR_printtup *) self;
 	Portal		portal = myState->portal;
-
+elog(WARNING, "-> printtup_startup");
 	/*
 	 * Create I/O buffer to be used for all messages.  This cannot be inside
 	 * tmpcontext, since we want to re-use it across rows.
@@ -169,7 +169,7 @@ SendRowDescriptionMessage(StringInfo buf, TupleDesc typeinfo,
 	int			natts = typeinfo->natts;
 	int			i;
 	ListCell   *tlist_item = list_head(targetlist);
-
+elog(WARNING, "-> SendRowDescriptionMessage");
 	/* tuple descriptor message type */
 	pq_beginmessage_reuse(buf, 'T');
 	/* # of attrs in tuples */
@@ -306,7 +306,7 @@ printtup(TupleTableSlot *slot, DestReceiver *self)
 	StringInfo	buf = &myState->buf;
 	int			natts = typeinfo->natts;
 	int			i;
-
+elog(WARNING, "-> printtup");
 	/* Set or update my derived attribute info, if needed */
 	if (myState->attrinfo != typeinfo || myState->nattrs != natts)
 		printtup_prepare_info(myState, typeinfo, natts);
@@ -386,7 +386,7 @@ static void
 printtup_shutdown(DestReceiver *self)
 {
 	DR_printtup *myState = (DR_printtup *) self;
-
+elog(WARNING, "-> printtup_shutdown");
 	if (myState->myinfo)
 		pfree(myState->myinfo);
 	myState->myinfo = NULL;

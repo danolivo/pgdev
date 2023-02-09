@@ -1005,7 +1005,7 @@ pgss_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count,
 		if (prev_ExecutorRun)
 			prev_ExecutorRun(queryDesc, direction, count, execute_once);
 		else
-			standard_ExecutorRun(queryDesc, direction, count, execute_once);
+			standard_ExecutorRun(queryDesc, direction, count, execute_once, false);
 	}
 	PG_FINALLY();
 	{

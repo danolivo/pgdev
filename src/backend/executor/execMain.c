@@ -310,15 +310,63 @@ ExecutorRun(QueryDesc *queryDesc,
 			ScanDirection direction, uint64 count,
 			bool execute_once)
 {
+	MemoryContext saveMemoryContext = CurrentMemoryContext;
+	bool restarted = false;
+	PlannedStmt *stmt = NULL;
+
+	if (queryDesc->estate->replan)
+	{
+		MemoryContext oldctx = MemoryContextSwitchTo(TopMemoryContext);
+		stmt = copyObject(queryDesc->plannedstmt);
+		MemoryContextSwitchTo(oldctx);
+	}
+restart:
+	PG_TRY();
+	{
 	if (ExecutorRun_hook)
 		(*ExecutorRun_hook) (queryDesc, direction, count, execute_once);
 	else
-		standard_ExecutorRun(queryDesc, direction, count, execute_once);
+		standard_ExecutorRun(queryDesc, direction, count, execute_once, restarted);
+	}
+	PG_CATCH();
+	{
+		MemoryContext ecxt = MemoryContextSwitchTo(saveMemoryContext);
+		ErrorData 	 *errdata = CopyErrorData();
+
+		if (stmt != NULL && !restarted &&
+			errdata->sqlerrcode == ERRCODE_INADEQUATE_QUERY_EXECUTION_TIME)
+		{
+			int eflags = queryDesc->estate->es_top_eflags;
+
+			FlushErrorState();
+			FreeErrorData(errdata);
+			ExecutorFinish(queryDesc);
+
+			/* Time to learn */
+
+			ExecutorEnd(queryDesc);
+
+			/* Replannning procedure here */
+
+			/* Restart machinery */
+			eflags = eflags & ~EXEC_FLAG_REPLAN;
+			queryDesc->plannedstmt = stmt;
+			ExecutorStart(queryDesc, eflags);
+			restarted = true;
+			elog(WARNING, "GOTO replan");
+			goto restart;
+		}
+
+		FreeErrorData(errdata);
+		MemoryContextSwitchTo(ecxt);
+	}
+	PG_END_TRY();
 }
 
 void
 standard_ExecutorRun(QueryDesc *queryDesc,
-					 ScanDirection direction, uint64 count, bool execute_once)
+					 ScanDirection direction, uint64 count, bool execute_once,
+					 bool restarted)
 {
 	EState	   *estate;
 	CmdType		operation;
@@ -356,8 +404,8 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 
 	sendTuples = (operation == CMD_SELECT ||
 				  queryDesc->plannedstmt->hasReturning);
-
-	if (sendTuples)
+elog(WARNING, "standard_ExecutorRun");
+	if (sendTuples && !restarted)
 		dest->rStartup(dest, operation, queryDesc->tupDesc);
 
 	/*
