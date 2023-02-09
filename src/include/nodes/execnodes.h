@@ -708,6 +708,8 @@ typedef struct EState
 	 */
 	List	   *es_insert_pending_result_relations;
 	List	   *es_insert_pending_modifytables;
+
+	bool		replan;
 } EState;
 
 

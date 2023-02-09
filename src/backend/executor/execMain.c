@@ -244,6 +244,15 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 			break;
 	}
 
+	if ((eflags & EXEC_FLAG_REPLAN) && queryDesc->plannedstmt->replan != NULL)
+	{
+		/* Enable instrumentation to have a chance for learning on results */
+		queryDesc->instrument_options |= INSTRUMENT_TIMER;
+
+		/* Set execution statement tag to tell executor if it could use replan trigger */
+		estate->replan = true;
+	}
+
 	/*
 	 * Copy other important information into the EState
 	 */

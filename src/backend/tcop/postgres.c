@@ -64,6 +64,7 @@
 #include "storage/sinval.h"
 #include "tcop/fastpath.h"
 #include "tcop/pquery.h"
+#include "tcop/replan.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/guc_hooks.h"
@@ -853,6 +854,7 @@ pg_plan_query(Query *querytree, const char *query_string, int cursorOptions,
 			  ParamListInfo boundParams)
 {
 	PlannedStmt *plan;
+	ReplanningStuff *node = NULL;
 
 	/* Utility commands have no plans. */
 	if (querytree->commandType == CMD_UTILITY)
@@ -866,8 +868,31 @@ pg_plan_query(Query *querytree, const char *query_string, int cursorOptions,
 	if (log_planner_stats)
 		ResetUsage();
 
+	if (QueryInadequateExecutionTime > 0 && querytree->commandType == CMD_SELECT &&
+		/*
+		 * So far, I just added it to avoid annoying false negatives in
+		 * regression tests. But we should invent some technique to avoid simple
+		 * queries.
+		 */
+		list_length(querytree->rtable) > 1)
+	{
+		MemoryContext oldctx = MemoryContextSwitchTo(TopMemoryContext);
+
+		/* Copy, because planner scribbles on parse trees */
+		node = palloc(sizeof(ReplanningStuff));
+		node->querytree = copyObject(querytree);
+		node->query_string = strdup(query_string);
+		node->cursorOptions = cursorOptions;
+		node->boundParams = boundParams; /* lives in long-lived memctx */
+		node->snapshot = CopySnapshot(GetActiveSnapshot()); /* snapshot for planning purposes. Do the check ActiveSnapshotSet() before? */
+
+		MemoryContextSwitchTo(oldctx);
+	}
+
 	/* call the optimizer */
 	plan = planner(querytree, query_string, cursorOptions, boundParams);
+
+	plan->replan = (node != NULL) ? (char *) node : NULL;
 
 	if (log_planner_stats)
 		ShowUsage("PLANNER STATISTICS");
@@ -1071,6 +1096,10 @@ exec_simple_query(const char *query_string)
 		Portal		portal;
 		DestReceiver *receiver;
 		int16		format;
+		MemoryContext scxt;
+		volatile bool allowReplan = false;
+		volatile bool headerSent = false;
+		volatile bool needRestart = false;
 
 		pgstat_report_query_id(0, true);
 
@@ -1156,6 +1185,8 @@ exec_simple_query(const char *query_string)
 		plantree_list = pg_plan_queries(querytree_list, query_string,
 										CURSOR_OPT_PARALLEL_OK, NULL);
 
+		/* Store the snapshot to get a consistent state on replanning */
+
 		/*
 		 * Done with the snapshot used for parsing/planning.
 		 *
@@ -1169,6 +1200,23 @@ exec_simple_query(const char *query_string)
 		if (snapshot_set)
 			PopActiveSnapshot();
 
+		scxt = CurrentMemoryContext;
+
+		/* Don't have logic for multiple stamants so far */
+		if (list_length(plantree_list) == 1)
+		{
+			PlannedStmt *stmt = linitial_node(PlannedStmt, plantree_list);
+			allowReplan = ((stmt->replan != NULL) ? true : false);
+		}
+
+restart:
+		needRestart = false;
+		if (allowReplan)
+			/* Maybe be better to define savepoint? */
+			BeginInternalSubTransaction("replanning");
+
+PG_TRY();
+{
 		/* If we got a cancel signal in analysis or planning, quit */
 		CHECK_FOR_INTERRUPTS();
 
@@ -1195,7 +1243,7 @@ exec_simple_query(const char *query_string)
 		/*
 		 * Start the portal.  No parameters here.
 		 */
-		PortalStart(portal, NULL, 0, InvalidSnapshot);
+		PortalStart(portal, NULL, allowReplan ? EXEC_FLAG_REPLAN : 0, InvalidSnapshot);
 
 		/*
 		 * Select the appropriate output format: text unless we are doing a
@@ -1224,7 +1272,10 @@ exec_simple_query(const char *query_string)
 		 */
 		receiver = CreateDestReceiver(dest);
 		if (dest == DestRemote)
-			SetRemoteDestReceiverParams(receiver, portal);
+		{
+			SetRemoteDestReceiverParams(receiver, portal, !headerSent);
+			headerSent = true;
+		}
 
 		/*
 		 * Switch back to transaction context for execution.
@@ -1241,6 +1292,51 @@ exec_simple_query(const char *query_string)
 						 receiver,
 						 receiver,
 						 &qc);
+}
+PG_CATCH();
+{
+	if (allowReplan)
+	{
+		MemoryContext	ecxt = MemoryContextSwitchTo(scxt);
+		ErrorData	   *errdata = CopyErrorData();
+
+		Assert(IsSubTransaction());
+
+		RollbackAndReleaseCurrentSubTransaction();
+
+		if (errdata->sqlerrcode == ERRCODE_INADEQUATE_QUERY_EXECUTION_TIME)
+		{
+			Assert(qc.nprocessed <= 0);
+
+			FlushErrorState();
+			FreeErrorData(errdata);
+
+			/* Time to learn */
+			/* --------------*/
+
+			/* Replannning procedure here */
+
+			plantree_list = list_make1(try_replan((PlannedStmt*)linitial(plantree_list)));
+			allowReplan = false;
+			needRestart = true;
+		}
+		else
+		{
+			FreeErrorData(errdata);
+			MemoryContextSwitchTo(ecxt);
+			PG_RE_THROW();
+		}
+	}
+	else
+		PG_RE_THROW();
+}
+PG_END_TRY();
+
+		if (needRestart)
+			goto restart;
+
+		if (allowReplan)
+			ReleaseCurrentSubTransaction();
 
 		receiver->rDestroy(receiver);
 
@@ -2123,7 +2219,7 @@ exec_execute_message(const char *portal_name, long max_rows)
 	 */
 	receiver = CreateDestReceiver(dest);
 	if (dest == DestRemoteExecute)
-		SetRemoteDestReceiverParams(receiver, portal);
+		SetRemoteDestReceiverParams(receiver, portal, true);
 
 	/*
 	 * Ensure we are in a transaction command (this should normally be the

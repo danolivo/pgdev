@@ -18,7 +18,7 @@
 
 extern DestReceiver *printtup_create_DR(CommandDest dest);
 
-extern void SetRemoteDestReceiverParams(DestReceiver *self, Portal portal);
+extern void SetRemoteDestReceiverParams(DestReceiver *self, Portal portal, bool sendDescrip);
 
 extern void SendRowDescriptionMessage(StringInfo buf,
 									  TupleDesc typeinfo, List *targetlist, int16 *formats);

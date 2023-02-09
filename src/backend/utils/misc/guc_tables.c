@@ -62,6 +62,7 @@
 #include "replication/logicallauncher.h"
 #include "replication/slot.h"
 #include "replication/syncrep.h"
+#include "tcop/replan.h"
 #include "storage/bufmgr.h"
 #include "storage/large_object.h"
 #include "storage/pg_shmem.h"
@@ -2450,6 +2451,17 @@ struct config_int ConfigureNamesInt[] =
 		NULL, NULL, NULL
 	},
 #endif
+
+	{
+		{"query_inadequate_execution_time", PGC_SUSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("Sets the query execution time after which the query should be re-planned."),
+			gettext_noop("A value of 0 turns off this feature."),
+			GUC_UNIT_MS
+		},
+		&QueryInadequateExecutionTime,
+		0, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
 
 	{
 		{"statement_timeout", PGC_USERSET, CLIENT_CONN_STATEMENT,

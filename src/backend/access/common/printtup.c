@@ -78,12 +78,7 @@ printtup_create_DR(CommandDest dest)
 	self->pub.rDestroy = printtup_destroy;
 	self->pub.mydest = dest;
 
-	/*
-	 * Send T message automatically if DestRemote, but not if
-	 * DestRemoteExecute
-	 */
-	self->sendDescrip = (dest == DestRemote);
-
+	self->sendDescrip = false;
 	self->attrinfo = NULL;
 	self->nattrs = 0;
 	self->myinfo = NULL;
@@ -97,13 +92,18 @@ printtup_create_DR(CommandDest dest)
  * Set parameters for a DestRemote (or DestRemoteExecute) receiver
  */
 void
-SetRemoteDestReceiverParams(DestReceiver *self, Portal portal)
+SetRemoteDestReceiverParams(DestReceiver *self, Portal portal, bool sendDescrip)
 {
 	DR_printtup *myState = (DR_printtup *) self;
 
 	Assert(myState->pub.mydest == DestRemote ||
 		   myState->pub.mydest == DestRemoteExecute);
 
+	/*
+	 * Send T message automatically if DestRemote, but not if
+	 * DestRemoteExecute
+	 */
+	myState->sendDescrip = (sendDescrip && (myState->pub.mydest == DestRemote));
 	myState->portal = portal;
 }
 

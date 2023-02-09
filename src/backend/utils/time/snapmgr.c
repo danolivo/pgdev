@@ -171,7 +171,7 @@ static List *exportedSnapshots = NIL;
 
 /* Prototypes for local functions */
 static TimestampTz AlignTimestampToMinuteBoundary(TimestampTz ts);
-static Snapshot CopySnapshot(Snapshot snapshot);
+//static Snapshot CopySnapshot(Snapshot snapshot);
 static void FreeSnapshot(Snapshot snapshot);
 static void SnapshotResetXmin(void);
 
@@ -605,7 +605,7 @@ SetTransactionSnapshot(Snapshot sourcesnap, VirtualTransactionId *sourcevxid,
  * The copy is palloc'd in TopTransactionContext and has initial refcounts set
  * to 0.  The returned snapshot has the copied flag set.
  */
-static Snapshot
+Snapshot
 CopySnapshot(Snapshot snapshot)
 {
 	Snapshot	newsnap;

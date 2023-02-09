@@ -122,7 +122,7 @@ extern void UpdateActiveSnapshotCommandId(void);
 extern void PopActiveSnapshot(void);
 extern Snapshot GetActiveSnapshot(void);
 extern bool ActiveSnapshotSet(void);
-
+extern Snapshot CopySnapshot(Snapshot snapshot);
 extern Snapshot RegisterSnapshot(Snapshot snapshot);
 extern void UnregisterSnapshot(Snapshot snapshot);
 extern Snapshot RegisterSnapshotOnOwner(Snapshot snapshot, ResourceOwner owner);

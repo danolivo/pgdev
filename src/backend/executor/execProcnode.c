@@ -118,6 +118,7 @@
 #include "executor/nodeWorktablescan.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "tcop/replan.h"
 
 static TupleTableSlot *ExecProcNodeFirst(PlanState *node);
 static TupleTableSlot *ExecProcNodeInstr(PlanState *node);
@@ -480,6 +481,9 @@ ExecProcNodeInstr(PlanState *node)
 	result = node->ExecProcNodeReal(node);
 
 	InstrStopNode(node->instrument, TupIsNull(result) ? 0.0 : 1.0);
+
+	if (node->instrument && node->state->replan)
+		check_replan_trigger(node);
 
 	return result;
 }
