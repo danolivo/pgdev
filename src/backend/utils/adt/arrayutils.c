@@ -99,25 +99,26 @@ ArrayGetNItemsSafe(int ndim, const int *dims, struct Node *escontext)
 
 		/* A negative dimension implies that UB-LB overflowed ... */
 		if (dims[i] < 0)
-			ereturn(escontext, -1,
+			Assert(0);
+	/*		ereturn(escontext, -1,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("array size exceeds the maximum allowed (%d)",
+					 errmsg("array size exceeds the maximum allowe8d (%d)",
 							(int) MaxArraySize)));
-
+*/
 		prod = (int64) ret * (int64) dims[i];
 
 		ret = (int32) prod;
 		if ((int64) ret != prod)
 			ereturn(escontext, -1,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("array size exceeds the maximum allowed (%d)",
+					 errmsg("array size exceeds the maximum allowed9 (%d)",
 							(int) MaxArraySize)));
 	}
 	Assert(ret >= 0);
 	if ((Size) ret > MaxArraySize)
 		ereturn(escontext, -1,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("array size exceeds the maximum allowed (%d)",
+				 errmsg("array size exceeds the maximum allowed10 (%d)",
 						(int) MaxArraySize)));
 	return (int) ret;
 }

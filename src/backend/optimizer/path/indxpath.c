@@ -193,6 +193,123 @@ static bool ec_member_matches_indexcol(PlannerInfo *root, RelOptInfo *rel,
 									   EquivalenceClass *ec, EquivalenceMember *em,
 									   void *arg);
 
+void
+try_transform_ors(RelOptInfo *rel)
+{
+typedef struct abc
+{
+	Node *node;
+	List *consts;
+	Oid collation;
+	Oid opno;
+	RestrictInfo *rinfo;
+} abc;
+	List *clauses = rel->baserestrictinfo;
+	ListCell *lc1;
+	ListCell *lc2;
+	ListCell *lc3;
+	List *clause_groups = NIL;
+
+	foreach (lc1, clauses)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc1);
+		List *target_clauses = NIL;
+
+		if (!restriction_is_or_clause(rinfo))
+			continue;
+
+		foreach(lc2, ((BoolExpr *) rinfo->orclause)->args)
+		{
+			RestrictInfo *rinfo1 = lfirst_node(RestrictInfo, lc2);
+			Node *non_const_expr;
+			Node *const_expr;
+
+			if (!is_opclause(rinfo1->clause) ||
+				!(bms_is_empty(rinfo1->left_relids) ^ bms_is_empty(rinfo1->right_relids)) ||
+				contain_volatile_functions((Node *) rinfo1->clause)
+				/*||
+				!op_mergejoinable(((OpExpr *)rinfo1->clause)->opno)*/)
+			{
+				target_clauses = lappend(target_clauses, rinfo);
+				continue;
+			}
+
+			non_const_expr = bms_is_empty(rinfo1->left_relids) ?
+												get_rightop(rinfo1->clause) :
+												get_leftop(rinfo1->clause);
+			const_expr = bms_is_empty(rinfo1->left_relids) ?
+												get_leftop(rinfo1->clause) :
+												get_rightop(rinfo1->clause);
+
+			foreach(lc3, clause_groups)
+			{
+				abc *v = (abc *) lfirst(lc3);
+
+				Assert(v->node != NULL);
+
+				if (equal(v->node, non_const_expr))
+				{
+					v->consts = lappend(v->consts, const_expr);
+					non_const_expr = NULL;
+					break;
+				}
+			}
+
+			if (non_const_expr != NULL)
+			{
+				abc *v = palloc0(sizeof(abc));
+
+				v->node = non_const_expr;
+				v->consts = lappend(v->consts, const_expr);
+				v->collation = exprInputCollation((Node *)rinfo1->clause);
+				v->opno = ((OpExpr *) rinfo1->clause)->opno;
+				v->rinfo = rinfo1;
+				clause_groups = lappend(clause_groups,  (void *) v);
+			}
+		}
+
+		if (clause_groups != NIL)
+		{
+			ListCell *lc;
+
+			elog(WARNING, "OR clause has found");
+
+			foreach(lc, clause_groups)
+			{
+				abc *v = (abc *) lfirst(lc);
+				elog(WARNING, "clause %d", list_length(v->consts));
+
+				if (list_length(v->consts) > 1)
+				{
+					ScalarArrayOpExpr *saopexpr;
+					ArrayExpr *newa;
+
+					newa = makeNode(ArrayExpr);
+					newa->element_typeid = exprType(v->node);
+					newa->array_typeid = get_array_type(newa->element_typeid);
+					newa->elements = v->consts;
+					newa->multidims = false;
+					newa->location = -1;
+
+					saopexpr = makeNode(ScalarArrayOpExpr);
+					saopexpr->opno = v->opno;
+					saopexpr->opfuncid = get_opcode(v->opno);
+					saopexpr->hashfuncid = InvalidOid;
+					saopexpr->negfuncid = InvalidOid;
+					saopexpr->useOr = true;
+					saopexpr->inputcollid = v->collation;
+					saopexpr->args = list_make2(v->node, newa);
+					saopexpr->location = -1;
+					v->rinfo->clause = (Expr *) saopexpr;
+				}
+
+				target_clauses = lappend(target_clauses, v->rinfo);
+			}
+		}
+		elog(WARNING, "target_clauses: %d", list_length(target_clauses));
+		((BoolExpr *) rinfo->orclause)->args = target_clauses;
+	}
+}
 
 /*
  * create_index_paths()
@@ -247,6 +364,7 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 	if (rel->indexlist == NIL)
 		return;
 
+//	try_transform_ors(rel);
 	/* Bitmap paths are collected and then dealt with at the end */
 	bitindexpaths = bitjoinpaths = joinorclauses = NIL;
 

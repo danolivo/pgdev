@@ -71,6 +71,7 @@ extern void debug_print_rel(PlannerInfo *root, RelOptInfo *rel);
  * indxpath.c
  *	  routines to generate index paths
  */
+void try_transform_ors(RelOptInfo *rel);
 extern void create_index_paths(PlannerInfo *root, RelOptInfo *rel);
 extern bool relation_has_unique_index_for(PlannerInfo *root, RelOptInfo *rel,
 										  List *restrictlist,

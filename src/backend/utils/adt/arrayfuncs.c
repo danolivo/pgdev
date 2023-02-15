@@ -956,7 +956,7 @@ ReadArrayStr(char *arrayStr,
 			if (!AllocSizeIsValid(totbytes))
 				ereturn(escontext, false,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("array size exceeds the maximum allowed (%d)",
+						 errmsg("array size exceeds the maximum allowed2 (%d)",
 								(int) MaxAllocSize)));
 		}
 	}
@@ -1565,7 +1565,7 @@ ReadArrayBinary(StringInfo buf,
 			if (!AllocSizeIsValid(totbytes))
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("array size exceeds the maximum allowed (%d)",
+						 errmsg("array size exceeds the maximum allowed3 (%d)",
 								(int) MaxAllocSize)));
 		}
 	}
@@ -3284,7 +3284,7 @@ array_map(Datum arrayd,
 			if (!AllocSizeIsValid(nbytes))
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						 errmsg("array size exceeds the maximum allowed (%d)",
+						 errmsg("array size exceeds the maximum allowed4 (%d)",
 								(int) MaxAllocSize)));
 		}
 	}
@@ -3513,7 +3513,7 @@ construct_md_array(Datum *elems,
 		if (!AllocSizeIsValid(nbytes))
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("array size exceeds the maximum allowed (%d)",
+					 errmsg("array size exceeds the maximum allowed5 (%d)",
 							(int) MaxAllocSize)));
 	}
 
@@ -6176,7 +6176,7 @@ array_fill_internal(ArrayType *dims, ArrayType *lbs,
 			!AllocSizeIsValid(totbytes))
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("array size exceeds the maximum allowed (%d)",
+					 errmsg("array size exceeds the maximum allowed6 (%d)",
 							(int) MaxAllocSize)));
 
 		/*
@@ -6517,7 +6517,7 @@ array_replace_internal(ArrayType *array,
 				if (!AllocSizeIsValid(nbytes))
 					ereport(ERROR,
 							(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-							 errmsg("array size exceeds the maximum allowed (%d)",
+							 errmsg("array size exceeds the maximum allowed7 (%d)",
 									(int) MaxAllocSize)));
 			}
 			nresult++;

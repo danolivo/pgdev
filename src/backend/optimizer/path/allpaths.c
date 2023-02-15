@@ -756,7 +756,7 @@ set_plain_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	 * its tlist.
 	 */
 	required_outer = rel->lateral_relids;
-
+try_transform_ors(rel);
 	/* Consider sequential scan */
 	add_path(rel, create_seqscan_path(root, rel, required_outer, 0));
 
