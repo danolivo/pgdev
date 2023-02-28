@@ -853,8 +853,8 @@ PlannedStmt *
 pg_plan_query(Query *querytree, const char *query_string, int cursorOptions,
 			  ParamListInfo boundParams)
 {
-	PlannedStmt *plan;
-	ReplanningStuff *node = NULL;
+	PlannedStmt		   *plan;
+	ReplanningStuff	   *node = NULL;
 
 	/* Utility commands have no plans. */
 	if (querytree->commandType == CMD_UTILITY)
@@ -874,19 +874,28 @@ pg_plan_query(Query *querytree, const char *query_string, int cursorOptions,
 		 * regression tests. But we should invent some technique to avoid simple
 		 * queries.
 		 */
-		list_length(querytree->rtable) > 1)
+		list_length(querytree->rtable) >= 1)
 	{
-		MemoryContext oldctx = MemoryContextSwitchTo(TopMemoryContext);
+		if (querytree->replanning == NULL)
+		{
+			/* Switch to TopTransactionContext later */
+			MemoryContext oldctx = MemoryContextSwitchTo(TopMemoryContext);
 
-		/* Copy, because planner scribbles on parse trees */
-		node = palloc(sizeof(ReplanningStuff));
-		node->querytree = copyObject(querytree);
-		node->query_string = strdup(query_string);
-		node->cursorOptions = cursorOptions;
-		node->boundParams = boundParams; /* lives in long-lived memctx */
-		node->snapshot = CopySnapshot(GetActiveSnapshot()); /* snapshot for planning purposes. Do the check ActiveSnapshotSet() before? */
-
-		MemoryContextSwitchTo(oldctx);
+			/* Copy, because planner scribbles on parse trees */
+			node = palloc(sizeof(ReplanningStuff));
+			node->querytree = copyObject(querytree);
+			node->query_string = strdup(query_string);
+			node->cursorOptions = cursorOptions;
+			node->boundParams = boundParams; /* lives in long-lived memctx */
+			node->snapshot = CopySnapshot(GetActiveSnapshot()); /* snapshot for planning purposes. Do the check ActiveSnapshotSet() before? */
+			node->mctx = AllocSetContextCreate(TopMemoryContext,
+											   "ReplanningContext",
+											   ALLOCSET_DEFAULT_SIZES);
+			node->data = NULL;
+			MemoryContextSwitchTo(oldctx);
+		}
+		else
+			node = (ReplanningStuff *) querytree->replanning;
 	}
 
 	/* call the optimizer */
@@ -1100,6 +1109,7 @@ exec_simple_query(const char *query_string)
 		volatile bool allowReplan = false;
 		volatile bool headerSent = false;
 		volatile bool needRestart = false;
+		int counter = 0; /* Just for debugging purposes */
 
 		pgstat_report_query_id(0, true);
 
@@ -1302,26 +1312,38 @@ PG_CATCH();
 
 		Assert(IsSubTransaction());
 
-		RollbackAndReleaseCurrentSubTransaction();
-
 		if (errdata->sqlerrcode == ERRCODE_INADEQUATE_QUERY_EXECUTION_TIME)
 		{
+			PlannedStmt *stmt;
+
 			Assert(qc.nprocessed <= 0);
 
 			FlushErrorState();
 			FreeErrorData(errdata);
 
 			/* Time to learn */
+			stmt = (PlannedStmt*) linitial(plantree_list);
+			elog(WARNING, "START Learning");
+			learn_partially_executed_state(stmt);
+			RollbackAndReleaseCurrentSubTransaction();
 			/* --------------*/
 
 			/* Replannning procedure here */
+			plantree_list = list_make1(try_replan(stmt));
 
-			plantree_list = list_make1(try_replan((PlannedStmt*)linitial(plantree_list)));
-			allowReplan = false;
+			/* Only for development purposes: no more replanning */
+			if (counter++ >= 3)
+				allowReplan = false;
 			needRestart = true;
 		}
 		else
 		{
+			/*
+			 * Revert subtransaction, because top level transaction could ignore
+			 * underlying errors.
+			 */
+			RollbackAndReleaseCurrentSubTransaction();
+
 			FreeErrorData(errdata);
 			MemoryContextSwitchTo(ecxt);
 			PG_RE_THROW();

@@ -272,6 +272,7 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	rel->all_partrels = NULL;
 	rel->partexprs = NULL;
 	rel->nullable_partexprs = NULL;
+	rel->hash = UINT64_MAX;
 
 	/*
 	 * Pass assorted information down the inheritance hierarchy.
@@ -732,6 +733,7 @@ build_join_rel(PlannerInfo *root,
 	joinrel->all_partrels = NULL;
 	joinrel->partexprs = NULL;
 	joinrel->nullable_partexprs = NULL;
+	joinrel->hash = UINT64_MAX;
 
 	/* Compute information relevant to the foreign relations. */
 	set_foreign_rel_properties(joinrel, outer_rel, inner_rel);
@@ -917,6 +919,7 @@ build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
 	joinrel->all_partrels = NULL;
 	joinrel->partexprs = NULL;
 	joinrel->nullable_partexprs = NULL;
+	joinrel->hash = UINT64_MAX;
 
 	/* Compute information relevant to foreign relations. */
 	set_foreign_rel_properties(joinrel, outer_rel, inner_rel);
@@ -1434,6 +1437,7 @@ fetch_upper_rel(PlannerInfo *root, UpperRelationKind kind, Relids relids)
 	upperrel->cheapest_total_path = NULL;
 	upperrel->cheapest_unique_path = NULL;
 	upperrel->cheapest_parameterized_paths = NIL;
+	upperrel->hash = 0;
 
 	root->upper_rels[kind] = lappend(root->upper_rels[kind], upperrel);
 

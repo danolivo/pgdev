@@ -104,6 +104,7 @@ typedef struct PlannedStmt
 
 	/* Should be generalized like a list of an extended parameters */
 	char	   *replan pg_node_attr(equal_ignore, query_jumble_ignore, read_write_ignore, read_as(0));
+	char *abc;
 } PlannedStmt;
 
 /* macro for fetching the Plan associated with a SubPlan node */
@@ -176,6 +177,9 @@ typedef struct Plan
 	 */
 	Bitmapset  *extParam;
 	Bitmapset  *allParam;
+
+	/* Almost unique identifier of node */
+	uint64		nodeid;
 } Plan;
 
 /* ----------------

@@ -4975,7 +4975,7 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
 	return clamp_row_est(tuples);
 }
 
-
+#include "tcop/replan.h"
 /*
  * set_baserel_size_estimates
  *		Set the size estimates for the given base relation.
@@ -4997,15 +4997,19 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 	/* Should only be applied to base relations */
 	Assert(rel->relid > 0);
 
-	nrows = rel->tuples *
-		clauselist_selectivity(root,
-							   rel->baserestrictinfo,
-							   0,
-							   JOIN_INNER,
-							   NULL);
+	nrows = replan_rows_estimate(root, rel);
+	if (nrows <= 0)
+	{
+		nrows = rel->tuples *
+			clauselist_selectivity(root,
+								   rel->baserestrictinfo,
+								   0,
+								   JOIN_INNER,
+								   NULL);
+	}
 
 	rel->rows = clamp_row_est(nrows);
-
+elog(WARNING, "set_baserel_size_estimates: [%lu] - %.1lf", rel->hash, rel->rows);
 	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
 
 	set_rel_width(root, rel);

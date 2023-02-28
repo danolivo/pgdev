@@ -1739,7 +1739,10 @@ ExplainNode(PlanState *planstate, List *ancestors,
 
 	/* target list */
 	if (es->verbose)
+	{
 		show_plan_tlist(planstate, ancestors, es);
+		ExplainPropertyUInteger("Hash: ", NULL, plan->nodeid, es);
+	}
 
 	/* unique join */
 	switch (nodeTag(plan))

@@ -97,13 +97,9 @@ CleanQuerytext(const char *query, int *location, int *len)
 }
 
 JumbleState *
-JumbleQuery(Query *query, const char *querytext)
+JumbleStateInit(void)
 {
-	JumbleState *jstate = NULL;
-
-	Assert(IsQueryIdEnabled());
-
-	jstate = (JumbleState *) palloc(sizeof(JumbleState));
+	JumbleState *jstate = (JumbleState *) palloc(sizeof(JumbleState));
 
 	/* Set up workspace for query jumbling */
 	jstate->jumble = (unsigned char *) palloc(JUMBLE_SIZE);
@@ -113,6 +109,24 @@ JumbleQuery(Query *query, const char *querytext)
 		palloc(jstate->clocations_buf_size * sizeof(LocationLen));
 	jstate->clocations_count = 0;
 	jstate->highest_extern_param_id = 0;
+	return jstate;
+}
+
+JumbleState *
+JumbleExpr(Expr * expr)
+{
+	JumbleState *jstate = JumbleStateInit();
+
+	_jumbleNode(jstate, (Node *) expr);
+	return jstate;
+}
+
+JumbleState *
+JumbleQuery(Query *query, const char *querytext)
+{
+	JumbleState *jstate = JumbleStateInit();
+
+	Assert(IsQueryIdEnabled());
 
 	/* Compute query ID and mark the Query node with it */
 	_jumbleNode(jstate, (Node *) query);

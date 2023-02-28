@@ -4388,6 +4388,9 @@ print_path(PlannerInfo *root, Path *path, int indent)
 		case T_TidPath:
 			ptype = "TidScan";
 			break;
+		case T_TidRangePath:
+			ptype = "TidRangeScan";
+			break;
 		case T_SubqueryScanPath:
 			ptype = "SubqueryScan";
 			break;

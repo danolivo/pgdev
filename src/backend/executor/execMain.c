@@ -144,7 +144,7 @@ ExecutorStart(QueryDesc *queryDesc, int eflags)
 	else
 		standard_ExecutorStart(queryDesc, eflags);
 }
-
+#include "tcop/replan.h"
 void
 standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
@@ -244,10 +244,14 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 			break;
 	}
 
+	/*
+	 * Set may-be-replanned sign telling underlying nodes about this fact.
+	 * Should be done before initialization of es_instrument.
+	 */
 	if ((eflags & EXEC_FLAG_REPLAN) && queryDesc->plannedstmt->replan != NULL)
 	{
 		/* Enable instrumentation to have a chance for learning on results */
-		queryDesc->instrument_options |= INSTRUMENT_TIMER;
+		queryDesc->instrument_options |= INSTRUMENT_TIMER | INSTRUMENT_ROWS;
 
 		/* Set execution statement tag to tell executor if it could use replan trigger */
 		estate->replan = true;
@@ -274,6 +278,13 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	 */
 	InitPlan(queryDesc, eflags);
 
+	/* Time to save execution context for the plan */
+	if (estate->replan)
+	{
+		ReplanningStuff* replan = (ReplanningStuff *)
+												queryDesc->plannedstmt->replan;
+		replan->queryDesc = queryDesc;
+	}
 	MemoryContextSwitchTo(oldcontext);
 }
 

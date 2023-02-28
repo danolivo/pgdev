@@ -1034,6 +1034,8 @@ typedef struct RelOptInfo
 	List	  **partexprs pg_node_attr(read_write_ignore);
 	/* Nullable partition key expressions */
 	List	  **nullable_partexprs pg_node_attr(read_write_ignore);
+
+	uint64		hash;
 } RelOptInfo;
 
 /*
