@@ -484,10 +484,10 @@ ExecProcNodeInstr(PlanState *node)
 
 	if (node->instrument && node->state->replan)
 		check_replan_trigger(node);
-//	else
-//		elog(WARNING, "--- %d %d", node->instrument == NULL,
-//			node->state->replan);
-
+/*	else
+		elog(WARNING, "--- %d %d", node->instrument == NULL,
+			node->state->replan);
+*/
 	return result;
 }
 

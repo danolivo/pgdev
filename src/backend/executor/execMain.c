@@ -256,6 +256,8 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		/* Set execution statement tag to tell executor if it could use replan trigger */
 		estate->replan = true;
 	}
+	else
+		elog(WARNING, "NO_REPLAN: %d %d", eflags & EXEC_FLAG_REPLAN, queryDesc->plannedstmt->replan != NULL);
 
 	/*
 	 * Copy other important information into the EState

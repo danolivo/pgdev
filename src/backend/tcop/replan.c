@@ -43,20 +43,23 @@ try_replan(PlannedStmt *src_stmt)
 	PopActiveSnapshot();
 	return stmt;
 }
-
+static PlannedStmt *cur_stmt = NULL;
 void
 check_replan_trigger(PlanState *node)
 {
 	Assert(node->instrument);
 	Assert(!INSTR_TIME_IS_ZERO(node->instrument->counter));
-//elog(WARNING, "trigger");
+//elog(WARNING, "trigger %.1ld", node->state->es_processed);
 	if (node->state->es_processed > 0)
 		return;
 
 	if (INSTR_TIME_GET_MILLISEC(node->instrument->counter) >= QueryInadequateExecutionTime)
+	{
+		cur_stmt = node->state->es_plannedstmt;
 		ereport(ERROR,
 		(errcode(ERRCODE_INADEQUATE_QUERY_EXECUTION_TIME),
 					 errmsg("ERRCODE_INADEQUATE_QUERY_EXECUTION_TIME")));
+	}
 }
 
 /*
@@ -132,8 +135,9 @@ learn_partially_executed_state(PlannedStmt *stmt)
 	ReplanningStuff	   *replan;
 	PlanState		   *state;
 
+	stmt = cur_stmt;
 	Assert(stmt->replan);
-
+elog(WARNING, "ABC");
 	replan = (ReplanningStuff *) stmt->replan;
 	state = replan->queryDesc->planstate;
 

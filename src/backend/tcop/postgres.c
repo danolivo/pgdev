@@ -880,7 +880,7 @@ pg_plan_query(Query *querytree, const char *query_string, int cursorOptions,
 		{
 			/* Switch to TopTransactionContext later */
 			MemoryContext oldctx = MemoryContextSwitchTo(TopMemoryContext);
-
+elog(WARNING, "pg_plan_query: REPLAN");
 			/* Copy, because planner scribbles on parse trees */
 			node = palloc(sizeof(ReplanningStuff));
 			node->querytree = copyObject(querytree);
@@ -896,6 +896,11 @@ pg_plan_query(Query *querytree, const char *query_string, int cursorOptions,
 		}
 		else
 			node = (ReplanningStuff *) querytree->replanning;
+	}
+	else
+	{
+		elog(WARNING, "pg_plan_query: REPLAN_DEC: %d %d",
+			querytree->commandType, list_length(querytree->rtable));
 	}
 
 	/* call the optimizer */
@@ -1217,8 +1222,18 @@ exec_simple_query(const char *query_string)
 		{
 			PlannedStmt *stmt = linitial_node(PlannedStmt, plantree_list);
 			allowReplan = ((stmt->replan != NULL) ? true : false);
-		}
+			if (!allowReplan)
+			{
+				if (stmt->utilityStmt && nodeTag(stmt->utilityStmt) == T_ExplainStmt)
+				{
+					allowReplan = true;
+					elog(WARNING, "Allow EXPLAIN");
+				}
 
+			}
+		}
+		if (!allowReplan)
+			elog(WARNING, "NO: %d", list_length(plantree_list));
 restart:
 		needRestart = false;
 		if (allowReplan)
@@ -1249,7 +1264,7 @@ PG_TRY();
 						  commandTag,
 						  plantree_list,
 						  NULL);
-
+elog(WARNING, "ALLOW_REPLAN: %d", allowReplan);
 		/*
 		 * Start the portal.  No parameters here.
 		 */
@@ -1311,7 +1326,7 @@ PG_CATCH();
 		ErrorData	   *errdata = CopyErrorData();
 
 		Assert(IsSubTransaction());
-
+elog(WARNING, "REPLAN1");
 		if (errdata->sqlerrcode == ERRCODE_INADEQUATE_QUERY_EXECUTION_TIME)
 		{
 			PlannedStmt *stmt;
@@ -1329,7 +1344,8 @@ PG_CATCH();
 			/* --------------*/
 
 			/* Replannning procedure here */
-			plantree_list = list_make1(try_replan(stmt));
+			if (stmt->commandType == CMD_SELECT)
+				plantree_list = list_make1(try_replan(stmt));
 
 			/* Only for development purposes: no more replanning */
 			if (counter++ >= 3)

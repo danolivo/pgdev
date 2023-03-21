@@ -574,9 +574,9 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 		eflags = EXEC_FLAG_EXPLAIN_ONLY;
 	if (into)
 		eflags |= GetIntoRelEFlags(into);
-
+elog(WARNING, "Start explain");
 	/* call ExecutorStart to prepare the plan for execution */
-	ExecutorStart(queryDesc, eflags);
+	ExecutorStart(queryDesc, eflags | EXEC_FLAG_REPLAN);
 
 	/* Execute the plan for statistics if asked for */
 	if (es->analyze)
