@@ -49,6 +49,7 @@
 
 #include "access/parallel.h"
 #include "catalog/pg_authid.h"
+#include "commands/extension.h"
 #include "common/hashfn.h"
 #include "executor/instrument.h"
 #include "funcapi.h"
@@ -107,6 +108,14 @@ static const uint32 PGSS_PG_MAJOR_VERSION = PG_VERSION_NUM / 100;
 									!IsA(n, PrepareStmt) && \
 									!IsA(n, DeallocateStmt))
 
+#define GET_QUERYID(node) \
+	(Bigint *) GetExtensionData(node->ext_field, "pg_stat_statements")
+
+#define INSERT_QUERYID(node, queryid) \
+	castNode(Bigint, AddExtensionDataToNode((Node *) node, \
+											"pg_stat_statements", \
+											(Node *) makeBigint((int64) queryid), \
+											true))
 /*
  * Extension version number, for supporting older extension versions' objects
  */
@@ -821,6 +830,13 @@ error:
 static void
 pgss_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
 {
+	Bigint *queryId;
+
+	if ((queryId = GET_QUERYID(query)) == NULL)
+		queryId = INSERT_QUERYID(query, query->queryId);
+
+	Assert(queryId);
+
 	if (prev_post_parse_analyze_hook)
 		prev_post_parse_analyze_hook(pstate, query, jstate);
 
@@ -837,7 +853,7 @@ pgss_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
 	{
 		if (pgss_track_utility && !PGSS_HANDLED_UTILITY(query->utilityStmt))
 		{
-			query->queryId = UINT64CONST(0);
+			queryId->val = UINT64CONST(0);
 			return;
 		}
 	}
@@ -851,7 +867,7 @@ pgss_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
 	 */
 	if (jstate && jstate->clocations_count > 0)
 		pgss_store(pstate->p_sourcetext,
-				   query->queryId,
+				   queryId->val,
 				   query->stmt_location,
 				   query->stmt_len,
 				   PGSS_INVALID,
@@ -873,7 +889,10 @@ pgss_planner(Query *parse,
 			 int cursorOptions,
 			 ParamListInfo boundParams)
 {
-	PlannedStmt *result;
+	PlannedStmt	   *result;
+	Bigint		   *queryId;
+
+	queryId = GET_QUERYID(parse);
 
 	/*
 	 * We can't process the query if no query_string is provided, as
@@ -889,7 +908,7 @@ pgss_planner(Query *parse,
 	 */
 	if (pgss_enabled(plan_nested_level + exec_nested_level)
 		&& pgss_track_planning && query_string
-		&& parse->queryId != UINT64CONST(0))
+		&& queryId && queryId->val != UINT64CONST(0))
 	{
 		instr_time	start;
 		instr_time	duration;
@@ -936,7 +955,7 @@ pgss_planner(Query *parse,
 		WalUsageAccumDiff(&walusage, &pgWalUsage, &walusage_start);
 
 		pgss_store(query_string,
-				   parse->queryId,
+				   queryId->val,
 				   parse->stmt_location,
 				   parse->stmt_len,
 				   PGSS_PLAN,
@@ -966,17 +985,22 @@ pgss_planner(Query *parse,
 static void
 pgss_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
+	Bigint *queryId;
+
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
 		standard_ExecutorStart(queryDesc, eflags);
+
+	queryId = GET_QUERYID(queryDesc->plannedstmt);
 
 	/*
 	 * If query has queryId zero, don't track it.  This prevents double
 	 * counting of optimizable statements that are directly contained in
 	 * utility statements.
 	 */
-	if (pgss_enabled(exec_nested_level) && queryDesc->plannedstmt->queryId != UINT64CONST(0))
+	if (pgss_enabled(exec_nested_level) &&
+		queryId && queryId->val != UINT64CONST(0))
 	{
 		/*
 		 * Set up to track total elapsed time in ExecutorRun.  Make sure the
@@ -1043,9 +1067,11 @@ pgss_ExecutorFinish(QueryDesc *queryDesc)
 static void
 pgss_ExecutorEnd(QueryDesc *queryDesc)
 {
-	uint64		queryId = queryDesc->plannedstmt->queryId;
+	Bigint *queryId;
 
-	if (queryId != UINT64CONST(0) && queryDesc->totaltime &&
+	queryId = GET_QUERYID(queryDesc->plannedstmt);
+
+	if (queryId && queryId->val != UINT64CONST(0) && queryDesc->totaltime &&
 		pgss_enabled(exec_nested_level))
 	{
 		/*
@@ -1055,7 +1081,7 @@ pgss_ExecutorEnd(QueryDesc *queryDesc)
 		InstrEndLoop(queryDesc->totaltime);
 
 		pgss_store(queryDesc->sourceText,
-				   queryId,
+				   queryId->val,
 				   queryDesc->plannedstmt->stmt_location,
 				   queryDesc->plannedstmt->stmt_len,
 				   PGSS_EXEC,
@@ -1084,9 +1110,16 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 					DestReceiver *dest, QueryCompletion *qc)
 {
 	Node	   *parsetree = pstmt->utilityStmt;
-	uint64		saved_queryId = pstmt->queryId;
+	uint64		saved_queryId;
+	Bigint	   *queryId;
 	int			saved_stmt_location = pstmt->stmt_location;
 	int			saved_stmt_len = pstmt->stmt_len;
+
+	if ((queryId = GET_QUERYID(pstmt)) == NULL)
+		queryId = INSERT_QUERYID(pstmt, pstmt->queryId);
+
+	Assert(queryId);
+	saved_queryId = queryId->val;
 
 	/*
 	 * Force utility statements to get queryId zero.  We do this even in cases
@@ -1103,7 +1136,7 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 	 * only.
 	 */
 	if (pgss_enabled(exec_nested_level) && pgss_track_utility)
-		pstmt->queryId = UINT64CONST(0);
+		queryId->val = UINT64CONST(0);
 
 	/*
 	 * If it's an EXECUTE statement, we don't track it and don't increment the
@@ -1158,7 +1191,7 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 		 * freed.  We must copy everything we still need into local variables,
 		 * which we did above.
 		 *
-		 * For the same reason, we can't risk restoring pstmt->queryId to its
+		 * For the same reason, we can't risk restoring queryId to its
 		 * former value, which'd otherwise be a good idea.
 		 */
 

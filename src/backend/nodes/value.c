@@ -29,6 +29,18 @@ makeInteger(int i)
 }
 
 /*
+ *	makeInteger
+ */
+Bigint *
+makeBigint(int64 i)
+{
+	Bigint    *v = makeNode(Bigint);
+
+	v->val = i;
+	return v;
+}
+
+/*
  *	makeFloat
  *
  * Caller is responsible for passing a palloc'd string.

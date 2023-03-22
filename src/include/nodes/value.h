@@ -33,6 +33,14 @@ typedef struct Integer
 	int			ival;
 } Integer;
 
+typedef struct Bigint
+{
+	pg_node_attr(special_read_write)
+
+	NodeTag		type;
+	int64		val;
+} Bigint;
+
 /*
  * Float is internally represented as string.  Using T_Float as the node type
  * simply indicates that the contents of the string look like a valid numeric
@@ -77,11 +85,13 @@ typedef struct BitString
 } BitString;
 
 #define intVal(v)		(castNode(Integer, v)->ival)
+#define bigintVal(v)	(castNode(Bigint, v)->val)
 #define floatVal(v)		atof(castNode(Float, v)->fval)
 #define boolVal(v)		(castNode(Boolean, v)->boolval)
 #define strVal(v)		(castNode(String, v)->sval)
 
 extern Integer *makeInteger(int i);
+extern Bigint *makeBigint(int64 i);
 extern Float *makeFloat(char *numericStr);
 extern Boolean *makeBoolean(bool val);
 extern String *makeString(char *str);

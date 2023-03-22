@@ -4232,6 +4232,12 @@ QueryRewrite(Query *parsetree)
 
 		query->queryId = input_query_id;
 
+		/*
+		 * Should we copy extension fields here? Guess no, because it could be
+		 * quite different query. Much simpler to skip these fields and allow
+		 * extensions to realize that and re-generate data if needed.
+		 */
+
 		results = lappend(results, query);
 	}
 

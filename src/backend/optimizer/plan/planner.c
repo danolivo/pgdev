@@ -517,6 +517,7 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 
 	result->commandType = parse->commandType;
 	result->queryId = parse->queryId;
+	result->ext_field = copyObject(parse->ext_field);
 	result->hasReturning = (parse->returningList != NIL);
 	result->hasModifyingCTE = parse->hasModifyingCTE;
 	result->canSetTag = parse->canSetTag;

@@ -3395,3 +3395,106 @@ read_whole_file(const char *filename, int *length)
 	buf[*length] = '\0';
 	return buf;
 }
+
+static ExtensionData *
+_initial_actions(Node *node, const char *entryname)
+{
+	ExtensionData **ext_field;
+	ExtensionData  *scanner;
+	ExtensionData  *elem = NULL;
+
+	switch (nodeTag(node))
+	{
+		case T_Query:
+			ext_field = &((Query *) node)->ext_field;
+			break;
+		case T_PlannedStmt:
+			ext_field = &((PlannedStmt *) node)->ext_field;
+			break;
+		default:
+			/* TODO: use ereport */
+			elog(ERROR, "Unexpected node type: %d", nodeTag(node));
+	}
+
+	Assert(strlen(entryname) > 0);
+#ifdef USE_ASSERT_CHECKING
+	{
+		const char *c;
+		/* check name doesn't contain escapable symbols */
+		for (c = entryname; *c; c++)
+			Assert(isgraph(*c) && strchr("(){}\\\"", *c) == NULL);
+	}
+#endif
+
+	/* Check existing entry */
+	for (scanner = *ext_field; scanner != NULL; scanner = scanner->next)
+	{
+		if (strcmp(scanner->name, entryname) == 0)
+		{
+				elem = scanner;
+				break;
+		}
+	}
+
+	if (elem == NULL)
+	{
+		elem = makeNode(ExtensionData);
+		elem->next = *ext_field;
+		elem->name = pstrdup(entryname);
+		*ext_field = elem;
+	}
+
+	return elem;
+}
+
+Node *
+AddExtensionDataToNode(Node *node, const char *entryname, const Node *data,
+					   bool noCopy)
+{
+	MemoryContext	destCtx = GetMemoryChunkContext(node);
+	MemoryContext	oldctx;
+	ExtensionData  *elem;
+
+	/* Safely store in the Query memory context */
+	oldctx = MemoryContextSwitchTo(destCtx);
+
+	elem = _initial_actions(node, entryname);
+	elem->node = (Node *) (noCopy ? data : copyObject(data));
+
+	MemoryContextSwitchTo(oldctx);
+
+#ifdef USE_ASSERT_CHECKING
+	if (noCopy)
+	{
+		/* brute check val is copyable */
+		MemoryContext tmpctx;
+
+		tmpctx = AllocSetContextCreate(CurrentMemoryContext,
+									   "assert_checking",
+									   ALLOCSET_DEFAULT_SIZES);
+		oldctx = MemoryContextSwitchTo(tmpctx);
+		(void) copyObject(data);
+		MemoryContextSwitchTo(oldctx);
+		MemoryContextDelete(tmpctx);
+	}
+#endif
+
+	return elem->node;
+}
+
+/*
+ * Return the node, stored in extended area of Query or PlannedStmt or
+ * NULL, if not found.
+ */
+Node *
+GetExtensionData(ExtensionData *extdata, const char *entryname)
+{
+	while (extdata != NULL)
+	{
+		if (strcmp(entryname, extdata->name) == 0)
+			return extdata->node;
+
+		extdata = extdata->next;
+	}
+	return NULL;
+}

@@ -101,6 +101,8 @@ typedef struct PlannedStmt
 	/* statement location in source string (copied from Query) */
 	int			stmt_location;	/* start location, or -1 if unknown */
 	int			stmt_len;		/* length in bytes; 0 means "rest of string" */
+
+	ExtensionData *ext_field  pg_node_attr(query_jumble_ignore, read_write_ignore, equal_ignore, read_as(NULL));
 } PlannedStmt;
 
 /* macro for fetching the Plan associated with a SubPlan node */

@@ -101,6 +101,27 @@ typedef uint64 AclMode;			/* a bitmask of privilege bits */
 #define ACL_SELECT_FOR_UPDATE	ACL_UPDATE
 
 
+/*
+ * Structure definition should be hidden from an user, but current serialization
+ * techniques make it impossible.
+ * XXX: Instead of name, maybe better to invent some unique id for each loaded
+ * library, according to the position in file_list, as an example?
+ */
+typedef struct ExtensionData
+{
+	/*
+	 * Don't allow reading the field (remember, extension may be dynamically
+	 * loaded into a backend. Parallel workers still don't need it.
+	 * Allow writing it for debug purposes.
+	 */
+	pg_node_attr(no_equal, no_read, no_query_jumble)
+
+	NodeTag					type;
+	char				   *name;
+	Node				   *node;
+	struct ExtensionData   *next;
+} ExtensionData;
+
 /*****************************************************************************
  *	Query Tree
  *****************************************************************************/
@@ -236,6 +257,8 @@ typedef struct Query
 	int			stmt_location;
 	/* length in bytes; 0 means "rest of string" */
 	int			stmt_len pg_node_attr(query_jumble_ignore);
+
+	ExtensionData *ext_field pg_node_attr(query_jumble_ignore, read_write_ignore, equal_ignore, read_as(NULL));
 } Query;
 
 

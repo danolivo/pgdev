@@ -823,6 +823,7 @@ pg_rewrite_query(Query *query)
 			 * here to avoid breaking pg_stat_statements.
 			 */
 			new_query->queryId = curr_query->queryId;
+			new_query->ext_field = copyObject(curr_query->ext_field);
 
 			new_list = lappend(new_list, new_query);
 			pfree(str);
@@ -956,6 +957,7 @@ pg_plan_queries(List *querytrees, const char *query_string, int cursorOptions,
 			stmt->stmt_location = query->stmt_location;
 			stmt->stmt_len = query->stmt_len;
 			stmt->queryId = query->queryId;
+			stmt->ext_field = copyObject(query->ext_field);
 		}
 		else
 		{

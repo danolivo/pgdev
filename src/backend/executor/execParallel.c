@@ -176,6 +176,7 @@ ExecSerializePlan(Plan *plan, EState *estate)
 	pstmt = makeNode(PlannedStmt);
 	pstmt->commandType = CMD_SELECT;
 	pstmt->queryId = pgstat_get_my_query_id();
+	/* What about Extension nodes here? */
 	pstmt->hasReturning = false;
 	pstmt->hasModifyingCTE = false;
 	pstmt->canSetTag = true;
