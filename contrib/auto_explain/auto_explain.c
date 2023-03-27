@@ -19,13 +19,16 @@
 #include "common/pg_prng.h"
 #include "executor/instrument.h"
 #include "jit/jit.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/params.h"
+#include "optimizer/optimizer.h"
 #include "utils/guc.h"
 
 PG_MODULE_MAGIC;
 
 /* GUC variables */
 static int	auto_explain_log_min_duration = -1; /* msec or -1 */
+static double auto_explain_log_min_error = -1;
 static int	auto_explain_log_parameter_max_length = -1; /* bytes or -1 */
 static bool auto_explain_log_analyze = false;
 static bool auto_explain_log_verbose = false;
@@ -68,7 +71,7 @@ static int	nesting_level = 0;
 static bool current_query_sampled = false;
 
 #define auto_explain_enabled() \
-	(auto_explain_log_min_duration >= 0 && \
+	((auto_explain_log_min_duration >= 0 || auto_explain_log_min_error >= 0) && \
 	 (nesting_level == 0 || auto_explain_log_nested_statements) && \
 	 current_query_sampled)
 
@@ -104,6 +107,18 @@ _PG_init(void)
 							NULL,
 							NULL,
 							NULL);
+
+	DefineCustomRealVariable("auto_explain.log_min_error",
+							 "Sets the minimum planning error above which plans will be logged.",
+							 "Zero prints all plans. -1 turns this feature off.",
+							 &auto_explain_log_min_error,
+							 -1,
+							 -1, INT_MAX, /* Looks like so huge error, as INT_MAX don't make a sense */
+							 PGC_SUSET,
+							 GUC_UNIT_MS,
+							 NULL,
+							 NULL,
+							 NULL);
 
 	DefineCustomIntVariable("auto_explain.log_parameter_max_length",
 							"Sets the maximum length of query parameters to log.",
@@ -273,7 +288,8 @@ explain_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	 */
 	if (nesting_level == 0)
 	{
-		if (auto_explain_log_min_duration >= 0 && !IsParallelWorker())
+		if ((auto_explain_log_min_duration >= 0 || auto_explain_log_min_error >= 0)
+			&& !IsParallelWorker())
 			current_query_sampled = (pg_prng_double(&pg_global_prng_state) < auto_explain_sample_rate);
 		else
 			current_query_sampled = false;
@@ -281,6 +297,10 @@ explain_ExecutorStart(QueryDesc *queryDesc, int eflags)
 
 	if (auto_explain_enabled())
 	{
+		if (auto_explain_log_min_error >= 0 &&
+			(eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
+			queryDesc->instrument_options |= INSTRUMENT_TIMER;
+
 		/* Enable per-node instrumentation iff log_analyze is required. */
 		if (auto_explain_log_analyze && (eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
 		{
@@ -361,6 +381,105 @@ explain_ExecutorFinish(QueryDesc *queryDesc)
 	PG_END_TRY();
 }
 
+typedef struct scour_context
+{
+	double	error;
+	double	totaltime;
+	int		nnodes;
+} scour_context;
+
+static bool
+prediction_walker(PlanState *pstate, void *context)
+{
+	double			plan_rows,
+					real_rows = 0;
+	scour_context  *ctx = (scour_context *) context;
+	bool			is_finished = pstate->instrument->finished;
+	double			relative_time;
+
+	if (pstate->instrument->nloops == 0.0)
+		/* Skip 'never executed' case */
+		goto go_further;
+
+	/*
+	 * Calculate number of rows predicted by the optimizer and really passed
+	 * through the node. This simplistic code becomes a bit tricky in the case
+	 * of parallel workers.
+	 */
+	if (pstate->worker_instrument)
+	{
+		double	wnloops = 0.;
+		double	wntuples = 0.;
+		double	divisor = pstate->worker_instrument->num_workers;
+		double	leader_contribution;
+		int i;
+
+		/* XXX: Copy-pasted from the get_parallel_divisor() */
+		leader_contribution = 1.0 - (0.3 * divisor);
+		if (leader_contribution > 0)
+			divisor += leader_contribution;
+		plan_rows = pstate->plan->plan_rows * divisor;
+
+		for (i = 0; i < pstate->worker_instrument->num_workers; i++)
+		{
+			double t = pstate->worker_instrument->instrument[i].ntuples;
+			double l = pstate->worker_instrument->instrument[i].nloops;
+
+			if (l <= 0.0)
+				/* Again, a 'never executed' case */
+				goto go_further;
+
+			if (pstate->worker_instrument->instrument[i].finished == TS_IN_ACTION)
+				is_finished = false;
+
+			wntuples += t;
+			wnloops += l;
+			real_rows += t/l;
+		}
+
+		Assert(pstate->instrument->nloops >= wnloops);
+		Assert(pstate->instrument->ntuples >= wntuples);
+		if (pstate->instrument->nloops - wnloops > 0.0)
+			real_rows += (pstate->instrument->ntuples - wntuples) /
+								(pstate->instrument->nloops - wnloops);
+	}
+	else
+	{
+		plan_rows = pstate->plan->plan_rows;
+		real_rows = pstate->instrument->ntuples / pstate->instrument->nloops;
+	}
+
+	plan_rows = clamp_row_est(plan_rows);
+	real_rows = clamp_row_est(real_rows);
+
+	/* Skip 'Early Terminated' case, if no useful information can be gathered */
+	if (!is_finished && real_rows < plan_rows)
+		goto go_further;
+
+	/*
+	 * Now, we can calculate a value of the estimation relative error has made
+	 * by the optimizer.
+	 */
+	Assert(pstate->instrument->total > 0);
+	relative_time = pstate->instrument->total / ctx->totaltime;
+	ctx->error += fabs(real_rows - plan_rows) * relative_time / plan_rows;
+	ctx->nnodes++;
+
+go_further:
+	planstate_tree_walker(pstate, prediction_walker, context);
+	return false;
+}
+
+static double
+scour_prediction_underestimation(PlanState *pstate, double totaltime)
+{
+	scour_context	ctx = {.error = 0, .totaltime = totaltime, .nnodes = 0};
+
+	Assert(totaltime > 0);
+	prediction_walker(pstate, (void *) &ctx);
+	return (ctx.nnodes > 0) ? ctx.error / ctx.nnodes : -1.0;
+}
+
 /*
  * ExecutorEnd hook: log results if needed
  */
@@ -371,6 +490,7 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 	{
 		MemoryContext oldcxt;
 		double		msec;
+		double		normalized_error = -1.0;
 
 		/*
 		 * Make sure we operate in the per-query context, so any cruft will be
@@ -384,13 +504,22 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 		 */
 		InstrEndLoop(queryDesc->totaltime);
 
+		if (!(queryDesc->estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY))
+			normalized_error = scour_prediction_underestimation(
+												queryDesc->planstate,
+												queryDesc->totaltime->total);
+
 		/* Log plan if duration is exceeded. */
 		msec = queryDesc->totaltime->total * 1000.0;
-		if (msec >= auto_explain_log_min_duration)
+		if ((auto_explain_log_min_duration >= 0 &&
+			msec >= auto_explain_log_min_duration) ||
+			(auto_explain_log_min_error >= 0 &&
+			normalized_error >= auto_explain_log_min_error))
 		{
 			ExplainState *es = NewExplainState();
 
-			es->analyze = (queryDesc->instrument_options && auto_explain_log_analyze);
+			es->analyze = (queryDesc->instrument_options &&
+				(auto_explain_log_analyze || auto_explain_log_min_error >= 0.0));
 			es->verbose = auto_explain_log_verbose;
 			es->buffers = (es->analyze && auto_explain_log_buffers);
 			es->wal = (es->analyze && auto_explain_log_wal);
@@ -427,8 +556,8 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 			 * often result in duplication.
 			 */
 			ereport(auto_explain_log_level,
-					(errmsg("duration: %.3f ms  plan:\n%s",
-							msec, es->str->data),
+					(errmsg("duration: %.3f ms, relative error: %.4lf  plan:\n%s",
+							msec, normalized_error, es->str->data),
 					 errhidestmt(true)));
 		}
 
