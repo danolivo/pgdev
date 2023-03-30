@@ -3396,8 +3396,53 @@ read_whole_file(const char *filename, int *length)
 	return buf;
 }
 
+#define EXTDATA_ENTRIES_NUM	(64)
+
+/*
+ * Storage for registered ExtensionData entries.
+ * Most common use case should be - registering one entry on extension startup.
+ * It would be better to store complex structures as a node tree in single
+ * extension entry, because it can affect performance and the extension only
+ * knows its data and should be responsible for additional overhead.
+ * So, we need quite limited number of entries.
+ */
+struct
+{
+	char *label;
+} ExtensionDataEntries [EXTDATA_ENTRIES_NUM] = {0};
+
+int
+RegisterExtensionDataEntry(const char *label)
+{
+	int num;
+
+	for (num = 0; num < EXTDATA_ENTRIES_NUM; num++)
+	{
+		MemoryContext oldmemctx;
+
+		if (ExtensionDataEntries[num].label != NULL)
+			continue;
+
+		oldmemctx = MemoryContextSwitchTo(TopMemoryContext);
+		ExtensionDataEntries[num].label = pstrdup(label);
+		MemoryContextSwitchTo(oldmemctx);
+		break;
+	}
+
+	return (num < EXTDATA_ENTRIES_NUM) ? num : -1;
+}
+
+void
+UnRegisterExtensionDataEntry(int num)
+{
+	if (ExtensionDataEntries[num].label == NULL)
+		elog(ERROR, "Extension data entry already freed");
+
+	pfree(ExtensionDataEntries[num].label);
+}
+
 static ExtensionData *
-_initial_actions(Node *node, const char *entryname)
+_initial_actions(Node *node, int entryId)
 {
 	ExtensionData **ext_field;
 	ExtensionData  *scanner;
@@ -3417,19 +3462,13 @@ _initial_actions(Node *node, const char *entryname)
 	}
 
 	Assert(strlen(entryname) > 0);
-#ifdef USE_ASSERT_CHECKING
-	{
-		const char *c;
-		/* check name doesn't contain escapable symbols */
-		for (c = entryname; *c; c++)
-			Assert(isgraph(*c) && strchr("(){}\\\"", *c) == NULL);
-	}
-#endif
+	Assert(entryId >= 0 && entryId < EXTDATA_ENTRIES_NUM &&
+		   ExtensionDataEntries[entryId].label != NULL);
 
 	/* Check existing entry */
 	for (scanner = *ext_field; scanner != NULL; scanner = scanner->next)
 	{
-		if (strcmp(scanner->name, entryname) == 0)
+		if (scanner->eid == entryId)
 		{
 				elem = scanner;
 				break;
@@ -3439,8 +3478,8 @@ _initial_actions(Node *node, const char *entryname)
 	if (elem == NULL)
 	{
 		elem = makeNode(ExtensionData);
+		elem->eid = entryId;
 		elem->next = *ext_field;
-		elem->name = pstrdup(entryname);
 		*ext_field = elem;
 	}
 
@@ -3448,7 +3487,7 @@ _initial_actions(Node *node, const char *entryname)
 }
 
 Node *
-AddExtensionDataToNode(Node *node, const char *entryname, const Node *data,
+AddExtensionDataToNode(Node *node, int entryId, const Node *data,
 					   bool noCopy)
 {
 	MemoryContext	destCtx = GetMemoryChunkContext(node);
@@ -3458,7 +3497,7 @@ AddExtensionDataToNode(Node *node, const char *entryname, const Node *data,
 	/* Safely store in the Query memory context */
 	oldctx = MemoryContextSwitchTo(destCtx);
 
-	elem = _initial_actions(node, entryname);
+	elem = _initial_actions(node, entryId);
 	elem->node = (Node *) (noCopy ? data : copyObject(data));
 
 	MemoryContextSwitchTo(oldctx);
@@ -3487,11 +3526,11 @@ AddExtensionDataToNode(Node *node, const char *entryname, const Node *data,
  * NULL, if not found.
  */
 Node *
-GetExtensionData(ExtensionData *extdata, const char *entryname)
+GetExtensionData(ExtensionData *extdata, int entryId)
 {
 	while (extdata != NULL)
 	{
-		if (strcmp(entryname, extdata->name) == 0)
+		if (extdata->eid == entryId)
 			return extdata->node;
 
 		extdata = extdata->next;

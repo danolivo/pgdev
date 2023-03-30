@@ -109,11 +109,11 @@ static const uint32 PGSS_PG_MAJOR_VERSION = PG_VERSION_NUM / 100;
 									!IsA(n, DeallocateStmt))
 
 #define GET_QUERYID(node) \
-	(Bigint *) GetExtensionData(node->ext_field, "pg_stat_statements")
+	(Bigint *) GetExtensionData(node->ext_field, extendedEntryID)
 
 #define INSERT_QUERYID(node, queryid) \
 	castNode(Bigint, AddExtensionDataToNode((Node *) node, \
-											"pg_stat_statements", \
+											extendedEntryID, \
 											(Node *) makeBigint((int64) queryid), \
 											true))
 /*
@@ -298,6 +298,7 @@ static bool pgss_track_utility = true;	/* whether to track utility commands */
 static bool pgss_track_planning = false;	/* whether to track planning
 											 * duration */
 static bool pgss_save = true;	/* whether to save stats across shutdown */
+static int extendedEntryID = -1; /* Use to add queryId into the Query struct */
 
 
 #define pgss_enabled(level) \
@@ -482,6 +483,8 @@ _PG_init(void)
 	ExecutorEnd_hook = pgss_ExecutorEnd;
 	prev_ProcessUtility = ProcessUtility_hook;
 	ProcessUtility_hook = pgss_ProcessUtility;
+
+	extendedEntryID = RegisterExtensionDataEntry("pg_stat_statements");
 }
 
 /*

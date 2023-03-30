@@ -117,7 +117,7 @@ typedef struct ExtensionData
 	pg_node_attr(no_equal, no_read, no_query_jumble)
 
 	NodeTag					type;
-	char				   *name;
+	int16					eid; /* entry id. See RegisterExtensionDataEntry */
 	Node				   *node;
 	struct ExtensionData   *next;
 } ExtensionData;

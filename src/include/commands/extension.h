@@ -53,8 +53,10 @@ extern bool extension_file_exists(const char *extensionName);
 extern ObjectAddress AlterExtensionNamespace(const char *extensionName, const char *newschema,
 											 Oid *oldschema);
 
-extern Node *AddExtensionDataToNode(Node *node, const char *entryname,
+extern int RegisterExtensionDataEntry(const char *label);
+extern void UnRegisterExtensionDataEntry(int num);
+extern Node *AddExtensionDataToNode(Node *node, int entryId,
 									const Node *data, bool noCopy);
-extern Node *GetExtensionData(ExtensionData *extdata, const char *entryname);
+extern Node *GetExtensionData(ExtensionData *extdata, int entryId);
 
 #endif							/* EXTENSION_H */
