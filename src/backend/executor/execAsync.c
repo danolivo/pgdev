@@ -89,7 +89,7 @@ ExecAsyncNotify(AsyncRequest *areq)
 {
 	/* must provide our own instrumentation support */
 	if (areq->requestee->instrument)
-		InstrStartNode(areq->requestee->instrument);
+		InstrStartNodeExecution(areq->requestee->instrument);
 
 	switch (nodeTag(areq->requestee))
 	{
@@ -106,7 +106,7 @@ ExecAsyncNotify(AsyncRequest *areq)
 
 	/* must provide our own instrumentation support */
 	if (areq->requestee->instrument)
-		InstrStopNode(areq->requestee->instrument,
+		InstrStopNodeExecution(areq->requestee->instrument,
 					  TupIsNull(areq->result) ? 0.0 : 1.0);
 }
 

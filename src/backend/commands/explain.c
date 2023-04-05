@@ -1654,6 +1654,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		double		total_ms = 1000.0 * planstate->instrument->total / nloops;
 		double		rows = planstate->instrument->ntuples / nloops;
 
+		Assert(planstate->instrument->finished >= TS_NOT_APPLICABLE &&
+			   planstate->instrument->finished <= TS_LOOP_FINISHED);
+
 		if (es->format == EXPLAIN_FORMAT_TEXT)
 		{
 			if (es->timing)
@@ -1664,6 +1667,16 @@ ExplainNode(PlanState *planstate, List *ancestors,
 				appendStringInfo(es->str,
 								 " (actual rows=%.0f loops=%.0f)",
 								 rows, nloops);
+
+			if (es->verbose)
+			{
+				if (planstate->instrument->finished == TS_IN_ACTION)
+					appendStringInfoString(es->str, " (early terminated)");
+				else
+				{
+					/* Don't make a noise in a common case */
+				}
+			}
 		}
 		else
 		{
@@ -1676,6 +1689,17 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			}
 			ExplainPropertyFloat("Actual Rows", NULL, rows, 0, es);
 			ExplainPropertyFloat("Actual Loops", NULL, nloops, 0, es);
+
+			if (es->verbose)
+			{
+				if (planstate->instrument->finished == TS_IN_ACTION)
+					ExplainPropertyText("Termination Status",
+										"early terminated", es);
+				else
+				{
+					/* Don't make a noise in a common case */
+				}
+			}
 		}
 	}
 	else if (es->analyze)

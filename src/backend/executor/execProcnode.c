@@ -475,11 +475,11 @@ ExecProcNodeInstr(PlanState *node)
 {
 	TupleTableSlot *result;
 
-	InstrStartNode(node->instrument);
+	InstrStartNodeExecution(node->instrument);
 
 	result = node->ExecProcNodeReal(node);
 
-	InstrStopNode(node->instrument, TupIsNull(result) ? 0.0 : 1.0);
+	InstrStopNodeExecution(node->instrument, TupIsNull(result) ? 0.0 : 1.0);
 
 	return result;
 }

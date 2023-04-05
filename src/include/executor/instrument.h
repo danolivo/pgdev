@@ -63,6 +63,13 @@ typedef enum InstrumentOption
 	INSTRUMENT_ALL = PG_INT32_MAX
 } InstrumentOption;
 
+typedef enum TermStatus
+{
+	TS_NOT_APPLICABLE = 0, /* Can be used by some analyzing tools, to skip such a node */
+	TS_IN_ACTION,
+	TS_LOOP_FINISHED
+} TermStatus;
+
 typedef struct Instrumentation
 {
 	/* Parameters set at node creation: */
@@ -72,6 +79,7 @@ typedef struct Instrumentation
 	bool		async_mode;		/* true if node is in async mode */
 	/* Info about current plan cycle: */
 	bool		running;		/* true if we've completed first tuple */
+	TermStatus	finished;		/* true, if we have finished loop of the node scanning */
 	instr_time	starttime;		/* start time of current iteration of node */
 	instr_time	counter;		/* accumulated runtime for this node */
 	double		firsttuple;		/* time for first tuple of this cycle */
@@ -98,6 +106,22 @@ typedef struct WorkerInstrumentation
 
 extern PGDLLIMPORT BufferUsage pgBufferUsage;
 extern PGDLLIMPORT WalUsage pgWalUsage;
+
+/*
+ * Just to reduce invasiveness of solution.
+ */
+ #define InstrStartNodeExecution(instr) \
+	{ \
+		InstrStartNode(instr); \
+		instr->finished = TS_IN_ACTION; \
+	}
+
+#define InstrStopNodeExecution(instr, ntuples) \
+	{ \
+		InstrStopNode(instr, ntuples); \
+		if (!instr->async_mode && (ntuples) < 1.0) \
+			instr->finished = TS_LOOP_FINISHED; \
+	}
 
 extern Instrumentation *InstrAlloc(int n, int instrument_options,
 								   bool async_mode);
