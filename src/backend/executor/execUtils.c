@@ -1438,8 +1438,11 @@ prediction_walker(PlanState *pstate, void *context)
 	bool			is_finished = pstate->instrument->finished;
 	double			relative_time;
 
-	if (pstate->instrument->nloops == 0.0)
-		/* Skip 'never executed' case */
+	if (pstate->instrument->nloops == 0.0 || pstate->instrument->total == 0.0)
+		/*
+		 * Skip 'never executed' case and the case of manual switching off of
+		 * the timing instrumentation
+		 */
 		goto go_further;
 
 	/*

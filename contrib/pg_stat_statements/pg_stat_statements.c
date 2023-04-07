@@ -84,7 +84,7 @@ PG_MODULE_MAGIC;
 #define PGSS_TEXT_FILE	PG_STAT_TMP_DIR "/pgss_query_texts.stat"
 
 /* Magic number identifying the stats file format */
-static const uint32 PGSS_FILE_HEADER = 0x20220408;
+static const uint32 PGSS_FILE_HEADER = 0x20230407;
 
 /* PostgreSQL major version number, changes in which invalidate all entries */
 static const uint32 PGSS_PG_MAJOR_VERSION = PG_VERSION_NUM / 100;
@@ -118,7 +118,8 @@ typedef enum pgssVersion
 	PGSS_V1_3,
 	PGSS_V1_8,
 	PGSS_V1_9,
-	PGSS_V1_10
+	PGSS_V1_10,
+	PGSS_V1_11
 } pgssVersion;
 
 typedef enum pgssStoreKind
@@ -200,6 +201,11 @@ typedef struct Counters
 	int64		jit_emission_count; /* number of times emission time has been
 									 * > 0 */
 	double		jit_emission_time;	/* total time to emit jit code */
+
+	double		min_error;
+	double		max_error;
+	double		mean_error;
+	double		error_counter;
 } Counters;
 
 /*
@@ -288,6 +294,7 @@ static int	pgss_track = PGSS_TRACK_TOP;	/* tracking level */
 static bool pgss_track_utility = true;	/* whether to track utility commands */
 static bool pgss_track_planning = false;	/* whether to track planning
 											 * duration */
+static bool pgss_track_estimation_error = true;	/* whether to track relative error of estimation */
 static bool pgss_save = true;	/* whether to save stats across shutdown */
 
 
@@ -313,6 +320,7 @@ PG_FUNCTION_INFO_V1(pg_stat_statements_1_3);
 PG_FUNCTION_INFO_V1(pg_stat_statements_1_8);
 PG_FUNCTION_INFO_V1(pg_stat_statements_1_9);
 PG_FUNCTION_INFO_V1(pg_stat_statements_1_10);
+PG_FUNCTION_INFO_V1(pg_stat_statements_1_11);
 PG_FUNCTION_INFO_V1(pg_stat_statements);
 PG_FUNCTION_INFO_V1(pg_stat_statements_info);
 
@@ -343,7 +351,7 @@ static void pgss_store(const char *query, uint64 queryId,
 					   const BufferUsage *bufusage,
 					   const WalUsage *walusage,
 					   const struct JitInstrumentation *jitusage,
-					   JumbleState *jstate);
+					   JumbleState *jstate, double normalized_error);
 static void pg_stat_statements_internal(FunctionCallInfo fcinfo,
 										pgssVersion api_version,
 										bool showtext);
@@ -433,6 +441,17 @@ _PG_init(void)
 							 NULL,
 							 &pgss_track_planning,
 							 false,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("pg_stat_statements.track_estimation_error",
+							 "Selects whether estimation errors of the planner is tracked by pg_stat_statements.",
+							 NULL,
+							 &pgss_track_estimation_error,
+							 true,
 							 PGC_SUSET,
 							 0,
 							 NULL,
@@ -860,7 +879,8 @@ pgss_post_parse_analyze(ParseState *pstate, Query *query, JumbleState *jstate)
 				   NULL,
 				   NULL,
 				   NULL,
-				   jstate);
+				   jstate,
+				   -1);
 }
 
 /*
@@ -945,7 +965,8 @@ pgss_planner(Query *parse,
 				   &bufusage,
 				   &walusage,
 				   NULL,
-				   NULL);
+				   NULL,
+				   -1);
 	}
 	else
 	{
@@ -978,6 +999,11 @@ pgss_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	 */
 	if (pgss_enabled(exec_nested_level) && queryDesc->plannedstmt->queryId != UINT64CONST(0))
 	{
+		/* Enable instrumentation, if needed */
+		if (pgss_track_estimation_error &&
+			(eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
+			queryDesc->instrument_options |= INSTRUMENT_TIMER;
+
 		/*
 		 * Set up to track total elapsed time in ExecutorRun.  Make sure the
 		 * space is allocated in the per-query context so it will go away at
@@ -1048,11 +1074,19 @@ pgss_ExecutorEnd(QueryDesc *queryDesc)
 	if (queryId != UINT64CONST(0) && queryDesc->totaltime &&
 		pgss_enabled(exec_nested_level))
 	{
+		double normalized_error = -1.0;
+
 		/*
 		 * Make sure stats accumulation is done.  (Note: it's okay if several
 		 * levels of hook all do this.)
 		 */
 		InstrEndLoop(queryDesc->totaltime);
+
+		if (queryDesc->planstate->instrument &&
+			queryDesc->instrument_options & INSTRUMENT_TIMER)
+			normalized_error = scour_prediction_underestimation(
+												queryDesc->planstate,
+												queryDesc->totaltime->total);
 
 		pgss_store(queryDesc->sourceText,
 				   queryId,
@@ -1064,7 +1098,8 @@ pgss_ExecutorEnd(QueryDesc *queryDesc)
 				   &queryDesc->totaltime->bufusage,
 				   &queryDesc->totaltime->walusage,
 				   queryDesc->estate->es_jit ? &queryDesc->estate->es_jit->instr : NULL,
-				   NULL);
+				   NULL,
+				   normalized_error);
 	}
 
 	if (prev_ExecutorEnd)
@@ -1194,7 +1229,8 @@ pgss_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 				   &bufusage,
 				   &walusage,
 				   NULL,
-				   NULL);
+				   NULL,
+				   -1);
 	}
 	else
 	{
@@ -1228,7 +1264,7 @@ pgss_store(const char *query, uint64 queryId,
 		   const BufferUsage *bufusage,
 		   const WalUsage *walusage,
 		   const struct JitInstrumentation *jitusage,
-		   JumbleState *jstate)
+		   JumbleState *jstate, double normalized_error)
 {
 	pgssHashKey key;
 	pgssEntry  *entry;
@@ -1358,6 +1394,21 @@ pgss_store(const char *query, uint64 queryId,
 			e->counters.min_time[kind] = total_time;
 			e->counters.max_time[kind] = total_time;
 			e->counters.mean_time[kind] = total_time;
+
+			if (normalized_error >= 0)
+			{
+				e->counters.min_error = normalized_error;
+				e->counters.max_error = normalized_error;
+				e->counters.mean_error = normalized_error;
+				e->counters.error_counter = 1;
+			}
+			else
+			{
+				e->counters.min_error = -1;
+				e->counters.max_error = -1;
+				e->counters.mean_error = -1;
+				e->counters.error_counter = 0;
+			}
 		}
 		else
 		{
@@ -1377,6 +1428,29 @@ pgss_store(const char *query, uint64 queryId,
 				e->counters.min_time[kind] = total_time;
 			if (e->counters.max_time[kind] < total_time)
 				e->counters.max_time[kind] = total_time;
+
+			/*
+			 * Error can't be calculated for some queries. Also, some stranger
+			 * queries can fall into the class occasionally.
+			 * We embrace such cases just to not deface a value of the
+			 * estimation error.
+			 */
+			if (normalized_error >= 0)
+			{
+				/* Calculate mean error */
+				e->counters.error_counter++;
+				old_mean = e->counters.mean_error;
+				e->counters.mean_error +=
+						(normalized_error - old_mean) / e->counters.mean_error;
+
+				/* calculate min and max error */
+				if (e->counters.min_error < 0 ||
+					e->counters.min_error > normalized_error)
+					e->counters.min_error = normalized_error;
+				if (e->counters.max_error < 0 ||
+					e->counters.max_error < normalized_error)
+					e->counters.max_error = normalized_error;
+			}
 		}
 		e->counters.rows += rows;
 		e->counters.shared_blks_hit += bufusage->shared_blks_hit;
@@ -1464,7 +1538,8 @@ pg_stat_statements_reset(PG_FUNCTION_ARGS)
 #define PG_STAT_STATEMENTS_COLS_V1_8	32
 #define PG_STAT_STATEMENTS_COLS_V1_9	33
 #define PG_STAT_STATEMENTS_COLS_V1_10	43
-#define PG_STAT_STATEMENTS_COLS			43	/* maximum of above */
+#define PG_STAT_STATEMENTS_COLS_V1_11	46
+#define PG_STAT_STATEMENTS_COLS			46	/* maximum of above */
 
 /*
  * Retrieve statement statistics.
@@ -1476,6 +1551,16 @@ pg_stat_statements_reset(PG_FUNCTION_ARGS)
  * expected API version is identified by embedding it in the C name of the
  * function.  Unfortunately we weren't bright enough to do that for 1.1.
  */
+Datum
+pg_stat_statements_1_11(PG_FUNCTION_ARGS)
+{
+	bool		showtext = PG_GETARG_BOOL(0);
+
+	pg_stat_statements_internal(fcinfo, PGSS_V1_11, showtext);
+
+	return (Datum) 0;
+}
+
 Datum
 pg_stat_statements_1_10(PG_FUNCTION_ARGS)
 {
@@ -1604,6 +1689,10 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 			break;
 		case PG_STAT_STATEMENTS_COLS_V1_10:
 			if (api_version != PGSS_V1_10)
+				elog(ERROR, "incorrect number of output arguments");
+			break;
+		case PG_STAT_STATEMENTS_COLS_V1_11:
+			if (api_version != PGSS_V1_11)
 				elog(ERROR, "incorrect number of output arguments");
 			break;
 		default:
@@ -1838,6 +1927,12 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 			values[i++] = Int64GetDatumFast(tmp.jit_emission_count);
 			values[i++] = Float8GetDatumFast(tmp.jit_emission_time);
 		}
+		if (api_version >= PGSS_V1_11)
+		{
+			values[i++] = Float8GetDatumFast(tmp.min_error);
+			values[i++] = Float8GetDatumFast(tmp.max_error);
+			values[i++] = Float8GetDatumFast(tmp.mean_error);
+		}
 
 		Assert(i == (api_version == PGSS_V1_0 ? PG_STAT_STATEMENTS_COLS_V1_0 :
 					 api_version == PGSS_V1_1 ? PG_STAT_STATEMENTS_COLS_V1_1 :
@@ -1846,6 +1941,7 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 					 api_version == PGSS_V1_8 ? PG_STAT_STATEMENTS_COLS_V1_8 :
 					 api_version == PGSS_V1_9 ? PG_STAT_STATEMENTS_COLS_V1_9 :
 					 api_version == PGSS_V1_10 ? PG_STAT_STATEMENTS_COLS_V1_10 :
+					 api_version == PGSS_V1_11 ? PG_STAT_STATEMENTS_COLS_V1_11 :
 					 -1 /* fail if you forget to update this assert */ ));
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
