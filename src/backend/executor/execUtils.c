@@ -57,6 +57,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/optimizer.h"
 #include "parser/parsetree.h"
 #include "parser/parse_relation.h"
 #include "partitioning/partdesc.h"
@@ -1419,4 +1420,103 @@ ExecGetResultRelCheckAsUser(ResultRelInfo *relInfo, EState *estate)
 			 RelationGetRelid(relInfo->ri_RelationDesc));
 
 	return perminfo->checkAsUser ? perminfo->checkAsUser : GetUserId();
+}
+
+typedef struct scour_context
+{
+	double	error;
+	double	totaltime;
+	int		nnodes;
+} scour_context;
+
+static bool
+prediction_walker(PlanState *pstate, void *context)
+{
+	double			plan_rows,
+					real_rows = 0;
+	scour_context  *ctx = (scour_context *) context;
+	bool			is_finished = pstate->instrument->finished;
+	double			relative_time;
+
+	if (pstate->instrument->nloops == 0.0)
+		/* Skip 'never executed' case */
+		goto go_further;
+
+	/*
+	 * Calculate number of rows predicted by the optimizer and really passed
+	 * through the node. This simplistic code becomes a bit tricky in the case
+	 * of parallel workers.
+	 */
+	if (pstate->worker_instrument)
+	{
+		double	wnloops = 0.;
+		double	wntuples = 0.;
+		double	divisor = pstate->worker_instrument->num_workers;
+		double	leader_contribution;
+		int i;
+
+		/* XXX: Copy-pasted from the get_parallel_divisor() */
+		leader_contribution = 1.0 - (0.3 * divisor);
+		if (leader_contribution > 0)
+			divisor += leader_contribution;
+		plan_rows = pstate->plan->plan_rows * divisor;
+
+		for (i = 0; i < pstate->worker_instrument->num_workers; i++)
+		{
+			double t = pstate->worker_instrument->instrument[i].ntuples;
+			double l = pstate->worker_instrument->instrument[i].nloops;
+
+			if (l <= 0.0)
+				/* Again, a 'never executed' case */
+				goto go_further;
+
+			if (pstate->worker_instrument->instrument[i].finished == TS_IN_ACTION)
+				is_finished = false;
+
+			wntuples += t;
+			wnloops += l;
+			real_rows += t/l;
+		}
+
+		Assert(pstate->instrument->nloops >= wnloops);
+		Assert(pstate->instrument->ntuples >= wntuples);
+		if (pstate->instrument->nloops - wnloops > 0.0)
+			real_rows += (pstate->instrument->ntuples - wntuples) /
+								(pstate->instrument->nloops - wnloops);
+	}
+	else
+	{
+		plan_rows = pstate->plan->plan_rows;
+		real_rows = pstate->instrument->ntuples / pstate->instrument->nloops;
+	}
+
+	plan_rows = clamp_row_est(plan_rows);
+	real_rows = clamp_row_est(real_rows);
+
+	/* Skip 'Early Terminated' case, if no useful information can be gathered */
+	if (!is_finished && real_rows < plan_rows)
+		goto go_further;
+
+	/*
+	 * Now, we can calculate a value of the estimation relative error has made
+	 * by the optimizer.
+	 */
+	Assert(pstate->instrument->total > 0);
+	relative_time = pstate->instrument->total / ctx->totaltime;
+	ctx->error += fabs(real_rows - plan_rows) * relative_time / plan_rows;
+	ctx->nnodes++;
+
+go_further:
+	planstate_tree_walker(pstate, prediction_walker, context);
+	return false;
+}
+
+double
+scour_prediction_underestimation(PlanState *pstate, double totaltime)
+{
+	scour_context	ctx = {.error = 0, .totaltime = totaltime, .nnodes = 0};
+
+	Assert(totaltime > 0);
+	prediction_walker(pstate, (void *) &ctx);
+	return (ctx.nnodes > 0) ? ctx.error / ctx.nnodes : -1.0;
 }

@@ -621,6 +621,7 @@ extern Bitmapset *ExecGetUpdatedCols(ResultRelInfo *relinfo, EState *estate);
 extern Bitmapset *ExecGetExtraUpdatedCols(ResultRelInfo *relinfo, EState *estate);
 extern Bitmapset *ExecGetAllUpdatedCols(ResultRelInfo *relinfo, EState *estate);
 
+extern double scour_prediction_underestimation(PlanState *pstate, double totaltime);
 /*
  * prototypes from functions in execIndexing.c
  */
