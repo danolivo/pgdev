@@ -45,6 +45,8 @@
 
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/parallel.h"
 #include "access/relscan.h"
 #include "access/table.h"
