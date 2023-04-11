@@ -1437,10 +1437,14 @@ prediction_walker(PlanState *pstate, void *context)
 	double			plan_rows,
 					real_rows = 0;
 	scour_context  *ctx = (scour_context *) context;
-	bool			is_finished = pstate->instrument->finished;
+	bool			is_finished = (pstate->instrument->finished != TS_IN_ACTION);
 	double			relative_time;
+	double			delta;
 
-	if (pstate->instrument->nloops == 0.0 || pstate->instrument->total == 0.0)
+	/* Finish the node before an analysis */
+	InstrEndLoop(pstate->instrument);
+
+	if (pstate->instrument->nloops <= 0.0 || pstate->instrument->total == 0.0)
 		/*
 		 * Skip 'never executed' case and the case of manual switching off of
 		 * the timing instrumentation
@@ -1472,8 +1476,13 @@ prediction_walker(PlanState *pstate, void *context)
 			double l = pstate->worker_instrument->instrument[i].nloops;
 
 			if (l <= 0.0)
-				/* Again, a 'never executed' case */
-				goto go_further;
+			{
+				/*
+				 * Worker could start but not to process any tuples just because
+				 * of laziness. Skip such a node.
+				 */
+				continue;
+			}
 
 			if (pstate->worker_instrument->instrument[i].finished == TS_IN_ACTION)
 				is_finished = false;
@@ -1497,9 +1506,15 @@ prediction_walker(PlanState *pstate, void *context)
 
 	plan_rows = clamp_row_est(plan_rows);
 	real_rows = clamp_row_est(real_rows);
+	delta = clamp_row_est(fabs(real_rows - plan_rows));
 
 	/* Skip 'Early Terminated' case, if no useful information can be gathered */
 	if (!is_finished && real_rows < plan_rows)
+		/*
+		 * In the case, when instrumentation is in NOT APPLICABLE state, we
+		 * still use its data because MultiExec nodes finish the job in one
+		 * execution call.
+		 */
 		goto go_further;
 
 	/*
@@ -1507,8 +1522,8 @@ prediction_walker(PlanState *pstate, void *context)
 	 * by the optimizer.
 	 */
 	Assert(pstate->instrument->total > 0);
-	relative_time = pstate->instrument->total / ctx->totaltime;
-	ctx->error += fabs(real_rows - plan_rows) * relative_time / plan_rows;
+	relative_time = pstate->instrument->total / pstate->instrument->nloops / ctx->totaltime;
+	ctx->error += fabs(log(delta)) * relative_time / plan_rows;
 	ctx->nnodes++;
 
 go_further:
@@ -1523,5 +1538,5 @@ scour_prediction_underestimation(PlanState *pstate, double totaltime)
 
 	Assert(totaltime > 0);
 	prediction_walker(pstate, (void *) &ctx);
-	return (ctx.nnodes > 0) ? ctx.error / ctx.nnodes : -1.0;
+	return (ctx.nnodes > 0) ? ctx.error/* / ctx.nnodes */: -1.0;
 }
