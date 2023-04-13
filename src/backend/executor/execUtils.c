@@ -1438,10 +1438,9 @@ prediction_walker(PlanState *pstate, void *context)
 	double			plan_rows,
 					real_rows = 0;
 	scour_context  *ctx = (scour_context *) context;
-	bool			is_finished = (pstate->instrument->finished != TS_IN_ACTION);
+	bool			is_finished;
 	double			relative_time;
-	double			delta;
-	double			nloops = pstate->instrument->nloops;
+	double			nloops;
 	int				tmp_counter;
 
 	/* At first, increment the counter */
@@ -1450,8 +1449,13 @@ prediction_walker(PlanState *pstate, void *context)
 	tmp_counter = ctx->counter;
 	planstate_tree_walker(pstate, prediction_walker, context);
 
-	/* Finish the node before an analysis */
+	/*
+	 * Finish the node before an analysis. And only after that we can touch any
+	 * instrument fields.
+	 */
 	InstrEndLoop(pstate->instrument);
+	nloops = pstate->instrument->nloops;
+	is_finished = (pstate->instrument->finished != TS_IN_ACTION);
 
 	if (nloops <= 0.0 || pstate->instrument->total == 0.0)
 		/*
@@ -1500,7 +1504,8 @@ prediction_walker(PlanState *pstate, void *context)
 
 			if (tmp_counter == ctx->counter)
 				wntuples += pstate->worker_instrument->instrument[i].nfiltered1 +
-							pstate->worker_instrument->instrument[i].nfiltered2;
+							pstate->worker_instrument->instrument[i].nfiltered2 +
+							pstate->instrument->ntuples2;
 
 			wnloops += l;
 			real_rows += t/l;
@@ -1516,7 +1521,8 @@ prediction_walker(PlanState *pstate, void *context)
 			/* In leaf nodes we should get into account filtered tuples */
 			if (tmp_counter == ctx->counter)
 				ntuples += (pstate->instrument->nfiltered1 +
-												pstate->instrument->nfiltered1);
+												pstate->instrument->nfiltered2 +
+												pstate->instrument->ntuples2);
 
 			Assert(ntuples >= wntuples);
 			real_rows += (ntuples - wntuples) / (nloops - wnloops);
@@ -1530,12 +1536,12 @@ prediction_walker(PlanState *pstate, void *context)
 		/* In leaf nodes we should get into account filtered tuples */
 		if (tmp_counter == ctx->counter)
 			real_rows += (pstate->instrument->nfiltered1 +
-									pstate->instrument->nfiltered2) / nloops;
+									pstate->instrument->nfiltered2 +
+									pstate->instrument->ntuples2) / nloops;
 	}
 
 	plan_rows = clamp_row_est(plan_rows);
 	real_rows = clamp_row_est(real_rows);
-	delta = clamp_row_est(fabs(real_rows - plan_rows));
 
 	/* Skip 'Early Terminated' case, if no useful information can be gathered */
 	if (!is_finished && real_rows < plan_rows)
@@ -1550,9 +1556,11 @@ prediction_walker(PlanState *pstate, void *context)
 	 * Now, we can calculate a value of the estimation relative error has made
 	 * by the optimizer.
 	 */
-	Assert(pstate->instrument->total > 0);
-	relative_time = pstate->instrument->total / pstate->instrument->nloops / ctx->totaltime;
-	ctx->error += fabs(log(delta)) * relative_time / plan_rows;
+	Assert(pstate->instrument->total > 0.0);
+
+	relative_time = pstate->instrument->total /
+									pstate->instrument->nloops / ctx->totaltime;
+	ctx->error += fabs(log(real_rows / plan_rows)) * relative_time;
 	ctx->nnodes++;
 
 	return false;
@@ -1565,5 +1573,5 @@ scour_prediction_underestimation(PlanState *pstate, double totaltime)
 
 	Assert(totaltime > 0);
 	prediction_walker(pstate, (void *) &ctx);
-	return (ctx.nnodes > 0) ? ctx.error/* / ctx.nnodes */: -1.0;
+	return (ctx.nnodes > 0) ? ctx.error : -1.0;
 }
