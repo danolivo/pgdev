@@ -1000,7 +1000,7 @@ pgss_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	if (pgss_enabled(exec_nested_level) && queryDesc->plannedstmt->queryId != UINT64CONST(0))
 	{
 		/* Enable instrumentation, if needed */
-		if (pgss_track_estimation_error &&
+		if ((pgss_track_estimation_error && !queryDesc->plannedstmt->utilityStmt) &&
 			(eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0)
 			queryDesc->instrument_options |= INSTRUMENT_TIMER;
 
@@ -1439,9 +1439,10 @@ pgss_store(const char *query, uint64 queryId,
 			{
 				/* Calculate mean error */
 				e->counters.error_counter++;
-				old_mean = e->counters.mean_error;
+				old_mean = (e->counters.mean_error >= 0.0) ?
+												e->counters.mean_error : 0.0;
 				e->counters.mean_error +=
-						(normalized_error - old_mean) / e->counters.mean_error;
+					(normalized_error - old_mean) / e->counters.error_counter;
 
 				/* calculate min and max error */
 				if (e->counters.min_error < 0 ||
