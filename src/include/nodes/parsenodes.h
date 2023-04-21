@@ -238,7 +238,7 @@ typedef struct Query
 	/* length in bytes; 0 means "rest of string" */
 	int			stmt_len pg_node_attr(query_jumble_ignore);
 
-	char	   *replanning pg_node_attr(equal_ignore, query_jumble_ignore, read_write_ignore, read_as(0));
+	char	   *replanning pg_node_attr(copy_as_scalar, equal_ignore, query_jumble_ignore, read_write_ignore, read_as(NULL));
 } Query;
 
 

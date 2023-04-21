@@ -268,7 +268,6 @@ _jumbleNode(JumbleState *jstate, Node *node)
 		case T_XidList:
 			_jumbleList(jstate, expr);
 			break;
-
 		default:
 			/* Only a warning, since we can stumble along anyway */
 			elog(WARNING, "unrecognized node type: %d",

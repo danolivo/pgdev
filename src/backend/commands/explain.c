@@ -28,6 +28,7 @@
 #include "parser/parsetree.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/bufmgr.h"
+#include "tcop/replan.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/guc_tables.h"
@@ -574,9 +575,9 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 		eflags = EXEC_FLAG_EXPLAIN_ONLY;
 	if (into)
 		eflags |= GetIntoRelEFlags(into);
-elog(WARNING, "Start explain");
+
 	/* call ExecutorStart to prepare the plan for execution */
-	ExecutorStart(queryDesc, eflags | EXEC_FLAG_REPLAN);
+	ExecutorStart(queryDesc, eflags);
 
 	/* Execute the plan for statistics if asked for */
 	if (es->analyze)
@@ -1741,7 +1742,8 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	if (es->verbose)
 	{
 		show_plan_tlist(planstate, ancestors, es);
-		ExplainPropertyUInteger("Hash: ", NULL, plan->nodeid, es);
+		if (ShowNodeHash)
+			ExplainPropertyUInteger("Hash: ", NULL, plan->nodeid, es);
 	}
 
 	/* unique join */

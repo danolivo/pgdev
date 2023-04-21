@@ -347,6 +347,7 @@ build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 	subroot->aggtransinfos = NIL;
 
 	subroot->parse = parse = copyObject(root->parse);
+//	subroot->parse->replanning = NULL; /* ??? */
 	IncrementVarSublevelsUp((Node *) parse, 1, 1);
 
 	/* append_rel_list might contain outer Vars? */

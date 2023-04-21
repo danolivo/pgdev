@@ -547,10 +547,14 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 			break;
 	}
 
-	plan->nodeid = generate_signature(root, best_path->parent);
-	best_path->parent->hash = plan->nodeid;
+	if (root->parse->replanning != NULL)
+	{
+		plan->nodeid = generate_signature(root, best_path->parent);
+		best_path->parent->hash = plan->nodeid;
+//		elog(WARNING, "--> %lu (%d %d)", plan->nodeid, best_path->type, best_path->pathtype);
+	}
 
-//	elog(WARNING, "--> %lu (%d %d)", plan->nodeid, best_path->type, best_path->pathtype);
+
 	return plan;
 }
 

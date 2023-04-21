@@ -257,7 +257,7 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		estate->replan = true;
 	}
 	else
-		elog(WARNING, "NO_REPLAN: %d %d", eflags & EXEC_FLAG_REPLAN, queryDesc->plannedstmt->replan != NULL);
+		elog(DEBUG2, "NO_REPLAN: %d %d", eflags & EXEC_FLAG_REPLAN, queryDesc->plannedstmt->replan != NULL);
 
 	/*
 	 * Copy other important information into the EState

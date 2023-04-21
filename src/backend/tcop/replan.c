@@ -23,7 +23,8 @@
 #include "tcop/tcopprot.h"
 #include "utils/snapmgr.h"
 
-int QueryInadequateExecutionTime = 0;
+int QueryInadequateExecutionTime = -1;
+bool ShowNodeHash = false;
 
 PlannedStmt *
 try_replan(PlannedStmt *src_stmt)
@@ -35,7 +36,7 @@ try_replan(PlannedStmt *src_stmt)
 	int					cursorOptions = node->cursorOptions;
 
 	/* Attach hash table with cardinalities learned */
-	query->replanning = (char *) node;
+//	query->replanning = (char *) node;
 
 	/* Copy before the push to save original snapshot for usage on a next iteration */
 	PushActiveSnapshot(CopySnapshot(node->snapshot));
@@ -76,7 +77,7 @@ learnOnPlanState(PlanState *p, void *context)
 
 	Assert(p->instrument);
 	Assert(nodeid != UINT64_MAX);
-elog(WARNING, "Learn node1 %lu ptype: %d", nodeid, p->plan->type);
+
 	planstate_tree_walker(p, learnOnPlanState, context);
 
 	if (nodeid == 0)
@@ -123,8 +124,8 @@ elog(WARNING, "Learn node1 %lu ptype: %d", nodeid, p->plan->type);
 	{
 		entry->cardinality = clamp_row_est(cardinality);
 	}
-	elog(WARNING, "Learn node (%lu, %.1lf) (%.1lf, %.1lf, %.1lf)", entry->key.key, entry->cardinality,
-		p->plan->plan_rows, p->instrument->ntuples, p->instrument->nloops);
+//	elog(WARNING, "Learn node (%lu, %.1lf) (%.1lf, %.1lf, %.1lf)", entry->key.key, entry->cardinality,
+//		p->plan->plan_rows, p->instrument->ntuples, p->instrument->nloops);
 
 	return false;
 }
@@ -137,7 +138,7 @@ learn_partially_executed_state(PlannedStmt *stmt)
 
 	stmt = cur_stmt;
 	Assert(stmt->replan);
-elog(WARNING, "ABC");
+//elog(WARNING, "ABC");
 	replan = (ReplanningStuff *) stmt->replan;
 	state = replan->queryDesc->planstate;
 
@@ -178,7 +179,7 @@ uint8cmp(const void *a, const void *b)
 	else
 		return -1;
 }
-#include "nodes/queryjumble.h"
+
 static uint64
 extract_clauses(List *rinfos, List *reloids, List *subsigns)
 {
@@ -191,16 +192,15 @@ extract_clauses(List *rinfos, List *reloids, List *subsigns)
 	foreach(lc, rinfos)
 	{
 		RestrictInfo   *rinfo = lfirst_node(RestrictInfo, lc);
-		Expr		   *clause;
 		char		   *str;
-		JumbleState *jstate;
 
-		if (rinfo->orclause)
-			clause = rinfo->orclause;
-		else
-			clause = rinfo->clause;
-		jstate = JumbleExpr(clause);
-		str = (char *) jstate->jumble;
+		/*
+		 * Unfortunately, we can't use sort of query jumbling here. Maybe it's
+		 * a time to invent it?
+		 * XXX: Don't mind orclause here because it is the same, but with a
+		 * RestrictInfo node added on each OR expression.
+		 */
+		str = (char *) nodeToString(rinfo->clause);
 		hashes[i++] = hash_bytes_extended((const unsigned char *) str,
 										  strlen(str), 0);
 		pfree(str);
@@ -328,7 +328,7 @@ find_subsequent_rels(Path *path, RelOptInfo *prel, List **rels)
 	if (prel != path->parent)
 	{
 		/* In accordance with my current knowledge it shouldn't happen */
-		Assert(path->parent->hash != UINT64_MAX);
+//		Assert(path->parent->hash != UINT64_MAX);
 
 		*rels = lappend(*rels, (void *) &path->parent->hash);
 		return;
@@ -504,7 +504,7 @@ find_subsequent_rels(Path *path, RelOptInfo *prel, List **rels)
 uint64
 generate_signature(PlannerInfo *root, RelOptInfo *rel)
 {
-	uint64	signature;
+	uint64	signature = -1;
 	List   *relids;
 	List   *subsigns = NIL;
 	List   *rinfos = NIL;
@@ -526,9 +526,9 @@ generate_signature(PlannerInfo *root, RelOptInfo *rel)
 	 * Two or more connected path nodes implement this RelOptInfo.
 	 * TODO: in the case of bushy path tree here it will be asserted.
 	 */
-	Assert(rel->hash == UINT64_MAX || rel->hash == signature);
+//	Assert(rel->hash == UINT64_MAX || rel->hash == signature);
 
-	return signature;
+	return (signature != 0) ? signature : 1;
 }
 
 
@@ -552,15 +552,14 @@ replan_rows_estimate(PlannerInfo *root, RelOptInfo *rel)
 
 	htab = (HTAB *) replan->data;
 	if (htab == NULL)
-		elog(PANIC, "Replan htab not initialized");
+		return -3;
 
 	key.key = generate_signature(root, rel);
 
 	entry = hash_search(htab, &key, HASH_FIND, &found);
-	elog(WARNING, "Return cardinality: %lu, %d", key.key, found);
+
 	if (!found)
 		return -1;
-elog(WARNING, "Return cardinality: %.1lf", entry->cardinality);
 
 	/* Save hash value into the RelOptInfo as a sign that we've made a decision */
 	rel->hash = key.key;

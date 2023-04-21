@@ -5009,7 +5009,6 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 	}
 
 	rel->rows = clamp_row_est(nrows);
-elog(WARNING, "set_baserel_size_estimates: [%lu] - %.1lf", rel->hash, rel->rows);
 	cost_qual_eval(&rel->baserestrictcost, rel->baserestrictinfo, root);
 
 	set_rel_width(root, rel);

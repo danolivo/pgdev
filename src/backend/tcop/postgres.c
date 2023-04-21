@@ -868,45 +868,56 @@ pg_plan_query(Query *querytree, const char *query_string, int cursorOptions,
 	if (log_planner_stats)
 		ResetUsage();
 
-	if (QueryInadequateExecutionTime > 0 && querytree->commandType == CMD_SELECT &&
+	/*
+	 * Make a preliminary estimation on replanning.
+	 * We should somehow predict necessity of the replanning, because in that
+	 * case the querytree must be copied and planner must know about it to
+	 * generate/attach signatures to nodes.
+	 */
+	if (QueryInadequateExecutionTime >= 0 &&
+		querytree->commandType == CMD_SELECT &&
 		/*
-		 * So far, I just added it to avoid annoying false negatives in
-		 * regression tests. But we should invent some technique to avoid simple
-		 * queries.
+		 * So far, It is just added to avoid performance starvation on short
+		 * queries and annoying false negatives in regression tests. But we
+		 * should invent some technique to avoid simple queries.
 		 */
 		list_length(querytree->rtable) >= 1)
 	{
 		if (querytree->replanning == NULL)
 		{
-			/* Switch to TopTransactionContext later */
-			MemoryContext oldctx = MemoryContextSwitchTo(TopMemoryContext);
-elog(WARNING, "pg_plan_query: REPLAN");
-			/* Copy, because planner scribbles on parse trees */
-			node = palloc(sizeof(ReplanningStuff));
-			node->querytree = copyObject(querytree);
+			MemoryContext oldctx = MemoryContextSwitchTo(TopTransactionContext);
+
+			node = palloc0(sizeof(ReplanningStuff));
 			node->query_string = strdup(query_string);
 			node->cursorOptions = cursorOptions;
 			node->boundParams = boundParams; /* lives in long-lived memctx */
 			node->snapshot = CopySnapshot(GetActiveSnapshot()); /* snapshot for planning purposes. Do the check ActiveSnapshotSet() before? */
-			node->mctx = AllocSetContextCreate(TopMemoryContext,
-											   "ReplanningContext",
-											   ALLOCSET_DEFAULT_SIZES);
+			node->mctx = AllocSetContextCreate(TopTransactionContext,
+										   "ReplanningContext",
+										   ALLOCSET_DEFAULT_SIZES);
 			node->data = NULL;
+			elog(DEBUG2, "Optimizer: Query can be replanned on a trigger");
+
+			/* Add a sign for the planner to attach signature to each plan node */
+			querytree->replanning = (char *) node;
+
+			/* Copy, because planner scribbles on parse trees */
+			node->querytree = copyObject(querytree);
+//elog(WARNING, "-- %d %d", querytree->replanning == NULL, node->querytree->replanning == NULL);
 			MemoryContextSwitchTo(oldctx);
 		}
 		else
 			node = (ReplanningStuff *) querytree->replanning;
 	}
 	else
-	{
-		elog(WARNING, "pg_plan_query: REPLAN_DEC: %d %d",
-			querytree->commandType, list_length(querytree->rtable));
-	}
+		elog(DEBUG2, "Optimizer: avoid replanning machinery for the query %s",
+			 query_string);
 
 	/* call the optimizer */
 	plan = planner(querytree, query_string, cursorOptions, boundParams);
 
-	plan->replan = (node != NULL) ? (char *) node : NULL;
+	/* If we decided to add replanning context - do it here. */
+	plan->replan = (char *) node;
 
 	if (log_planner_stats)
 		ShowUsage("PLANNER STATISTICS");
@@ -1217,23 +1228,13 @@ exec_simple_query(const char *query_string)
 
 		scxt = CurrentMemoryContext;
 
-		/* Don't have logic for multiple stamants so far */
+		/* Don't have a logic for multiple statements so far */
 		if (list_length(plantree_list) == 1)
 		{
 			PlannedStmt *stmt = linitial_node(PlannedStmt, plantree_list);
 			allowReplan = ((stmt->replan != NULL) ? true : false);
-			if (!allowReplan)
-			{
-				if (stmt->utilityStmt && nodeTag(stmt->utilityStmt) == T_ExplainStmt)
-				{
-					allowReplan = true;
-					elog(WARNING, "Allow EXPLAIN");
-				}
-
-			}
 		}
-		if (!allowReplan)
-			elog(WARNING, "NO: %d", list_length(plantree_list));
+
 restart:
 		needRestart = false;
 		if (allowReplan)
@@ -1264,7 +1265,7 @@ PG_TRY();
 						  commandTag,
 						  plantree_list,
 						  NULL);
-elog(WARNING, "ALLOW_REPLAN: %d", allowReplan);
+
 		/*
 		 * Start the portal.  No parameters here.
 		 */
@@ -1326,10 +1327,10 @@ PG_CATCH();
 		ErrorData	   *errdata = CopyErrorData();
 
 		Assert(IsSubTransaction());
-elog(WARNING, "REPLAN1");
+
 		if (errdata->sqlerrcode == ERRCODE_INADEQUATE_QUERY_EXECUTION_TIME)
 		{
-			PlannedStmt *stmt;
+//			PlannedStmt *stmt;
 
 			Assert(qc.nprocessed <= 0);
 
@@ -1337,19 +1338,17 @@ elog(WARNING, "REPLAN1");
 			FreeErrorData(errdata);
 
 			/* Time to learn */
-			stmt = (PlannedStmt*) linitial(plantree_list);
-			elog(WARNING, "START Learning");
-			learn_partially_executed_state(stmt);
+//			stmt = (PlannedStmt*) linitial(plantree_list);
+			elog(DEBUG2, "Start learning on partially executed statement");
+//			learn_partially_executed_state(stmt);
+			/* Only for development purposes: no more replanning */
+			if (counter++ >= 3)
+				allowReplan = false;
 			RollbackAndReleaseCurrentSubTransaction();
 			/* --------------*/
 
 			/* Replannning procedure here */
-			if (stmt->commandType == CMD_SELECT)
-				plantree_list = list_make1(try_replan(stmt));
-
-			/* Only for development purposes: no more replanning */
-			if (counter++ >= 3)
-				allowReplan = false;
+//			plantree_list = list_make1(try_replan(stmt));
 			needRestart = true;
 		}
 		else

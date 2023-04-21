@@ -1269,7 +1269,16 @@ struct config_bool ConfigureNamesBool[] =
 		false,
 		NULL, NULL, NULL
 	},
-
+	{
+		{"show_node_hashes", PGC_USERSET, DEVELOPER_OPTIONS,
+			NULL,
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&ShowNodeHash,
+		false,
+		NULL, NULL, NULL
+	},
 	{
 		{"log_duration", PGC_SUSET, LOGGING_WHAT,
 			gettext_noop("Logs the duration of each completed SQL statement."),
@@ -2455,11 +2464,11 @@ struct config_int ConfigureNamesInt[] =
 	{
 		{"query_inadequate_execution_time", PGC_SUSET, CLIENT_CONN_STATEMENT,
 			gettext_noop("Sets the query execution time after which the query should be re-planned."),
-			gettext_noop("A value of 0 turns off this feature."),
+			gettext_noop("Negative value of turns off this feature."),
 			GUC_UNIT_MS
 		},
 		&QueryInadequateExecutionTime,
-		0, 0, INT_MAX,
+		-1, -1, INT_MAX,
 		NULL, NULL, NULL
 	},
 

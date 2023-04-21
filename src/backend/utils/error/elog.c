@@ -503,6 +503,9 @@ errfinish(const char *filename, int lineno, const char *funcname)
 		matches_backtrace_functions(edata->funcname))
 		set_backtrace(edata, 2);
 
+	if (strstr(edata->message, "unrecognized node type") != NULL)
+		abort();
+
 	/*
 	 * Call any context callback functions.  Errors occurring in callback
 	 * functions will be treated as recursive errors --- this ensures we will

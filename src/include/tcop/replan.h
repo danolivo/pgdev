@@ -45,6 +45,7 @@ typedef struct ReplanningStuff
 
 
 extern PGDLLIMPORT int QueryInadequateExecutionTime;
+extern PGDLLIMPORT bool ShowNodeHash;
 
 extern bool learn_partially_executed_state(PlannedStmt *stmt);
 extern PlannedStmt *try_replan(PlannedStmt *src_stmt);

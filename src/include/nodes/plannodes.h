@@ -103,8 +103,7 @@ typedef struct PlannedStmt
 	int			stmt_len;		/* length in bytes; 0 means "rest of string" */
 
 	/* Should be generalized like a list of an extended parameters */
-	char	   *replan pg_node_attr(equal_ignore, query_jumble_ignore, read_write_ignore, read_as(0));
-	char *abc;
+	char *replan pg_node_attr(copy_as_scalar, query_jumble_ignore, read_as(NULL), read_write_ignore);
 } PlannedStmt;
 
 /* macro for fetching the Plan associated with a SubPlan node */
