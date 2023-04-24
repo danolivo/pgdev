@@ -546,6 +546,35 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 			break;
 	}
 
+	if (best_path->parent->signature != 0 &&
+		best_path->parent->signature != -1)
+	{
+		bool top_path = true;
+		/*
+		 * RelOptInfo is signed. We must transfer this signature only at the top
+		 * plan node.
+		 */
+
+		if (best_path->parent->cheapest_total_path != best_path)
+		{
+			/* Rare long way */
+			if (!list_member_ptr(best_path->parent->pathlist, best_path))
+				top_path = false;
+		}
+
+		if (top_path)
+			plan->signature = best_path->parent->signature;
+		else
+			/* for DEBUG purposes: show that we have a signature but this node
+			 * is not a top node in the subtree.
+			 */
+			plan->signature = -1;
+	}
+	else
+	{
+		/* Assume, it was set to 0 by default */
+	}
+
 	return plan;
 }
 

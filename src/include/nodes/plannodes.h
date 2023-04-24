@@ -173,6 +173,8 @@ typedef struct Plan
 	 */
 	Bitmapset  *extParam;
 	Bitmapset  *allParam;
+
+	uint64		signature;
 } Plan;
 
 /* ----------------

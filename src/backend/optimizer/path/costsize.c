@@ -4980,6 +4980,90 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
 }
 
 
+
+static int
+uint8cmp(const void *a, const void *b)
+{
+	uint64		*a1 = (uint64 *) a;
+	uint64		*b1 = (uint64 *) b;
+
+	if (*a1 > *b1)
+		return 1;
+	else if (*a1 == *b1)
+		return 0;
+	else
+		return -1;
+}
+#include "common/hashfn.h"
+static uint64
+hash_clauses_relids(List *rinfos, List *reloids)
+{
+	ListCell   *lc;
+	int			nhashes = list_length(rinfos) + list_length(reloids);
+	int			nreloids = nhashes - list_length(rinfos);
+	uint64	   *hashes = palloc0(nhashes * sizeof(*hashes));
+	int			i = 0;
+	uint64		res;
+
+	foreach(lc, rinfos)
+	{
+		RestrictInfo   *rinfo = lfirst_node(RestrictInfo, lc);
+		char		   *str;
+
+		/*
+		 * Unfortunately, we can't use sort of query jumbling here. Maybe it's
+		 * a time to invent it?
+		 * XXX: Don't mind orclause here because it is the same, but with a
+		 * RestrictInfo node added on each OR expression.
+		 * XXX: remember about subplans.
+		 */
+		str = (char *) nodeToString(rinfo->clause);
+		hashes[i++] = hash_bytes_extended((const unsigned char *) str,
+										  strlen(str), 0);
+		pfree(str);
+	}
+	qsort(hashes, i, sizeof(*hashes), uint8cmp);
+
+	/* Add reloids to the list */
+	foreach(lc, reloids)
+	{
+		Oid reloid = lfirst_oid(lc);
+
+		hashes[i++] = (uint64) reloid; /* can hash this value, but not really needed so far */
+	}
+	qsort(&hashes[list_length(rinfos)], nreloids, sizeof(*hashes), uint8cmp);
+
+	res = hash_bytes_extended((const unsigned char *) hashes,
+							   nhashes * sizeof(*hashes), 0);
+
+	/* 0 - inserted in vitro, without planning. */
+	if (res == 0)
+		return 1;
+	if (res == -1)
+		return 2;
+	return res;
+}
+
+static void
+generate_baserel_signature(PlannerInfo *root, RelOptInfo *rel)
+{
+	List *relids;
+
+	Assert(rel->relid > 0);
+	switch (planner_rt_fetch(rel->relid, root)->rtekind)
+	{
+		case RTE_RELATION:
+			relids = list_make1_oid(root->simple_rte_array[rel->relid]->relid);
+			break;
+		default:
+			/* XXX: Do we make better? */
+			relids = list_make1_oid((Oid) rel->relid);
+			break;
+	}
+
+	rel->signature = hash_clauses_relids(rel->baserestrictinfo, relids);
+}
+
 /*
  * set_baserel_size_estimates
  *		Set the size estimates for the given base relation.
@@ -5001,6 +5085,7 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 	/* Should only be applied to base relations */
 	Assert(rel->relid > 0);
 
+	generate_baserel_signature(root, rel);
 	nrows = rel->tuples *
 		clauselist_selectivity(root,
 							   rel->baserestrictinfo,
