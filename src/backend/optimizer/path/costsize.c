@@ -4997,7 +4997,7 @@ set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel)
 	/* Should only be applied to base relations */
 	Assert(rel->relid > 0);
 
-	nrows = replan_rows_estimate(root, rel);
+	nrows = replan_baserel_rows_estimate(root, rel);
 	if (nrows <= 0)
 	{
 		nrows = rel->tuples *

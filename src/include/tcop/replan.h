@@ -50,7 +50,7 @@ extern PGDLLIMPORT bool ShowNodeHash;
 extern bool learn_partially_executed_state(PlannedStmt *stmt);
 extern PlannedStmt *try_replan(PlannedStmt *src_stmt);
 extern void check_replan_trigger(PlanState *node);
-extern uint64 generate_signature(PlannerInfo *root, RelOptInfo *rel);
-extern double replan_rows_estimate(PlannerInfo *root, RelOptInfo *rel);
+extern uint64 generate_baserel_signature(PlannerInfo *root, RelOptInfo *rel);
+extern double replan_baserel_rows_estimate(PlannerInfo *root, RelOptInfo *rel);
 
 #endif							/* REPLAN_H */

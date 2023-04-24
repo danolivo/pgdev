@@ -124,8 +124,6 @@ learnOnPlanState(PlanState *p, void *context)
 	{
 		entry->cardinality = clamp_row_est(cardinality);
 	}
-//	elog(WARNING, "Learn node (%lu, %.1lf) (%.1lf, %.1lf, %.1lf)", entry->key.key, entry->cardinality,
-//		p->plan->plan_rows, p->instrument->ntuples, p->instrument->nloops);
 
 	return false;
 }
@@ -138,7 +136,7 @@ learn_partially_executed_state(PlannedStmt *stmt)
 
 	stmt = cur_stmt;
 	Assert(stmt->replan);
-//elog(WARNING, "ABC");
+
 	replan = (ReplanningStuff *) stmt->replan;
 	state = replan->queryDesc->planstate;
 
@@ -501,34 +499,29 @@ find_subsequent_rels(Path *path, RelOptInfo *prel, List **rels)
 /*
  * TODO: implement subplans
  */
-uint64
-generate_signature(PlannerInfo *root, RelOptInfo *rel)
+void
+generate_baserel_signature(PlannerInfo *root, RelOptInfo *rel)
 {
 	uint64	signature = -1;
 	List   *relids;
 	List   *subsigns = NIL;
 	List   *rinfos = NIL;
 
-	if (rel->reloptkind == RELOPT_UPPER_REL)
-		return 0;
+	Assert(rel->reloptkind == RELOPT_BASEREL);
 
 	/* Make a node signature */
 	relids = get_relids_list(root, rel);
 	rinfos = list_concat(rinfos, rel->baserestrictinfo);
-	rinfos = list_concat(rinfos, rel->joininfo);
-
-	if (rel->cheapest_total_path)
-		find_subsequent_rels(rel->cheapest_total_path, rel, &subsigns);
 
 	signature = extract_clauses(rinfos, relids, subsigns);
 
-	/*
-	 * Two or more connected path nodes implement this RelOptInfo.
-	 * TODO: in the case of bushy path tree here it will be asserted.
-	 */
-//	Assert(rel->hash == UINT64_MAX || rel->hash == signature);
+	/* A shift to avoid specific cases. */
+	if (signature == -1)
+		signature = 1;
+	else if (signature == 0)
+		signature = 2;
 
-	return (signature != 0) ? signature : 1;
+	rel->signature = signature;
 }
 
 
@@ -536,17 +529,17 @@ generate_signature(PlannerInfo *root, RelOptInfo *rel)
  *
  * Cardinality Estimation Hooks
  *
- * ****************************************************************************/
+ * ************************************************************************** */
 
 double
-replan_rows_estimate(PlannerInfo *root, RelOptInfo *rel)
+replan_baserel_rows_estimate(PlannerInfo *root, RelOptInfo *rel)
 {
 	ReplanningStuff	   *replan = (ReplanningStuff *) root->parse->replanning;
 	HTAB			   *htab;
 	LearningData	   *entry;
 	LearningDataKey		key;
 	bool				found;
-
+return -1;
 	if (replan == NULL)
 		return -2;
 
@@ -554,14 +547,17 @@ replan_rows_estimate(PlannerInfo *root, RelOptInfo *rel)
 	if (htab == NULL)
 		return -3;
 
-	key.key = generate_signature(root, rel);
+	key.key = generate_baserel_signature(root, rel);
 
 	entry = hash_search(htab, &key, HASH_FIND, &found);
 
 	if (!found)
-		return -1;
+	{
+		rel->signature = -1;
+		return -1.0;
+	}
 
 	/* Save hash value into the RelOptInfo as a sign that we've made a decision */
-	rel->hash = key.key;
+	rel->signature = key.key;
 	return entry->cardinality;
 }

@@ -1035,7 +1035,13 @@ typedef struct RelOptInfo
 	/* Nullable partition key expressions */
 	List	  **nullable_partexprs pg_node_attr(read_write_ignore);
 
-	uint64		hash;
+	/*
+	 * Signature. It is transferred to the plan node, which is on the top of the
+	 * subtree, implementing this RelOptInfo. Can be used to learn some real
+	 * facts during execution phase and recognize this node on the next
+	 * iteration (next execution ?) of the query execution.
+	 */
+	uint64		signature;
 } RelOptInfo;
 
 /*
