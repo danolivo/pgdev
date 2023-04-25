@@ -547,7 +547,7 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 	}
 
 	if (best_path->parent->signature != 0 &&
-		best_path->parent->signature != -1)
+		best_path->parent->signature != 1)
 	{
 		bool top_path = true;
 		/*
@@ -568,11 +568,12 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 			/* for DEBUG purposes: show that we have a signature but this node
 			 * is not a top node in the subtree.
 			 */
-			plan->signature = -1;
+			plan->signature = 1;
 	}
 	else
 	{
 		/* Assume, it was set to 0 by default */
+		plan->signature = best_path->parent->signature+2;
 	}
 
 	return plan;
@@ -5420,6 +5421,7 @@ copy_plan_costsize(Plan *dest, Plan *src)
 	dest->parallel_aware = false;
 	/* Assume the inserted node is parallel-safe, if child plan is. */
 	dest->parallel_safe = src->parallel_safe;
+	dest->signature = src->signature;
 }
 
 /*

@@ -453,6 +453,48 @@ standard_ExecutorFinish(QueryDesc *queryDesc)
 	estate->es_finished = true;
 }
 
+#include "nodes/nodeFuncs.h"
+/*
+ * TODO: think about case with parallel workers.
+ */
+static bool
+learnOnPlanState(PlanState *p, void *context)
+{
+	planstate_tree_walker(p, learnOnPlanState, context);
+
+	switch (p->plan->type)
+	{
+		case T_SeqScan:
+		case T_SampleScan:
+		case T_IndexScan:
+		case T_IndexOnlyScan:
+		case T_BitmapHeapScan:
+		case T_TidScan:
+		case T_TidRangeScan:
+		case T_SubqueryScan:
+		case T_FunctionScan:
+		case T_TableFuncScan:
+		case T_ValuesScan:
+		case T_CteScan:
+		case T_WorkTableScan:
+		case T_NamedTuplestoreScan:
+		case T_ForeignScan:
+		case T_CustomScan:
+			Assert(p->plan->signature != 0);
+			break;
+		default:
+			break;
+	}
+	return false;
+}
+
+static bool
+learn_partially_executed_state(PlanState *stmt)
+{
+	(void ) learnOnPlanState(stmt, NULL);
+	return true;
+}
+
 /* ----------------------------------------------------------------
  *		ExecutorEnd
  *
@@ -468,6 +510,8 @@ standard_ExecutorFinish(QueryDesc *queryDesc)
 void
 ExecutorEnd(QueryDesc *queryDesc)
 {
+	learn_partially_executed_state(queryDesc->planstate);
+
 	if (ExecutorEnd_hook)
 		(*ExecutorEnd_hook) (queryDesc);
 	else

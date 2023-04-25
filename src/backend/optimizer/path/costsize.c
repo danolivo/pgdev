@@ -5038,9 +5038,9 @@ hash_clauses_relids(List *rinfos, List *reloids)
 
 	/* 0 - inserted in vitro, without planning. */
 	if (res == 0)
-		return 1;
-	if (res == -1)
 		return 2;
+	if (res == 1)
+		return 3;
 	return res;
 }
 
@@ -5062,6 +5062,7 @@ generate_baserel_signature(PlannerInfo *root, RelOptInfo *rel)
 	}
 
 	rel->signature = hash_clauses_relids(rel->baserestrictinfo, relids);
+	Assert(rel->signature != 0 && rel->signature != 1);
 }
 
 /*
