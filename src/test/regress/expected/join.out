@@ -5807,11 +5807,13 @@ explain (costs off)
 select p.* from
   (parent p left join child c on (p.k = c.k)) join parent x on p.k = x.k
   where p.k = 1 and p.k = 2;
-        QUERY PLAN        
---------------------------
+                   QUERY PLAN                   
+------------------------------------------------
  Result
    One-Time Filter: false
-(2 rows)
+   ->  Index Scan using parent_pkey on parent x
+         Index Cond: (k = 1)
+(4 rows)
 
 -- bug 5255: this is not optimizable by join removal
 begin;
@@ -6326,6 +6328,24 @@ on true;
          ->  Materialize
                ->  Seq Scan on int8_tbl y
 (7 rows)
+
+-- Check updating of Lateral links from top-level query to the removing relation
+explain (COSTS OFF)
+SELECT * FROM pg_am am WHERE am.amname IN (
+  SELECT c1.relname AS relname
+  FROM pg_class c1
+    JOIN pg_class c2
+    ON c1.oid=c2.oid AND c1.oid < 10
+);
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Nested Loop Semi Join
+   Join Filter: (am.amname = c2.relname)
+   ->  Seq Scan on pg_am am
+   ->  Materialize
+         ->  Index Scan using pg_class_oid_index on pg_class c2
+               Index Cond: ((oid < '10'::oid) AND (oid IS NOT NULL))
+(6 rows)
 
 --
 -- SJR corner case: uniqueness of an inner is [partially] derived from

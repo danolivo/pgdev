@@ -2394,6 +2394,15 @@ left join (select coalesce(y.q1, 1) from int8_tbl y
 	on true) z
 on true;
 
+-- Check updating of Lateral links from top-level query to the removing relation
+explain (COSTS OFF)
+SELECT * FROM pg_am am WHERE am.amname IN (
+  SELECT c1.relname AS relname
+  FROM pg_class c1
+    JOIN pg_class c2
+    ON c1.oid=c2.oid AND c1.oid < 10
+);
+
 --
 -- SJR corner case: uniqueness of an inner is [partially] derived from
 -- baserestrictinfo clauses.

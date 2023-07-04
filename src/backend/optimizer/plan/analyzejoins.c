@@ -424,6 +424,8 @@ remove_rel_from_query_common(PlannerInfo *root, RelOptInfo *rel,
 		sjinf->commute_above_r = replace_relid(sjinf->commute_above_r, ojrelid, subst);
 		sjinf->commute_below_l = replace_relid(sjinf->commute_below_l, ojrelid, subst);
 		sjinf->commute_below_r = replace_relid(sjinf->commute_below_r, ojrelid, subst);
+
+		replace_varno((Node *) sjinf->semi_rhs_exprs, relid, subst);
 	}
 
 	/*
@@ -465,6 +467,8 @@ remove_rel_from_query_common(PlannerInfo *root, RelOptInfo *rel,
 			/* ph_needed might or might not become empty */
 			phv->phrels = replace_relid(phv->phrels, relid, subst);
 			phv->phrels = replace_relid(phv->phrels, ojrelid, subst);
+			phinfo->ph_lateral = replace_relid(phinfo->ph_lateral, relid, subst);
+			phinfo->ph_var->phrels = replace_relid(phinfo->ph_var->phrels, relid, subst);
 			Assert(!bms_is_empty(phv->phrels));
 			Assert(phv->phnullingrels == NULL); /* no need to adjust */
 		}
@@ -1545,6 +1549,7 @@ update_eclass(EquivalenceClass *ec, int from, int to)
 		}
 
 		em->em_relids = replace_relid(em->em_relids, from, to);
+		em->em_jdomain->jd_relids = replace_relid(em->em_jdomain->jd_relids, from, to);
 
 		/* We only process inner joins */
 		replace_varno((Node *) em->em_expr, from, to);
@@ -2101,7 +2106,7 @@ remove_self_joins_one_group(PlannerInfo *root, Relids relids)
 			 */
 			restrictlist = generate_join_implied_equalities(root, joinrelids,
 															inner->relids,
-															outer, 0);
+															outer, NULL);
 
 			/*
 			 * Process restrictlist to seperate the self join quals out of
@@ -2110,6 +2115,14 @@ remove_self_joins_one_group(PlannerInfo *root, Relids relids)
 			 */
 			split_selfjoin_quals(root, restrictlist, &selfjoinquals,
 								 &otherjoinquals, inner->relid, outer->relid);
+
+			/*
+			 * To enable SJE for the only degenerate case without any self join
+			 * clauses at all, add baserestrictinfo to this list.
+			 * Degenerate case works only if both sides have the same clause. So
+			 * doesn't matter which side to add.
+			 */
+			selfjoinquals = list_concat(selfjoinquals, outer->baserestrictinfo);
 
 			/*
 			 * Determine if the inner table can duplicate outer rows.  We must
