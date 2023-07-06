@@ -2084,21 +2084,6 @@ remove_self_joins_one_group(PlannerInfo *root, Relids relids)
 			joinrelids = bms_add_member(joinrelids, k);
 
 			/*
-			 * Be safe to do not remove table participated in complicated PH
-			 */
-			foreach(lc, root->placeholder_list)
-			{
-				PlaceHolderInfo *phinfo = (PlaceHolderInfo *) lfirst(lc);
-
-				/* there isn't any other place to eval PHV */
-				if (bms_is_subset(phinfo->ph_eval_at, joinrelids) ||
-					bms_is_subset(phinfo->ph_needed, joinrelids))
-					break;
-			}
-			if (lc)
-				continue;
-
-			/*
 			 * At this stage joininfo lists of inner and outer can contain
 			 * only clauses, required for a superior outer join that can't
 			 * influence on this optimization. So, we can avoid to call the
