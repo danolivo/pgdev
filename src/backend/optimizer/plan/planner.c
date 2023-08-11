@@ -6849,7 +6849,7 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 			is_sorted = pathkeys_count_contained_in(root->group_pathkeys,
 													path->pathkeys,
 													&presorted_keys);
-
+elog(WARNING, "--> PARAM: %d", path->param_info != NULL);
 			if (!is_sorted)
 			{
 				/*
@@ -6910,6 +6910,8 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 			}
 			else if (parse->groupClause)
 			{
+				elog(WARNING, "--> Group");
+				Assert(0);
 				/*
 				 * We have GROUP BY without aggregation or grouping sets. Make
 				 * a GroupPath.

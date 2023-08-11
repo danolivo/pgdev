@@ -1012,6 +1012,7 @@ create_index_path(PlannerInfo *root,
 	pathnode->path.pathtarget = rel->reltarget;
 	pathnode->path.param_info = get_baserel_parampathinfo(root, rel,
 														  required_outer);
+	elog(WARNING, "--> INDEX: %d", pathnode->path.param_info != NULL);
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel;
 	pathnode->path.parallel_workers = 0;
@@ -3008,7 +3009,8 @@ create_group_path(PlannerInfo *root,
 	pathnode->path.parent = rel;
 	pathnode->path.pathtarget = target;
 	/* For now, assume we are above any joins, so no parameterization */
-	pathnode->path.param_info = NULL;
+	pathnode->path.param_info = subpath->param_info;//get_groupby_parampathinfo(root, rel, subpath);
+	elog(WARNING, "[%d %d] %d", subpath->type, subpath->pathtype, subpath->param_info != NULL);
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe;

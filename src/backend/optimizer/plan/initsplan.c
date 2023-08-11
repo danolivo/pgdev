@@ -519,7 +519,7 @@ create_lateral_join_info(PlannerInfo *root)
 	{
 		RelOptInfo *brel = root->simple_rel_array[rti];
 		Relids		lateral_relids;
-
+elog(WARNING, "--> Block1: %d", rti);
 		/* there may be empty slots corresponding to non-baserel RTEs */
 		if (brel == NULL)
 			continue;
@@ -528,7 +528,10 @@ create_lateral_join_info(PlannerInfo *root)
 
 		/* ignore RTEs that are "other rels" */
 		if (brel->reloptkind != RELOPT_BASEREL)
+		{
+			elog(WARNING, "--> Block: %d", brel->reloptkind);
 			continue;
+		}
 
 		lateral_relids = NULL;
 

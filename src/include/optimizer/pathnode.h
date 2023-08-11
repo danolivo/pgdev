@@ -332,6 +332,9 @@ extern ParamPathInfo *get_joinrel_parampathinfo(PlannerInfo *root,
 												List **restrict_clauses);
 extern ParamPathInfo *get_appendrel_parampathinfo(RelOptInfo *appendrel,
 												  Relids required_outer);
+extern ParamPathInfo *get_groupby_parampathinfo(PlannerInfo *root,
+												RelOptInfo *rel,
+												Path *subpath);
 extern ParamPathInfo *find_param_path_info(RelOptInfo *rel,
 										   Relids required_outer);
 extern Bitmapset *get_param_path_clause_serials(Path *path);

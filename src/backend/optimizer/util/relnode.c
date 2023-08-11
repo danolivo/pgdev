@@ -1529,6 +1529,18 @@ find_childrel_parents(PlannerInfo *root, RelOptInfo *rel)
  * be responsible for evaluating.
  */
 ParamPathInfo *
+get_groupby_parampathinfo(PlannerInfo *root, RelOptInfo *rel,
+						  Path *subpath)
+{
+	Relids required_outer = rel->lateral_relids;
+
+	if (bms_is_empty(required_outer))
+		return NULL;
+
+	Assert(0);
+}
+
+ParamPathInfo *
 get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 						  Relids required_outer)
 {
