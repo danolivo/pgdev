@@ -6,6 +6,7 @@ include $(top_builddir)/src/Makefile.global
 
 SUBDIRS = \
 		adminpack	\
+		pg_extension	\
 		amcheck		\
 		auth_delay	\
 		auto_explain	\
