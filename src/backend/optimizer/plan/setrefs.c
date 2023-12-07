@@ -3090,7 +3090,7 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 		}
 
 		/* No referent found for Var */
-		elog(PANIC, "variable not found in subplan target lists");
+		elog(ERROR, "variable not found in subplan target lists");
 	}
 	if (IsA(node, PlaceHolderVar))
 	{

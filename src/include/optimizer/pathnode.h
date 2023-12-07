@@ -347,9 +347,4 @@ extern RelOptInfo *build_child_join_rel(PlannerInfo *root,
 										RelOptInfo *parent_joinrel, List *restrictlist,
 										SpecialJoinInfo *sjinfo);
 
-extern void build_joinrel_partition_info(PlannerInfo *root,
-										RelOptInfo *joinrel, RelOptInfo *outer_rel,
-										RelOptInfo *inner_rel, SpecialJoinInfo *sjinfo,
-										List *restrictlist);
-
 #endif							/* PATHNODE_H */

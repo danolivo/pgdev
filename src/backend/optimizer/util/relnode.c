@@ -67,11 +67,19 @@ static List *subbuild_joinrel_joinlist(RelOptInfo *joinrel,
 static void set_foreign_rel_properties(RelOptInfo *joinrel,
 									   RelOptInfo *outer_rel, RelOptInfo *inner_rel);
 static void add_join_rel(PlannerInfo *root, RelOptInfo *joinrel);
+static void build_joinrel_partition_info(PlannerInfo *root,
+										 RelOptInfo *joinrel,
+										 RelOptInfo *outer_rel, RelOptInfo *inner_rel,
+										 SpecialJoinInfo *sjinfo,
+										 List *restrictlist);
 static bool have_partkey_equi_join(PlannerInfo *root, RelOptInfo *joinrel,
 								   RelOptInfo *rel1, RelOptInfo *rel2,
 								   JoinType jointype, List *restrictlist);
 static int	match_expr_to_partition_keys(Expr *expr, RelOptInfo *rel,
 										 bool strict_op);
+static void set_joinrel_partition_key_exprs(RelOptInfo *joinrel,
+											RelOptInfo *outer_rel, RelOptInfo *inner_rel,
+											JoinType jointype);
 static void build_child_join_reltarget(PlannerInfo *root,
 									   RelOptInfo *parentrel,
 									   RelOptInfo *childrel,
@@ -2072,7 +2080,7 @@ build_joinrel_partition_info_asymm(PlannerInfo *root,
 								   List *restrictlist)
 {
 	/* Check feasibility */
-
+//return;
 	if (!IS_PARTITIONED_REL(prel) || inner_rel->part_scheme != NULL ||
 		IS_OTHER_REL(inner_rel) || !prel->consider_asymmetric_join)
 		return;
@@ -2094,13 +2102,18 @@ build_joinrel_partition_info_asymm(PlannerInfo *root,
 	if (!is_inner_rel_safe_for_asymmetric_join(root, inner_rel))
 		return;
 
-	joinrel->boundinfo = prel->boundinfo;
-	joinrel->nparts = prel->nparts;
-	joinrel->part_rels =
-			(RelOptInfo **) palloc0(sizeof(RelOptInfo *) * prel->nparts);
+//	joinrel->boundinfo = prel->boundinfo;
+//	joinrel->nparts = prel->nparts;
+//	joinrel->part_rels =
+//			(RelOptInfo **) palloc0(sizeof(RelOptInfo *) * prel->nparts);
 	joinrel->part_scheme = prel->part_scheme;
+	/*
+	 * Dev NOTE:
+	 * boundinfo, nparts and part_rels will be initialized later -
+	 * See code of the compute_partition_bounds as an explanation.
+	 */
 
-	set_joinrel_partition_key_exprs(joinrel, prel, inner_rel, sjinfo->jointype);
+	//set_joinrel_partition_key_exprs(joinrel, prel, inner_rel, sjinfo->jointype);
 	joinrel->consider_asymmetric_join = true;
 
 	/*
@@ -2124,18 +2137,19 @@ build_joinrel_partition_info(PlannerInfo *root,
 {
 	PartitionScheme part_scheme;
 
-	/* Nothing to do if partitionwise join techniques are disabled. */
-	if (!enable_partitionwise_join && ! enable_asymmetric_join)
-	{
-		Assert(!IS_PARTITIONED_REL(joinrel));
-		return;
-	}
-
-	if (inner_rel->part_scheme == NULL && outer_rel->consider_asymmetric_join)
+	if (enable_asymmetric_join &&
+		inner_rel->part_scheme == NULL && outer_rel->consider_asymmetric_join)
 	{
 		/* Here we can do an attempt for asymmetric join only */
 		build_joinrel_partition_info_asymm(root, joinrel, outer_rel, inner_rel,
 										   sjinfo, restrictlist);
+		return;
+	}
+
+	/* Nothing to do if partitionwise join techniques are disabled. */
+	if (!enable_partitionwise_join)
+	{
+		Assert(!IS_PARTITIONED_REL(joinrel));
 		return;
 	}
 
@@ -2388,7 +2402,7 @@ match_expr_to_partition_keys(Expr *expr, RelOptInfo *rel, bool strict_op)
  * set_joinrel_partition_key_exprs
  *		Initialize partition key expressions for a partitioned joinrel.
  */
-void
+static void
 set_joinrel_partition_key_exprs(RelOptInfo *joinrel,
 								RelOptInfo *outer_rel, RelOptInfo *inner_rel,
 								JoinType jointype)
@@ -2411,18 +2425,11 @@ set_joinrel_partition_key_exprs(RelOptInfo *joinrel,
 		/* mark these const to enforce that we copy them properly */
 		const List *outer_expr = outer_rel->partexprs[cnt];
 		const List *outer_null_expr = outer_rel->nullable_partexprs[cnt];
-		const List *inner_expr = NIL;
-		const List *inner_null_expr = NIL;
+		const List *inner_expr = inner_rel->partexprs[cnt];
+		const List *inner_null_expr = inner_rel->nullable_partexprs[cnt];
 		List	   *partexpr = NIL;
 		List	   *nullable_partexpr = NIL;
 		ListCell   *lc;
-
-
-		if (inner_rel->partexprs)
-			inner_expr = inner_rel->partexprs[cnt];
-
-		if (inner_rel->nullable_partexprs)
-			inner_null_expr = inner_rel->nullable_partexprs[cnt];
 
 		switch (jointype)
 		{
