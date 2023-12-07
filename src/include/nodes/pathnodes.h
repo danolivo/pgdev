@@ -983,6 +983,7 @@ typedef struct RelOptInfo
 	 */
 	/* consider partitionwise join paths? (if partitioned rel) */
 	bool		consider_partitionwise_join;
+	bool		consider_asymmetric_join;
 
 	/*
 	 * inheritance links, if this is an otherrel (otherwise NULL):

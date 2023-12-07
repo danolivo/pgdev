@@ -269,5 +269,8 @@ extern PathKey *make_canonical_pathkey(PlannerInfo *root,
 									   int strategy, bool nulls_first);
 extern void add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 									List *live_childrels);
+extern void set_joinrel_partition_key_exprs(RelOptInfo *joinrel,
+											RelOptInfo *outer_rel, RelOptInfo *inner_rel,
+											JoinType jointype);
 
 #endif							/* PATHS_H */

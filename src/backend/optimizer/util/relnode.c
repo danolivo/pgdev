@@ -18,6 +18,7 @@
 
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/pathnodes.h"
 #include "optimizer/appendinfo.h"
 #include "optimizer/clauses.h"
 #include "optimizer/cost.h"
@@ -31,6 +32,7 @@
 #include "optimizer/tlist.h"
 #include "parser/parse_relation.h"
 #include "rewrite/rewriteManip.h"
+#include "parser/parsetree.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 
@@ -65,19 +67,11 @@ static List *subbuild_joinrel_joinlist(RelOptInfo *joinrel,
 static void set_foreign_rel_properties(RelOptInfo *joinrel,
 									   RelOptInfo *outer_rel, RelOptInfo *inner_rel);
 static void add_join_rel(PlannerInfo *root, RelOptInfo *joinrel);
-static void build_joinrel_partition_info(PlannerInfo *root,
-										 RelOptInfo *joinrel,
-										 RelOptInfo *outer_rel, RelOptInfo *inner_rel,
-										 SpecialJoinInfo *sjinfo,
-										 List *restrictlist);
 static bool have_partkey_equi_join(PlannerInfo *root, RelOptInfo *joinrel,
 								   RelOptInfo *rel1, RelOptInfo *rel2,
 								   JoinType jointype, List *restrictlist);
 static int	match_expr_to_partition_keys(Expr *expr, RelOptInfo *rel,
 										 bool strict_op);
-static void set_joinrel_partition_key_exprs(RelOptInfo *joinrel,
-											RelOptInfo *outer_rel, RelOptInfo *inner_rel,
-											JoinType jointype);
 static void build_child_join_reltarget(PlannerInfo *root,
 									   RelOptInfo *parentrel,
 									   RelOptInfo *childrel,
@@ -276,6 +270,7 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	rel->joininfo = NIL;
 	rel->has_eclass_joins = false;
 	rel->consider_partitionwise_join = false;	/* might get changed later */
+	rel->consider_asymmetric_join = false;
 	rel->part_scheme = NULL;
 	rel->nparts = -1;
 	rel->boundinfo = NULL;
@@ -748,6 +743,7 @@ build_join_rel(PlannerInfo *root,
 	joinrel->joininfo = NIL;
 	joinrel->has_eclass_joins = false;
 	joinrel->consider_partitionwise_join = false;	/* might get changed later */
+	joinrel->consider_asymmetric_join = false;
 	joinrel->parent = NULL;
 	joinrel->top_parent = NULL;
 	joinrel->top_parent_relids = NULL;
@@ -879,11 +875,8 @@ build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
 	AppendRelInfo **appinfos;
 	int			nappinfos;
 
-	/* Only joins between "other" relations land here. */
-	Assert(IS_OTHER_REL(outer_rel) && IS_OTHER_REL(inner_rel));
-
-	/* The parent joinrel should have consider_partitionwise_join set. */
-	Assert(parent_joinrel->consider_partitionwise_join);
+	/* Either of relations must be "other" relation at least. */
+	Assert(IS_OTHER_REL(outer_rel) || IS_OTHER_REL(inner_rel));
 
 	/*
 	 * Find the AppendRelInfo structures for the child baserels.  We'll need
@@ -942,6 +935,7 @@ build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
 	joinrel->joininfo = NIL;
 	joinrel->has_eclass_joins = false;
 	joinrel->consider_partitionwise_join = false;	/* might get changed later */
+	joinrel->consider_asymmetric_join = false;
 	joinrel->parent = parent_joinrel;
 	joinrel->top_parent = parent_joinrel->top_parent ? parent_joinrel->top_parent : parent_joinrel;
 	joinrel->top_parent_relids = joinrel->top_parent->relids;
@@ -1989,12 +1983,140 @@ get_param_path_clause_serials(Path *path)
 }
 
 /*
+ * Check inner rel properties, required to participate in asymmetric join
+ * XXX: Looks like it needs a lot of refactoring
+ */
+static bool
+is_inner_rel_safe_for_asymmetric_join(PlannerInfo *root, RelOptInfo *inner_rel)
+{
+	RangeTblEntry *rte;
+	bool		rte_safe;
+	ListCell   *lc;
+
+	/*
+	 * If inner_rel requires outer parameters, reparametrization usually can't
+	 * fix it.
+	 */
+	if (!bms_is_empty(inner_rel->lateral_relids))
+		return false;
+
+	/*
+	 * Forbid asymmetric join for non-simple inner rels for now.
+	 */
+	if (!IS_SIMPLE_REL(inner_rel))
+		return false;
+
+	/*
+	 * Don't allow asymmetric JOIN of two append subplans. In the case of a
+	 * parameterized NL join, a reparameterization procedure will lead to
+	 * large memory allocations and a CPU consumption: each reparameterization
+	 * will induce subpath duplication, creating new ParamPathInfo instance
+	 * and increasing of ppilist up to number of partitions in the inner.
+	 * Also, if we have many partitions, each bitmapset variable will be large
+	 * and many leaks of such variable (caused by relid replacement) will
+	 * highly increase memory consumption. So, we deny such paths for now.
+	 */
+	foreach(lc, inner_rel->pathlist)
+	{
+		if (IsA(lfirst(lc), AppendPath))
+			return false;
+	}
+
+	rte = planner_rt_fetch(inner_rel->relid, root);
+
+	Assert(rte);
+	switch (rte->rtekind)
+	{
+		case RTE_RELATION:
+			{
+				/* Allow asymmetric join with simple relation */
+				rte_safe = true;
+				break;
+			}
+		case RTE_FUNCTION:
+			{
+				rte_safe = true;
+				foreach(lc, rte->functions)
+				{
+					RangeTblFunction *rtfunc = (RangeTblFunction *) lfirst(lc);
+
+					/* Allow only immutable functions on constants */
+					if (contain_var_clause(rtfunc->funcexpr) ||
+						contain_mutable_functions(rtfunc->funcexpr) ||
+						contain_subplans(rtfunc->funcexpr))
+					{
+						rte_safe = false;
+						break;
+					}
+				}
+				break;
+			}
+
+			/*
+			 * For other types we need stronger checks. However, the strongest
+			 * our reason for asymmetric join is foreign join push down. And
+			 * it is possible currently only for relations and function scans.
+			 */
+		default:
+			rte_safe = false;
+	}
+	return rte_safe;
+}
+
+static void
+build_joinrel_partition_info_asymm(PlannerInfo *root,
+								   RelOptInfo *joinrel,
+								   RelOptInfo *prel,
+								   RelOptInfo *inner_rel,
+								   SpecialJoinInfo *sjinfo,
+								   List *restrictlist)
+{
+	/* Check feasibility */
+
+	if (!IS_PARTITIONED_REL(prel) || inner_rel->part_scheme != NULL ||
+		IS_OTHER_REL(inner_rel) || !prel->consider_asymmetric_join)
+		return;
+
+	/* It's either a non-partitioned joinrel or the one we've already visited */
+	if (joinrel->nparts != -1 /*&& joinrel->nparts != prel->nparts*/) // XXX: Why we need second part ?
+		return;
+
+	Assert(joinrel->part_scheme == NULL);
+
+	if (sjinfo->jointype != JOIN_INNER && sjinfo->jointype != JOIN_LEFT)
+		return;
+
+	/* Disallow recursive usage of asymmetric join machinery */
+	if (root->join_rel_level == NULL) // Still needed ?
+		return;
+
+	/* Check that inner rel is suitable */
+	if (!is_inner_rel_safe_for_asymmetric_join(root, inner_rel))
+		return;
+
+	joinrel->boundinfo = prel->boundinfo;
+	joinrel->nparts = prel->nparts;
+	joinrel->part_rels =
+			(RelOptInfo **) palloc0(sizeof(RelOptInfo *) * prel->nparts);
+	joinrel->part_scheme = prel->part_scheme;
+
+	set_joinrel_partition_key_exprs(joinrel, prel, inner_rel, sjinfo->jointype);
+	joinrel->consider_asymmetric_join = true;
+
+	/*
+	 * It is impossible to be successful in both partitionwise strategies.
+	 * At least for now
+	 */
+	Assert(!joinrel->consider_partitionwise_join);
+}
+
+/*
  * build_joinrel_partition_info
  *		Checks if the two relations being joined can use partitionwise join
  *		and if yes, initialize partitioning information of the resulting
  *		partitioned join relation.
  */
-static void
+void
 build_joinrel_partition_info(PlannerInfo *root,
 							 RelOptInfo *joinrel, RelOptInfo *outer_rel,
 							 RelOptInfo *inner_rel, SpecialJoinInfo *sjinfo,
@@ -2002,10 +2124,18 @@ build_joinrel_partition_info(PlannerInfo *root,
 {
 	PartitionScheme part_scheme;
 
-	/* Nothing to do if partitionwise join technique is disabled. */
-	if (!enable_partitionwise_join)
+	/* Nothing to do if partitionwise join techniques are disabled. */
+	if (!enable_partitionwise_join && ! enable_asymmetric_join)
 	{
 		Assert(!IS_PARTITIONED_REL(joinrel));
+		return;
+	}
+
+	if (inner_rel->part_scheme == NULL && outer_rel->consider_asymmetric_join)
+	{
+		/* Here we can do an attempt for asymmetric join only */
+		build_joinrel_partition_info_asymm(root, joinrel, outer_rel, inner_rel,
+										   sjinfo, restrictlist);
 		return;
 	}
 
@@ -2258,7 +2388,7 @@ match_expr_to_partition_keys(Expr *expr, RelOptInfo *rel, bool strict_op)
  * set_joinrel_partition_key_exprs
  *		Initialize partition key expressions for a partitioned joinrel.
  */
-static void
+void
 set_joinrel_partition_key_exprs(RelOptInfo *joinrel,
 								RelOptInfo *outer_rel, RelOptInfo *inner_rel,
 								JoinType jointype)
@@ -2281,11 +2411,18 @@ set_joinrel_partition_key_exprs(RelOptInfo *joinrel,
 		/* mark these const to enforce that we copy them properly */
 		const List *outer_expr = outer_rel->partexprs[cnt];
 		const List *outer_null_expr = outer_rel->nullable_partexprs[cnt];
-		const List *inner_expr = inner_rel->partexprs[cnt];
-		const List *inner_null_expr = inner_rel->nullable_partexprs[cnt];
+		const List *inner_expr = NIL;
+		const List *inner_null_expr = NIL;
 		List	   *partexpr = NIL;
 		List	   *nullable_partexpr = NIL;
 		ListCell   *lc;
+
+
+		if (inner_rel->partexprs)
+			inner_expr = inner_rel->partexprs[cnt];
+
+		if (inner_rel->nullable_partexprs)
+			inner_null_expr = inner_rel->nullable_partexprs[cnt];
 
 		switch (jointype)
 		{

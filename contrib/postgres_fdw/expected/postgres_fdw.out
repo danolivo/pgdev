@@ -10070,6 +10070,32 @@ SELECT t1.a, t2.b FROM fprt1 t1 INNER JOIN fprt2 t2 ON (t1.a = t2.b) WHERE t1.a 
  400 | 400
 (4 rows)
 
+-- FOR UPDATE requires whole-row reference, and so asymmetric join doesn't apply
+EXPLAIN (COSTS OFF)
+SELECT t1.a,t2.b FROM fprt1 t1 , ftprt2_p1 t2 WHERE (t1.a = t2.b) AND t1.a < 250 AND t2.c like '%0004' ORDER BY 1,2 FOR UPDATE OF t2;
+                   QUERY PLAN                   
+------------------------------------------------
+ LockRows
+   ->  Merge Join
+         Merge Cond: (t1.a = t2.b)
+         ->  Foreign Scan on ftprt1_p1 t1
+         ->  Materialize
+               ->  Foreign Scan on ftprt2_p1 t2
+(6 rows)
+
+SELECT t1.a,t2.b FROM fprt1 t1 , ftprt2_p1 t2 WHERE (t1.a = t2.b) AND t1.a < 250 AND t2.c like '%0004' ORDER BY 1,2 FOR UPDATE OF t2;
+  a  |  b  
+-----+-----
+ 204 | 204
+ 210 | 210
+ 216 | 216
+ 222 | 222
+ 228 | 228
+ 234 | 234
+ 240 | 240
+ 246 | 246
+(8 rows)
+
 RESET enable_partitionwise_join;
 -- ===================================================================
 -- test partitionwise aggregates
