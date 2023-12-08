@@ -2080,7 +2080,7 @@ build_joinrel_partition_info_asymm(PlannerInfo *root,
 								   List *restrictlist)
 {
 	/* Check feasibility */
-//return;
+
 	if (!IS_PARTITIONED_REL(prel) || inner_rel->part_scheme != NULL ||
 		IS_OTHER_REL(inner_rel) || !prel->consider_asymmetric_join)
 		return;
@@ -2102,20 +2102,16 @@ build_joinrel_partition_info_asymm(PlannerInfo *root,
 	if (!is_inner_rel_safe_for_asymmetric_join(root, inner_rel))
 		return;
 
-//	joinrel->boundinfo = prel->boundinfo;
-//	joinrel->nparts = prel->nparts;
-//	joinrel->part_rels =
-//			(RelOptInfo **) palloc0(sizeof(RelOptInfo *) * prel->nparts);
-	joinrel->part_scheme = prel->part_scheme;
 	/*
 	 * Dev NOTE:
 	 * boundinfo, nparts and part_rels will be initialized later -
 	 * See code of the compute_partition_bounds as an explanation.
 	 */
+	joinrel->part_scheme = prel->part_scheme;
 
-	//set_joinrel_partition_key_exprs(joinrel, prel, inner_rel, sjinfo->jointype);
+	set_joinrel_partition_key_exprs(joinrel, prel, inner_rel, sjinfo->jointype);
 	joinrel->consider_asymmetric_join = true;
-
+//elog(WARNING, "-- TRUE");
 	/*
 	 * It is impossible to be successful in both partitionwise strategies.
 	 * At least for now
@@ -2137,13 +2133,22 @@ build_joinrel_partition_info(PlannerInfo *root,
 {
 	PartitionScheme part_scheme;
 
-	if (enable_asymmetric_join &&
-		inner_rel->part_scheme == NULL && outer_rel->consider_asymmetric_join)
+	if (enable_asymmetric_join)
 	{
-		/* Here we can do an attempt for asymmetric join only */
-		build_joinrel_partition_info_asymm(root, joinrel, outer_rel, inner_rel,
-										   sjinfo, restrictlist);
-		return;
+		if (inner_rel->part_scheme == NULL && outer_rel->consider_asymmetric_join)
+		{
+			/* Here we can do an attempt for asymmetric join only */
+			build_joinrel_partition_info_asymm(root, joinrel, outer_rel, inner_rel,
+											   sjinfo, restrictlist);
+			return;
+		}
+		else if (sjinfo->jointype == JOIN_INNER && outer_rel->part_scheme == NULL && inner_rel->consider_asymmetric_join)
+		{
+			/* Here we can do an attempt for asymmetric join only */
+			build_joinrel_partition_info_asymm(root, joinrel, inner_rel, outer_rel,
+											   sjinfo, restrictlist);
+			return;
+		}
 	}
 
 	/* Nothing to do if partitionwise join techniques are disabled. */
@@ -2425,8 +2430,10 @@ set_joinrel_partition_key_exprs(RelOptInfo *joinrel,
 		/* mark these const to enforce that we copy them properly */
 		const List *outer_expr = outer_rel->partexprs[cnt];
 		const List *outer_null_expr = outer_rel->nullable_partexprs[cnt];
-		const List *inner_expr = inner_rel->partexprs[cnt];
-		const List *inner_null_expr = inner_rel->nullable_partexprs[cnt];
+		const List *inner_expr = (inner_rel->partexprs != NULL) ?
+												inner_rel->partexprs[cnt] : NIL;
+		const List *inner_null_expr = (inner_rel->nullable_partexprs != NULL) ?
+									inner_rel->nullable_partexprs[cnt] : NIL;
 		List	   *partexpr = NIL;
 		List	   *nullable_partexpr = NIL;
 		ListCell   *lc;

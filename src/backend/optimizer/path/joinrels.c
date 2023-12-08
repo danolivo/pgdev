@@ -1699,115 +1699,140 @@ try_partitionwise_join(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2,
 	}
 }
 
+/*
+ * DEV NOTE:
+ * Remember to set joinrel->nparts to 0 in the case we reject this way.
+ */
 static void
 try_asymmetric_partitionwise_join(PlannerInfo *root,
-								  RelOptInfo *inner_rel,
-								  RelOptInfo *prel,
+								  RelOptInfo *rel1,
+								  RelOptInfo *rel2,
 								  RelOptInfo *joinrel,
 								  SpecialJoinInfo *parent_sjinfo,
 								  List *parent_restrictlist)
 {
-	int		i;
-	List   *live_children = NIL;
+	int			cnt_parts;
+	RelOptInfo *inner_rel = rel1;
+	RelOptInfo *prel = rel2;
 
 	/*
 	 * Try this technique only if partitionwise joins are allowed and this
 	 * asymmetric join can be built safely.
 	 */
-	if (!enable_asymmetric_join || !joinrel->consider_asymmetric_join)
+	if (!enable_asymmetric_join || joinrel->nparts >= 0 ||
+		!joinrel->consider_asymmetric_join)
 		return;
 
-	return;
+	/* True value of consider_asymmetric_join means this determinant */
+	Assert(joinrel->part_scheme != NULL && joinrel->nparts == -1);
 
-	Assert(joinrel->nparts == -1);
-
-	for (i = 0; i < prel->nparts; i++)
+	if (!IS_PARTITIONED_REL(prel))
 	{
-		RelOptInfo		   *child_rel = prel->part_rels[i];
-		Relids				child_joinrelids;
-		RelOptInfo		   *child_joinrel;
+		prel = rel1;
+		inner_rel = rel2;
+	}
+
+	if (!IS_PARTITIONED_REL(prel))
+		return;
+
+	Assert(REL_HAS_ALL_PART_PROPS(prel));
+
+	/* Compute partition bounds */
+	joinrel->boundinfo = prel->boundinfo;
+	joinrel->nparts = prel->nparts;
+	joinrel->part_rels =
+				(RelOptInfo **) palloc0(sizeof(RelOptInfo *) * prel->nparts);
+
+	/*
+	 * Create child-join relations for this asymmetric join, if those don't
+	 * exist. Add paths to child-joins for a pair of child relations
+	 * corresponding to the given pair of parent relations.
+	 */
+	for (cnt_parts = 0; cnt_parts < joinrel->nparts; cnt_parts++)
+	{
+		RelOptInfo		   *inner;
+		RelOptInfo		   *outer_child;
+		bool				child_empty;
 		SpecialJoinInfo	   *child_sjinfo;
 		List			   *child_restrictlist;
-		int					nappinfos;
+		RelOptInfo		   *child_joinrel;
 		AppendRelInfo	  **appinfos;
+		int					nappinfos;
 
-		if (child_rel == NULL)
+		inner = inner_rel; // TODO: must make new entry here
+		outer_child = prel->part_rels[cnt_parts];
+
+		Assert(!IS_DUMMY_REL(inner));
+		child_empty = (outer_child == NULL || IS_DUMMY_REL(outer_child));
+
+		switch (parent_sjinfo->jointype)
 		{
-			/* If we have visited this joinrel, corresponding child_joinrel should also be empty */
-			if (joinrel->part_rels[i] != NULL)
-			{
-				joinrel->part_scheme = NULL;
-				return;
-			}
-			continue;
+			case JOIN_INNER:
+				if (child_empty)
+					continue;	/* ignore this join segment */
+				break;
+			case JOIN_LEFT:
+				break;
+			default:
+				/* other values not expected here */
+				elog(ERROR, "unrecognized join type: %d",
+					 (int) parent_sjinfo->jointype);
+				break;
 		}
 
-		child_joinrelids = bms_union(child_rel->relids, inner_rel->relids);
+		if (outer_child == NULL)
+		{
+			joinrel->nparts = 0;
+			return;
+		}
+
+		if (IS_SIMPLE_REL(prel) && !outer_child->consider_asymmetric_join)
+		{
+			joinrel->nparts = 0;
+			return;
+		}
+
+		Assert(!bms_overlap(inner->relids, outer_child->relids));
+
+		/*
+		 * Construct SpecialJoinInfo from parent join relations's
+		 * SpecialJoinInfo.
+		 */
 		child_sjinfo = build_child_join_sjinfo(root, parent_sjinfo,
-											   child_rel->relids,
-											   inner_rel->relids);
-		appinfos = find_appinfos_by_relids(root, child_joinrelids, &nappinfos);
+											   inner->relids,
+											   outer_child->relids);
+
+		/* Find the AppendRelInfo structures */
+		appinfos = find_appinfos_by_relids(root,
+										   outer_child->relids,
+										   &nappinfos);
 
 		child_restrictlist =
 			(List *) adjust_appendrel_attrs(root,
 											(Node *) parent_restrictlist,
 											nappinfos, appinfos);
-		child_joinrel = find_join_rel(root, child_joinrelids);
-		if (!child_joinrel)
-		{
-			/* There can be no child_joinrel only if we haven't visited this joinrel */
-			if (joinrel->part_rels[i] != NULL)
-			{
-				joinrel->part_scheme = NULL;
-				return;
-			}
-			child_joinrel = build_child_join_rel(root,
-												 child_rel,
-												 inner_rel,
-												 joinrel,
-												 child_restrictlist,
+
+		Assert(joinrel->part_rels[cnt_parts] == NULL);
+
+		child_joinrel = build_child_join_rel(root, outer_child, inner,
+												 joinrel, child_restrictlist,
 												 child_sjinfo);
+		joinrel->part_rels[cnt_parts] = child_joinrel;
+		joinrel->live_parts = bms_add_member(joinrel->live_parts, cnt_parts);
+		joinrel->all_partrels = bms_add_members(joinrel->all_partrels,
+												child_joinrel->relids);
 
-			joinrel->part_rels[i] = child_joinrel;
-			joinrel->live_parts = bms_add_member(joinrel->live_parts, i);
-			joinrel->all_partrels = bms_add_members(joinrel->all_partrels,
-													child_joinrel->relids);
-		}
-		else
-		{
-			/* Found child joinrel, which we haven't generated. Avoid using it. */
-			if (joinrel->part_rels[i] != child_joinrel)
-			{
-				/*
-				 * Setting part_scheme to NULL is enough to avoid generate_partitionwise_join_paths()
-				 * dealing with this relation or to prevent further usage of this joinrel in PWJ.
-				 * We don't set nparts to avoid reallocating joinrel->part_rels
-				 * on the next entry into try_asymmetric_partitionwise_join() for this relation.
-				 */
-				joinrel->part_scheme = NULL;
-				return;
-			}
-		}
+		Assert(bms_equal(child_joinrel->relids,
+						 adjust_child_relids(joinrel->relids,
+											 nappinfos, appinfos)));
 
-		live_children = lappend(live_children, child_joinrel);
-		populate_joinrel_with_paths(root,
-									child_rel,
-									inner_rel,
-									child_joinrel,
-									child_sjinfo,
+		/* And make paths for the child join */
+		populate_joinrel_with_paths(root, outer_child, inner,
+									child_joinrel, child_sjinfo,
 									child_restrictlist);
-		if (child_joinrel->pathlist == NIL)
-		{
-			/*
-			 * Setting part_scheme to NULL is enough to avoid generate_partitionwise_join_paths()
-			 * dealing with this relation or to prevent further usage of this joinrel in PWJ.
-			 * We don't set nparts to avoid reallocating joinrel->part_rels
-			 * on the next entry into try_asymmetric_partitionwise_join() for this relation.
-			 */
-			joinrel->part_scheme = NULL;
-			return;
-		}
-		/* Just to explain in which cases it found. */
+
+		pfree(appinfos);
+
 		Assert(child_joinrel->pathlist != NIL);
 		set_cheapest(child_joinrel);
 	}

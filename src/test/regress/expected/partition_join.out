@@ -2564,18 +2564,28 @@ SET max_parallel_workers_per_gather = 0;
 EXPLAIN (COSTS OFF)
 SELECT *
   FROM prt5 JOIN t5_1 ON a = aid AND alabel like '%abc%';
-                   QUERY PLAN                    
--------------------------------------------------
- Hash Join
-   Hash Cond: (prt5.a = t5_1.aid)
-   ->  Append
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Append
+   ->  Hash Join
+         Hash Cond: (prt5_1.a = t5_1.aid)
          ->  Seq Scan on prt5_p0 prt5_1
+         ->  Hash
+               ->  Seq Scan on t5_1
+                     Filter: (alabel ~~ '%abc%'::text)
+   ->  Hash Join
+         Hash Cond: (prt5_2.a = t5_1.aid)
          ->  Seq Scan on prt5_p1 prt5_2
+         ->  Hash
+               ->  Seq Scan on t5_1
+                     Filter: (alabel ~~ '%abc%'::text)
+   ->  Hash Join
+         Hash Cond: (prt5_3.a = t5_1.aid)
          ->  Seq Scan on prt5_p2 prt5_3
-   ->  Hash
-         ->  Seq Scan on t5_1
-               Filter: (alabel ~~ '%abc%'::text)
-(9 rows)
+         ->  Hash
+               ->  Seq Scan on t5_1
+                     Filter: (alabel ~~ '%abc%'::text)
+(19 rows)
 
 -- The same, but appended with UNION ALL
 EXPLAIN (COSTS OFF)
@@ -2661,24 +2671,44 @@ EXPLAIN (COSTS OFF)
 SELECT count(*)
   FROM prt5 JOIN t5_1 ON a = aid AND alabel like '%ab%'
             JOIN t5_2 ON b = bid AND blabel like '%cd%';
-                         QUERY PLAN                         
-------------------------------------------------------------
+                            QUERY PLAN                            
+------------------------------------------------------------------
  Aggregate
-   ->  Hash Join
-         Hash Cond: (prt5.b = t5_2.bid)
+   ->  Append
          ->  Hash Join
-               Hash Cond: (prt5.a = t5_1.aid)
-               ->  Append
+               Hash Cond: (prt5_1.b = t5_2.bid)
+               ->  Hash Join
+                     Hash Cond: (prt5_1.a = t5_1.aid)
                      ->  Seq Scan on prt5_p0 prt5_1
-                     ->  Seq Scan on prt5_p1 prt5_2
-                     ->  Seq Scan on prt5_p2 prt5_3
+                     ->  Hash
+                           ->  Seq Scan on t5_1
+                                 Filter: (alabel ~~ '%ab%'::text)
                ->  Hash
-                     ->  Seq Scan on t5_1
-                           Filter: (alabel ~~ '%ab%'::text)
-         ->  Hash
-               ->  Seq Scan on t5_2
-                     Filter: (blabel ~~ '%cd%'::text)
-(15 rows)
+                     ->  Seq Scan on t5_2
+                           Filter: (blabel ~~ '%cd%'::text)
+         ->  Hash Join
+               Hash Cond: (prt5_2.b = t5_2.bid)
+               ->  Hash Join
+                     Hash Cond: (prt5_2.a = t5_1.aid)
+                     ->  Seq Scan on prt5_p1 prt5_2
+                     ->  Hash
+                           ->  Seq Scan on t5_1
+                                 Filter: (alabel ~~ '%ab%'::text)
+               ->  Hash
+                     ->  Seq Scan on t5_2
+                           Filter: (blabel ~~ '%cd%'::text)
+         ->  Hash Join
+               Hash Cond: (prt5_3.b = t5_2.bid)
+               ->  Hash Join
+                     Hash Cond: (prt5_3.a = t5_1.aid)
+                     ->  Seq Scan on prt5_p2 prt5_3
+                     ->  Hash
+                           ->  Seq Scan on t5_1
+                                 Filter: (alabel ~~ '%ab%'::text)
+               ->  Hash
+                     ->  Seq Scan on t5_2
+                           Filter: (blabel ~~ '%cd%'::text)
+(35 rows)
 
 SELECT count(*)
   FROM prt5 JOIN t5_1 ON a = aid AND alabel like '%ab%'
@@ -2707,18 +2737,28 @@ SELECT * FROM prt5 RIGHT JOIN t5_1 ON a = aid AND alabel like '%abc%';
 -- left side can be extracted, but no cost benefit
 EXPLAIN (COSTS OFF)
 SELECT * FROM prt5 LEFT JOIN t5_1 ON a = aid AND alabel like '%abc%';
-                   QUERY PLAN                    
--------------------------------------------------
- Hash Left Join
-   Hash Cond: (prt5.a = t5_1.aid)
-   ->  Append
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Append
+   ->  Hash Left Join
+         Hash Cond: (prt5_1.a = t5_1.aid)
          ->  Seq Scan on prt5_p0 prt5_1
+         ->  Hash
+               ->  Seq Scan on t5_1
+                     Filter: (alabel ~~ '%abc%'::text)
+   ->  Hash Left Join
+         Hash Cond: (prt5_2.a = t5_1.aid)
          ->  Seq Scan on prt5_p1 prt5_2
+         ->  Hash
+               ->  Seq Scan on t5_1
+                     Filter: (alabel ~~ '%abc%'::text)
+   ->  Hash Left Join
+         Hash Cond: (prt5_3.a = t5_1.aid)
          ->  Seq Scan on prt5_p2 prt5_3
-   ->  Hash
-         ->  Seq Scan on t5_1
-               Filter: (alabel ~~ '%abc%'::text)
-(9 rows)
+         ->  Hash
+               ->  Seq Scan on t5_1
+                     Filter: (alabel ~~ '%abc%'::text)
+(19 rows)
 
 -- validation of the results with/without asymmetric partition-wise join
 SELECT * INTO pg_temp.result01a
@@ -2767,19 +2807,31 @@ EXPLAIN (COSTS OFF)
 SELECT small.* FROM small
 	JOIN part_l0 ON small.y = part_l0.y AND small.y + part_l0.y < 10
 	LEFT JOIN big ON big.x = small.x;
-                                  QUERY PLAN                                   
--------------------------------------------------------------------------------
- Nested Loop Left Join
-   ->  Nested Loop
-         Join Filter: ((small.y = part_l0.y) AND ((small.y + part_l0.y) < 10))
-         ->  Append
+                                       QUERY PLAN                                        
+-----------------------------------------------------------------------------------------
+ Append
+   ->  Nested Loop Left Join
+         ->  Nested Loop
+               Join Filter: ((small.y = part_l0_1.y) AND ((small.y + part_l0_1.y) < 10))
+               ->  Seq Scan on small
                ->  Seq Scan on part0_l2 part_l0_1
+         ->  Index Only Scan using big_x_idx on big
+               Index Cond: (x = (small.x)::numeric)
+   ->  Nested Loop Left Join
+         ->  Nested Loop
+               Join Filter: ((small.y = part_l0_2.y) AND ((small.y + part_l0_2.y) < 10))
                ->  Seq Scan on part1_l2 part_l0_2
+               ->  Seq Scan on small
+         ->  Index Only Scan using big_x_idx on big
+               Index Cond: (x = (small.x)::numeric)
+   ->  Nested Loop Left Join
+         ->  Nested Loop
+               Join Filter: ((small.y = part_l0_3.y) AND ((small.y + part_l0_3.y) < 10))
+               ->  Seq Scan on small
                ->  Seq Scan on part1_l1 part_l0_3
-         ->  Seq Scan on small
-   ->  Index Only Scan using big_x_idx on big
-         Index Cond: (x = (small.x)::numeric)
-(10 rows)
+         ->  Index Only Scan using big_x_idx on big
+               Index Cond: (x = (small.x)::numeric)
+(22 rows)
 
 SELECT small.* FROM small
 	JOIN part_l0 ON small.y = part_l0.y AND small.y + part_l0.y < 10
@@ -2793,25 +2845,47 @@ EXPLAIN (COSTS OFF)
 SELECT count(*) FROM small
 	JOIN part_l0 ON small.y = part_l0.y AND small.y + part_l0.y < 10
 	LEFT JOIN big ON big.x = small.x OR big.x = part_l0.x;
-                                      QUERY PLAN                                      
---------------------------------------------------------------------------------------
+                                          QUERY PLAN                                           
+-----------------------------------------------------------------------------------------------
  Aggregate
-   ->  Nested Loop Left Join
-         ->  Nested Loop
-               Join Filter: ((small.y = part_l0.y) AND ((small.y + part_l0.y) < 10))
-               ->  Append
+   ->  Append
+         ->  Nested Loop Left Join
+               ->  Nested Loop
+                     Join Filter: ((small.y = part_l0_1.y) AND ((small.y + part_l0_1.y) < 10))
+                     ->  Seq Scan on small
                      ->  Seq Scan on part0_l2 part_l0_1
+               ->  Bitmap Heap Scan on big
+                     Recheck Cond: ((x = (small.x)::numeric) OR (x = (part_l0_1.x)::numeric))
+                     ->  BitmapOr
+                           ->  Bitmap Index Scan on big_x_idx
+                                 Index Cond: (x = (small.x)::numeric)
+                           ->  Bitmap Index Scan on big_x_idx
+                                 Index Cond: (x = (part_l0_1.x)::numeric)
+         ->  Nested Loop Left Join
+               ->  Nested Loop
+                     Join Filter: ((small.y = part_l0_2.y) AND ((small.y + part_l0_2.y) < 10))
                      ->  Seq Scan on part1_l2 part_l0_2
+                     ->  Seq Scan on small
+               ->  Bitmap Heap Scan on big
+                     Recheck Cond: ((x = (small.x)::numeric) OR (x = (part_l0_2.x)::numeric))
+                     ->  BitmapOr
+                           ->  Bitmap Index Scan on big_x_idx
+                                 Index Cond: (x = (small.x)::numeric)
+                           ->  Bitmap Index Scan on big_x_idx
+                                 Index Cond: (x = (part_l0_2.x)::numeric)
+         ->  Nested Loop Left Join
+               ->  Nested Loop
+                     Join Filter: ((small.y = part_l0_3.y) AND ((small.y + part_l0_3.y) < 10))
+                     ->  Seq Scan on small
                      ->  Seq Scan on part1_l1 part_l0_3
-               ->  Seq Scan on small
-         ->  Bitmap Heap Scan on big
-               Recheck Cond: ((x = (small.x)::numeric) OR (x = (part_l0.x)::numeric))
-               ->  BitmapOr
-                     ->  Bitmap Index Scan on big_x_idx
-                           Index Cond: (x = (small.x)::numeric)
-                     ->  Bitmap Index Scan on big_x_idx
-                           Index Cond: (x = (part_l0.x)::numeric)
-(16 rows)
+               ->  Bitmap Heap Scan on big
+                     Recheck Cond: ((x = (small.x)::numeric) OR (x = (part_l0_3.x)::numeric))
+                     ->  BitmapOr
+                           ->  Bitmap Index Scan on big_x_idx
+                                 Index Cond: (x = (small.x)::numeric)
+                           ->  Bitmap Index Scan on big_x_idx
+                                 Index Cond: (x = (part_l0_3.x)::numeric)
+(38 rows)
 
 SELECT count(*) FROM small
 	JOIN part_l0 ON small.y = part_l0.y AND small.y + part_l0.y < 10
