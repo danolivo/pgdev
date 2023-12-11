@@ -1719,12 +1719,12 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 	 * Try this technique only if partitionwise joins are allowed and this
 	 * asymmetric join can be built safely.
 	 */
-	if (!enable_asymmetric_join || joinrel->nparts >= 0 ||
+	if (!enable_asymmetric_join ||
 		!joinrel->consider_asymmetric_join)
 		return;
 
 	/* True value of consider_asymmetric_join means this determinant */
-	Assert(joinrel->part_scheme != NULL && joinrel->nparts == -1);
+	Assert(joinrel->part_scheme != NULL);
 
 	if (!IS_PARTITIONED_REL(prel))
 	{
@@ -1738,10 +1738,16 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 	Assert(REL_HAS_ALL_PART_PROPS(prel));
 
 	/* Compute partition bounds */
-	joinrel->boundinfo = prel->boundinfo;
-	joinrel->nparts = prel->nparts;
-	joinrel->part_rels =
+	if (joinrel->boundinfo == NULL)
+	{
+		Assert(joinrel->nparts == -1);
+		joinrel->boundinfo = prel->boundinfo;
+		joinrel->nparts = prel->nparts;
+		joinrel->part_rels =
 				(RelOptInfo **) palloc0(sizeof(RelOptInfo *) * prel->nparts);
+	}
+	else
+		Assert(joinrel->nparts == prel->nparts && joinrel->part_rels != NULL);
 
 	/*
 	 * Create child-join relations for this asymmetric join, if those don't
@@ -1780,15 +1786,9 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 				break;
 		}
 
-		if (outer_child == NULL)
+		if (outer_child == NULL ||
+			(IS_SIMPLE_REL(prel) && !outer_child->consider_asymmetric_join))
 		{
-			joinrel->nparts = 0;
-			return;
-		}
-
-		if (IS_SIMPLE_REL(prel) && !outer_child->consider_asymmetric_join)
-		{
-			joinrel->nparts = 0;
 			return;
 		}
 
@@ -1812,15 +1812,18 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 											(Node *) parent_restrictlist,
 											nappinfos, appinfos);
 
-		Assert(joinrel->part_rels[cnt_parts] == NULL);
-
-		child_joinrel = build_child_join_rel(root, outer_child, inner,
+		if (joinrel->part_rels[cnt_parts] == NULL)
+		{
+			child_joinrel = build_child_join_rel(root, outer_child, inner,
 												 joinrel, child_restrictlist,
 												 child_sjinfo);
-		joinrel->part_rels[cnt_parts] = child_joinrel;
-		joinrel->live_parts = bms_add_member(joinrel->live_parts, cnt_parts);
-		joinrel->all_partrels = bms_add_members(joinrel->all_partrels,
-												child_joinrel->relids);
+			joinrel->part_rels[cnt_parts] = child_joinrel;
+			joinrel->live_parts = bms_add_member(joinrel->live_parts, cnt_parts);
+			joinrel->all_partrels = bms_add_members(joinrel->all_partrels,
+													child_joinrel->relids);
+		}
+		else
+			child_joinrel = joinrel->part_rels[cnt_parts];
 
 		Assert(bms_equal(child_joinrel->relids,
 						 adjust_child_relids(joinrel->relids,
