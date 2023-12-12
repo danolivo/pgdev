@@ -102,6 +102,12 @@ extern void add_paths_to_joinrel(PlannerInfo *root, RelOptInfo *joinrel,
  *	  routines to determine which relations to join
  */
 extern void join_search_one_level(PlannerInfo *root, int level);
+extern void try_asymmetric_partitionwise_join(PlannerInfo *root,
+											  RelOptInfo *rel1,
+											  RelOptInfo *rel2,
+											  RelOptInfo *joinrel,
+											  SpecialJoinInfo *parent_sjinfo,
+											  List *parent_restrictlist);
 extern RelOptInfo *make_join_rel(PlannerInfo *root,
 								 RelOptInfo *rel1, RelOptInfo *rel2);
 extern Relids add_outer_joins_to_relids(PlannerInfo *root, Relids input_relids,

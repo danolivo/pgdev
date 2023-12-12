@@ -72,6 +72,11 @@ static void build_joinrel_partition_info(PlannerInfo *root,
 										 RelOptInfo *outer_rel, RelOptInfo *inner_rel,
 										 SpecialJoinInfo *sjinfo,
 										 List *restrictlist);
+static void build_joinrel_partition_info_ext(PlannerInfo *root,
+										 RelOptInfo *joinrel,
+										 RelOptInfo *outer_rel, RelOptInfo *inner_rel,
+										 SpecialJoinInfo *sjinfo,
+										 List *restrictlist);
 static bool have_partkey_equi_join(PlannerInfo *root, RelOptInfo *joinrel,
 								   RelOptInfo *rel1, RelOptInfo *rel2,
 								   JoinType jointype, List *restrictlist);
@@ -813,7 +818,7 @@ build_join_rel(PlannerInfo *root,
 	joinrel->has_eclass_joins = has_relevant_eclass_joinclause(root, joinrel);
 
 	/* Store the partition information. */
-	build_joinrel_partition_info(root, joinrel, outer_rel, inner_rel, sjinfo,
+	build_joinrel_partition_info_ext(root, joinrel, outer_rel, inner_rel, sjinfo,
 								 restrictlist);
 
 	/*
@@ -985,7 +990,7 @@ build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
 	joinrel->has_eclass_joins = parent_joinrel->has_eclass_joins;
 
 	/* Is the join between partitions itself partitioned? */
-	build_joinrel_partition_info(root, joinrel, outer_rel, inner_rel, sjinfo,
+	build_joinrel_partition_info_ext(root, joinrel, outer_rel, inner_rel, sjinfo,
 								 restrictlist);
 
 	/* Child joinrel is parallel safe if parent is parallel safe. */
@@ -2082,12 +2087,12 @@ build_joinrel_partition_info_asymm(PlannerInfo *root,
 	/* Check feasibility */
 
 	if (!IS_PARTITIONED_REL(prel) || inner_rel->part_scheme != NULL ||
-		IS_OTHER_REL(inner_rel) || !prel->consider_asymmetric_join)
+		IS_OTHER_REL(inner_rel))
 		return;
 
 	/* It's either a non-partitioned joinrel or the one we've already visited */
-	if (joinrel->nparts != -1 /*&& joinrel->nparts != prel->nparts*/) // XXX: Why we need second part ?
-		return;
+//	if (joinrel->nparts != -1 /*&& joinrel->nparts != prel->nparts*/) // XXX: Why we need second part ?
+//		return;
 
 	Assert(joinrel->part_scheme == NULL);
 
@@ -2111,7 +2116,7 @@ build_joinrel_partition_info_asymm(PlannerInfo *root,
 
 	set_joinrel_partition_key_exprs(joinrel, prel, inner_rel, sjinfo->jointype);
 	joinrel->consider_asymmetric_join = true;
-//elog(WARNING, "-- TRUE");
+
 	/*
 	 * It is impossible to be successful in both partitionwise strategies.
 	 * At least for now
@@ -2125,31 +2130,13 @@ build_joinrel_partition_info_asymm(PlannerInfo *root,
  *		and if yes, initialize partitioning information of the resulting
  *		partitioned join relation.
  */
-void
+static void
 build_joinrel_partition_info(PlannerInfo *root,
 							 RelOptInfo *joinrel, RelOptInfo *outer_rel,
 							 RelOptInfo *inner_rel, SpecialJoinInfo *sjinfo,
 							 List *restrictlist)
 {
 	PartitionScheme part_scheme;
-
-	if (enable_asymmetric_join)
-	{
-		if (inner_rel->part_scheme == NULL && outer_rel->consider_asymmetric_join)
-		{
-			/* Here we can do an attempt for asymmetric join only */
-			build_joinrel_partition_info_asymm(root, joinrel, outer_rel, inner_rel,
-											   sjinfo, restrictlist);
-			return;
-		}
-		else if (sjinfo->jointype == JOIN_INNER && outer_rel->part_scheme == NULL && inner_rel->consider_asymmetric_join)
-		{
-			/* Here we can do an attempt for asymmetric join only */
-			build_joinrel_partition_info_asymm(root, joinrel, inner_rel, outer_rel,
-											   sjinfo, restrictlist);
-			return;
-		}
-	}
 
 	/* Nothing to do if partitionwise join techniques are disabled. */
 	if (!enable_partitionwise_join)
@@ -2207,6 +2194,28 @@ build_joinrel_partition_info(PlannerInfo *root,
 	Assert(outer_rel->consider_partitionwise_join);
 	Assert(inner_rel->consider_partitionwise_join);
 	joinrel->consider_partitionwise_join = true;
+}
+
+static void
+build_joinrel_partition_info_ext(PlannerInfo *root,
+							 RelOptInfo *joinrel, RelOptInfo *outer_rel,
+							 RelOptInfo *inner_rel, SpecialJoinInfo *sjinfo,
+							 List *restrictlist)
+{
+	build_joinrel_partition_info(root, joinrel, outer_rel, inner_rel, sjinfo,
+								 restrictlist);
+
+	if (enable_asymmetric_join)
+	{
+		if (inner_rel->part_scheme == NULL)
+			/* Here we can do an attempt for asymmetric join only */
+			build_joinrel_partition_info_asymm(root, joinrel, outer_rel, inner_rel,
+											   sjinfo, restrictlist);
+		if (sjinfo->jointype == JOIN_INNER && outer_rel->part_scheme == NULL)
+			/* Here we can do an attempt for asymmetric join only */
+			build_joinrel_partition_info_asymm(root, joinrel, inner_rel, outer_rel,
+											   sjinfo, restrictlist);
+	}
 }
 
 /*
