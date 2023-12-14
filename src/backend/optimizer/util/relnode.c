@@ -2090,10 +2090,6 @@ build_joinrel_partition_info_asymm(PlannerInfo *root,
 		IS_OTHER_REL(inner_rel))
 		return;
 
-	/* It's either a non-partitioned joinrel or the one we've already visited */
-//	if (joinrel->nparts != -1 /*&& joinrel->nparts != prel->nparts*/) // XXX: Why we need second part ?
-//		return;
-
 	Assert(joinrel->part_scheme == NULL);
 
 	if (sjinfo->jointype != JOIN_INNER && sjinfo->jointype != JOIN_LEFT)

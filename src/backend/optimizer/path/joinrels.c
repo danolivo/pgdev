@@ -1739,7 +1739,10 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 
 	Assert(REL_HAS_ALL_PART_PROPS(prel));
 
-	/* Compute partition bounds */
+	/*
+	 * Compute partition bounds. Remember, after that point we can't get out
+	 * of this routine without paths population.
+	 */
 	if (joinrel->boundinfo == NULL)
 	{
 		Assert(joinrel->nparts == -1);
@@ -1788,10 +1791,11 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 				break;
 		}
 
-		if (outer_child == NULL ||
-			(IS_SIMPLE_REL(prel) && !outer_child->consider_asymmetric_join))
+		if (outer_child == NULL)
 		{
-			return;
+			/* Pruned partition. Still be pruned after AJ. */
+			joinrel->part_rels[cnt_parts] = NULL;
+			continue;
 		}
 
 		Assert(!bms_overlap(inner->relids, outer_child->relids));

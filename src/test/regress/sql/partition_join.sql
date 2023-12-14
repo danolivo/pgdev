@@ -619,6 +619,29 @@ EXPLAIN (COSTS OFF)
 SELECT *
   FROM prt5 JOIN t5_1 ON a = aid AND alabel like '%abc%';
 
+-- AJ: the case of WholeRowVar
+EXPLAIN (COSTS OFF)
+SELECT (t1.*)::prt1 FROM prt1 t1, prt2_p1 t2 WHERE (t1.a = t2.b);
+
+-- AJ with partitioned table (one partition has pruned)
+EXPLAIN (COSTS OFF)
+SELECT (t1.*)::prt1
+FROM prt1 t1, prt2_p1 t2
+WHERE (t1.a = t2.b) AND (t1.a = 542 OR t1.a = 1);
+
+-- Can't use AJ because of complex inner as well as PWJ (one partition pruned)
+EXPLAIN (COSTS OFF)
+SELECT (t1.*)::prt1
+FROM prt1 t1, prt2_p1 t2, prt1 t3
+WHERE (t1.a = t2.b) AND (t1.a = 542 OR t1.a = 1) AND t2.a = t3.a;
+
+-- TODO: We don't see any AJ or PWJ, but may be it's a game of costs?
+EXPLAIN (COSTS OFF)
+SELECT (t1.*)::prt1
+FROM prt1 t1, prt2_p1 t2, prt1 t3
+WHERE (t1.a = t2.b) AND (t1.a = 542 OR t1.a = 1)
+  AND (t2.a = t3.a) AND (t3.a = 543 OR t3.a = 2);
+
 -- The same, but appended with UNION ALL
 EXPLAIN (COSTS OFF)
 SELECT * FROM (
