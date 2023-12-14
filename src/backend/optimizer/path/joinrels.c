@@ -899,7 +899,6 @@ add_outer_joins_to_relids(PlannerInfo *root, Relids input_relids,
  *	  contains the join clauses and the other clauses applicable for given pair
  *	  of the joining relations.
  */
-static bool force_population = false;
 static void
 populate_joinrel_with_paths(PlannerInfo *root, RelOptInfo *rel1,
 							RelOptInfo *rel2, RelOptInfo *joinrel,
@@ -1052,16 +1051,7 @@ populate_joinrel_with_paths(PlannerInfo *root, RelOptInfo *rel1,
 			elog(ERROR, "unrecognized join type: %d", (int) sjinfo->jointype);
 			break;
 	}
-if (force_population)
-{
-	ListCell *lc;
-	foreach(lc, joinrel->pathlist)
-	{
-		Path *p = (Path *) lfirst(lc);
-		p->startup_cost = 1.1;
-		p->total_cost = 1.1;
-	}
-}
+
 	/* Apply partitionwise join technique, if possible. */
 	try_partitionwise_join(root, rel1, rel2, joinrel, sjinfo, restrictlist);
 
@@ -1700,12 +1690,12 @@ try_partitionwise_join(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2,
 		Assert(bms_equal(child_joinrel->relids,
 						 adjust_child_relids(joinrel->relids,
 											 nappinfos, appinfos)));
-force_population = true;
+
 		/* And make paths for the child join */
 		populate_joinrel_with_paths(root, child_rel1, child_rel2,
 									child_joinrel, child_sjinfo,
 									child_restrictlist);
-force_population = false;
+
 		pfree(appinfos);
 		free_child_join_sjinfo(child_sjinfo);
 	}
@@ -1840,12 +1830,11 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 //		Assert(bms_equal(child_joinrel->relids,
 //						 adjust_child_relids(joinrel->relids,
 //											 nappinfos, appinfos)));
-force_population = true;
+
 		/* And make paths for the child join */
 		populate_joinrel_with_paths(root, outer_child, inner,
 									child_joinrel, child_sjinfo,
 									child_restrictlist);
-force_population = false;
 
 		pfree(appinfos);
 
