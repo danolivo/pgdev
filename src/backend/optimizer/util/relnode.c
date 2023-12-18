@@ -2087,7 +2087,7 @@ build_joinrel_partition_info_asymm(PlannerInfo *root,
 	/* Check feasibility */
 
 	if (!IS_PARTITIONED_REL(prel) || inner_rel->part_scheme != NULL ||
-		IS_OTHER_REL(inner_rel))
+		IS_OTHER_REL(inner_rel) || !inner_rel->consider_asymmetric_join)
 		return;
 
 	Assert(joinrel->part_scheme == NULL);

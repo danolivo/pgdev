@@ -360,6 +360,11 @@ static void
 set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 			 Index rti, RangeTblEntry *rte)
 {
+	/* Enable asymmetric join if target list doesn't contain WholeRowVar */
+	if (rel->reloptkind == RELOPT_BASEREL && rel->attr_needed &&
+		bms_is_empty(rel->attr_needed[InvalidAttrNumber - rel->min_attr]))
+		rel->consider_asymmetric_join = enable_asymmetric_join;
+
 	if (rel->reloptkind == RELOPT_BASEREL &&
 		relation_excluded_by_constraints(root, rel, rte))
 	{
@@ -967,6 +972,11 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 		bms_is_empty(rel->attr_needed[InvalidAttrNumber - rel->min_attr]))
 	{
 		rel->consider_partitionwise_join = enable_partitionwise_join;
+
+		/*
+		 * Enable asymmetric join for a case when partitioned relation contains
+		 * only one partition
+		 */
 		rel->consider_asymmetric_join = enable_asymmetric_join;
 	}
 
