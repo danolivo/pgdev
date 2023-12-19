@@ -2590,25 +2590,17 @@ SELECT *
 -- AJ: the case of WholeRowVar
 EXPLAIN (COSTS OFF)
 SELECT (t1.*)::prt1 FROM prt1 t1, prt2_p1 t2 WHERE (t1.a = t2.b);
-                 QUERY PLAN                 
---------------------------------------------
- Append
-   ->  Hash Join
-         Hash Cond: (t1_1.a = t2.b)
+              QUERY PLAN              
+--------------------------------------
+ Hash Join
+   Hash Cond: (t1.a = t2.b)
+   ->  Append
          ->  Seq Scan on prt1_p1 t1_1
-         ->  Hash
-               ->  Seq Scan on prt2_p1 t2
-   ->  Hash Join
-         Hash Cond: (t1_2.a = t2.b)
          ->  Seq Scan on prt1_p2 t1_2
-         ->  Hash
-               ->  Seq Scan on prt2_p1 t2
-   ->  Hash Join
-         Hash Cond: (t2.b = t1_3.a)
+         ->  Seq Scan on prt1_p3 t1_3
+   ->  Hash
          ->  Seq Scan on prt2_p1 t2
-         ->  Hash
-               ->  Seq Scan on prt1_p3 t1_3
-(16 rows)
+(8 rows)
 
 -- AJ with partitioned table (one partition has pruned)
 EXPLAIN (COSTS OFF)
@@ -2617,20 +2609,16 @@ FROM prt1 t1, prt2_p1 t2
 WHERE (t1.a = t2.b) AND (t1.a = 542 OR t1.a = 1);
                      QUERY PLAN                     
 ----------------------------------------------------
- Append
-   ->  Hash Join
-         Hash Cond: (t2.b = t1_1.a)
-         ->  Seq Scan on prt2_p1 t2
-         ->  Hash
+ Hash Join
+   Hash Cond: (t2.b = t1.a)
+   ->  Seq Scan on prt2_p1 t2
+   ->  Hash
+         ->  Append
                ->  Seq Scan on prt1_p1 t1_1
                      Filter: ((a = 542) OR (a = 1))
-   ->  Hash Join
-         Hash Cond: (t2.b = t1_2.a)
-         ->  Seq Scan on prt2_p1 t2
-         ->  Hash
                ->  Seq Scan on prt1_p3 t1_2
                      Filter: ((a = 542) OR (a = 1))
-(13 rows)
+(9 rows)
 
 -- Can't use AJ because of complex inner as well as PWJ (one partition pruned)
 EXPLAIN (COSTS OFF)

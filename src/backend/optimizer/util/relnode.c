@@ -2086,8 +2086,15 @@ build_joinrel_partition_info_asymm(PlannerInfo *root,
 {
 	/* Check feasibility */
 
+	/* Enable asymmetric join only if target list doesn't contain WholeRowVar */
+	if ((prel->attr_needed &&
+		!bms_is_empty(prel->attr_needed[InvalidAttrNumber - prel->min_attr])) ||
+		(inner_rel->attr_needed &&
+		!bms_is_empty(inner_rel->attr_needed[InvalidAttrNumber - inner_rel->min_attr])))
+		return;
+
 	if (!IS_PARTITIONED_REL(prel) || inner_rel->part_scheme != NULL ||
-		IS_OTHER_REL(inner_rel) || !inner_rel->consider_asymmetric_join)
+		IS_OTHER_REL(inner_rel))
 		return;
 
 	Assert(joinrel->part_scheme == NULL);

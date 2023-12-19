@@ -360,11 +360,6 @@ static void
 set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 			 Index rti, RangeTblEntry *rte)
 {
-	/* Enable asymmetric join if target list doesn't contain WholeRowVar */
-	if (rel->reloptkind == RELOPT_BASEREL && rel->attr_needed &&
-		bms_is_empty(rel->attr_needed[InvalidAttrNumber - rel->min_attr]))
-		rel->consider_asymmetric_join = enable_asymmetric_join;
-
 	if (rel->reloptkind == RELOPT_BASEREL &&
 		relation_excluded_by_constraints(root, rel, rte))
 	{
