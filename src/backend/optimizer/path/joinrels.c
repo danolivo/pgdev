@@ -1509,9 +1509,7 @@ try_partitionwise_join(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2,
 
 	/* Nothing to do, if the join relation is not partitioned. */
 	if (joinrel->part_scheme == NULL || joinrel->nparts == 0 ||
-		!joinrel->consider_partitionwise_join
-		/*||
-		joinrel->consider_asymmetric_join*/)
+		!joinrel->consider_partitionwise_join)
 		return;
 
 	/* The join relation should have consider_partitionwise_join set. */
@@ -1722,7 +1720,8 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 	 * asymmetric join can be built safely.
 	 */
 	if (!enable_asymmetric_join ||
-		!joinrel->consider_asymmetric_join)
+		!parent_sjinfo->consider_asymmetric_join ||
+		joinrel->part_scheme == NULL)
 		return;
 
 	/* True value of consider_asymmetric_join means this determinant */
@@ -1894,6 +1893,7 @@ build_child_join_sjinfo(PlannerInfo *root, SpecialJoinInfo *parent_sjinfo,
 															 (Node *) sjinfo->semi_rhs_exprs,
 															 right_nappinfos,
 															 right_appinfos);
+	sjinfo->consider_asymmetric_join = false;
 
 	pfree(left_appinfos);
 	pfree(right_appinfos);

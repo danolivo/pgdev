@@ -283,7 +283,6 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	rel->joininfo = NIL;
 	rel->has_eclass_joins = false;
 	rel->consider_partitionwise_join = false;	/* might get changed later */
-	rel->consider_asymmetric_join = false;
 	rel->part_scheme = NULL;
 	rel->nparts = -1;
 	rel->boundinfo = NULL;
@@ -756,7 +755,6 @@ build_join_rel(PlannerInfo *root,
 	joinrel->joininfo = NIL;
 	joinrel->has_eclass_joins = false;
 	joinrel->consider_partitionwise_join = false;	/* might get changed later */
-	joinrel->consider_asymmetric_join = false;
 	joinrel->parent = NULL;
 	joinrel->top_parent = NULL;
 	joinrel->top_parent_relids = NULL;
@@ -948,7 +946,6 @@ build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
 	joinrel->joininfo = NIL;
 	joinrel->has_eclass_joins = false;
 	joinrel->consider_partitionwise_join = false;	/* might get changed later */
-	joinrel->consider_asymmetric_join = false;
 	joinrel->parent = parent_joinrel;
 	joinrel->top_parent = parent_joinrel->top_parent ? parent_joinrel->top_parent : parent_joinrel;
 	joinrel->top_parent_relids = joinrel->top_parent->relids;
@@ -2118,7 +2115,7 @@ build_joinrel_partition_info_asymm(PlannerInfo *root,
 	joinrel->part_scheme = prel->part_scheme;
 
 	set_joinrel_partition_key_exprs(joinrel, prel, inner_rel, sjinfo->jointype);
-	joinrel->consider_asymmetric_join = true;
+	sjinfo->consider_asymmetric_join = true;
 
 	/*
 	 * It is impossible to be successful in both partitionwise strategies.

@@ -983,7 +983,6 @@ typedef struct RelOptInfo
 	 */
 	/* consider partitionwise join paths? (if partitioned rel) */
 	bool		consider_partitionwise_join;
-	bool		consider_asymmetric_join;
 
 	/*
 	 * inheritance links, if this is an otherrel (otherwise NULL):
@@ -2892,6 +2891,8 @@ struct SpecialJoinInfo
 	bool		semi_can_hash;	/* true if semi_operators are all hash */
 	List	   *semi_operators; /* OIDs of equality join operators */
 	List	   *semi_rhs_exprs; /* righthand-side expressions of these ops */
+
+	bool		consider_asymmetric_join;
 };
 
 /*
