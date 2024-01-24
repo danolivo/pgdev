@@ -112,6 +112,13 @@ static Oid	get_btree_test_op(Oid pred_op, Oid clause_op, bool refute_it);
 static void InvalidateOprProofCacheCallBack(Datum arg, int cacheid, uint32 hashvalue);
 
 
+bool
+saop_covered_by_predicates(ScalarArrayOpExpr *saop, List *predicate_lists,
+						  List **saoplst)
+{
+	return false;
+}
+
 /*
  * predicate_implied_by
  *	  Recursively checks whether the clauses in clause_list imply that the

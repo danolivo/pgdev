@@ -159,6 +159,15 @@ extern List *expand_function_arguments(List *args, bool include_out_arguments,
 
 /* in util/predtest.c: */
 
+typedef struct PredicatesData
+{
+	int					id;
+	List			   *predicate;
+	ScalarArrayOpExpr  *saop;
+} PredicatesData;
+
+extern bool saop_covered_by_predicates(ScalarArrayOpExpr *saop,
+									  List *predicate_lists, List **saoplst);
 extern bool predicate_implied_by(List *predicate_list, List *clause_list,
 								 bool weak);
 extern bool predicate_refuted_by(List *predicate_list, List *clause_list,

@@ -1221,6 +1221,46 @@ build_paths_for_OR(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * Building index paths over SAOP clause differs from the logic of OR clauses.
+ * Here we iterate across all the array elements and split them to SAOPs,
+ * corresponding to different indexes. We must match each element to an index.
+ */
+static List *
+build_paths_for_SAOP(PlannerInfo *root, RelOptInfo *rel,
+				   ScalarArrayOpExpr *saop, List *other_clauses)
+{
+	List	   *result = NIL;
+	List	   *predicate_lists = NIL;
+	List	   *saoplst = NIL;
+	ListCell   *lc;
+	PredicatesData *pd;
+
+	Assert(saop->useOr);
+
+	/* Collect predicates */
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *index = (IndexOptInfo *) lfirst(lc);
+
+		/* Ignore index if it doesn't support bitmap scans */
+		if (!index->amhasgetbitmap || index->indpred == NIL)
+			continue;
+
+		pd = palloc(sizeof(PredicatesData));
+		pd->id = foreach_current_index(lc);
+		pd->predicate = index->indpred;
+		pd->saop = NULL;
+		predicate_lists = lappend(predicate_lists, (void *) pd);
+	}
+
+	/* Split the array data according to index predicates. */
+	if (!saop_covered_by_predicates(saop, predicate_lists, &saoplst))
+		return NIL;
+
+	return result;
+}
+
+/*
  * generate_bitmap_or_paths
  *		Look through the list of clauses to find OR clauses, and generate
  *		a BitmapOrPath for each one we can handle that way.  Return a list
@@ -1247,19 +1287,41 @@ generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
 	foreach(lc, clauses)
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
-		List	   *pathlist;
+		List	   *pathlist = NIL;
 		Path	   *bitmapqual;
 		ListCell   *j;
 
 		/* Ignore RestrictInfos that aren't ORs */
 		if (!restriction_is_or_clause(rinfo))
-			continue;
+		{
+			List	   *indlist;
+
+			if (!restriction_is_saop_clause(rinfo))
+				continue;
+
+			indlist = build_paths_for_SAOP(root, rel,
+										   (ScalarArrayOpExpr *) rinfo->clause,
+										   all_clauses);
+
+			if (indlist == NIL)
+			{
+				pathlist = NIL;
+				break;
+			}
+
+			/*
+			 * OK, pick the most promising AND combination, and add it to
+			 * pathlist.
+			 */
+			bitmapqual = choose_bitmap_and(root, rel, indlist);
+			pathlist = lappend(pathlist, bitmapqual);
+		}
+		else {
 
 		/*
 		 * We must be able to match at least one index to each of the arms of
 		 * the OR, else we can't use it.
 		 */
-		pathlist = NIL;
 		foreach(j, ((BoolExpr *) rinfo->orclause)->args)
 		{
 			Node	   *orarg = (Node *) lfirst(j);
@@ -1309,6 +1371,7 @@ generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
 			 */
 			bitmapqual = choose_bitmap_and(root, rel, indlist);
 			pathlist = lappend(pathlist, bitmapqual);
+		}
 		}
 
 		/*
