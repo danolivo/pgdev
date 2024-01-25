@@ -112,11 +112,59 @@ static Oid	get_btree_test_op(Oid pred_op, Oid clause_op, bool refute_it);
 static void InvalidateOprProofCacheCallBack(Datum arg, int cacheid, uint32 hashvalue);
 
 
+/*
+ * Could this ANY () expression can be split into a set of ANYs over partial
+ * indexes
+ */
 bool
 saop_covered_by_predicates(ScalarArrayOpExpr *saop, List *predicate_lists,
-						  List **saoplst)
+						   List **saoplst)
 {
-	return false;
+	ListCell		   *lc;
+	PredIterInfoData	clause_info;
+	bool				result = false;
+
+	Assert(IsA(saop, ScalarArrayOpExpr));
+
+	if (predicate_classify((Node *) saop, &clause_info) != CLASS_OR)
+		return false;
+
+	iterate_begin(pitem, (Node *) saop, clause_info)
+	{
+		result = false;
+
+		foreach(lc, predicate_lists)
+		{
+			PredicatesData *pd = (PredicatesData *) lfirst(lc);
+			ArrayExpr	   *aexpr;
+
+			if (!predicate_implied_by_recurse(pitem, pd->predicate, false))
+				continue;
+
+			/* Predicate is found. Add the elem to the saop clause */
+			if (pd->saop == NULL)
+			{
+				/* First time initialization */
+				pd->saop = makeNode(ScalarArrayOpExpr);
+				memcpy(pd->saop, saop, sizeof(ScalarArrayOpExpr));
+				Assert(IsA(lsecond(saop->args), ArrayExpr));
+				aexpr = makeNode(ArrayExpr);
+				memcpy(aexpr, lsecond_node(ArrayExpr, saop->args), sizeof(ArrayExpr));
+				aexpr->elements = NIL;
+				pd->saop->args = list_make2(linitial(saop->args), aexpr);
+			}
+
+			Assert(list_length(pd->saop->args) == 2);
+			aexpr = lsecond_node(ArrayExpr, pd->saop->args);
+			aexpr->elements = lappend(aexpr->elements, pitem);
+			result = true;
+			break;
+		}
+		if (!result)
+			break;
+	}
+	iterate_end(clause_info);
+	return result;
 }
 
 /*

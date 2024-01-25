@@ -1229,10 +1229,10 @@ static List *
 build_paths_for_SAOP(PlannerInfo *root, RelOptInfo *rel,
 				   ScalarArrayOpExpr *saop, List *other_clauses)
 {
-	List	   *result = NIL;
-	List	   *predicate_lists = NIL;
-	List	   *saoplst = NIL;
-	ListCell   *lc;
+	List		   *result = NIL;
+	List		   *predicate_lists = NIL;
+	List		   *saoplst = NIL;
+	ListCell	   *lc;
 	PredicatesData *pd;
 
 	Assert(saop->useOr);
@@ -1243,19 +1243,65 @@ build_paths_for_SAOP(PlannerInfo *root, RelOptInfo *rel,
 		IndexOptInfo *index = (IndexOptInfo *) lfirst(lc);
 
 		/* Ignore index if it doesn't support bitmap scans */
-		if (!index->amhasgetbitmap || index->indpred == NIL)
+		if (!index->amhasgetbitmap || index->indpred == NIL || index->predOK)
 			continue;
 
 		pd = palloc(sizeof(PredicatesData));
 		pd->id = foreach_current_index(lc);
-		pd->predicate = index->indpred;
+		pd->predicate = list_length(index->indpred) == 1 ?
+										(Node *) linitial(index->indpred) :
+										(Node *) index->indpred;
 		pd->saop = NULL;
 		predicate_lists = lappend(predicate_lists, (void *) pd);
 	}
 
 	/* Split the array data according to index predicates. */
-	if (!saop_covered_by_predicates(saop, predicate_lists, &saoplst))
+	if (predicate_lists == NIL ||
+		!saop_covered_by_predicates(saop, predicate_lists, &saoplst))
 		return NIL;
+
+	elog(WARNING, "Works!");
+
+	foreach(lc, predicate_lists)
+	{
+		PredicatesData *pd = (PredicatesData *) lfirst(lc);
+		List		   *all_clauses;
+		IndexOptInfo   *index;
+		IndexClauseSet	clauseset;
+		List		   *indexpaths;
+
+		if (pd->saop == NULL)
+			continue;
+
+		index = list_nth(rel->indexlist, pd->id);
+		all_clauses = lappend(list_copy(other_clauses), pd->saop);
+
+		if (!predicate_implied_by(index->indpred, all_clauses, false))
+			elog(ERROR, "Logical mistake: \n%s\n%s",
+			nodeToString(index->indpred), nodeToString(all_clauses));
+
+		if (predicate_implied_by(index->indpred, other_clauses, false))
+			return NIL;
+
+		/* Time to generate index paths */
+		MemSet(&clauseset, 0, sizeof(clauseset));
+		match_clauses_to_index(root, list_make1(pd->saop), index, &clauseset);
+		match_clauses_to_index(root, other_clauses, index, &clauseset);
+		Assert(clauseset.nonempty);
+
+		/*
+		 * Construct paths if possible.
+		 */
+		indexpaths = build_index_paths(root, rel,
+									   index, &clauseset,
+									   true,
+									   ST_BITMAPSCAN,
+									   NULL,
+									   NULL);
+		result = list_concat(result, indexpaths);
+
+		list_free(all_clauses);
+	}
 
 	return result;
 }

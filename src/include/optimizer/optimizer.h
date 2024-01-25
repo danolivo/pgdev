@@ -162,7 +162,7 @@ extern List *expand_function_arguments(List *args, bool include_out_arguments,
 typedef struct PredicatesData
 {
 	int					id;
-	List			   *predicate;
+	Node			   *predicate;
 	ScalarArrayOpExpr  *saop;
 } PredicatesData;
 
