@@ -1260,7 +1260,7 @@ build_paths_for_SAOP(PlannerInfo *root, RelOptInfo *rel, RestrictInfo *rinfo,
 		!saop_covered_by_predicates(saop, predicate_lists, &saoplst))
 		return NIL;
 
-	elog(WARNING, "Works!");
+	other_clauses = list_delete_ptr(other_clauses, rinfo);
 
 	foreach(lc, predicate_lists)
 	{
@@ -1277,21 +1277,20 @@ build_paths_for_SAOP(PlannerInfo *root, RelOptInfo *rel, RestrictInfo *rinfo,
 		index = list_nth(rel->indexlist, pd->id);
 		rinfo1 = palloc(sizeof(RestrictInfo));
 		memcpy(rinfo1, rinfo, sizeof(RestrictInfo));
-		rinfo1->clause = (Expr *) pd->saop;
+
+		rinfo1->clause = (Expr *) estimate_expression_value(root, (Node *) pd->saop);
 		all_clauses = lappend(list_copy(other_clauses), rinfo1);
 
-		if (!predicate_implied_by(index->indpred, list_make1(rinfo1), false))
+		if (!predicate_implied_by(index->indpred, list_make1(rinfo1), true))
 			elog(ERROR, "Logical mistake: \n%s\n%s",
-			nodeToString(index->indpred), nodeToString(all_clauses));
-		else
-			elog(WARNING, "Passed");
+			nodeToString(index->indpred), nodeToString(rinfo1));
 
 		if (predicate_implied_by(index->indpred, other_clauses, false))
 			return NIL;
 
 		/* Time to generate index paths */
 		MemSet(&clauseset, 0, sizeof(clauseset));
-		match_clauses_to_index(root, list_make1(pd->saop), index, &clauseset);
+		match_clauses_to_index(root, list_make1(rinfo1), index, &clauseset);
 		match_clauses_to_index(root, other_clauses, index, &clauseset);
 		Assert(clauseset.nonempty);
 
@@ -1304,11 +1303,10 @@ build_paths_for_SAOP(PlannerInfo *root, RelOptInfo *rel, RestrictInfo *rinfo,
 									   ST_BITMAPSCAN,
 									   NULL,
 									   NULL);
-		result = list_concat(result, indexpaths);
+		result = lappend(result, indexpaths);
 
 		list_free(all_clauses);
 	}
-
 	return result;
 }
 
@@ -1347,6 +1345,7 @@ generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
 		if (!restriction_is_or_clause(rinfo))
 		{
 			List	   *indlist;
+			ListCell   *lc;
 
 			if (!restriction_is_saop_clause(rinfo))
 				continue;
@@ -1365,8 +1364,13 @@ generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
 			 * OK, pick the most promising AND combination, and add it to
 			 * pathlist.
 			 */
-			bitmapqual = choose_bitmap_and(root, rel, indlist);
-			pathlist = lappend(pathlist, bitmapqual);
+			foreach (lc, indlist)
+			{
+				List *plist = lfirst_node(List, lc);
+
+				bitmapqual = choose_bitmap_and(root, rel, plist);
+				pathlist = lappend(pathlist, bitmapqual);
+			}
 		}
 		else {
 

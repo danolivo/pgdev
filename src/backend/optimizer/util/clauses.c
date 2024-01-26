@@ -3708,6 +3708,7 @@ contain_non_const_walker(Node *node, void *context)
 	if (IsA(node, List))
 		return expression_tree_walker(node, contain_non_const_walker, context);
 	/* Otherwise, abort the tree traversal and return true */
+
 	return true;
 }
 
