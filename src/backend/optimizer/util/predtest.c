@@ -123,6 +123,7 @@ saop_covered_by_predicates(ScalarArrayOpExpr *saop, List *predicate_lists,
 	ListCell		   *lc;
 	PredIterInfoData	clause_info;
 	bool				result = false;
+	bool				isConstArray;
 
 	Assert(IsA(saop, ScalarArrayOpExpr));
 
@@ -136,27 +137,12 @@ saop_covered_by_predicates(ScalarArrayOpExpr *saop, List *predicate_lists,
 		foreach(lc, predicate_lists)
 		{
 			PredicatesData *pd = (PredicatesData *) lfirst(lc);
-			ArrayExpr	   *aexpr;
 
 			if (!predicate_implied_by_recurse(pitem, pd->predicate, false))
 				continue;
 
 			/* Predicate is found. Add the elem to the saop clause */
-			if (pd->saop == NULL)
-			{
-				/* First time initialization */
-				pd->saop = makeNode(ScalarArrayOpExpr);
-				memcpy(pd->saop, saop, sizeof(ScalarArrayOpExpr));
-				Assert(IsA(lsecond(saop->args), ArrayExpr));
-				aexpr = makeNode(ArrayExpr);
-				memcpy(aexpr, lsecond_node(ArrayExpr, saop->args), sizeof(ArrayExpr));
-				aexpr->elements = NIL;
-				pd->saop->args = list_make2(linitial(saop->args), aexpr);
-			}
-
-			Assert(list_length(pd->saop->args) == 2);
-			aexpr = lsecond_node(ArrayExpr, pd->saop->args);
-			aexpr->elements = lappend(aexpr->elements, pitem);
+			pd->elems = lappend(pd->elems, pitem);
 			result = true;
 			break;
 		}
@@ -164,7 +150,63 @@ saop_covered_by_predicates(ScalarArrayOpExpr *saop, List *predicate_lists,
 			break;
 	}
 	iterate_end(clause_info);
-	return result;
+
+	if (!result)
+		return false;
+
+	/* Build saops, separately for each index */
+	isConstArray = IsA(lsecond(saop->args), Const) ? true : false;
+
+	foreach(lc, predicate_lists)
+	{
+		PredicatesData *pd = (PredicatesData *) lfirst(lc);
+		ArrayType  *arrayval = NULL;
+		Const	   *c = NULL;
+
+		if (pd->elems == NIL)
+			continue;
+
+		if (isConstArray)
+		{
+			Const	   *arrayconst = lsecond_node(Const, saop->args);
+			Datum	   *elems = palloc(list_length(pd->elems) * sizeof(Datum));
+			int			nelems = 0;
+			int16		elmlen;
+			bool		elmbyval;
+			char		elmalign;
+			ListCell   *lc;
+
+			foreach(lc, pd->elems)
+			{
+				elems[nelems++] = PointerGetDatum(lfirst(lc));
+			}
+			arrayval = DatumGetArrayTypeP(arrayconst->constvalue);
+			get_typlenbyvalalign(ARR_ELEMTYPE(arrayval),
+								 &elmlen, &elmbyval, &elmalign);
+			c = palloc(sizeof(Const));
+			memcpy(c, arrayconst, sizeof(Const));
+			arrayval = construct_array(elems, nelems, arrayval->elemtype,
+									   elmlen, elmbyval, elmalign);
+			c->constvalue = PointerGetDatum(arrayval);
+		}
+		else
+		{
+			Assert(IsA(lsecond(saop->args), ArrayExpr));
+		}
+
+		if (pd->saop == NULL)
+		{
+			/* First time initialization */
+			pd->saop = makeNode(ScalarArrayOpExpr);
+			memcpy(pd->saop, saop, sizeof(ScalarArrayOpExpr));
+			Assert(IsA(lsecond(saop->args), ArrayExpr) ||
+				   IsA(lsecond(saop->args), Const));
+			Assert(c != NULL);
+			pd->saop->args = list_make2(linitial(saop->args), c);
+		}
+	}
+
+	return true;
 }
 
 /*

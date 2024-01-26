@@ -163,6 +163,7 @@ typedef struct PredicatesData
 {
 	int					id;
 	Node			   *predicate;
+	List			   *elems;
 	ScalarArrayOpExpr  *saop;
 } PredicatesData;
 

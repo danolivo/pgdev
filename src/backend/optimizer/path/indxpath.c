@@ -1226,14 +1226,15 @@ build_paths_for_OR(PlannerInfo *root, RelOptInfo *rel,
  * corresponding to different indexes. We must match each element to an index.
  */
 static List *
-build_paths_for_SAOP(PlannerInfo *root, RelOptInfo *rel,
-				   ScalarArrayOpExpr *saop, List *other_clauses)
+build_paths_for_SAOP(PlannerInfo *root, RelOptInfo *rel, RestrictInfo *rinfo,
+				   List *other_clauses)
 {
 	List		   *result = NIL;
 	List		   *predicate_lists = NIL;
 	List		   *saoplst = NIL;
 	ListCell	   *lc;
 	PredicatesData *pd;
+	ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) rinfo->clause;
 
 	Assert(saop->useOr);
 
@@ -1246,12 +1247,11 @@ build_paths_for_SAOP(PlannerInfo *root, RelOptInfo *rel,
 		if (!index->amhasgetbitmap || index->indpred == NIL || index->predOK)
 			continue;
 
-		pd = palloc(sizeof(PredicatesData));
+		pd = palloc0(sizeof(PredicatesData));
 		pd->id = foreach_current_index(lc);
 		pd->predicate = list_length(index->indpred) == 1 ?
 										(Node *) linitial(index->indpred) :
 										(Node *) index->indpred;
-		pd->saop = NULL;
 		predicate_lists = lappend(predicate_lists, (void *) pd);
 	}
 
@@ -1269,16 +1269,22 @@ build_paths_for_SAOP(PlannerInfo *root, RelOptInfo *rel,
 		IndexOptInfo   *index;
 		IndexClauseSet	clauseset;
 		List		   *indexpaths;
+		RestrictInfo   *rinfo1;
 
-		if (pd->saop == NULL)
+		if (pd->elems == NIL)
 			continue;
 
 		index = list_nth(rel->indexlist, pd->id);
-		all_clauses = lappend(list_copy(other_clauses), pd->saop);
+		rinfo1 = palloc(sizeof(RestrictInfo));
+		memcpy(rinfo1, rinfo, sizeof(RestrictInfo));
+		rinfo1->clause = (Expr *) pd->saop;
+		all_clauses = lappend(list_copy(other_clauses), rinfo1);
 
-		if (!predicate_implied_by(index->indpred, all_clauses, false))
+		if (!predicate_implied_by(index->indpred, list_make1(rinfo1), false))
 			elog(ERROR, "Logical mistake: \n%s\n%s",
 			nodeToString(index->indpred), nodeToString(all_clauses));
+		else
+			elog(WARNING, "Passed");
 
 		if (predicate_implied_by(index->indpred, other_clauses, false))
 			return NIL;
@@ -1346,7 +1352,7 @@ generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
 				continue;
 
 			indlist = build_paths_for_SAOP(root, rel,
-										   (ScalarArrayOpExpr *) rinfo->clause,
+										   rinfo,
 										   all_clauses);
 
 			if (indlist == NIL)
