@@ -1219,6 +1219,7 @@ build_paths_for_OR(PlannerInfo *root, RelOptInfo *rel,
 
 	return result;
 }
+#include "parser/parse_expr.h"
 
 /*
  * Building index paths over SAOP clause differs from the logic of OR clauses.
@@ -1277,7 +1278,6 @@ build_paths_for_SAOP(PlannerInfo *root, RelOptInfo *rel, RestrictInfo *rinfo,
 		index = list_nth(rel->indexlist, pd->id);
 		rinfo1 = palloc(sizeof(RestrictInfo));
 		memcpy(rinfo1, rinfo, sizeof(RestrictInfo));
-
 		rinfo1->clause = (Expr *) estimate_expression_value(root, (Node *) pd->saop);
 		all_clauses = lappend(list_copy(other_clauses), rinfo1);
 
@@ -1292,7 +1292,8 @@ build_paths_for_SAOP(PlannerInfo *root, RelOptInfo *rel, RestrictInfo *rinfo,
 		MemSet(&clauseset, 0, sizeof(clauseset));
 		match_clauses_to_index(root, list_make1(rinfo1), index, &clauseset);
 		match_clauses_to_index(root, other_clauses, index, &clauseset);
-		Assert(clauseset.nonempty);
+
+		/* Predicate has found already. So, it is ok for the empty match */
 
 		/*
 		 * Construct paths if possible.
@@ -1310,11 +1311,48 @@ build_paths_for_SAOP(PlannerInfo *root, RelOptInfo *rel, RestrictInfo *rinfo,
 	return result;
 }
 
+static List *
+generate_saop_pathlist(PlannerInfo *root, RelOptInfo *rel,
+					   RestrictInfo *rinfo, List *all_clauses)
+{
+	List	   *pathlist = NIL;
+	Path	   *bitmapqual;
+	List	   *indlist;
+	ListCell   *lc;
+
+	if (!enable_or_transformation)
+		return NIL;
+
+
+	/*
+	 * We must be able to match at least one index to each element of
+	 * the array, else we can't use it.
+	 */
+	indlist = build_paths_for_SAOP(root, rel, rinfo, all_clauses);
+	if (indlist == NIL)
+		return NIL;
+
+	/*
+	 * OK, pick the most promising AND combination, and add it to
+	 * pathlist.
+	 */
+	foreach (lc, indlist)
+	{
+		List *plist = lfirst_node(List, lc);
+
+		bitmapqual = choose_bitmap_and(root, rel, plist);
+		pathlist = lappend(pathlist, bitmapqual);
+	}
+
+	return pathlist;
+}
+
 /*
  * generate_bitmap_or_paths
- *		Look through the list of clauses to find OR clauses, and generate
- *		a BitmapOrPath for each one we can handle that way.  Return a list
- *		of the generated BitmapOrPaths.
+ *		Look through the list of clauses to find OR and SAOP clauses, and
+ *		Each saop clause are splitted to be covered by partial indexes.
+ *		generate a BitmapOrPath for each one we can handle that way.
+ *		Return a list of the generated BitmapOrPaths.
  *
  * other_clauses is a list of additional clauses that can be assumed true
  * for the purpose of generating indexquals, but are not to be searched for
@@ -1341,93 +1379,95 @@ generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
 		Path	   *bitmapqual;
 		ListCell   *j;
 
-		/* Ignore RestrictInfos that aren't ORs */
-		if (!restriction_is_or_clause(rinfo))
+		if (restriction_is_saop_clause(rinfo))
 		{
-			List	   *indlist;
-			ListCell   *lc;
-
-			if (!restriction_is_saop_clause(rinfo))
-				continue;
-
-			indlist = build_paths_for_SAOP(root, rel,
-										   rinfo,
-										   all_clauses);
-
-			if (indlist == NIL)
-			{
-				pathlist = NIL;
-				break;
-			}
-
+			pathlist = generate_saop_pathlist(root, rel, rinfo,
+											  all_clauses);
+		}
+		else if (!restriction_is_or_clause(rinfo))
+			/* Ignore RestrictInfos that aren't ORs */
+			continue;
+		else
+		{
 			/*
-			 * OK, pick the most promising AND combination, and add it to
-			 * pathlist.
+			 * We must be able to match at least one index to each of the arms of
+			 * the OR, else we can't use it.
 			 */
-			foreach (lc, indlist)
+			foreach(j, ((BoolExpr *) rinfo->orclause)->args)
 			{
-				List *plist = lfirst_node(List, lc);
+				Node	   *orarg = (Node *) lfirst(j);
+				List	   *indlist;
 
-				bitmapqual = choose_bitmap_and(root, rel, plist);
+				/* OR arguments should be ANDs or sub-RestrictInfos */
+				if (is_andclause(orarg))
+				{
+					List	   *andargs = ((BoolExpr *) orarg)->args;
+
+					indlist = build_paths_for_OR(root, rel,
+												 andargs,
+												 all_clauses);
+
+					/* Recurse in case there are sub-ORs */
+					indlist = list_concat(indlist,
+										  generate_bitmap_or_paths(root, rel,
+																   andargs,
+																   all_clauses));
+				}
+				else
+				{
+					RestrictInfo *ri = castNode(RestrictInfo, orarg);
+					List	   *orargs;
+
+					Assert(!restriction_is_or_clause(ri));
+
+					orargs = list_make1(ri);
+
+					if (restriction_is_saop_clause(ri))
+					{
+						List *paths;
+
+						paths = generate_saop_pathlist(root, rel, ri,
+														 all_clauses);
+
+						if (paths != NIL)
+						{
+							/*
+							 * Add paths to pathlist and immediately jump to the
+							 * next element of the OR clause.
+							 */
+							pathlist = list_concat(pathlist, paths);
+							continue;
+						}
+
+						/*
+						 * Pass down out of this if construction:
+						 * If saop isn't covered by partial indexes, try to
+						 * build scan path for the saop as a whole.
+						 */
+					}
+
+					indlist = build_paths_for_OR(root, rel,
+												 orargs,
+												 all_clauses);
+				}
+
+				/*
+				 * If nothing matched this arm, we can't do anything with this OR
+				 * clause.
+				 */
+				if (indlist == NIL)
+				{
+					pathlist = NIL;
+					break;
+				}
+
+				/*
+				 * OK, pick the most promising AND combination, and add it to
+				 * pathlist.
+				 */
+				bitmapqual = choose_bitmap_and(root, rel, indlist);
 				pathlist = lappend(pathlist, bitmapqual);
 			}
-		}
-		else {
-
-		/*
-		 * We must be able to match at least one index to each of the arms of
-		 * the OR, else we can't use it.
-		 */
-		foreach(j, ((BoolExpr *) rinfo->orclause)->args)
-		{
-			Node	   *orarg = (Node *) lfirst(j);
-			List	   *indlist;
-
-			/* OR arguments should be ANDs or sub-RestrictInfos */
-			if (is_andclause(orarg))
-			{
-				List	   *andargs = ((BoolExpr *) orarg)->args;
-
-				indlist = build_paths_for_OR(root, rel,
-											 andargs,
-											 all_clauses);
-
-				/* Recurse in case there are sub-ORs */
-				indlist = list_concat(indlist,
-									  generate_bitmap_or_paths(root, rel,
-															   andargs,
-															   all_clauses));
-			}
-			else
-			{
-				RestrictInfo *ri = castNode(RestrictInfo, orarg);
-				List	   *orargs;
-
-				Assert(!restriction_is_or_clause(ri));
-				orargs = list_make1(ri);
-
-				indlist = build_paths_for_OR(root, rel,
-											 orargs,
-											 all_clauses);
-			}
-
-			/*
-			 * If nothing matched this arm, we can't do anything with this OR
-			 * clause.
-			 */
-			if (indlist == NIL)
-			{
-				pathlist = NIL;
-				break;
-			}
-
-			/*
-			 * OK, pick the most promising AND combination, and add it to
-			 * pathlist.
-			 */
-			bitmapqual = choose_bitmap_and(root, rel, indlist);
-			pathlist = lappend(pathlist, bitmapqual);
-		}
 		}
 
 		/*
