@@ -2229,8 +2229,8 @@ select * from prtx1
 where not exists (select 1 from prtx2
                   where prtx2.a=prtx1.a and prtx2.b=prtx1.b and prtx2.c=123)
   and a<20 and c=120;
-                         QUERY PLAN                          
--------------------------------------------------------------
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
  Append
    ->  Nested Loop Anti Join
          ->  Seq Scan on prtx1_1
@@ -2244,17 +2244,12 @@ where not exists (select 1 from prtx2
                      ->  Bitmap Index Scan on prtx2_1_c_idx
                            Index Cond: (c = 123)
    ->  Nested Loop Anti Join
+         Join Filter: ((prtx2_2.a = prtx1_2.a) AND (prtx2_2.b = prtx1_2.b))
          ->  Seq Scan on prtx1_2
                Filter: ((a < 20) AND (c = 120))
-         ->  Bitmap Heap Scan on prtx2_2
-               Recheck Cond: ((b = prtx1_2.b) AND (c = 123))
-               Filter: (a = prtx1_2.a)
-               ->  BitmapAnd
-                     ->  Bitmap Index Scan on prtx2_2_b_idx
-                           Index Cond: (b = prtx1_2.b)
-                     ->  Bitmap Index Scan on prtx2_2_c_idx
-                           Index Cond: (c = 123)
-(23 rows)
+         ->  Index Scan using prtx2_2_c_idx on prtx2_2
+               Index Cond: (c = 123)
+(18 rows)
 
 select * from prtx1
 where not exists (select 1 from prtx2

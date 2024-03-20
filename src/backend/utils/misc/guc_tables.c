@@ -919,6 +919,16 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"enable_index_estimate", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables estimation of equality if the constant is out of statistic boundaries."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&enable_index_estimate,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"enable_partitionwise_join", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables partitionwise join."),
 			NULL,

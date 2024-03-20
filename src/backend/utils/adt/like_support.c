@@ -643,7 +643,7 @@ patternsel_common(PlannerInfo *root,
 		/*
 		 * Pattern specifies an exact match, so estimate as for '='
 		 */
-		result = var_eq_const(&vardata, eqopr, collation, prefix->constvalue,
+		result = var_eq_const_ext(root, &vardata, eqopr, collation, prefix->constvalue,
 							  false, true, false);
 	}
 	else

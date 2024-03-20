@@ -180,6 +180,10 @@ extern double ineq_histogram_selectivity(PlannerInfo *root,
 										 bool isgt, bool iseq,
 										 Oid collation,
 										 Datum constval, Oid consttype);
+extern double var_eq_const_ext(PlannerInfo *root, VariableStatData *vardata,
+							   Oid oproid, Oid collation,
+							   Datum constval, bool constisnull,
+							   bool varonleft, bool negate);
 extern double var_eq_const(VariableStatData *vardata,
 						   Oid oproid, Oid collation,
 						   Datum constval, bool constisnull,

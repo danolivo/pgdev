@@ -273,10 +273,10 @@ eqsel_internal(PG_FUNCTION_ARGS, bool negate)
 	 * in the query.)
 	 */
 	if (IsA(other, Const))
-		selec = var_eq_const(&vardata, operator, collation,
-							 ((Const *) other)->constvalue,
-							 ((Const *) other)->constisnull,
-							 varonleft, negate);
+		selec = var_eq_const_ext(root, &vardata, operator, collation,
+								 ((Const *) other)->constvalue,
+								 ((Const *) other)->constisnull,
+								 varonleft, negate);
 	else
 		selec = var_eq_non_const(&vardata, operator, collation, other,
 								 varonleft, negate);
@@ -287,19 +287,157 @@ eqsel_internal(PG_FUNCTION_ARGS, bool negate)
 }
 
 /*
+ * Lookup the value in the index and try to estimate number of the tuples with
+ * the same value.
+ */
+static Selectivity
+estimate_ntuples_by_index(PlannerInfo *root, VariableStatData *vardata,
+						  Datum constval,
+						  Oid collation, Oid regprocoid, int32 stawidth)
+{
+	RelOptInfo	   *rel = vardata->rel;
+	RangeTblEntry  *rte = root->simple_rte_array[rel->relid];
+	ListCell	   *lc;
+	int64			ntuples = 0;
+	Selectivity		selec = -1.;
+	TIDBitmap	   *tbm;
+	MemoryContext tmpcontext;
+	MemoryContext oldcontext;
+
+	/* Make sure any cruft gets recycled when we're done */
+	tmpcontext = AllocSetContextCreate(CurrentMemoryContext,
+									   "estimate_ntuples_by_index workspace",
+									   ALLOCSET_DEFAULT_SIZES);
+	oldcontext = MemoryContextSwitchTo(tmpcontext);
+
+	tbm = tbm_create(work_mem * 1024L, NULL);
+
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo   *index = (IndexOptInfo *) lfirst(lc);
+		ScanKeyData		scankeys[1];
+		SnapshotData	SnapshotNonVacuumable;
+		IndexScanDesc	index_scan;
+		Relation		heapRel;
+		Relation		indexRel;
+
+		if (index->relam != BTREE_AM_OID)
+			continue;
+		if (index->indpred != NIL)
+			continue;
+		if (index->hypothetical)
+			continue;
+		if (!match_index_to_operand(vardata->var, 0, index))
+			continue;
+
+		heapRel = table_open(rte->relid, NoLock);
+		indexRel = index_open(index->indexoid, NoLock);
+
+		ScanKeyEntryInitialize(&scankeys[0],
+								   0,
+								   1,
+								   BTEqualStrategyNumber,
+								   vardata->atttype,
+								   collation,
+								   regprocoid,
+								   constval);
+		InitNonVacuumableSnapshot(SnapshotNonVacuumable,
+								  GlobalVisTestFor(heapRel));
+
+		index_scan = index_beginscan(heapRel, indexRel,
+									 &SnapshotNonVacuumable,
+									 1, 0);
+		index_scan->xs_want_itup = true;
+		index_rescan(index_scan, scankeys, 1, NULL, 0);
+
+		if (indexRel->rd_indam->amgetbitmap != NULL)
+		{
+			ntuples = index_getbitmap(index_scan, tbm);
+			selec = (ntuples > 0) ? ntuples / vardata->rel->tuples :
+													1. / vardata->rel->tuples;
+		}
+		else
+			selec = -1.;
+
+		index_endscan(index_scan);
+		index_close(indexRel, NoLock);
+		table_close(heapRel, NoLock);
+		break;
+	}
+
+	MemoryContextSwitchTo(oldcontext);
+	MemoryContextDelete(tmpcontext);
+
+	return selec;
+}
+
+/*
+ * Returns 0 if the value covered by the histogram.
+ */
+static bool
+const_out_of_scope(VariableStatData *vardata, Datum value)
+{
+	AttStatsSlot	sslot;
+	bool			result = false;
+
+	if (HeapTupleIsValid(vardata->statsTuple) &&
+		get_attstatsslot(&sslot, vardata->statsTuple,
+						 STATISTIC_KIND_HISTOGRAM, InvalidOid,
+						 ATTSTATSSLOT_VALUES))
+	{
+		FmgrInfo		opproc;
+		TypeCacheEntry *type;
+		Oid				funcoid;
+		bool			cmpres;
+
+		/* Load operators for the type */
+		type = lookup_type_cache(vardata->vartype, TYPECACHE_LT_OPR | TYPECACHE_GT_OPR);
+
+		/* Check: low boundary greater than value */
+		funcoid = get_opcode(type->gt_opr);
+		fmgr_info(funcoid, &opproc);
+		cmpres = DatumGetBool(FunctionCall2Coll(&opproc,
+													   type->typcollation,
+													   sslot.values[0],
+													   value));
+
+
+		if (cmpres)
+			result = true;
+		else
+		{
+			/* Check: top boundary lower than value */
+			funcoid = get_opcode(type->lt_opr);
+			fmgr_info(funcoid, &opproc);
+			cmpres = DatumGetBool(FunctionCall2Coll(&opproc,
+													type->typcollation,
+													sslot.values[sslot.nvalues - 1],
+													value));
+			if (cmpres)
+				result = true;
+		}
+
+		free_attstatsslot(&sslot);
+	}
+
+	return result;
+}
+
+/*
  * var_eq_const --- eqsel for var = const case
  *
  * This is exported so that some other estimation functions can use it.
  */
 double
-var_eq_const(VariableStatData *vardata, Oid oproid, Oid collation,
-			 Datum constval, bool constisnull,
-			 bool varonleft, bool negate)
+var_eq_const_ext(PlannerInfo *root, VariableStatData *vardata, Oid oproid, Oid collation,
+				 Datum constval, bool constisnull,
+				 bool varonleft, bool negate)
 {
-	double		selec;
-	double		nullfrac = 0.0;
-	bool		isdefault;
-	Oid			opfuncoid;
+	double				selec;
+	double				nullfrac = 0.0;
+	bool				isdefault;
+	Oid					opfuncoid;
+	Form_pg_statistic	stats = NULL;
 
 	/*
 	 * If the constant is NULL, assume operator is strict and return zero, ie,
@@ -314,8 +452,6 @@ var_eq_const(VariableStatData *vardata, Oid oproid, Oid collation,
 	 */
 	if (HeapTupleIsValid(vardata->statsTuple))
 	{
-		Form_pg_statistic stats;
-
 		stats = (Form_pg_statistic) GETSTRUCT(vardata->statsTuple);
 		nullfrac = stats->stanullfrac;
 	}
@@ -331,7 +467,7 @@ var_eq_const(VariableStatData *vardata, Oid oproid, Oid collation,
 	{
 		selec = 1.0 / vardata->rel->tuples;
 	}
-	else if (HeapTupleIsValid(vardata->statsTuple) &&
+	else if (stats &&
 			 statistic_proc_security_check(vardata,
 										   (opfuncoid = get_opcode(oproid))))
 	{
@@ -402,6 +538,18 @@ var_eq_const(VariableStatData *vardata, Oid oproid, Oid collation,
 			 */
 			selec = sslot.numbers[i];
 		}
+		else if (enable_index_estimate && stats && root &&
+				 const_out_of_scope(vardata, constval) &&
+				 (selec = estimate_ntuples_by_index(root, vardata, constval,
+													collation, opfuncoid,
+													stats->stawidth)) >= 0.)
+		{
+			/*
+			 * value to estimate is out of the boundaries of the histogram. And
+			 * we attempted to find an index and probe it.
+			 * At this point we successfully done it.
+			 */
+		}
 		else
 		{
 			/*
@@ -455,6 +603,15 @@ var_eq_const(VariableStatData *vardata, Oid oproid, Oid collation,
 	CLAMP_PROBABILITY(selec);
 
 	return selec;
+}
+
+double
+var_eq_const(VariableStatData *vardata, Oid oproid, Oid collation,
+			 Datum constval, bool constisnull,
+			 bool varonleft, bool negate)
+{
+	return var_eq_const_ext(NULL, vardata, oproid, collation,
+							constval, constisnull, varonleft, negate);
 }
 
 /*
