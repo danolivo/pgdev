@@ -299,7 +299,8 @@ extern Path *reparameterize_path(PlannerInfo *root, Path *path,
 								 Relids required_outer,
 								 double loop_count);
 extern Path *reparameterize_path_by_child(PlannerInfo *root, Path *path,
-										  RelOptInfo *child_rel);
+										  RelOptInfo *child_rel,
+										  bool needFlatCopy);
 extern bool path_is_reparameterizable_by_child(Path *path,
 											   RelOptInfo *child_rel);
 
