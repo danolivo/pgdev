@@ -204,7 +204,11 @@ adjust_appendrel_attrs(PlannerInfo *root, Node *node, int nappinfos,
 
 	/* If there's nothing to adjust, just return a duplication */
 	if (nappinfos == 0)
+	{
+		elog(WARNING, "NOTHING TO ADJUST");
+
 		return copyObject(node);
+	}
 
 	/* Should never be translating a Query tree. */
 	Assert(node == NULL || !IsA(node, Query));
@@ -226,7 +230,7 @@ adjust_appendrel_attrs_mutator(Node *node,
 	{
 		Var		   *var = (Var *) copyObject(node);
 		AppendRelInfo *appinfo = NULL;
-
+//elog(WARNING, "VAR varno: %d", var->varno);
 		if (var->varlevelsup != 0)
 			return (Node *) var;	/* no changes needed */
 

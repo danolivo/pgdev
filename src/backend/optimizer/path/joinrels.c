@@ -1698,7 +1698,7 @@ try_partitionwise_join(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2,
 		free_child_join_sjinfo(child_sjinfo);
 	}
 }
-
+int level = 0;
 /*
  * DEV NOTE:
  * Remember to set joinrel->nparts to 0 in the case we reject this way.
@@ -1719,8 +1719,7 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 	 * Try this technique only if partitionwise joins are allowed and this
 	 * asymmetric join can be built safely.
 	 */
-	if (!enable_asymmetric_join ||
-		!parent_sjinfo->consider_asymmetric_join ||
+	if (!enable_asymmetric_join || !joinrel->consider_asymmetric_join ||
 		joinrel->part_scheme == NULL)
 		return;
 
@@ -1752,7 +1751,10 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 	}
 	else
 		Assert(joinrel->nparts == prel->nparts && joinrel->part_rels != NULL);
-
+	level++;
+//	elog(WARNING, "[%d] Attempt to JOIN Asymmetrically %s and %s",
+//			level, nodeToString(rel1->relids), nodeToString(rel2->relids));
+//	Assert(level < 2);
 	/*
 	 * Create child-join relations for this asymmetric join, if those don't
 	 * exist. Add paths to child-joins for a pair of child relations
@@ -1826,6 +1828,8 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 			joinrel->live_parts = bms_add_member(joinrel->live_parts, cnt_parts);
 			joinrel->all_partrels = bms_add_members(joinrel->all_partrels,
 													child_joinrel->relids);
+//			elog(WARNING, "AJ-gen rel: %s (%lX)",
+//				nodeToString(child_joinrel->relids), (uint64)child_joinrel);
 		}
 		else
 			child_joinrel = joinrel->part_rels[cnt_parts];
@@ -1841,9 +1845,12 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 
 		pfree(appinfos);
 
-		Assert(child_joinrel->pathlist != NIL);
-		set_cheapest(child_joinrel);
+//		Assert(child_joinrel->pathlist != NIL);
+//		set_cheapest(child_joinrel);
 	}
+
+	level--;
+//	elog(WARNING, "END JOIN Asymmetrically"	);
 }
 
 /*
@@ -1893,8 +1900,6 @@ build_child_join_sjinfo(PlannerInfo *root, SpecialJoinInfo *parent_sjinfo,
 															 (Node *) sjinfo->semi_rhs_exprs,
 															 right_nappinfos,
 															 right_appinfos);
-	sjinfo->consider_asymmetric_join = false;
-
 	pfree(left_appinfos);
 	pfree(right_appinfos);
 

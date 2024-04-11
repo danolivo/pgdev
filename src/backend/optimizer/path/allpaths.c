@@ -4315,7 +4315,7 @@ generate_partitionwise_join_paths(PlannerInfo *root, RelOptInfo *rel)
 		return;
 
 	/* The relation should have consider_partitionwise_join set. */
-//	Assert(rel->consider_partitionwise_join);
+	Assert(rel->consider_partitionwise_join ^ rel->consider_asymmetric_join);
 
 	/* Guard against stack overflow due to overly deep partition hierarchy. */
 	check_stack_depth();
