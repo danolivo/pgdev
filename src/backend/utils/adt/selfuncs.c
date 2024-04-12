@@ -357,7 +357,8 @@ estimate_ntuples_by_index(PlannerInfo *root, VariableStatData *vardata,
 													1. / vardata->rel->tuples;
 		}
 		else
-			selec = -1.;
+			/* Probe another index */
+			continue;
 
 		index_endscan(index_scan);
 		index_close(indexRel, NoLock);
@@ -391,7 +392,8 @@ const_out_of_scope(VariableStatData *vardata, Datum value)
 		bool			cmpres;
 
 		/* Load operators for the type */
-		type = lookup_type_cache(vardata->vartype, TYPECACHE_LT_OPR | TYPECACHE_GT_OPR);
+		type = lookup_type_cache(vardata->vartype,
+								 TYPECACHE_LT_OPR | TYPECACHE_GT_OPR);
 
 		/* Check: low boundary greater than value */
 		funcoid = get_opcode(type->gt_opr);
