@@ -2117,9 +2117,6 @@ build_joinrel_partition_info_asymm(PlannerInfo *root,
 
 	Assert(joinrel->part_scheme == NULL);
 
-	if (sjinfo->jointype != JOIN_INNER && sjinfo->jointype != JOIN_LEFT)
-		return;
-
 	/* Disallow recursive usage of asymmetric join machinery */
 	if (root->join_rel_level == NULL) // Still needed ?
 		return;
@@ -2219,23 +2216,23 @@ build_joinrel_partition_info(PlannerInfo *root,
 
 static void
 build_joinrel_partition_info_ext(PlannerInfo *root,
-							 RelOptInfo *joinrel, RelOptInfo *outer_rel,
-							 RelOptInfo *inner_rel, SpecialJoinInfo *sjinfo,
-							 List *restrictlist)
+								 RelOptInfo *joinrel, RelOptInfo *outer_rel,
+								 RelOptInfo *inner_rel, SpecialJoinInfo *sjinfo,
+								 List *restrictlist)
 {
 	build_joinrel_partition_info(root, joinrel, outer_rel, inner_rel, sjinfo,
 								 restrictlist);
 
-	if (enable_asymmetric_join)
+	if (enable_asymmetric_join && sjinfo->jointype != JOIN_FULL)
 	{
 		if (inner_rel->part_scheme == NULL)
 			/* Here we can do an attempt for asymmetric join only */
-			build_joinrel_partition_info_asymm(root, joinrel, outer_rel, inner_rel,
-											   sjinfo, restrictlist);
+			build_joinrel_partition_info_asymm(root, joinrel, outer_rel,
+											   inner_rel, sjinfo, restrictlist);
 		if (sjinfo->jointype == JOIN_INNER && outer_rel->part_scheme == NULL)
 			/* Here we can do an attempt for asymmetric join only */
-			build_joinrel_partition_info_asymm(root, joinrel, inner_rel, outer_rel,
-											   sjinfo, restrictlist);
+			build_joinrel_partition_info_asymm(root, joinrel, inner_rel,
+											   outer_rel, sjinfo, restrictlist);
 	}
 }
 

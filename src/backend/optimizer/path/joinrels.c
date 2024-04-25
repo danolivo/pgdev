@@ -1699,33 +1699,36 @@ try_partitionwise_join(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2,
  * DEV NOTE:
  * Remember to set joinrel->nparts to 0 in the case we reject this way.
  */
-void
+static void
 try_asymmetric_partitionwise_join(PlannerInfo *root,
-								  RelOptInfo *rel1,
-								  RelOptInfo *rel2,
+								  RelOptInfo *outer,
+								  RelOptInfo *inner,
 								  RelOptInfo *joinrel,
 								  SpecialJoinInfo *parent_sjinfo,
 								  List *parent_restrictlist)
 {
 	int			cnt_parts;
-	RelOptInfo *inner_rel = rel1;
-	RelOptInfo *prel = rel2;
+	RelOptInfo *inner_rel = inner;
+	RelOptInfo *prel = outer;
 
 	/*
 	 * Try this technique only if partitionwise joins are allowed and this
 	 * asymmetric join can be built safely.
 	 */
-	if (!joinrel->consider_asymmetric_join ||
-		joinrel->part_scheme == NULL)
+	if (!joinrel->consider_asymmetric_join || joinrel->part_scheme == NULL)
 		return;
-
-	/* True value of consider_asymmetric_join means this determinant */
-	Assert(joinrel->part_scheme != NULL);
 
 	if (!IS_PARTITIONED_REL(prel))
 	{
-		prel = rel1;
-		inner_rel = rel2;
+		if (parent_sjinfo->jointype != JOIN_INNER)
+			/*
+			 * Can't change the order of inputs because left or anti join
+			 * depend on the order.
+			 */
+			return;
+
+		prel = inner;
+		inner_rel = outer;
 	}
 
 	if (!IS_PARTITIONED_REL(prel))
@@ -1770,13 +1773,16 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 		Assert(!IS_DUMMY_REL(inner));
 		child_empty = (outer_child == NULL || IS_DUMMY_REL(outer_child));
 
+		/* Remember, inner already can't be dummy at this point */
 		switch (parent_sjinfo->jointype)
 		{
 			case JOIN_INNER:
+			case JOIN_SEMI:
 				if (child_empty)
 					continue;	/* ignore this join segment */
 				break;
 			case JOIN_LEFT:
+			case JOIN_ANTI:
 				break;
 			default:
 				/* other values not expected here */

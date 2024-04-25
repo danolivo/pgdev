@@ -2620,6 +2620,68 @@ WHERE (t1.a = t2.b) AND (t1.a = 542 OR t1.a = 1);
                      Filter: ((a = 542) OR (a = 1))
 (9 rows)
 
+-- Test AJ on anti join
+-- First test mostly for the future SJE with support of partitioned tables.
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM prt1 t1, prt2_p1 t2
+WHERE NOT EXISTS (SELECT * FROM prt1 WHERE prt1.a = t1.a);
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Aggregate
+   ->  Append
+         ->  Nested Loop
+               ->  Hash Anti Join
+                     Hash Cond: (t1_1.a = prt1_1.a)
+                     ->  Seq Scan on prt1_p1 t1_1
+                     ->  Hash
+                           ->  Seq Scan on prt1_p1 prt1_1
+               ->  Seq Scan on prt2_p1 t2
+         ->  Nested Loop
+               ->  Hash Anti Join
+                     Hash Cond: (t1_2.a = prt1_2.a)
+                     ->  Seq Scan on prt1_p2 t1_2
+                     ->  Hash
+                           ->  Seq Scan on prt1_p2 prt1_2
+               ->  Seq Scan on prt2_p1 t2
+         ->  Nested Loop
+               ->  Hash Anti Join
+                     Hash Cond: (t1_3.a = prt1_3.a)
+                     ->  Seq Scan on prt1_p3 t1_3
+                     ->  Hash
+                           ->  Seq Scan on prt1_p3 prt1_3
+               ->  Seq Scan on prt2_p1 t2
+(23 rows)
+
+SELECT count(*) FROM prt1 t1, prt2_p1 t2
+WHERE NOT EXISTS (SELECT * FROM prt1 WHERE prt1.a = t1.a);
+ count 
+-------
+     0
+(1 row)
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM prt2_p1 t1
+WHERE NOT EXISTS (SELECT * FROM prt1 WHERE prt1.a = t1.b);
+                  QUERY PLAN                  
+----------------------------------------------
+ Aggregate
+   ->  Hash Right Anti Join
+         Hash Cond: (prt1.a = t1.b)
+         ->  Append
+               ->  Seq Scan on prt1_p1 prt1_1
+               ->  Seq Scan on prt1_p2 prt1_2
+               ->  Seq Scan on prt1_p3 prt1_3
+         ->  Hash
+               ->  Seq Scan on prt2_p1 t1
+(9 rows)
+
+SELECT count(*) FROM prt2_p1 t1
+WHERE NOT EXISTS (SELECT * FROM prt1 WHERE prt1.a = t1.b);
+ count 
+-------
+    42
+(1 row)
+
 -- Can't use AJ because of complex inner as well as PWJ (one partition pruned)
 EXPLAIN (COSTS OFF)
 SELECT (t1.*)::prt1

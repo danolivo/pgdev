@@ -629,6 +629,19 @@ SELECT (t1.*)::prt1
 FROM prt1 t1, prt2_p1 t2
 WHERE (t1.a = t2.b) AND (t1.a = 542 OR t1.a = 1);
 
+-- Test AJ on anti join
+-- First test mostly for the future SJE with support of partitioned tables.
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM prt1 t1, prt2_p1 t2
+WHERE NOT EXISTS (SELECT * FROM prt1 WHERE prt1.a = t1.a);
+SELECT count(*) FROM prt1 t1, prt2_p1 t2
+WHERE NOT EXISTS (SELECT * FROM prt1 WHERE prt1.a = t1.a);
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM prt2_p1 t1
+WHERE NOT EXISTS (SELECT * FROM prt1 WHERE prt1.a = t1.b);
+SELECT count(*) FROM prt2_p1 t1
+WHERE NOT EXISTS (SELECT * FROM prt1 WHERE prt1.a = t1.b);
+
 -- Can't use AJ because of complex inner as well as PWJ (one partition pruned)
 EXPLAIN (COSTS OFF)
 SELECT (t1.*)::prt1
