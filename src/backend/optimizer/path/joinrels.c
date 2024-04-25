@@ -1767,7 +1767,7 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 		AppendRelInfo	  **appinfos;
 		int					nappinfos;
 
-		inner = inner_rel; // TODO: must make new entry here
+		inner = inner_rel;
 		outer_child = prel->part_rels[cnt_parts];
 
 		Assert(!IS_DUMMY_REL(inner));
@@ -1793,10 +1793,27 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 
 		if (outer_child == NULL)
 		{
-			/* Pruned partition. Still be pruned after AJ. */
-			joinrel->part_rels[cnt_parts] = NULL;
-			continue;
+			/*
+			 * Mark the joinrel as unpartitioned so that later functions treat
+			 * it correctly.
+			 * It is not obvious that we need return here. But we follow the
+			 * commit 7ad6498 and just reduce risk of fault for quite rare case.
+			 * Anyway, it can be fixed in the future.
+			 */
+			joinrel->nparts = 0;
+			return;
 		}
+
+		/*
+		 * XXX:
+		 * If we want to provide each child join with personal copy of inner
+		 * relation - it is a good place to do.
+		 * The main reason why we still don't do it - what if AJ had
+		 * implemented over arbitrary inner subtree, not only a baserel? In that
+		 * case we inevitable must copy whole subtree of RelOptInfos. But we
+		 * don't have standard machinery to do this and even insight on how to
+		 * do it with strong guarantees.
+		 */
 
 		Assert(!bms_overlap(inner->relids, outer_child->relids));
 
@@ -1837,6 +1854,13 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 									child_restrictlist);
 
 		pfree(appinfos);
+
+		/*
+		 * free_child_join_sjinfo(child_sjinfo);
+		 * We can't free it here, because min_righthand value isn't changed
+		 * in the AJ optimisation yet - remember that the same copy of inner
+		 * relation participates in each child join.
+		 */
 	}
 }
 

@@ -2156,7 +2156,7 @@ build_joinrel_partition_info(PlannerInfo *root,
 {
 	PartitionScheme part_scheme;
 
-	/* Nothing to do if partitionwise join techniques are disabled. */
+	/* Nothing to do if partitionwise join technique is disabled. */
 	if (!enable_partitionwise_join)
 	{
 		Assert(!IS_PARTITIONED_REL(joinrel));

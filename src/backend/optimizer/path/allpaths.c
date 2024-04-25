@@ -958,14 +958,15 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 	Assert(IS_SIMPLE_REL(rel));
 
 	/*
-	 * If this is a partitioned baserel, set the consider_partitionwise_join and
-	 * enable_asymmetric_join flags; currently, we only consider partitionwise
-	 * joins with the baserel if its targetlist doesn't contain a whole-row Var.
+	 * If this is a partitioned baserel, set the consider_partitionwise_join
+	 * flag; currently, we only consider partitionwise joins with the baserel
+	 * if its targetlist doesn't contain a whole-row Var.
 	 */
-	if (rel->reloptkind == RELOPT_BASEREL &&
+	if (enable_partitionwise_join &&
+		rel->reloptkind == RELOPT_BASEREL &&
 		rte->relkind == RELKIND_PARTITIONED_TABLE &&
 		bms_is_empty(rel->attr_needed[InvalidAttrNumber - rel->min_attr]))
-		rel->consider_partitionwise_join = enable_partitionwise_join;
+		rel->consider_partitionwise_join = true;
 
 	/*
 	 * Initialize to compute size estimates for whole append relation.
@@ -4302,7 +4303,10 @@ generate_partitionwise_join_paths(PlannerInfo *root, RelOptInfo *rel)
 	if (!IS_PARTITIONED_REL(rel))
 		return;
 
-	/* The relation should have consider_partitionwise_join set. */
+	/*
+	 * The relation should have consider_partitionwise_join or
+	 * consider_asymmetric_join set.
+	 */
 	Assert(rel->consider_partitionwise_join ^ rel->consider_asymmetric_join);
 
 	/* Guard against stack overflow due to overly deep partition hierarchy. */

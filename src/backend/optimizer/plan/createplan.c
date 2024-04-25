@@ -4343,7 +4343,7 @@ create_customscan_plan(PlannerInfo *root, CustomPath *best_path,
 /*
  * AJ path is a path which has OTHER_REL parent, non-other, non inherited relation on one side and partition on the opposite side
  * Partitioned side of the AJ can be RELOPT_OTHER_MEMBER_REL (base table) or
- * RELOPT_OTHER_JOINREL for a join. May it be OTHER_UPPER_REL - not for now.
+ * RELOPT_OTHER_JOINREL for a join. May it be OTHER_UPPER_REL? - not for now.
  * We should differ AJ from trivial UNION ALL.
  */
 static bool
@@ -4363,14 +4363,20 @@ is_asymmetric_join(NestPath *path)
 	plainrel = path->jpath.innerjoinpath->parent;
 	prel = path->jpath.outerjoinpath->parent;
 
+	/*
+	 * RelOptInfo can be implemented by a bushy path tree. In that case we
+	 * should dive below, but it is impractical right now - we can't check out
+	 * the code and test it because the case doesn't exists.
+	 */
+	Assert(prel != plainrel);
+
 	/* Identify prospective inner and outer of the AJ */
 	if (!IS_PARTITION(prel))
 	{
+		/* Inner join allows to change inner and outer sides of AJ */
 		plainrel = prel;
 		prel = path->jpath.innerjoinpath->parent;
 	}
-
-	Assert(prel != plainrel);
 
 	if (!IS_PARTITION(prel) || IS_OTHER_REL(plainrel))
 		return false;
