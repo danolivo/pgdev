@@ -997,7 +997,7 @@ build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
 
 	/* Is the join between partitions itself partitioned? */
 	build_joinrel_partition_info_ext(root, joinrel, outer_rel, inner_rel, sjinfo,
-								 restrictlist);
+									 restrictlist);
 
 	/* Child joinrel is parallel safe if parent is parallel safe. */
 	joinrel->consider_parallel = parent_joinrel->consider_parallel;
@@ -2175,8 +2175,8 @@ build_joinrel_partition_info(PlannerInfo *root,
 	 * the joins.  Please see optimizer/README for details.
 	 */
 	if (outer_rel->part_scheme == NULL || inner_rel->part_scheme == NULL ||
-		!outer_rel->consider_partitionwise_join ||
-		!inner_rel->consider_partitionwise_join ||
+		(!outer_rel->consider_partitionwise_join && !outer_rel->consider_asymmetric_join) ||
+		(!inner_rel->consider_partitionwise_join && !inner_rel->consider_asymmetric_join) ||
 		outer_rel->part_scheme != inner_rel->part_scheme ||
 		!have_partkey_equi_join(root, joinrel, outer_rel, inner_rel,
 								sjinfo->jointype, restrictlist))
@@ -2209,8 +2209,8 @@ build_joinrel_partition_info(PlannerInfo *root,
 	/*
 	 * Set the consider_partitionwise_join flag.
 	 */
-	Assert(outer_rel->consider_partitionwise_join);
-	Assert(inner_rel->consider_partitionwise_join);
+	Assert(outer_rel->consider_partitionwise_join || outer_rel->consider_asymmetric_join);
+	Assert(inner_rel->consider_partitionwise_join || inner_rel->consider_asymmetric_join);
 	joinrel->consider_partitionwise_join = true;
 }
 

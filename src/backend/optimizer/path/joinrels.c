@@ -1521,8 +1521,8 @@ try_partitionwise_join(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2,
 	Assert(REL_HAS_ALL_PART_PROPS(rel1) && REL_HAS_ALL_PART_PROPS(rel2));
 
 	/* The joining relations should have consider_partitionwise_join set. */
-	Assert(rel1->consider_partitionwise_join &&
-		   rel2->consider_partitionwise_join);
+	Assert((rel1->consider_partitionwise_join || rel1->consider_asymmetric_join) &&
+		   (rel2->consider_partitionwise_join || rel2->consider_asymmetric_join));
 
 	/*
 	 * The partition scheme of the join relation should match that of the
