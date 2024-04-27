@@ -4088,6 +4088,59 @@ reparameterize_path(PlannerInfo *root, Path *path,
 	return NULL;
 }
 
+
+#define IS_PARTITION(rel) \
+	(rel->reloptkind == RELOPT_OTHER_JOINREL || \
+	rel->reloptkind == RELOPT_OTHER_MEMBER_REL)
+
+/*
+ * AJ path is a path which has OTHER_REL parent, non-other, non inherited relation on one side and partition on the opposite side
+ * Partitioned side of the AJ can be RELOPT_OTHER_MEMBER_REL (base table) or
+ * RELOPT_OTHER_JOINREL for a join. May it be OTHER_UPPER_REL? - not for now.
+ * We should differ AJ from trivial UNION ALL.
+ */
+bool
+is_asymmetric_join(Path *path)
+{
+	RelOptInfo *rel = ((Path *) path)->parent;
+	RelOptInfo *plainrel;
+	RelOptInfo *prel;
+	JoinPath   *jpath;
+
+	Assert(IsA(path, NestPath) || IsA(path, MergePath) || IsA(path, HashPath));
+	jpath = (JoinPath *) path;
+
+	if (!IS_OTHER_REL(rel))
+		return false;
+
+	Assert(rel->reloptkind != RELOPT_OTHER_UPPER_REL);
+
+	/* Discover left and right sides of the join */
+
+	plainrel = jpath->innerjoinpath->parent;
+	prel = jpath->outerjoinpath->parent;
+
+	/*
+	 * RelOptInfo can be implemented by a bushy path tree. In that case we
+	 * should dive below, but it is impractical right now - we can't check out
+	 * the code and test it because the case doesn't exists.
+	 */
+	Assert(prel != plainrel);
+
+	/* Identify prospective inner and outer of the AJ */
+	if (!IS_PARTITION(prel))
+	{
+		/* Inner join allows to change inner and outer sides of AJ */
+		plainrel = prel;
+		prel = jpath->innerjoinpath->parent;
+	}
+
+	if (!IS_PARTITION(prel) || IS_OTHER_REL(plainrel))
+		return false;
+
+	return true;
+}
+
 /*
  * reparameterize_path_by_child
  * 		Given a path parameterized by the parent of the given child relation,
@@ -4097,6 +4150,11 @@ reparameterize_path(PlannerInfo *root, Path *path,
  * adjusted to refer to the correct varnos, and any subpaths must be
  * recursively reparameterized.  Other fields that refer to specific relids
  * also need adjustment.
+ *
+ * In the case of asymmetric join we utilise the same RelOptInfo in different
+ * parts of the plan. Being kludge example of coding it needs to make a copy of
+ * the node before modifying it. Recheck needFlatCopy decision each time it
+ * finds a join node during reparameterization, if it still not needed.
  *
  * The cost, number of rows, width and parallel path properties depend upon
  * path->parent, which does not change during the translation.  So we need
@@ -4282,6 +4340,9 @@ do { \
 				NestPath   *npath;
 				JoinPath   *jpath;
 
+				if (!needFlatCopy)
+					needFlatCopy = is_asymmetric_join(path) ? true : false;
+
 				FLAT_COPY_PATH(npath, path, NestPath);
 				jpath = (JoinPath *) npath;
 				REPARAMETERIZE_CHILD_PATH(jpath->outerjoinpath);
@@ -4295,6 +4356,9 @@ do { \
 			{
 				MergePath  *mpath;
 				JoinPath   *jpath;
+
+				if (!needFlatCopy)
+					needFlatCopy = is_asymmetric_join(path) ? true : false;
 
 				FLAT_COPY_PATH(mpath, path, MergePath);
 
@@ -4311,6 +4375,9 @@ do { \
 			{
 				HashPath   *hpath;
 				JoinPath   *jpath;
+
+				if (!needFlatCopy)
+					needFlatCopy = is_asymmetric_join(path) ? true : false;
 
 				FLAT_COPY_PATH(hpath, path, HashPath);
 

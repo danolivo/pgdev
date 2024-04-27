@@ -298,6 +298,7 @@ extern void adjust_limit_rows_costs(double *rows,
 extern Path *reparameterize_path(PlannerInfo *root, Path *path,
 								 Relids required_outer,
 								 double loop_count);
+extern bool is_asymmetric_join(Path *path);
 extern Path *reparameterize_path_by_child(PlannerInfo *root, Path *path,
 										  RelOptInfo *child_rel,
 										  bool needFlatCopy);

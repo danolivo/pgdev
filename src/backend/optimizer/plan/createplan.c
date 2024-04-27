@@ -4336,54 +4336,6 @@ create_customscan_plan(PlannerInfo *root, CustomPath *best_path,
 	return cplan;
 }
 
-#define IS_PARTITION(rel) \
-	(rel->reloptkind == RELOPT_OTHER_JOINREL || \
-	rel->reloptkind == RELOPT_OTHER_MEMBER_REL)
-
-/*
- * AJ path is a path which has OTHER_REL parent, non-other, non inherited relation on one side and partition on the opposite side
- * Partitioned side of the AJ can be RELOPT_OTHER_MEMBER_REL (base table) or
- * RELOPT_OTHER_JOINREL for a join. May it be OTHER_UPPER_REL? - not for now.
- * We should differ AJ from trivial UNION ALL.
- */
-static bool
-is_asymmetric_join(NestPath *path)
-{
-	RelOptInfo *rel = ((Path *) path)->parent;
-	RelOptInfo *plainrel;
-	RelOptInfo *prel;
-
-	if (!IS_OTHER_REL(rel))
-		return false;
-
-	Assert(rel->reloptkind != RELOPT_OTHER_UPPER_REL);
-
-	/* Discover left and right sides of the join */
-
-	plainrel = path->jpath.innerjoinpath->parent;
-	prel = path->jpath.outerjoinpath->parent;
-
-	/*
-	 * RelOptInfo can be implemented by a bushy path tree. In that case we
-	 * should dive below, but it is impractical right now - we can't check out
-	 * the code and test it because the case doesn't exists.
-	 */
-	Assert(prel != plainrel);
-
-	/* Identify prospective inner and outer of the AJ */
-	if (!IS_PARTITION(prel))
-	{
-		/* Inner join allows to change inner and outer sides of AJ */
-		plainrel = prel;
-		prel = path->jpath.innerjoinpath->parent;
-	}
-
-	if (!IS_PARTITION(prel) || IS_OTHER_REL(plainrel))
-		return false;
-
-	return true;
-}
-
 /*****************************************************************************
  *
  *	JOIN METHODS
@@ -4404,7 +4356,8 @@ create_nestloop_plan(PlannerInfo *root,
 	Relids		outerrelids;
 	List	   *nestParams;
 	Relids		saveOuterRels = root->curOuterRels;
-	bool		needFlatCopy = is_asymmetric_join(best_path) ? true : false;
+	bool		needFlatCopy =
+						is_asymmetric_join((Path *) best_path) ? true : false;
 
 	/*
 	 * If the inner path is parameterized by the topmost parent of the outer

@@ -771,10 +771,8 @@ RESET max_parallel_workers_per_gather;
 CREATE TABLE small (x int);
 CREATE TABLE big (x int, y int);
 CREATE TABLE part42 (x int, y int) PARTITION BY RANGE (x);
-CREATE TABLE p1 PARTITION OF part42 (x)
-    FOR VALUES FROM (0) TO (50);
-CREATE TABLE p2 PARTITION OF part42 (x)
-    FOR VALUES FROM (50) TO (101);
+CREATE TABLE p1 PARTITION OF part42 (x) FOR VALUES FROM (0) TO (50);
+CREATE TABLE p2 PARTITION OF part42 (x) FOR VALUES FROM (50) TO (101);
 INSERT INTO big (SELECT gs%10,gs FROM generate_series(1,10000) AS gs);
 INSERT INTO small (x) SELECT gs FROM generate_series (1,1) AS gs;
 INSERT INTO part42 SELECT gs%100, gs%100 FROM generate_series(1,100000) AS gs;
@@ -783,12 +781,14 @@ VACUUM ANALYZE small,big,part42;
 
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
+SET max_parallel_workers_per_gather = 0; -- Reduce test unstability
 EXPLAIN (COSTS OFF)
-SELECT * FROM part42 ext LEFT JOIN big JOIN part42 p2
-  ON (p2.x=big.y)
-  ON (ext.x=p2.x AND ext.y=big.y);
-RESET enable_hashjoin;
+SELECT * FROM part42 ext LEFT JOIN big
+  JOIN part42 p2 ON (p2.x=big.y)
+ON (ext.x=p2.x AND ext.y=big.y);
+RESET max_parallel_workers_per_gather;
 RESET enable_mergejoin;
+RESET enable_hashjoin;
 
 -- Parameterized path examples.
 CREATE TABLE prta (id integer, payload text) PARTITION BY HASH (id);
