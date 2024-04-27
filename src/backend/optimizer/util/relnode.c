@@ -700,6 +700,24 @@ build_join_rel(PlannerInfo *root,
 														   outer_rel,
 														   inner_rel,
 														   sjinfo);
+
+		if (enable_asymmetric_join && !joinrel->part_scheme)
+		{
+			/*
+			 * Asymmetric JOIN can be rejected because of a reason in case of,
+			 * for example JOIN(JOIN(P1,R1),P2).
+			 * But for a case of JOIN(JOIN(P1,P2),R1) it may be possible. So, we
+			 * must try to check AJ each time on attempt of building a JOIN.
+			 */
+			restrictlist = restrictlist_ptr ? *restrictlist_ptr :
+								build_joinrel_restrictlist(root,
+														  joinrel,
+														  outer_rel,
+														  inner_rel,
+														  sjinfo);
+			build_joinrel_partition_info_ext(root, joinrel, outer_rel,
+											 inner_rel, sjinfo, restrictlist);
+		}
 		return joinrel;
 	}
 
