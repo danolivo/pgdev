@@ -1758,7 +1758,6 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 	 */
 	for (cnt_parts = 0; cnt_parts < joinrel->nparts; cnt_parts++)
 	{
-		RelOptInfo		   *inner;
 		RelOptInfo		   *outer_child;
 		bool				child_empty;
 		SpecialJoinInfo	   *child_sjinfo;
@@ -1767,10 +1766,9 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 		AppendRelInfo	  **appinfos;
 		int					nappinfos;
 
-		inner = inner_rel;
 		outer_child = prel->part_rels[cnt_parts];
 
-		Assert(!IS_DUMMY_REL(inner));
+		Assert(!IS_DUMMY_REL(inner_rel));
 		child_empty = (outer_child == NULL || IS_DUMMY_REL(outer_child));
 
 		/* Remember, inner already can't be dummy at this point */
@@ -1778,11 +1776,10 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 		{
 			case JOIN_INNER:
 			case JOIN_SEMI:
-				if (child_empty)
-					continue;	/* ignore this join segment */
-				break;
 			case JOIN_LEFT:
 			case JOIN_ANTI:
+				if (child_empty)
+					continue;	/* ignore this join segment */
 				break;
 			default:
 				/* other values not expected here */
@@ -1815,14 +1812,14 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 		 * do it with strong guarantees.
 		 */
 
-		Assert(!bms_overlap(inner->relids, outer_child->relids));
+		Assert(!bms_overlap(inner_rel->relids, outer_child->relids));
 
 		/*
 		 * Construct SpecialJoinInfo from parent join relations's
 		 * SpecialJoinInfo.
 		 */
 		child_sjinfo = build_child_join_sjinfo(root, parent_sjinfo,
-											   inner->relids,
+											   inner_rel->relids,
 											   outer_child->relids);
 
 		/* Find the AppendRelInfo structures */
@@ -1837,7 +1834,7 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 
 		if (joinrel->part_rels[cnt_parts] == NULL)
 		{
-			child_joinrel = build_child_join_rel(root, outer_child, inner,
+			child_joinrel = build_child_join_rel(root, outer_child, inner_rel,
 												 joinrel, child_restrictlist,
 												 child_sjinfo);
 			joinrel->part_rels[cnt_parts] = child_joinrel;
@@ -1849,7 +1846,7 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 			child_joinrel = joinrel->part_rels[cnt_parts];
 
 		/* And make paths for the child join */
-		populate_joinrel_with_paths(root, outer_child, inner,
+		populate_joinrel_with_paths(root, outer_child, inner_rel,
 									child_joinrel, child_sjinfo,
 									child_restrictlist);
 
