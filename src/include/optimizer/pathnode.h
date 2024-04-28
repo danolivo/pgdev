@@ -308,6 +308,8 @@ extern bool path_is_reparameterizable_by_child(Path *path,
 /*
  * prototypes for relnode.c
  */
+extern bool is_inner_rel_safe_for_asymmetric_join(PlannerInfo *root,
+												  RelOptInfo *rel);
 extern void setup_simple_rel_arrays(PlannerInfo *root);
 extern void expand_planner_arrays(PlannerInfo *root, int add_size);
 extern RelOptInfo *build_simple_rel(PlannerInfo *root, int relid,

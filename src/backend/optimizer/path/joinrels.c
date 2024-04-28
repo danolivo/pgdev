@@ -1711,13 +1711,17 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 	RelOptInfo *inner_rel = inner;
 	RelOptInfo *prel = outer;
 
-	/*
-	 * Try this technique only if partitionwise joins are allowed and this
-	 * asymmetric join can be built safely.
-	 */
-	if (!joinrel->consider_asymmetric_join || joinrel->part_scheme == NULL)
+	/* Fast path if AJ is forbidden */
+	if (!joinrel->consider_asymmetric_join)
 		return;
 
+	Assert(joinrel->part_scheme != NULL);
+
+	/*
+	 * The caller will not juggle the inner and outer sides of the joinrel.
+	 * Hence, we need to check reverse order here ifi direct order isn't
+	 * acceptable one.
+	 */
 	if (!IS_PARTITIONED_REL(prel))
 	{
 		if (parent_sjinfo->jointype != JOIN_INNER)
@@ -1735,6 +1739,13 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 		return;
 
 	Assert(REL_HAS_ALL_PART_PROPS(prel));
+
+	/*
+	 * Recheck AJ conditions. XXX: do we need just to store allowed inner/outer
+	 * combinations in some sort of cache?
+	 */
+	if (!is_inner_rel_safe_for_asymmetric_join(root, inner_rel))
+		return;
 
 	/*
 	 * Compute partition bounds. Remember, after that point we can't get out
@@ -1844,6 +1855,31 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 		}
 		else
 			child_joinrel = joinrel->part_rels[cnt_parts];
+
+#ifdef USE_ASSERT_CHECKING
+		/*
+		 * Check correctness of the adjustment here. It is much faster and
+		 * easier to fix issues, detected here, than in setrefs.c module.
+		 */
+		{
+			Bitmapset *parent = bms_del_members(bms_copy(joinrel->relids),
+												child_joinrel->relids);
+			ListCell *lc;
+
+			Assert(!bms_is_empty(parent));
+
+			foreach(lc, child_restrictlist)
+			{
+				RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+				if(bms_intersect(parent, rinfo->clause_relids))
+					elog(ERROR, "Incorrect relids in the child join clause");
+			}
+		}
+#endif
+		Assert(bms_equal(child_joinrel->relids,
+						 adjust_child_relids(joinrel->relids,
+											 nappinfos, appinfos)));
 
 		/* And make paths for the child join */
 		populate_joinrel_with_paths(root, outer_child, inner_rel,

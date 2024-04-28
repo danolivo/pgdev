@@ -71,11 +71,6 @@ static void build_joinrel_partition_info(PlannerInfo *root,
 										 RelOptInfo *outer_rel, RelOptInfo *inner_rel,
 										 SpecialJoinInfo *sjinfo,
 										 List *restrictlist);
-static void build_joinrel_partition_info_ext(PlannerInfo *root,
-										 RelOptInfo *joinrel,
-										 RelOptInfo *outer_rel, RelOptInfo *inner_rel,
-										 SpecialJoinInfo *sjinfo,
-										 List *restrictlist);
 static bool have_partkey_equi_join(PlannerInfo *root, RelOptInfo *joinrel,
 								   RelOptInfo *rel1, RelOptInfo *rel2,
 								   JoinType jointype, List *restrictlist);
@@ -701,7 +696,7 @@ build_join_rel(PlannerInfo *root,
 														   inner_rel,
 														   sjinfo);
 
-		if (enable_asymmetric_join && !joinrel->part_scheme)
+		if (enable_asymmetric_join && joinrel->part_scheme == NULL)
 		{
 			/*
 			 * Asymmetric JOIN can be rejected because of a reason in case of,
@@ -715,8 +710,8 @@ build_join_rel(PlannerInfo *root,
 														  outer_rel,
 														  inner_rel,
 														  sjinfo);
-			build_joinrel_partition_info_ext(root, joinrel, outer_rel,
-											 inner_rel, sjinfo, restrictlist);
+			build_joinrel_partition_info(root, joinrel, outer_rel,
+										 inner_rel, sjinfo, restrictlist);
 		}
 		return joinrel;
 	}
@@ -842,7 +837,7 @@ build_join_rel(PlannerInfo *root,
 	joinrel->has_eclass_joins = has_relevant_eclass_joinclause(root, joinrel);
 
 	/* Store the partition information. */
-	build_joinrel_partition_info_ext(root, joinrel, outer_rel, inner_rel, sjinfo,
+	build_joinrel_partition_info(root, joinrel, outer_rel, inner_rel, sjinfo,
 								 restrictlist);
 
 	/*
@@ -1014,8 +1009,8 @@ build_child_join_rel(PlannerInfo *root, RelOptInfo *outer_rel,
 	joinrel->has_eclass_joins = parent_joinrel->has_eclass_joins;
 
 	/* Is the join between partitions itself partitioned? */
-	build_joinrel_partition_info_ext(root, joinrel, outer_rel, inner_rel, sjinfo,
-									 restrictlist);
+	build_joinrel_partition_info(root, joinrel, outer_rel, inner_rel, sjinfo,
+								 restrictlist);
 
 	/* Child joinrel is parallel safe if parent is parallel safe. */
 	joinrel->consider_parallel = parent_joinrel->consider_parallel;
@@ -2035,56 +2030,45 @@ get_param_path_clause_serials(Path *path)
  * Check inner rel properties, required to participate in asymmetric join
  * XXX: Looks like it needs a lot of refactoring
  */
-static bool
+bool
 is_inner_rel_safe_for_asymmetric_join(PlannerInfo *root, RelOptInfo *inner_rel)
 {
-	RangeTblEntry *rte;
-	bool		rte_safe;
-	ListCell   *lc;
+	int				i = -1;
 
 	/*
-	 * If inner_rel requires outer parameters, reparametrization usually can't
-	 * fix it.
+	 * Don't allow AJ with partitioned inner.
+	 * Also, don't allow lateral references to avoid re-parameterization issues
+	 * with relations like TABLESAMPLE, where repartitioning code changes RTE.
 	 */
-	if (!bms_is_empty(inner_rel->lateral_relids))
+	if (inner_rel->part_scheme != NULL ||
+		!bms_is_empty(inner_rel->lateral_relids))
 		return false;
 
-	/*
-	 * Forbid asymmetric join for non-simple inner rels for now.
-	 */
-	if (!IS_SIMPLE_REL(inner_rel))
-		return false;
-
-	/*
-	 * Don't allow asymmetric JOIN of two append subplans. In the case of a
-	 * parameterized NL join, a reparameterization procedure will lead to
-	 * large memory allocations and a CPU consumption: each reparameterization
-	 * will induce subpath duplication, creating new ParamPathInfo instance
-	 * and increasing of ppilist up to number of partitions in the inner.
-	 * Also, if we have many partitions, each bitmapset variable will be large
-	 * and many leaks of such variable (caused by relid replacement) will
-	 * highly increase memory consumption. So, we deny such paths for now.
-	 */
-	foreach(lc, inner_rel->pathlist)
+	while ((i = bms_next_member(inner_rel->relids, i)) > 0)
 	{
-		if (IsA(lfirst(lc), AppendPath))
+		RangeTblEntry  *rte;
+
+		/*
+		 * No one relation in the underlying inner join tree is a partitioned
+		 * one: we can't allow the situation when the part_rels would
+		 * not correspond partitioning schema.
+		 */
+		if (root->simple_rel_array[i] &&
+			root->simple_rel_array[i]->part_scheme != NULL)
 			return false;
-	}
 
-	rte = planner_rt_fetch(inner_rel->relid, root);
+		rte = planner_rt_fetch(i, root);
+		Assert(rte);
 
-	Assert(rte);
-	switch (rte->rtekind)
-	{
-		case RTE_RELATION:
-			{
+		switch (rte->rtekind)
+		{
+			case RTE_RELATION:
 				/* Allow asymmetric join with simple relation */
-				rte_safe = true;
 				break;
-			}
-		case RTE_FUNCTION:
+			case RTE_FUNCTION:
 			{
-				rte_safe = true;
+				ListCell   *lc;
+
 				foreach(lc, rte->functions)
 				{
 					RangeTblFunction *rtfunc = (RangeTblFunction *) lfirst(lc);
@@ -2093,10 +2077,7 @@ is_inner_rel_safe_for_asymmetric_join(PlannerInfo *root, RelOptInfo *inner_rel)
 					if (contain_var_clause(rtfunc->funcexpr) ||
 						contain_mutable_functions(rtfunc->funcexpr) ||
 						contain_subplans(rtfunc->funcexpr))
-					{
-						rte_safe = false;
-						break;
-					}
+						return false;
 				}
 				break;
 			}
@@ -2106,10 +2087,11 @@ is_inner_rel_safe_for_asymmetric_join(PlannerInfo *root, RelOptInfo *inner_rel)
 			 * our reason for asymmetric join is foreign join push down. And
 			 * it is possible currently only for relations and function scans.
 			 */
-		default:
-			rte_safe = false;
+			default:
+				return false;
+		}
 	}
-	return rte_safe;
+	return true;
 }
 
 static void
@@ -2122,21 +2104,14 @@ build_joinrel_partition_info_asymm(PlannerInfo *root,
 {
 	/* Check feasibility */
 
+	if (!IS_PARTITIONED_REL(prel))
+		return;
+
 	/* Enable asymmetric join only if target list doesn't contain WholeRowVar */
 	if ((prel->attr_needed &&
 		!bms_is_empty(prel->attr_needed[InvalidAttrNumber - prel->min_attr])) ||
 		(inner_rel->attr_needed &&
 		!bms_is_empty(inner_rel->attr_needed[InvalidAttrNumber - inner_rel->min_attr])))
-		return;
-
-	if (!IS_PARTITIONED_REL(prel) || inner_rel->part_scheme != NULL ||
-		IS_OTHER_REL(inner_rel))
-		return;
-
-	Assert(joinrel->part_scheme == NULL);
-
-	/* Disallow recursive usage of asymmetric join machinery */
-	if (root->join_rel_level == NULL) // Still needed ?
 		return;
 
 	/* Check that inner rel is suitable */
@@ -2174,11 +2149,14 @@ build_joinrel_partition_info(PlannerInfo *root,
 {
 	PartitionScheme part_scheme;
 
+	if (joinrel->consider_partitionwise_join || joinrel->consider_asymmetric_join)
+		return;
+
 	/* Nothing to do if partitionwise join technique is disabled. */
 	if (!enable_partitionwise_join)
 	{
 		Assert(!IS_PARTITIONED_REL(joinrel));
-		return;
+		goto asymmetric;
 	}
 
 	/*
@@ -2200,13 +2178,13 @@ build_joinrel_partition_info(PlannerInfo *root,
 								sjinfo->jointype, restrictlist))
 	{
 		Assert(!IS_PARTITIONED_REL(joinrel));
-		return;
+		goto asymmetric;
 	}
 
 	part_scheme = outer_rel->part_scheme;
 
 	/*
-	 * This function will be called only once for each joinrel, hence it
+	 * This place can be achieved only once for each joinrel, hence it
 	 * should not have partitioning fields filled yet.
 	 */
 	Assert(!joinrel->part_scheme && !joinrel->partexprs &&
@@ -2227,31 +2205,25 @@ build_joinrel_partition_info(PlannerInfo *root,
 	/*
 	 * Set the consider_partitionwise_join flag.
 	 */
-	Assert(outer_rel->consider_partitionwise_join || outer_rel->consider_asymmetric_join);
-	Assert(inner_rel->consider_partitionwise_join || inner_rel->consider_asymmetric_join);
+	Assert(outer_rel->consider_partitionwise_join ^ outer_rel->consider_asymmetric_join);
+	Assert(inner_rel->consider_partitionwise_join ^ inner_rel->consider_asymmetric_join);
 	joinrel->consider_partitionwise_join = true;
-}
 
-static void
-build_joinrel_partition_info_ext(PlannerInfo *root,
-								 RelOptInfo *joinrel, RelOptInfo *outer_rel,
-								 RelOptInfo *inner_rel, SpecialJoinInfo *sjinfo,
-								 List *restrictlist)
-{
-	build_joinrel_partition_info(root, joinrel, outer_rel, inner_rel, sjinfo,
-								 restrictlist);
+	/* Don't consider asymmetric join after successful partitioned decision. */
+	return;
 
-	if (enable_asymmetric_join && sjinfo->jointype != JOIN_FULL)
-	{
-		if (inner_rel->part_scheme == NULL)
-			/* Here we can do an attempt for asymmetric join only */
-			build_joinrel_partition_info_asymm(root, joinrel, outer_rel,
-											   inner_rel, sjinfo, restrictlist);
-		if (sjinfo->jointype == JOIN_INNER && outer_rel->part_scheme == NULL)
-			/* Here we can do an attempt for asymmetric join only */
-			build_joinrel_partition_info_asymm(root, joinrel, inner_rel,
-											   outer_rel, sjinfo, restrictlist);
-	}
+asymmetric:
+	if (!enable_asymmetric_join || sjinfo->jointype == JOIN_FULL)
+		return;
+
+	/*
+	 * Try to setup asymmetric join scheme. Because we are here only once for
+	 * the combination of inner and outer, we must check both variants at once.
+	 */
+	build_joinrel_partition_info_asymm(root, joinrel, outer_rel,
+									   inner_rel, sjinfo, restrictlist);
+	build_joinrel_partition_info_asymm(root, joinrel, inner_rel,
+									   outer_rel, sjinfo, restrictlist);
 }
 
 /*

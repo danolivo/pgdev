@@ -717,6 +717,24 @@ SELECT * FROM pg_temp.result02a EXCEPT SELECT * FROM pg_temp.result02b;
 
 SET enable_partitionwise_join = on;
 
+-- Trying different JOIN combinations optimiser can provide partitioned relation
+-- buried deeply in the inner subtree. Check that it doesn't provide
+-- inconsistency in the plan.
+EXPLAIN (COSTS OFF)
+SELECT * from prt1 d1, prt2 d2, unnest(array[3,4]) n, unnest(array[3,4]) g
+WHERE d1.a = n AND d2.b = d1.a and g = n;
+
+-- TODO:
+-- According to current logic decision on AJ or PWJ for specific joinrel
+-- can depend on the order of relations in the FROM list. See how it works.
+-- Can we resolve this issue somehow?
+EXPLAIN (COSTS OFF) -- PWJ on top
+SELECT * from prt1 d1, unnest(array[3,4]) n, prt2 d2
+WHERE d1.a = n AND d2.b = d1.a;
+EXPLAIN (COSTS OFF) -- AJ on top
+SELECT * from prt1 d1, prt2 d2, unnest(array[3,4]) n
+WHERE d1.a = n AND d2.b = d1.a;
+
 -- Check reparameterization code when an optimizer have to make two level relids
 -- adjustment.
 
