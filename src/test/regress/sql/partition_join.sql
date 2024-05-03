@@ -735,6 +735,12 @@ EXPLAIN (COSTS OFF) -- AJ on top
 SELECT * from prt1 d1, prt2 d2, unnest(array[3,4]) n
 WHERE d1.a = n AND d2.b = d1.a;
 
+-- Allow JOINs in the inner side of AJ
+EXPLAIN (COSTS OFF)
+SELECT * FROM prt1 d1 LEFT JOIN (unnest(array[3,4]) n
+  FULL OUTER JOIN unnest(array[3,4]) g ON (n=g))
+ON (d1.a = n);
+
 -- Check reparameterization code when an optimizer have to make two level relids
 -- adjustment.
 

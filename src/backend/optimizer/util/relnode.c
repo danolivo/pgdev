@@ -696,13 +696,14 @@ build_join_rel(PlannerInfo *root,
 														   inner_rel,
 														   sjinfo);
 
+#ifdef USE_ASSERT_CHECKING
 		if (enable_asymmetric_join && joinrel->part_scheme == NULL)
 		{
 			/*
-			 * Asymmetric JOIN can be rejected because of a reason in case of,
-			 * for example JOIN(JOIN(P1,R1),P2).
-			 * But for a case of JOIN(JOIN(P1,P2),R1) it may be possible. So, we
-			 * must try to check AJ each time on attempt of building a JOIN.
+			 * Potentially, Asymmetric JOIN can be rejected because of a reason
+			 * in case of, for example JOIN(JOIN(P1,R1),P2).
+			 * But for a case of JOIN(JOIN(P1,P2),R1) it may be possible.
+			 * Right now we can't find any ways for that case, but check it.
 			 */
 			restrictlist = restrictlist_ptr ? *restrictlist_ptr :
 								build_joinrel_restrictlist(root,
@@ -712,7 +713,9 @@ build_join_rel(PlannerInfo *root,
 														  sjinfo);
 			build_joinrel_partition_info(root, joinrel, outer_rel,
 										 inner_rel, sjinfo, restrictlist);
+			Assert(joinrel->part_scheme == NULL);
 		}
+#endif
 		return joinrel;
 	}
 
@@ -2063,7 +2066,10 @@ is_inner_rel_safe_for_asymmetric_join(PlannerInfo *root, RelOptInfo *inner_rel)
 		switch (rte->rtekind)
 		{
 			case RTE_RELATION:
-				/* Allow asymmetric join with simple relation */
+				if (rte->tablesample != NULL)
+					return false;
+				/* Allow asymmetric join */
+			case RTE_JOIN:
 				break;
 			case RTE_FUNCTION:
 			{
@@ -2083,12 +2089,22 @@ is_inner_rel_safe_for_asymmetric_join(PlannerInfo *root, RelOptInfo *inner_rel)
 			}
 
 			/*
-			 * For other types we need stronger checks. However, the strongest
-			 * our reason for asymmetric join is foreign join push down. And
-			 * it is possible currently only for relations and function scans.
+			 * Prohibit following RTEs in the inner of AJ.
+			 * Right now it means we don't ivest enough time into analysis of
+			 * consecuences and corner cases of AJ, applied to inner, containing
+			 * such RTE. This list can be revised in the future.
 			 */
-			default:
+			case RTE_VALUES:
+			case RTE_TABLEFUNC:
+			case RTE_SUBQUERY:
+			case RTE_CTE:
+			case RTE_NAMEDTUPLESTORE:
+			case RTE_RESULT:
 				return false;
+
+			default:
+				elog(ERROR, "unsupported RTE type %u", rte->rtekind);
+				break;
 		}
 	}
 	return true;

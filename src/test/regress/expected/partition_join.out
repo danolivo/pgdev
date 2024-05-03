@@ -3053,6 +3053,43 @@ WHERE d1.a = n AND d2.b = d1.a;
                ->  Function Scan on unnest n
 (28 rows)
 
+-- Allow JOINs in the inner side of AJ
+EXPLAIN (COSTS OFF)
+SELECT * FROM prt1 d1 LEFT JOIN (unnest(array[3,4]) n
+  FULL OUTER JOIN unnest(array[3,4]) g ON (n=g))
+ON (d1.a = n);
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Append
+   ->  Hash Left Join
+         Hash Cond: (d1_1.a = n.n)
+         ->  Seq Scan on prt1_p1 d1_1
+         ->  Hash
+               ->  Hash Left Join
+                     Hash Cond: (n.n = g.g)
+                     ->  Function Scan on unnest n
+                     ->  Hash
+                           ->  Function Scan on unnest g
+   ->  Hash Left Join
+         Hash Cond: (d1_2.a = n.n)
+         ->  Seq Scan on prt1_p2 d1_2
+         ->  Hash
+               ->  Hash Left Join
+                     Hash Cond: (n.n = g.g)
+                     ->  Function Scan on unnest n
+                     ->  Hash
+                           ->  Function Scan on unnest g
+   ->  Hash Left Join
+         Hash Cond: (d1_3.a = n.n)
+         ->  Seq Scan on prt1_p3 d1_3
+         ->  Hash
+               ->  Hash Left Join
+                     Hash Cond: (n.n = g.g)
+                     ->  Function Scan on unnest n
+                     ->  Hash
+                           ->  Function Scan on unnest g
+(28 rows)
+
 -- Check reparameterization code when an optimizer have to make two level relids
 -- adjustment.
 SET enable_hashjoin = 'off';
