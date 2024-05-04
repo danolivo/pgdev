@@ -1944,6 +1944,7 @@ build_child_join_sjinfo(PlannerInfo *root, SpecialJoinInfo *parent_sjinfo,
 															 (Node *) sjinfo->semi_rhs_exprs,
 															 right_nappinfos,
 															 right_appinfos);
+
 	pfree(left_appinfos);
 	pfree(right_appinfos);
 

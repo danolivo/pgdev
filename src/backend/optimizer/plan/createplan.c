@@ -4336,6 +4336,7 @@ create_customscan_plan(PlannerInfo *root, CustomPath *best_path,
 	return cplan;
 }
 
+
 /*****************************************************************************
  *
  *	JOIN METHODS

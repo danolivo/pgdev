@@ -30,7 +30,6 @@
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
 #include "parser/parse_relation.h"
-#include "parser/parsetree.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
@@ -2060,7 +2059,7 @@ is_inner_rel_safe_for_asymmetric_join(PlannerInfo *root, RelOptInfo *inner_rel)
 			root->simple_rel_array[i]->part_scheme != NULL)
 			return false;
 
-		rte = planner_rt_fetch(i, root);
+		rte = root->simple_rte_array[i];
 		Assert(rte);
 
 		switch (rte->rtekind)
@@ -2090,7 +2089,7 @@ is_inner_rel_safe_for_asymmetric_join(PlannerInfo *root, RelOptInfo *inner_rel)
 
 			/*
 			 * Prohibit following RTEs in the inner of AJ.
-			 * Right now it means we don't ivest enough time into analysis of
+			 * Right now it means we don't invest enough time into analysis of
 			 * consecuences and corner cases of AJ, applied to inner, containing
 			 * such RTE. This list can be revised in the future.
 			 */
