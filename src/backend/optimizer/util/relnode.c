@@ -2040,7 +2040,7 @@ is_inner_rel_safe_for_asymmetric_join(PlannerInfo *root, RelOptInfo *inner_rel)
 	/*
 	 * Don't allow AJ with partitioned inner.
 	 * Also, don't allow lateral references to avoid re-parameterization issues
-	 * with relations like TABLESAMPLE, where repartitioning code changes RTE.
+	 * with relations like TABLESAMPLE, where reparameterization code changes RTE.
 	 */
 	if (inner_rel->part_scheme != NULL ||
 		!bms_is_empty(inner_rel->lateral_relids))
@@ -2067,8 +2067,9 @@ is_inner_rel_safe_for_asymmetric_join(PlannerInfo *root, RelOptInfo *inner_rel)
 			case RTE_RELATION:
 				if (rte->tablesample != NULL)
 					return false;
-				/* Allow asymmetric join */
+				break;
 			case RTE_JOIN:
+				/* Allow JOIN inside asymmetric join */
 				break;
 			case RTE_FUNCTION:
 			{

@@ -4110,7 +4110,7 @@ is_asymmetric_join(Path *path)
 	Assert(IsA(path, NestPath) || IsA(path, MergePath) || IsA(path, HashPath));
 	jpath = (JoinPath *) path;
 
-	if (!IS_OTHER_REL(rel))
+	if (!enable_asymmetric_join || !IS_OTHER_REL(rel))
 		return false;
 
 	Assert(rel->reloptkind != RELOPT_OTHER_UPPER_REL);
