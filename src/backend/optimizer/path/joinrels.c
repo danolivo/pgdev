@@ -1696,8 +1696,13 @@ try_partitionwise_join(PlannerInfo *root, RelOptInfo *rel1, RelOptInfo *rel2,
 }
 
 /*
- * DEV NOTE:
- * Remember to set joinrel->nparts to 0 in the case we reject this way.
+ * Assess whether join between given outer partitioned and inner not partitioned
+ * relations can be broken down into joins between each partition and the inner
+ * relation; a technique called "asymmetric join"
+ *
+ * Asymmetric join is possible when a. inner relation doesn't contain
+ * partitioned or other unsafe relations under the hood and b. inner doesn't
+ * have lateral references to something inside the outer.
  */
 static void
 try_asymmetric_partitionwise_join(PlannerInfo *root,
@@ -1797,19 +1802,6 @@ try_asymmetric_partitionwise_join(PlannerInfo *root,
 				elog(ERROR, "unrecognized join type: %d",
 					 (int) parent_sjinfo->jointype);
 				break;
-		}
-
-		if (outer_child == NULL)
-		{
-			/*
-			 * Mark the joinrel as unpartitioned so that later functions treat
-			 * it correctly.
-			 * It is not obvious that we need return here. But we follow the
-			 * commit 7ad6498 and just reduce risk of fault for quite rare case.
-			 * Anyway, it can be fixed in the future.
-			 */
-			joinrel->nparts = 0;
-			return;
 		}
 
 		/*
