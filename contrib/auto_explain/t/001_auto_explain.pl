@@ -53,6 +53,15 @@ like(
 	qr/Seq Scan on pg_class/,
 	"sequential scan logged, text mode");
 
+$log_contents = $node->safe_psql(
+	"postgres", q{SELECT substring(libname, 'auto_explain'),version
+				  FROM module_info('auto_explain');});
+
+like(
+	$log_contents,
+	qr/auto_explain|1000000/,
+	"Check module version");
+
 # Prepared query.
 $log_contents = query_log($node,
 	q{PREPARE get_proc(name) AS SELECT * FROM pg_proc WHERE proname = $1; EXECUTE get_proc('int4pl');}

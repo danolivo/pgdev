@@ -263,6 +263,12 @@
 { oid => '89', descr => 'PostgreSQL version string',
   proname => 'version', provolatile => 's', prorettype => 'text',
   proargtypes => '', prosrc => 'pgsql_version' },
+{ oid => '111', descr => 'Module Info',
+  proname => 'module_info', provolatile => 's', prorettype => 'record',
+  proretset => 't', proargtypes => 'text', proallargtypes => '{text,text,int4}',
+  proargmodes => '{i,o,o}',
+  proargnames => '{module_name,libname,version}',
+  prosrc => 'module_info' },
 
 { oid => '86', descr => 'I/O',
   proname => 'pg_ddl_command_in', prorettype => 'pg_ddl_command',

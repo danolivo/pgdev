@@ -22,6 +22,8 @@
 
 PG_MODULE_MAGIC;
 
+PG_MODULE_INFO("auto_explain", 1000000);
+
 /* GUC variables */
 static int	auto_explain_log_min_duration = -1; /* msec or -1 */
 static int	auto_explain_log_parameter_max_length = -1; /* bytes or -1 */

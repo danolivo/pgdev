@@ -483,6 +483,12 @@ typedef struct
 	FMGR_ABI_EXTRA, \
 }
 
+typedef struct pg_minfo_struct
+{
+	char	name[NAMEDATALEN];
+	int32	ver;
+} pg_minfo_struct;
+
 StaticAssertDecl(sizeof(FMGR_ABI_EXTRA) <= sizeof(((Pg_magic_struct *) 0)->abi_extra),
 				 "FMGR_ABI_EXTRA too long");
 
@@ -492,8 +498,12 @@ StaticAssertDecl(sizeof(FMGR_ABI_EXTRA) <= sizeof(((Pg_magic_struct *) 0)->abi_e
  */
 typedef const Pg_magic_struct *(*PGModuleMagicFunction) (void);
 
+typedef const pg_minfo_struct *(*PGModuleInfoFunction) (void);
+
 #define PG_MAGIC_FUNCTION_NAME Pg_magic_func
 #define PG_MAGIC_FUNCTION_NAME_STRING "Pg_magic_func"
+#define PG_MODULEINFO_FUNCTION_NAME pg_module_info
+#define PG_MODULEINFO_FUNCTION_NAME_STRING "pg_module_info"
 
 #define PG_MODULE_MAGIC \
 extern PGDLLEXPORT const Pg_magic_struct *PG_MAGIC_FUNCTION_NAME(void); \
@@ -505,6 +515,14 @@ PG_MAGIC_FUNCTION_NAME(void) \
 } \
 extern int no_such_variable
 
+#define PG_MODULE_INFO(modulename, version) \
+extern PGDLLEXPORT const pg_minfo_struct *PG_MODULEINFO_FUNCTION_NAME(void); \
+const pg_minfo_struct * \
+PG_MODULEINFO_FUNCTION_NAME(void) \
+{ \
+	static const pg_minfo_struct module_info = {modulename, version}; \
+	return &module_info; \
+} \
 
 /*-------------------------------------------------------------------------
  *		Support routines and macros for callers of fmgr-compatible functions

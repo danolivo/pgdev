@@ -31,10 +31,12 @@
 #endif							/* !WIN32 */
 
 #include "fmgr.h"
+#include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "storage/shmem.h"
+#include "utils/builtins.h"
 #include "utils/hsearch.h"
 
 
@@ -61,7 +63,9 @@ typedef struct df_files
 	ino_t		inode;			/* Inode number of file */
 #endif
 	void	   *handle;			/* a handle for pg_dl* functions */
-	char		filename[FLEXIBLE_ARRAY_MEMBER];	/* Full pathname of file */
+	char		name[NAMEDATALEN];
+	int			version;
+	char		filename[256];	/* Full pathname of file */
 } DynamicFileList;
 
 static DynamicFileList *file_list = NULL;
@@ -185,6 +189,7 @@ internal_load_library(const char *libname)
 {
 	DynamicFileList *file_scanner;
 	PGModuleMagicFunction magic_func;
+	PGModuleInfoFunction minfo_func;
 	char	   *load_error;
 	struct stat stat_buf;
 	PG_init_t	PG_init;
@@ -279,6 +284,26 @@ internal_load_library(const char *libname)
 					(errmsg("incompatible library \"%s\": missing magic block",
 							libname),
 					 errhint("Extension libraries are required to use the PG_MODULE_MAGIC macro.")));
+		}
+
+		/*
+		 * Module info is an optional block. The PG_MODULE_MAGIC machinery
+		 * already checked compatibility of the module and the core codes. So,
+		 * we doesn't need to be too careful here.
+		 */
+		minfo_func = (PGModuleInfoFunction)
+			dlsym(file_scanner->handle, PG_MODULEINFO_FUNCTION_NAME_STRING);
+		if (minfo_func)
+		{
+			const pg_minfo_struct *minfo = (*minfo_func) ();
+
+			file_scanner->version = minfo->ver;
+			strcpy(file_scanner->name, minfo->name);
+		}
+		else
+		{
+			/* That means the library doesn't provide module info so far. */
+			file_scanner->version = -1;
 		}
 
 		/*
@@ -684,4 +709,50 @@ RestoreLibraryState(char *start_address)
 		internal_load_library(start_address);
 		start_address += strlen(start_address) + 1;
 	}
+}
+
+Datum
+module_info(PG_FUNCTION_ARGS)
+{
+	FuncCallContext	   *funcctx;
+	MemoryContext		oldcontext;
+	char			   *module_name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	DynamicFileList	   *file_scanner;
+	TupleDesc			tupdesc;
+	List			   *modlst = NIL;
+	Datum				result;
+	Datum				values[2];
+	bool				isnull[2] = {0,0};
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			elog(ERROR, "return type must be a row type");
+
+		for (file_scanner = file_list; file_scanner != NULL;
+			file_scanner = file_scanner->next)
+		{
+			if (strcmp(module_name, file_scanner->name) == 0)
+				modlst = lappend(modlst, file_scanner);
+		}
+
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+
+	if (modlst != NIL)
+	{
+		file_scanner = (DynamicFileList *) llast(modlst);
+		values[0] = CStringGetTextDatum(file_scanner->filename);
+		values[1] = Int32GetDatum(file_scanner->version);
+		result = HeapTupleGetDatum(heap_form_tuple(tupdesc, values, isnull));
+		modlst = list_delete_last(modlst);
+		SRF_RETURN_NEXT(funcctx, result);
+	}
+	else
+		SRF_RETURN_DONE(funcctx);
 }

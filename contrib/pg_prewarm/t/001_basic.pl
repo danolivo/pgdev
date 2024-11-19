@@ -25,8 +25,16 @@ $node->safe_psql("postgres",
 	  . "CREATE TABLE test(c1 int);\n"
 	  . "INSERT INTO test SELECT generate_series(1, 100);");
 
-# test read mode
+# test empty module info
 my $result =
+  $node->safe_psql("postgres", "SELECT * FROM module_info('fake_module');");
+like($result, qr/|/, 'Return null if module does not exist');
+$result =
+  $node->safe_psql("postgres", "SELECT * FROM module_info('pg_prewarm');");
+like($result, qr/|/, 'Return null if module does not provide an info');
+
+# test read mode
+$result =
   $node->safe_psql("postgres", "SELECT pg_prewarm('test', 'read');");
 like($result, qr/^[1-9][0-9]*$/, 'read mode succeeded');
 
