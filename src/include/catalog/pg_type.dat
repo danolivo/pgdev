@@ -695,4 +695,12 @@
   typreceive => 'brin_minmax_multi_summary_recv',
   typsend => 'brin_minmax_multi_summary_send', typalign => 'i',
   typstorage => 'x', typcollation => 'default' },
+
+{ oid => '9000', array_type_oid => '9001',
+  descr => 'typed record',
+  typname => 'typified_record', typlen => '-1', typbyval => 'f',
+  typreceive => 'typified_record_recv', typsend => 'typified_record_send',
+  typcategory => 'Z', typinput => 'typedrow_in', typoutput => 'typedrow_out',
+  typalign => 'i', typstorage => 'x', typcollation => 'default' },
+
 ]

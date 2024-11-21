@@ -113,6 +113,7 @@ OBJS = \
 	tsvector.o \
 	tsvector_op.o \
 	tsvector_parser.o \
+	typified_record.o	\
 	uuid.o \
 	varbit.o \
 	varchar.o \

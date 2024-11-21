@@ -36,6 +36,7 @@
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/table.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
@@ -998,6 +999,11 @@ foreign_expr_walker(Node *node,
 				else
 					state = FDW_COLLATE_UNSAFE;
 			}
+			break;
+		case T_RowExpr:
+			// XXX: sort out the collations
+			collation = InvalidOid;
+			state = FDW_COLLATE_NONE;
 			break;
 		default:
 
@@ -2868,6 +2874,30 @@ deparseStringLiteral(StringInfo buf, const char *val)
 	appendStringInfoChar(buf, '\'');
 }
 
+static void
+deparseRowExpr(RowExpr *node, deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+	bool		first;
+	ListCell   *arg;
+
+	if (list_length(node->args) < 2)
+		appendStringInfoString(buf, "ROW");
+
+	/* Deparse the first argument */
+	appendStringInfoString(buf, "(");
+
+	first = true;
+	foreach(arg, node->args)
+	{
+		if (!first)
+			appendStringInfoString(buf, ", ");
+		deparseExpr((Expr *) lfirst(arg), context);
+		first = false;
+	}
+	appendStringInfoString(buf, ")");
+}
+
 /*
  * Deparse given expression into context->buf.
  *
@@ -2927,6 +2957,9 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 			break;
 		case T_Aggref:
 			deparseAggref((Aggref *) node, context);
+			break;
+		case T_RowExpr:
+			deparseRowExpr((RowExpr *) node, context);
 			break;
 		default:
 			elog(ERROR, "unsupported expression type for deparse: %d",
@@ -3024,6 +3057,43 @@ deparseConst(Const *node, deparse_expr_cxt *context, int showtype)
 	bool		isfloat = false;
 	bool		isstring = false;
 	bool		needlabel;
+
+	/*
+	 * Special case: re-assemble array of records into array of typified
+	 * records. It allow us to have an info about structure of each record.
+	 */
+	if (node->consttype == RECORDARRAYOID)
+	{
+		ArrayType  *arrayval;
+		int16		elmlen;
+		bool		elmbyval;
+		char		elmalign;
+		int			num_elems;
+		Datum	   *elem_values;
+		bool	   *elem_nulls;
+		Oid			elmtype;
+
+		arrayval = DatumGetArrayTypeP(node->constvalue);
+		get_typlenbyvalalign(ARR_ELEMTYPE(arrayval),
+										  &elmlen, &elmbyval, &elmalign);
+		deconstruct_array(arrayval, ARR_ELEMTYPE(arrayval),
+						  elmlen, elmbyval, elmalign,
+						  &elem_values, &elem_nulls, &num_elems);
+
+		elmtype = TypenameGetTypidExtended("typified_record", false);
+		arrayval = construct_array(elem_values, num_elems,
+								   elmtype, elmlen, elmbyval, elmalign);
+
+		getTypeOutputInfo(get_array_type(elmtype), &typoutput, &typIsVarlena);
+		extval = OidOutputFunctionCall(typoutput, PointerGetDatum(arrayval));
+
+		appendStringInfoChar(buf, '\'');
+		appendStringInfoString(buf, extval);
+		appendStringInfoChar(buf, '\'');
+		appendStringInfo(buf, "::%s",
+						 deparse_type_name(get_array_type(elmtype), -1));
+		return;
+	}
 
 	if (node->constisnull)
 	{

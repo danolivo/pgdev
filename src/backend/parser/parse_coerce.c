@@ -283,6 +283,19 @@ coerce_type(ParseState *pstate, Node *node,
 
 		baseType = typeidType(baseTypeId);
 
+		/*
+		 * We don't need any conversion because typified record produces exactly
+		 * a record.
+		 * XXX: this section has a room for improvement & refactoring.
+		 */
+		if (targetTypeId == TYPIFIED_RECORDARRAYOID)
+		{
+			Assert(baseTypeId == TYPIFIED_RECORDARRAYOID);
+
+			baseTypeId = RECORDARRAYOID;
+			targetTypeId = RECORDARRAYOID;
+		}
+
 		newcon->consttype = baseTypeId;
 		newcon->consttypmod = inputTypeMod;
 		newcon->constcollid = typeTypeCollation(baseType);
