@@ -47,6 +47,7 @@
 #include "catalog/pg_ts_dict.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/plannodes.h"
 #include "optimizer/optimizer.h"
@@ -998,6 +999,11 @@ foreign_expr_walker(Node *node,
 				else
 					state = FDW_COLLATE_UNSAFE;
 			}
+			break;
+		case T_RowExpr:
+			// XXX: sort out the collations
+			collation = InvalidOid;
+			state = FDW_COLLATE_NONE;
 			break;
 		default:
 
@@ -2868,6 +2874,30 @@ deparseStringLiteral(StringInfo buf, const char *val)
 	appendStringInfoChar(buf, '\'');
 }
 
+static void
+deparseRowExpr(RowExpr *node, deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+	bool		first;
+	ListCell   *arg;
+
+	if (list_length(node->args) < 2)
+		appendStringInfoString(buf, "ROW");
+
+	/* Deparse the first argument */
+	appendStringInfoString(buf, "(");
+
+	first = true;
+	foreach(arg, node->args)
+	{
+		if (!first)
+			appendStringInfoString(buf, ", ");
+		deparseExpr((Expr *) lfirst(arg), context);
+		first = false;
+	}
+	appendStringInfoString(buf, ")");
+}
+
 /*
  * Deparse given expression into context->buf.
  *
@@ -2927,6 +2957,9 @@ deparseExpr(Expr *node, deparse_expr_cxt *context)
 			break;
 		case T_Aggref:
 			deparseAggref((Aggref *) node, context);
+			break;
+		case T_RowExpr:
+			deparseRowExpr((RowExpr *) node, context);
 			break;
 		default:
 			elog(ERROR, "unsupported expression type for deparse: %d",
@@ -3001,6 +3034,125 @@ deparseVar(Var *node, deparse_expr_cxt *context)
 	}
 }
 
+static Node *
+unpack_record_expr(Oid typeid, Datum datum, Oid constcollid, ParseLoc location)
+{
+	Node *node = NULL;
+	Datum	   *values;
+	bool	   *nulls;
+	int 		i;
+	int			nelems;
+
+	if (typeid == RECORDARRAYOID)
+	{
+		ArrayExpr  *newa = makeNode(ArrayExpr);
+		ArrayType  *arrayval;
+		int16		elmlen;
+		bool		elmbyval;
+		char		elmalign;
+
+		arrayval = DatumGetArrayTypeP(datum);
+		get_typlenbyvalalign(ARR_ELEMTYPE(arrayval),
+										  &elmlen, &elmbyval, &elmalign);
+		deconstruct_array(arrayval, ARR_ELEMTYPE(arrayval),
+						  elmlen, elmbyval, elmalign,
+						  &values, &nulls, &nelems);
+
+		newa->location = location;
+		newa->multidims = false; /* XXX */
+		newa->array_typeid = typeid;
+		newa->element_typeid = RECORDOID; /* Just cheaper get_base_element_type */
+		newa->array_collid = constcollid;
+
+		/* Unpack elements */
+		for(i = 0; i < nelems; i++)
+		{
+			Node *elem;
+
+			if (nulls[i])
+			{
+				/* Does null record possible in terms of SQL? */
+			}
+
+			elem = unpack_record_expr(newa->element_typeid, values[i],
+									  constcollid, location);
+			newa->elements = lappend(newa->elements, elem);
+		}
+		node = (Node *) newa;
+	}
+	else if (typeid == RECORDOID)
+	{
+		RowExpr		   *newr = makeNode(RowExpr);
+		HeapTupleHeader rec = DatumGetHeapTupleHeader(datum);
+		HeapTupleData	tuple;
+		Oid				tupType;
+		int32			tupTypmod;
+		TupleDesc		tupdesc;
+
+		tupType = HeapTupleHeaderGetTypeId(rec);
+		tupTypmod = HeapTupleHeaderGetTypMod(rec);
+		tupdesc = lookup_rowtype_tupdesc(tupType, tupTypmod);
+
+		values = (Datum *) palloc(tupdesc->natts * sizeof(Datum));
+		nulls = (bool *) palloc(tupdesc->natts * sizeof(bool));
+
+		/* Follow the code from record_cmp */
+		tuple.t_len = HeapTupleHeaderGetDatumLength(rec);
+		ItemPointerSetInvalid(&(tuple.t_self));
+		tuple.t_tableOid = InvalidOid;
+		tuple.t_data = rec;
+		heap_deform_tuple(&tuple, tupdesc, values, nulls);
+
+		newr->row_typeid = typeid;
+		newr->row_format = COERCE_EXPLICIT_CAST;
+		newr->location = location;
+
+		nelems = tupdesc->natts;
+
+		/* Extract fields */
+		for(i = 0; i < nelems; i++)
+		{
+			char	fname[16];
+			Node   *field;
+			Oid		elmtypeid;
+
+			Assert(!tupdesc->attrs[i].attisdropped);
+
+			elmtypeid = tupdesc->attrs[i].atttypid;
+
+			snprintf(fname, sizeof(fname), "f%d", i);
+			newr->colnames = lappend(newr->colnames, makeString(pstrdup(fname)));
+
+			if (elmtypeid == RECORDOID || elmtypeid == RECORDARRAYOID)
+				field = unpack_record_expr(tupdesc->attrs[0].atttypid, values[i],
+										   constcollid, location);
+			else if (nulls[i])
+				field = (Node *) makeConst(UNKNOWNOID, -1, InvalidOid, -2,
+										   (Datum) 0, true, false);
+			else
+			{
+				/* It is just a constant */
+				field = (Node *)  makeConst(elmtypeid,
+											tupdesc->attrs[i].atttypmod,
+											tupdesc->attrs[i].attcollation,
+											tupdesc->attrs[i].attlen,
+											values[i],
+											false,
+											tupdesc->attrs[i].attbyval);
+			}
+			newr->args = lappend(newr->args, field);
+		}
+		node = (Node *) newr;
+		ReleaseTupleDesc(tupdesc);
+	}
+	else
+	{
+		/* Just pass through */
+	}
+
+	return node;
+}
+
 /*
  * Deparse given constant value into context->buf.
  *
@@ -3024,6 +3176,20 @@ deparseConst(Const *node, deparse_expr_cxt *context, int showtype)
 	bool		isfloat = false;
 	bool		isstring = false;
 	bool		needlabel;
+
+	/*
+	 * Special case: re-assemble array or record and fill them with additional
+	 * information
+	 */
+	if (node->consttype == RECORDARRAYOID || node->consttype == RECORDOID)
+	{
+		Node *newnode;
+
+		newnode = unpack_record_expr(node->consttype, node->constvalue,
+									 node->constcollid, node->location);
+		deparseExpr((Expr *) newnode, context);
+		return;
+	}
 
 	if (node->constisnull)
 	{
