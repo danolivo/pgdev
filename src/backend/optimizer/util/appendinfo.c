@@ -495,6 +495,7 @@ adjust_appendrel_attrs_mutator(Node *node,
 		newinfo->right_bucketsize = -1;
 		newinfo->left_mcvfreq = -1;
 		newinfo->right_mcvfreq = -1;
+		newinfo->parent = oldinfo;
 
 		return (Node *) newinfo;
 	}

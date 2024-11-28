@@ -237,6 +237,7 @@ make_plain_restrictinfo(PlannerInfo *root,
 
 	restrictinfo->left_hasheqoperator = InvalidOid;
 	restrictinfo->right_hasheqoperator = InvalidOid;
+	restrictinfo->parent = NULL;
 
 	return restrictinfo;
 }

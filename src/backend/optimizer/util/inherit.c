@@ -917,6 +917,8 @@ apply_child_basequals(PlannerInfo *root, RelOptInfo *parentrel,
 			childquals = lappend(childquals, childrinfo);
 			/* track minimum security level among child quals */
 			cq_min_security = Min(cq_min_security, rinfo->security_level);
+
+			childrinfo->parent = rinfo;
 		}
 	}
 

@@ -699,6 +699,21 @@ clause_selectivity_ext(PlannerInfo *root,
 	{
 		rinfo = (RestrictInfo *) clause;
 
+		if (rinfo->parent != NULL)
+		{
+			if (rinfo->parent->norm_selec < 0. &&
+				rinfo->parent->outer_selec < 0.)
+			{
+				clause_selectivity_ext(root, (Node *) rinfo->parent, varRelid,
+									   jointype, sjinfo, false);
+			}
+
+			if (rinfo->norm_selec < 0)
+				rinfo->norm_selec = rinfo->parent->norm_selec;
+			if (rinfo->outer_selec < 0)
+				rinfo->outer_selec = rinfo->parent->outer_selec;
+		}
+
 		/*
 		 * If the clause is marked pseudoconstant, then it will be used as a
 		 * gating qual and should not affect selectivity estimates; hence
