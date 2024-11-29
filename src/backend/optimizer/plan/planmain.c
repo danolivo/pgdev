@@ -20,6 +20,7 @@
  */
 #include "postgres.h"
 
+#include "nodes/nodeFuncs.h"
 #include "optimizer/appendinfo.h"
 #include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
@@ -28,7 +29,9 @@
 #include "optimizer/paths.h"
 #include "optimizer/placeholder.h"
 #include "optimizer/planmain.h"
+#include "optimizer/restrictinfo.h"
 
+static void extract_non_equivalence_filters(PlannerInfo *root);
 
 /*
  * query_planner
@@ -258,6 +261,12 @@ query_planner(PlannerInfo *root,
 	extract_restriction_or_clauses(root);
 
 	/*
+	 * Look for additional clauses which can be pushed to another side of a join.
+	 * It adds to the clauselist 'A.x=B.x AND A.x<10' one more clause 'B.x<10'.
+	 */
+	extract_non_equivalence_filters(root);
+
+	/*
 	 * Now expand appendrels by adding "otherrels" for their children.  We
 	 * delay this to the end so that we have as much information as possible
 	 * available for each baserel, including all restriction clauses.  That
@@ -285,4 +294,204 @@ query_planner(PlannerInfo *root,
 		elog(ERROR, "failed to construct the join relation");
 
 	return final_rel;
+}
+
+static List *
+extract_base_clauses(PlannerInfo *root, Node *expr, int relid)
+{
+	List	   *clauses = NIL;
+	RelOptInfo *rel = find_base_rel(root, relid);
+
+	foreach_node(RestrictInfo, rinfo, rel->baserestrictinfo)
+	{
+		Node	   *expr2 = NULL;
+
+		if (rinfo->is_clone || rinfo->has_clone || rinfo->pseudoconstant ||
+			rinfo->security_level > 0 || rinfo->has_volatile ||
+			rinfo->mergeopfamilies != NIL ||
+			!bms_is_empty(rinfo->incompatible_relids) ||
+			!bms_is_empty(rinfo->outer_relids))
+			continue;
+
+		if (IsA(rinfo->clause, OpExpr))
+		{
+			if (bms_is_empty(rinfo->left_relids))
+				expr2 =  get_rightop(rinfo->clause);
+			else if (bms_is_empty(rinfo->right_relids))
+				expr2 =  get_leftop(rinfo->clause);
+			else
+				continue;
+		}
+		else if (IsA(rinfo->clause, ScalarArrayOpExpr))
+		{
+			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) rinfo->clause;
+
+			expr2 = (Node*) linitial(saop->args);
+		}
+		else
+			continue;
+
+		if (expr2 && IsA(expr2, RelabelType))
+				expr2 = (Node *) ((RelabelType *) expr2)->arg;
+		if (expr && IsA(expr, RelabelType))
+				expr = (Node *) ((RelabelType *) expr)->arg;
+
+		if (!equal(expr2, expr))
+			continue;
+
+		clauses = lappend(clauses, rinfo);
+	}
+	return clauses;
+}
+
+/*
+ * Add extra filters derived from other base relations.
+ *
+ * Using Equivalence Classes try to find clauses which can be used to filter
+ * more tuples.
+ */
+static void
+generate_extra_filters(PlannerInfo *root, RelOptInfo *rel)
+{
+	int		relid = rel->relid;
+	ListCell *lc;
+
+	Assert(rel->relid > 0);
+
+	/*
+	 * Take all the ECs where this relation may have potential match
+	 */
+	foreach_node(EquivalenceClass, ec, root->eq_classes)
+	{
+		List			   *exprs = NIL;
+		List			   *others = NIL;
+		List			   *others_expr = NIL;
+
+		/* EC must describe a join clause */
+		if (!bms_is_member(relid, ec->ec_relids) ||
+			bms_num_members(ec->ec_relids) == 1)
+			continue;
+
+		foreach_node(EquivalenceMember, em, ec->ec_members)
+		{
+			int	em_relid = 0;
+
+			if (em->em_is_child ||
+				!bms_get_singleton_member(em->em_relids, &em_relid))
+				continue;
+
+			Assert(em_relid > 0);
+
+			if (em_relid != relid)
+			{
+				List *bclauses = extract_base_clauses(
+										root, (Node *) em->em_expr, em_relid);
+
+				others = lappend(others, bclauses);
+				others_expr = lappend(others_expr, em);
+			}
+			else
+				exprs = list_concat(exprs, extract_base_clauses(
+											root, (Node *) em->em_expr, relid));
+		}
+
+		if (exprs == NIL || others == NIL)
+			continue;
+		Assert(list_length(others) == list_length(others_expr));
+
+		foreach_node(RestrictInfo, rinfo, exprs)
+		{
+			int	i;
+			void *tmp_arg_ptr;
+			void **arg = NULL;
+
+			if (IsA(rinfo->clause, OpExpr))
+			{
+				OpExpr *opexpr = (OpExpr *) rinfo->clause;
+
+				/* Temporary replace a var in the inner clause by the outer */
+				i = bms_is_empty(rinfo->left_relids) ? 1 : 0;
+				arg = &opexpr->args->elements[i].ptr_value;
+			}
+			else if (IsA(rinfo->clause, ScalarArrayOpExpr))
+			{
+				ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) rinfo->clause;
+				arg = &saop->args->elements[0].ptr_value;
+			}
+			else
+				Assert(0);
+
+			tmp_arg_ptr = *arg;
+
+			foreach (lc, others_expr)
+			{
+				EquivalenceMember *em = lfirst_node(EquivalenceMember, lc);
+				List *others_lst =
+						(List *) list_nth(others, foreach_current_index(lc));
+				bool duplicated = false;
+
+				Assert(bms_num_members(em->em_relids) == 1);
+
+				*arg = (void *) em->em_expr;
+
+				foreach_node(RestrictInfo, rinfo2, others_lst)
+				{
+					Assert(IsA(rinfo2->clause, OpExpr) ||
+						   IsA(rinfo2->clause, ScalarArrayOpExpr));
+
+					/* XXX: remember commuting case! */
+					if (equal(rinfo->clause, rinfo2->clause))
+					{
+						duplicated = true;
+						others_lst = foreach_delete_current(others_lst, rinfo2);
+						break;
+					}
+				}
+
+				if (!duplicated)
+				{
+					RestrictInfo *restrictinfo;
+
+					/* The clause can be attached to the outer side */
+					restrictinfo = make_restrictinfo(root,
+										 (Expr *) copyObject(rinfo->clause),
+										 rinfo->is_pushed_down,
+										 false, false, false, 0,
+										 em->em_relids,
+										 NULL, NULL);
+					distribute_restrictinfo_to_rels(root, restrictinfo);
+				}
+
+				*arg = tmp_arg_ptr;
+			}
+		}
+	}
+}
+
+static void
+extract_non_equivalence_filters(PlannerInfo *root)
+{
+	Index		rti;
+
+	for (rti = 1; rti < root->simple_rel_array_size; rti++)
+	{
+		RelOptInfo *rel = root->simple_rel_array[rti];
+
+		/* there may be empty slots corresponding to non-baserel RTEs */
+		if (rel == NULL)
+			continue;
+
+		Assert(rel->relid == rti);	/* sanity check on array */
+
+		/* ignore RTEs that are "other rels" */
+		if (rel->reloptkind != RELOPT_BASEREL)
+			continue;
+
+		/*
+		 * XXX: If needed, restrict it by the only partitioned case,
+		 * see rel->inh
+		 */
+
+		generate_extra_filters(root, rel);
+	}
 }

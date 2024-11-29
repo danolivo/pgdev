@@ -2995,3 +2995,18 @@ SELECT t1.a FROM skip_fetch t1 LEFT JOIN skip_fetch t2 ON t2.a = 1 WHERE t2.a IS
 
 RESET enable_indexonlyscan;
 RESET enable_seqscan;
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM tenk1 t1, tenk1 t2
+WHERE t1.unique1 = t2.unique1 AND t1.unique1 IN (1,2,3);
+SELECT count(*) FROM tenk1 t1, tenk1 t2
+WHERE t1.unique1 = t2.unique1 AND t1.unique1 IN (1,2,3);
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM tenk1 t1, tenk1 t2
+WHERE t1.unique1 = t2.unique1 AND t2.unique1 IN (1,2,3);
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM tenk1 t1, tenk1 t2
+WHERE t1.unique1 = t2.unique1 AND t2.unique1 < 2;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM tenk1 t1, tenk1 t2
+WHERE t1.unique1 = t2.unique1 AND t1.unique1 < 2;
