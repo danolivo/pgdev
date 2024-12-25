@@ -3650,6 +3650,10 @@ show_memoize_info(MemoizeState *mstate, List *ancestors, ExplainState *es)
 	{
 		ExplainPropertyText("Cache Key", keystr.data, es);
 		ExplainPropertyText("Cache Mode", mstate->binary_mode ? "binary" : "logical", es);
+
+		/* Report only in the single mode case to not break current tests */
+		if (mstate->singlerow)
+			ExplainPropertyText("Store Mode", "singlerow", es);
 	}
 	else
 	{
@@ -3657,6 +3661,11 @@ show_memoize_info(MemoizeState *mstate, List *ancestors, ExplainState *es)
 		appendStringInfo(es->str, "Cache Key: %s\n", keystr.data);
 		ExplainIndentText(es);
 		appendStringInfo(es->str, "Cache Mode: %s\n", mstate->binary_mode ? "binary" : "logical");
+		if (mstate->singlerow)
+		{
+			ExplainIndentText(es);
+			appendStringInfo(es->str, "Store Mode: %s\n", "singlerow");
+		}
 	}
 
 	pfree(keystr.data);

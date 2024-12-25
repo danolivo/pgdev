@@ -2545,7 +2545,7 @@ cost_memoize_rescan(PlannerInfo *root, MemoizePath *mpath,
 	ListCell   *lc;
 	Cost		input_startup_cost = mpath->subpath->startup_cost;
 	Cost		input_total_cost = mpath->subpath->total_cost;
-	double		tuples = mpath->subpath->rows;
+	double		tuples = mpath->singlerow ? 1 : mpath->subpath->rows;
 	double		calls = mpath->calls;
 	int			width = mpath->subpath->pathtarget->width;
 

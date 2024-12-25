@@ -2642,6 +2642,7 @@ ON B.hundred in (SELECT min(c.hundred) FROM tenk2 C WHERE c.odd = b.odd);
                ->  Memoize
                      Cache Key: b.hundred, b.odd
                      Cache Mode: binary
+                     Store Mode: singlerow
                      ->  Subquery Scan on "ANY_subquery"
                            Filter: (b.hundred = "ANY_subquery".min)
                            ->  Result
@@ -2650,5 +2651,5 @@ ON B.hundred in (SELECT min(c.hundred) FROM tenk2 C WHERE c.odd = b.odd);
                                          ->  Index Scan using tenk2_hundred on tenk2 c
                                                Index Cond: (hundred IS NOT NULL)
                                                Filter: (odd = b.odd)
-(16 rows)
+(17 rows)
 

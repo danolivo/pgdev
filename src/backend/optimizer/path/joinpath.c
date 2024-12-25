@@ -682,6 +682,7 @@ get_memoize_path(PlannerInfo *root, RelOptInfo *innerrel,
 	ListCell   *lc;
 	bool		binary_mode;
 	List	   *ph_lateral_vars;
+	bool		single_mode = false;
 
 	/* Obviously not if it's disabled */
 	if (!enable_memoize)
@@ -725,7 +726,7 @@ get_memoize_path(PlannerInfo *root, RelOptInfo *innerrel,
 	 */
 	if (!extra->inner_unique && (jointype == JOIN_SEMI ||
 								 jointype == JOIN_ANTI))
-		return NULL;
+		single_mode = true;
 
 	/*
 	 * Memoize normally marks cache entries as complete when it runs out of
@@ -808,7 +809,7 @@ get_memoize_path(PlannerInfo *root, RelOptInfo *innerrel,
 											inner_path,
 											param_exprs,
 											hash_operators,
-											extra->inner_unique,
+											extra->inner_unique || single_mode,
 											binary_mode,
 											outer_path->rows);
 	}

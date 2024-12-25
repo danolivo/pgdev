@@ -1707,7 +1707,7 @@ create_memoize_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	 */
 	pathnode->path.startup_cost = subpath->startup_cost + cpu_tuple_cost;
 	pathnode->path.total_cost = subpath->total_cost + cpu_tuple_cost;
-	pathnode->path.rows = subpath->rows;
+	pathnode->path.rows = (pathnode->singlerow) ? 1 : subpath->rows;
 
 	return pathnode;
 }
