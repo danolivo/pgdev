@@ -3043,6 +3043,9 @@ struct SpecialJoinInfo
 	bool		semi_can_hash;	/* true if semi_operators are all hash */
 	List	   *semi_operators; /* OIDs of equality join operators */
 	List	   *semi_rhs_exprs; /* righthand-side expressions of these ops */
+
+	/* For outer join, fraction of rows without a match. */
+	Selectivity	unmatched_frac;
 };
 
 /*

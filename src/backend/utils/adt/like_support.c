@@ -603,10 +603,7 @@ patternsel_common(PlannerInfo *root,
 	 */
 	if (HeapTupleIsValid(vardata.statsTuple))
 	{
-		Form_pg_statistic stats;
-
-		stats = (Form_pg_statistic) GETSTRUCT(vardata.statsTuple);
-		nullfrac = stats->stanullfrac;
+		nullfrac = compute_stanullfrac(&vardata, NULL);
 	}
 
 	/*

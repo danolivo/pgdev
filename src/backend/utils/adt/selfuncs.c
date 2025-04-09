@@ -156,6 +156,13 @@ static double eqjoinsel_inner(Oid opfuncoid, Oid collation,
 							  AttStatsSlot *sslot1, AttStatsSlot *sslot2,
 							  Form_pg_statistic stats1, Form_pg_statistic stats2,
 							  bool have_mcvs1, bool have_mcvs2);
+static double eqjoinsel_unmatch_left(Oid opfuncoid, Oid collation,
+									 VariableStatData *vardata1, VariableStatData *vardata2,
+									 double nd1, double nd2,
+									 bool isdefault1, bool isdefault2,
+									 AttStatsSlot *sslot1, AttStatsSlot *sslot2,
+									 Form_pg_statistic stats1, Form_pg_statistic stats2,
+									 bool have_mcvs1, bool have_mcvs2);
 static double eqjoinsel_semi(Oid opfuncoid, Oid collation,
 							 VariableStatData *vardata1, VariableStatData *vardata2,
 							 double nd1, double nd2,
@@ -319,10 +326,7 @@ var_eq_const(VariableStatData *vardata, Oid oproid, Oid collation,
 	 */
 	if (HeapTupleIsValid(vardata->statsTuple))
 	{
-		Form_pg_statistic stats;
-
-		stats = (Form_pg_statistic) GETSTRUCT(vardata->statsTuple);
-		nullfrac = stats->stanullfrac;
+		nullfrac = compute_stanullfrac(vardata, NULL);
 	}
 
 	/*
@@ -481,10 +485,7 @@ var_eq_non_const(VariableStatData *vardata, Oid oproid, Oid collation,
 	 */
 	if (HeapTupleIsValid(vardata->statsTuple))
 	{
-		Form_pg_statistic stats;
-
-		stats = (Form_pg_statistic) GETSTRUCT(vardata->statsTuple);
-		nullfrac = stats->stanullfrac;
+		nullfrac = compute_stanullfrac(vardata, NULL);
 	}
 
 	/*
@@ -997,10 +998,7 @@ generic_restriction_selectivity(PlannerInfo *root, Oid oproid, Oid collation,
 			selec = 0.9999;
 
 		/* Don't forget to account for nulls. */
-		if (HeapTupleIsValid(vardata.statsTuple))
-			nullfrac = ((Form_pg_statistic) GETSTRUCT(vardata.statsTuple))->stanullfrac;
-		else
-			nullfrac = 0.0;
+		nullfrac = compute_stanullfrac(&vardata, NULL);
 
 		/*
 		 * Now merge the results from the MCV and histogram calculations,
@@ -1552,12 +1550,10 @@ booltestsel(PlannerInfo *root, BoolTestType booltesttype, Node *arg,
 
 	if (HeapTupleIsValid(vardata.statsTuple))
 	{
-		Form_pg_statistic stats;
 		double		freq_null;
 		AttStatsSlot sslot;
 
-		stats = (Form_pg_statistic) GETSTRUCT(vardata.statsTuple);
-		freq_null = stats->stanullfrac;
+		freq_null = compute_stanullfrac(&vardata, NULL);
 
 		if (get_attstatsslot(&sslot, vardata.statsTuple,
 							 STATISTIC_KIND_MCV, InvalidOid,
@@ -1710,11 +1706,12 @@ nulltestsel(PlannerInfo *root, NullTestType nulltesttype, Node *arg,
 
 	if (HeapTupleIsValid(vardata.statsTuple))
 	{
-		Form_pg_statistic stats;
 		double		freq_null;
 
-		stats = (Form_pg_statistic) GETSTRUCT(vardata.statsTuple);
-		freq_null = stats->stanullfrac;
+		freq_null = compute_stanullfrac(&vardata, NULL);
+
+		if (sjinfo)
+			freq_null = freq_null + sjinfo->unmatched_frac - freq_null * sjinfo->unmatched_frac;
 
 		switch (nulltesttype)
 		{
@@ -2287,6 +2284,7 @@ eqjoinsel(PG_FUNCTION_ARGS)
 	Oid			collation = PG_GET_COLLATION();
 	double		selec;
 	double		selec_inner;
+	double		unmatched_frac;
 	VariableStatData vardata1;
 	VariableStatData vardata2;
 	double		nd1;
@@ -2358,6 +2356,26 @@ eqjoinsel(PG_FUNCTION_ARGS)
 								  &sslot1, &sslot2,
 								  stats1, stats2,
 								  have_mcvs1, have_mcvs2);
+
+	/*
+	 * calculate fraction of right without of matching row on left
+	 *
+	 * FIXME Should be restricted to JOIN_LEFT, we should have similar logic
+	 * for JOIN_FULL.
+	 *
+	 * XXX Probably should calculate unmatched as fraction of the join result,
+	 * not of the relation on the right (because the matched part can have more
+	 * matches per row and thus grow). Not sure. Depends on how it's used later.
+	 */
+	unmatched_frac = eqjoinsel_unmatch_left(opfuncoid, collation,
+											&vardata1, &vardata2,
+											nd1, nd2,
+											isdefault1, isdefault2,
+											&sslot1, &sslot2,
+											stats1, stats2,
+											have_mcvs1, have_mcvs2);
+
+	sjinfo->unmatched_frac = unmatched_frac;
 
 	switch (sjinfo->jointype)
 	{
@@ -2467,8 +2485,8 @@ eqjoinsel_inner(Oid opfuncoid, Oid collation,
 		FmgrInfo	eqproc;
 		bool	   *hasmatch1;
 		bool	   *hasmatch2;
-		double		nullfrac1 = stats1->stanullfrac;
-		double		nullfrac2 = stats2->stanullfrac;
+		double		nullfrac1 = compute_stanullfrac(vardata1, NULL);
+		double		nullfrac2 = compute_stanullfrac(vardata2, NULL);
 		double		matchprodfreq,
 					matchfreq1,
 					matchfreq2,
@@ -2629,6 +2647,120 @@ eqjoinsel_inner(Oid opfuncoid, Oid collation,
 }
 
 /*
+ * eqjoinsel_unmatch_left
+ *
+ * XXX Mostly copy paste of eqjoinsel_inner, but calculates unmatched fraction
+ * of the relation on the left. See eqjoinsel_inner for more comments.
+ *
+ * XXX Maybe we could/should integrate this into eqjoinsel_inner, so that we
+ * don't have to walk the MCV lists twice?
+ */
+static double
+eqjoinsel_unmatch_left(Oid opfuncoid, Oid collation,
+					   VariableStatData *vardata1, VariableStatData *vardata2,
+					   double nd1, double nd2,
+					   bool isdefault1, bool isdefault2,
+					   AttStatsSlot *sslot1, AttStatsSlot *sslot2,
+					   Form_pg_statistic stats1, Form_pg_statistic stats2,
+					   bool have_mcvs1, bool have_mcvs2)
+{
+	double		unmatchfreq;
+
+	if (have_mcvs1 && have_mcvs2)
+	{
+		LOCAL_FCINFO(fcinfo, 2);
+		FmgrInfo	eqproc;
+		bool	   *hasmatch1;
+		bool	   *hasmatch2;
+		double		matchprodfreq,
+					matchfreq1,
+					unmatchfreq1;
+		int			i,
+					nmatches;
+
+		if (!compute_innerside_nulls)
+			return 0.0;
+
+		fmgr_info(opfuncoid, &eqproc);
+
+		/*
+		 * Save a few cycles by setting up the fcinfo struct just once. Using
+		 * FunctionCallInvoke directly also avoids failure if the eqproc
+		 * returns NULL, though really equality functions should never do
+		 * that.
+		 */
+		InitFunctionCallInfoData(*fcinfo, &eqproc, 2, collation,
+								 NULL, NULL);
+		fcinfo->args[0].isnull = false;
+		fcinfo->args[1].isnull = false;
+
+		hasmatch1 = (bool *) palloc0(sslot1->nvalues * sizeof(bool));
+		hasmatch2 = (bool *) palloc0(sslot2->nvalues * sizeof(bool));
+
+		/*
+		 * Note we assume that each MCV will match at most one member of the
+		 * other MCV list.  If the operator isn't really equality, there could
+		 * be multiple matches --- but we don't look for them, both for speed
+		 * and because the math wouldn't add up...
+		 */
+		matchprodfreq = 0.0;
+		nmatches = 0;
+		for (i = 0; i < sslot1->nvalues; i++)
+		{
+			int			j;
+
+			fcinfo->args[0].value = sslot1->values[i];
+
+			for (j = 0; j < sslot2->nvalues; j++)
+			{
+				Datum		fresult;
+
+				if (hasmatch2[j])
+					continue;
+				fcinfo->args[1].value = sslot2->values[j];
+				fcinfo->isnull = false;
+				fresult = FunctionCallInvoke(fcinfo);
+				if (!fcinfo->isnull && DatumGetBool(fresult))
+				{
+					hasmatch1[i] = hasmatch2[j] = true;
+					matchprodfreq += sslot1->numbers[i] * sslot2->numbers[j];
+					nmatches++;
+					break;
+				}
+			}
+		}
+		CLAMP_PROBABILITY(matchprodfreq);
+		/* Sum up frequencies of matched and unmatched MCVs */
+		matchfreq1 = unmatchfreq1 = 0.0;
+		for (i = 0; i < sslot1->nvalues; i++)
+		{
+			if (hasmatch1[i])
+				matchfreq1 += sslot1->numbers[i];
+			else
+				unmatchfreq1 += sslot1->numbers[i];
+		}
+		CLAMP_PROBABILITY(matchfreq1);
+		CLAMP_PROBABILITY(unmatchfreq1);
+
+		unmatchfreq = unmatchfreq1;
+	}
+	else
+	{
+		/*
+		 * XXX Should this look at nullfrac on either side? Probably depends on
+		 * if we're calculating fraction of NULLs or fraction of unmatched rows.
+		 */
+		// unmatchfreq = (1.0 - nullfrac1) * (1.0 - nullfrac2);
+		if (nd1 > nd2)
+			unmatchfreq = (nd1 - nd2) * 1.0 / nd1;
+		else
+			unmatchfreq = (nd2 - nd1) * 1.0 / nd2;
+	}
+
+	return unmatchfreq;
+}
+
+/*
  * eqjoinsel_semi --- eqjoinsel for semi join
  *
  * (Also used for anti join, which we are supposed to estimate the same way.)
@@ -2694,7 +2826,7 @@ eqjoinsel_semi(Oid opfuncoid, Oid collation,
 		FmgrInfo	eqproc;
 		bool	   *hasmatch1;
 		bool	   *hasmatch2;
-		double		nullfrac1 = stats1->stanullfrac;
+		double		nullfrac1 = compute_stanullfrac(vardata1, NULL);
 		double		matchfreq1,
 					uncertainfrac,
 					uncertain;
@@ -2854,15 +2986,11 @@ neqjoinsel(PG_FUNCTION_ARGS)
 		VariableStatData leftvar;
 		VariableStatData rightvar;
 		bool		reversed;
-		HeapTuple	statsTuple;
 		double		nullfrac;
 
 		get_join_variables(root, args, sjinfo, &leftvar, &rightvar, &reversed);
-		statsTuple = reversed ? rightvar.statsTuple : leftvar.statsTuple;
-		if (HeapTupleIsValid(statsTuple))
-			nullfrac = ((Form_pg_statistic) GETSTRUCT(statsTuple))->stanullfrac;
-		else
-			nullfrac = 0.0;
+		nullfrac = compute_stanullfrac(reversed ? &rightvar : &leftvar, NULL);
+
 		ReleaseVariableStats(leftvar);
 		ReleaseVariableStats(rightvar);
 
@@ -3226,22 +3354,18 @@ mergejoinscansel(PlannerInfo *root, Node *clause,
 	 */
 	if (nulls_first)
 	{
-		Form_pg_statistic stats;
-
 		if (HeapTupleIsValid(leftvar.statsTuple))
 		{
-			stats = (Form_pg_statistic) GETSTRUCT(leftvar.statsTuple);
-			*leftstart += stats->stanullfrac;
+			*leftstart += compute_stanullfrac(&leftvar, NULL);
 			CLAMP_PROBABILITY(*leftstart);
-			*leftend += stats->stanullfrac;
+			*leftend += compute_stanullfrac(&leftvar, NULL);
 			CLAMP_PROBABILITY(*leftend);
 		}
 		if (HeapTupleIsValid(rightvar.statsTuple))
 		{
-			stats = (Form_pg_statistic) GETSTRUCT(rightvar.statsTuple);
-			*rightstart += stats->stanullfrac;
+			*rightstart += compute_stanullfrac(&rightvar, NULL);
 			CLAMP_PROBABILITY(*rightstart);
-			*rightend += stats->stanullfrac;
+			*rightend += compute_stanullfrac(&rightvar, NULL);
 			CLAMP_PROBABILITY(*rightend);
 		}
 	}
@@ -4049,10 +4173,7 @@ estimate_hash_bucket_stats(PlannerInfo *root, Node *hashkey, double nbuckets,
 	/* Get fraction that are null */
 	if (HeapTupleIsValid(vardata.statsTuple))
 	{
-		Form_pg_statistic stats;
-
-		stats = (Form_pg_statistic) GETSTRUCT(vardata.statsTuple);
-		stanullfrac = stats->stanullfrac;
+		stanullfrac = compute_stanullfrac(&vardata, NULL);
 	}
 	else
 		stanullfrac = 0.0;
@@ -5185,6 +5306,109 @@ ReleaseDummy(HeapTuple tuple)
 	pfree(tuple);
 }
 
+static int
+sjinfo_cmp(const ListCell *lc1, const ListCell *lc2)
+{
+	SpecialJoinInfo	*sjinfo1 = lfirst_node(SpecialJoinInfo, lc1);
+	SpecialJoinInfo	*sjinfo2 = lfirst_node(SpecialJoinInfo, lc2);
+	int num1 = bms_num_members(
+					bms_union(sjinfo1->min_lefthand, sjinfo1->min_righthand));
+	int num2 = bms_num_members(
+					bms_union(sjinfo2->min_lefthand, sjinfo2->min_righthand));
+
+	if (num1 > num2)
+		return 1;
+	else if (num1 == num2)
+		return 0;
+	else
+		return -1;
+}
+
+double
+compute_stanullfrac(VariableStatData *vardata, double *gen_frac)
+{
+	Form_pg_statistic	stats;
+	Var				   *var;
+	PlannerInfo		   *root = vardata->root;
+	List			   *sjinfos = NIL;
+	double				nullfrac;
+
+	if (gen_frac != NULL)
+		*gen_frac = 0.0;
+
+	if (!HeapTupleIsValid(vardata->statsTuple) || vardata->var == NULL)
+		return 0.0;
+
+	if (IsA(vardata->var, RelabelType))
+		var = (Var *) (((RelabelType *) vardata->var)->arg);
+	else
+		var = (Var *) vardata->var;
+
+	stats = (Form_pg_statistic) GETSTRUCT(vardata->statsTuple);
+	nullfrac = stats->stanullfrac;
+
+	if (!compute_innerside_nulls)
+		return nullfrac;
+
+	if (root == NULL || !IsA(var, Var) ||
+		bms_is_empty(var->varnullingrels))
+		return nullfrac;
+
+	/* Find all outer joins that can null this column */
+	foreach_node(SpecialJoinInfo, sjinfo, vardata->root->join_info_list)
+	{
+		RangeTblEntry *rte;
+
+		if (!OidIsValid(sjinfo->ojrelid) ||
+			!bms_is_member(sjinfo->ojrelid, var->varnullingrels))
+			continue;
+
+		Assert(OidIsValid(sjinfo->ojrelid));
+
+		/*
+		 * varnullingrels may refer not only outer joins - we need to filter
+		 * other objects in advance.
+		 */
+
+		rte = root->simple_rte_array[sjinfo->ojrelid];
+
+		if (rte->rtekind != RTE_JOIN)
+			continue;
+
+		Assert(sjinfo->ojrelid < root->simple_rel_array_size &&
+			root->simple_rel_array[sjinfo->ojrelid] == NULL);
+		Assert(bms_is_member(sjinfo->ojrelid, root->outer_join_rels));
+
+		sjinfos = lappend(sjinfos, sjinfo);
+		break;
+	}
+	list_sort(sjinfos, sjinfo_cmp);
+
+	foreach_node(SpecialJoinInfo, sjinfo, sjinfos)
+	{
+		double unmatched_frac;
+
+		if (sjinfo->unmatched_frac <= 0.0)
+			continue;
+
+		unmatched_frac = sjinfo->unmatched_frac - (sjinfo->unmatched_frac * nullfrac);
+		nullfrac = sjinfo->unmatched_frac + nullfrac -
+										(sjinfo->unmatched_frac * nullfrac);
+		Assert(nullfrac >= 0. && nullfrac <= 1.);
+
+
+		if (gen_frac != NULL)
+		{
+			*gen_frac = *gen_frac + unmatched_frac -
+										(unmatched_frac * *gen_frac);
+
+			Assert(*gen_frac >= 0.0 && *gen_frac <= 1.0);
+		}
+	}
+
+	return nullfrac;
+}
+
 /*
  * examine_variable
  *		Try to look up statistical data about an expression.
@@ -5250,6 +5474,7 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 		Var		   *var = (Var *) basenode;
 
 		/* Set up result fields other than the stats tuple */
+		vardata->root = root;
 		vardata->var = basenode;	/* return Var without relabeling */
 		vardata->rel = find_base_rel(root, var->varno);
 		vardata->atttype = var->vartype;
@@ -6085,6 +6310,7 @@ get_variable_numdistinct(VariableStatData *vardata, bool *isdefault)
 {
 	double		stadistinct;
 	double		stanullfrac = 0.0;
+	double		generatednullsfrac = 0.0;
 	double		ntuples;
 
 	*isdefault = false;
@@ -6102,7 +6328,7 @@ get_variable_numdistinct(VariableStatData *vardata, bool *isdefault)
 
 		stats = (Form_pg_statistic) GETSTRUCT(vardata->statsTuple);
 		stadistinct = stats->stadistinct;
-		stanullfrac = stats->stanullfrac;
+		stanullfrac = compute_stanullfrac(vardata, &generatednullsfrac);
 	}
 	else if (vardata->vartype == BOOLOID)
 	{
@@ -6189,7 +6415,7 @@ get_variable_numdistinct(VariableStatData *vardata, bool *isdefault)
 	 * If we had a relative estimate, use that.
 	 */
 	if (stadistinct < 0.0)
-		return clamp_row_est(-stadistinct * ntuples);
+		return clamp_row_est(-stadistinct * ntuples * (1.0 - generatednullsfrac));
 
 	/*
 	 * With no data, estimate ndistinct = ntuples if the table is small, else
@@ -6317,7 +6543,7 @@ get_variable_range(PlannerInfo *root, VariableStatData *vardata,
 
 			for (i = 0; i < sslot.nnumbers; i++)
 				sumcommon += sslot.numbers[i];
-			nullfrac = ((Form_pg_statistic) GETSTRUCT(vardata->statsTuple))->stanullfrac;
+			nullfrac = compute_stanullfrac(vardata, NULL);
 			if (sumcommon + nullfrac > 0.99999)
 				use_mcvs = true;
 		}

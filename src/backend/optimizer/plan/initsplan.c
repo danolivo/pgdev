@@ -1765,6 +1765,7 @@ make_outerjoininfo(PlannerInfo *root,
 	sjinfo->commute_above_r = NULL;
 	sjinfo->commute_below_l = NULL;
 	sjinfo->commute_below_r = NULL;
+	sjinfo->unmatched_frac = -1; /* Undefined */
 
 	compute_semijoin_info(root, sjinfo, clause);
 

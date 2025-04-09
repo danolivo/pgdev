@@ -97,6 +97,7 @@ typedef struct VariableStatData
 	bool		isunique;		/* matches unique index, DISTINCT or GROUP-BY
 								 * clause */
 	bool		acl_ok;			/* result of ACL check on table or column */
+	PlannerInfo *root;
 } VariableStatData;
 
 #define ReleaseVariableStats(vardata)  \
@@ -151,6 +152,7 @@ extern PGDLLIMPORT get_index_stats_hook_type get_index_stats_hook;
 
 /* Functions in selfuncs.c */
 
+extern double compute_stanullfrac(VariableStatData *vardata, double *gen_frac);
 extern void examine_variable(PlannerInfo *root, Node *node, int varRelid,
 							 VariableStatData *vardata);
 extern bool statistic_proc_security_check(VariableStatData *vardata, Oid func_oid);

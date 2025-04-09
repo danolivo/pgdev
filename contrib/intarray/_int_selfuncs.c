@@ -188,10 +188,7 @@ _int_matchsel(PG_FUNCTION_ARGS)
 	 */
 	if (HeapTupleIsValid(vardata.statsTuple))
 	{
-		Form_pg_statistic stats;
-
-		stats = (Form_pg_statistic) GETSTRUCT(vardata.statsTuple);
-		nullfrac = stats->stanullfrac;
+		nullfrac = compute_stanullfrac(&vardata, NULL);
 
 		/*
 		 * For an int4 array, the default array type analyze function will

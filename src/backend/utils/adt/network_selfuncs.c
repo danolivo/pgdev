@@ -89,7 +89,6 @@ networksel(PG_FUNCTION_ARGS)
 				mcv_selec,
 				non_mcv_selec;
 	Datum		constvalue;
-	Form_pg_statistic stats;
 	AttStatsSlot hslot;
 	double		sumcommon,
 				nullfrac;
@@ -127,8 +126,7 @@ networksel(PG_FUNCTION_ARGS)
 		PG_RETURN_FLOAT8(DEFAULT_SEL(operator));
 	}
 
-	stats = (Form_pg_statistic) GETSTRUCT(vardata.statsTuple);
-	nullfrac = stats->stanullfrac;
+	nullfrac = compute_stanullfrac(&vardata, NULL);
 
 	/*
 	 * If we have most-common-values info, add up the fractions of the MCV
@@ -263,7 +261,6 @@ static Selectivity
 networkjoinsel_inner(Oid operator,
 					 VariableStatData *vardata1, VariableStatData *vardata2)
 {
-	Form_pg_statistic stats;
 	double		nullfrac1 = 0.0,
 				nullfrac2 = 0.0;
 	Selectivity selec = 0.0,
@@ -283,8 +280,7 @@ networkjoinsel_inner(Oid operator,
 
 	if (HeapTupleIsValid(vardata1->statsTuple))
 	{
-		stats = (Form_pg_statistic) GETSTRUCT(vardata1->statsTuple);
-		nullfrac1 = stats->stanullfrac;
+		nullfrac1 = compute_stanullfrac(vardata1, NULL);
 
 		mcv1_exists = get_attstatsslot(&mcv1_slot, vardata1->statsTuple,
 									   STATISTIC_KIND_MCV, InvalidOid,
@@ -305,8 +301,7 @@ networkjoinsel_inner(Oid operator,
 
 	if (HeapTupleIsValid(vardata2->statsTuple))
 	{
-		stats = (Form_pg_statistic) GETSTRUCT(vardata2->statsTuple);
-		nullfrac2 = stats->stanullfrac;
+		nullfrac2 = compute_stanullfrac(vardata2, NULL);
 
 		mcv2_exists = get_attstatsslot(&mcv2_slot, vardata2->statsTuple,
 									   STATISTIC_KIND_MCV, InvalidOid,
@@ -390,7 +385,6 @@ static Selectivity
 networkjoinsel_semi(Oid operator,
 					VariableStatData *vardata1, VariableStatData *vardata2)
 {
-	Form_pg_statistic stats;
 	Selectivity selec = 0.0,
 				sumcommon1 = 0.0,
 				sumcommon2 = 0.0;
@@ -413,8 +407,7 @@ networkjoinsel_semi(Oid operator,
 
 	if (HeapTupleIsValid(vardata1->statsTuple))
 	{
-		stats = (Form_pg_statistic) GETSTRUCT(vardata1->statsTuple);
-		nullfrac1 = stats->stanullfrac;
+		nullfrac1 = compute_stanullfrac(vardata1, NULL);
 
 		mcv1_exists = get_attstatsslot(&mcv1_slot, vardata1->statsTuple,
 									   STATISTIC_KIND_MCV, InvalidOid,
@@ -435,8 +428,7 @@ networkjoinsel_semi(Oid operator,
 
 	if (HeapTupleIsValid(vardata2->statsTuple))
 	{
-		stats = (Form_pg_statistic) GETSTRUCT(vardata2->statsTuple);
-		nullfrac2 = stats->stanullfrac;
+		nullfrac2 = compute_stanullfrac(vardata2, NULL);
 
 		mcv2_exists = get_attstatsslot(&mcv2_slot, vardata2->statsTuple,
 									   STATISTIC_KIND_MCV, InvalidOid,

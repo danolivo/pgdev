@@ -925,4 +925,22 @@ SELECT * FROM check_estimated_rows('SELECT * FROM table_fillfactor');
 
 DROP TABLE table_fillfactor;
 
+CREATE TABLE test (x integer);
+INSERT INTO test (SELECT gs FROM generate_series(1,10000) AS gs);
+CREATE INDEX ON test (x);
+VACUUM ANALYZE test;
+
+-- SET enable_hashagg = off; -- avoid mem size unstable report
+
+SET compute_innerside_nulls = off;
+SELECT * FROM check_estimated_rows('
+  SELECT t2.x FROM test t1 LEFT JOIN test t2 ON (t1.x=-t2.x) GROUP BY t2.x;
+');
+
+SET compute_innerside_nulls = on;
+SELECT * FROM check_estimated_rows('
+  SELECT t2.x FROM test t1 LEFT JOIN test t2 ON (t1.x=-t2.x) GROUP BY t2.x;
+');
+DROP TABLE IF EXISTS test;
+
 -- End of Stats Test

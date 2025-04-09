@@ -302,11 +302,9 @@ calc_multirangesel(TypeCacheEntry *typcache, VariableStatData *vardata,
 	 */
 	if (HeapTupleIsValid(vardata->statsTuple))
 	{
-		Form_pg_statistic stats;
 		AttStatsSlot sslot;
 
-		stats = (Form_pg_statistic) GETSTRUCT(vardata->statsTuple);
-		null_frac = stats->stanullfrac;
+		null_frac = compute_stanullfrac(vardata, NULL);
 
 		/* Try to get fraction of empty multiranges */
 		if (get_attstatsslot(&sslot, vardata->statsTuple,

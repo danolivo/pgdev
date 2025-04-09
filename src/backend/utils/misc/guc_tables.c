@@ -1017,6 +1017,16 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"compute_innerside_nulls", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables considering NULL values have appeared because of unmatched side of OJ"),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&compute_innerside_nulls,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"enable_group_by_reordering", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables reordering of GROUP BY keys."),
 			NULL,
