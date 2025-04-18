@@ -886,7 +886,8 @@ SELECT name FROM tab_settings_flags
            name            
 ---------------------------
  default_statistics_target
-(1 row)
+ extra_optimisations
+(2 rows)
 
 -- Runtime-computed GUCs should be part of the preset category.
 SELECT name FROM tab_settings_flags
