@@ -1048,6 +1048,16 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"extra_optimisations", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables optimisations related to the 1C specifics"),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&extra_optimisations,
+		false,
+		NULL, NULL, NULL
+	},
+	{
 		/*
 		 * Not for general use --- used by SET SESSION AUTHORIZATION and SET
 		 * ROLE

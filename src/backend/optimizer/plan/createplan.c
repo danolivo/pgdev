@@ -72,6 +72,7 @@
 #define CP_LABEL_TLIST		0x0004	/* tlist must contain sortgrouprefs */
 #define CP_IGNORE_TLIST		0x0008	/* caller will replace tlist */
 
+bool extra_optimisations = false;
 
 static Plan *create_plan_recurse(PlannerInfo *root, Path *best_path,
 								 int flags);
@@ -317,6 +318,49 @@ static ModifyTable *make_modifytable(PlannerInfo *root, Plan *subplan,
 static GatherMerge *create_gather_merge_plan(PlannerInfo *root,
 											 GatherMergePath *best_path);
 
+
+/*
+ * Compare selectivities of two RestrictInfo clauses
+ */
+static int
+restriction_sel_cmp(const Cost c1, const Cost c2,
+					const Node *clause1, const Node *clause2)
+{
+	RestrictInfo *rinfo1;
+	RestrictInfo *rinfo2;
+
+	if (!IsA(clause1, RestrictInfo) || !IsA(clause1, RestrictInfo))
+		return 0;
+
+	rinfo1 = (RestrictInfo *) clause1;
+	rinfo2 = (RestrictInfo *) clause2;
+
+	if (c1 >= c2 * 2.0)
+		/* Too much difference in cost to order by selectivity */
+		return 1;
+
+	/*
+	 * Compare selectivities only if both estimations is set.
+	 *
+	 * Is it possible to have set both norm_selec and outer_selec? I may imagine
+	 * such cases of custom optimisation - but it is too rare. It would be
+	 * better to ignore them.
+	 */
+
+	if (rinfo1->norm_selec >= 0 && rinfo2->norm_selec >= 0)
+	{
+		return (rinfo1->norm_selec > rinfo2->norm_selec) -
+									(rinfo1->norm_selec < rinfo2->norm_selec);
+	}
+
+	if (rinfo1->outer_selec >= 0 && rinfo2->outer_selec >= 0)
+	{
+		return (rinfo1->outer_selec > rinfo2->outer_selec) -
+									(rinfo1->outer_selec < rinfo2->outer_selec);
+	}
+
+	return 0;
+}
 
 /*
  * create_plan
@@ -5444,8 +5488,8 @@ get_switched_clauses(List *clauses, Relids outerrelids)
  * selectivity, but it's not immediately clear how to account for both,
  * and given the uncertainty of the estimates the reliability of the decisions
  * would be doubtful anyway.  So we just order by security level then
- * estimated per-tuple cost, being careful not to change the order when
- * (as is often the case) the estimates are identical.
+ * estimated per-tuple cost but only if the cost is too different. If costs
+ * looks similar - order by selectivity.
  *
  * Although this will work on either bare clauses or RestrictInfos, it's
  * much faster to apply it to RestrictInfos, since it can re-use cost
@@ -5532,10 +5576,18 @@ order_qual_clauses(PlannerInfo *root, List *clauses)
 		{
 			QualItem   *olditem = &items[j - 1];
 
-			if (newitem.security_level > olditem->security_level ||
-				(newitem.security_level == olditem->security_level &&
-				 newitem.cost >= olditem->cost))
+			if (newitem.security_level > olditem->security_level)
 				break;
+			else if	(newitem.security_level == olditem->security_level)
+			{
+				if (extra_optimisations &&
+					restriction_sel_cmp(newitem.cost, olditem->cost,
+										newitem.clause, olditem->clause) > 0.)
+					break;
+
+				if (newitem.cost >= olditem->cost)
+					break;
+			}
 			items[j] = *olditem;
 		}
 		items[j] = newitem;
