@@ -320,7 +320,7 @@ static GatherMerge *create_gather_merge_plan(PlannerInfo *root,
 
 
 /*
- * Compare selectivities of two RestrictInfo clauses
+ * Decide on the evaluation order of two RestrictInfos.
  */
 static int
 restriction_sel_cmp(const Cost c1, const Cost c2,

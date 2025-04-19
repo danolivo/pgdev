@@ -5063,6 +5063,19 @@ cost_qual_eval_walker(Node *node, cost_qual_eval_context *context)
 		 */
 		return false;
 	}
+	else if (IsA(node, Var) && extra_optimisations)
+	{
+		Var *var = (Var *) node;
+
+		/*
+		 * The calculation of the value's offset costs something. Especially in
+		 * case of wide tuples with multiple variable-width columns. So, charge
+		 * a little to take that into account in the order_qual_clauses.
+		 */
+		context->total.per_tuple +=
+							(DEFAULT_CPU_OPERATOR_COST / 25.) * var->varattno;
+		return false;
+	}
 
 	/* recurse into children */
 	return expression_tree_walker(node, cost_qual_eval_walker, context);
