@@ -347,14 +347,27 @@ restriction_sel_cmp(const Cost c1, const Cost c2,
 	 * better to ignore them.
 	 */
 
-	if (rinfo1->norm_selec >= 0 && rinfo2->norm_selec >= 0)
+	if (rinfo1->norm_selec >= 0. && rinfo2->norm_selec >= 0.)
 	{
+		double eps = fabs(rinfo1->norm_selec - rinfo2->norm_selec) /
+									Max(rinfo1->norm_selec, rinfo2->norm_selec);
+
+		if (eps < 0.001)
+			/* Selectivity difference is too low. Fall back to the cost estimation */
+			return (c1 > c2) - (c2 > c1);
+
 		return (rinfo1->norm_selec > rinfo2->norm_selec) -
 									(rinfo1->norm_selec < rinfo2->norm_selec);
 	}
-
-	if (rinfo1->outer_selec >= 0 && rinfo2->outer_selec >= 0)
+	else if (rinfo1->outer_selec >= 0. && rinfo2->outer_selec >= 0.)
 	{
+		double eps = fabs(rinfo1->outer_selec - rinfo2->outer_selec) /
+								Max(rinfo1->outer_selec, rinfo2->outer_selec);
+
+		if (eps < 0.001)
+			/* Selectivity difference is too low. Fall back to the cost estimation */
+			return (c1 > c2) - (c2 > c1);
+
 		return (rinfo1->outer_selec > rinfo2->outer_selec) -
 									(rinfo1->outer_selec < rinfo2->outer_selec);
 	}
@@ -5580,12 +5593,13 @@ order_qual_clauses(PlannerInfo *root, List *clauses)
 				break;
 			else if	(newitem.security_level == olditem->security_level)
 			{
-				if (extra_optimisations &&
-					restriction_sel_cmp(newitem.cost, olditem->cost,
-										newitem.clause, olditem->clause) > 0.)
+				if (extra_optimisations)
+				{
+					if (restriction_sel_cmp(newitem.cost, olditem->cost,
+										newitem.clause, olditem->clause) >= 0)
 					break;
-
-				if (newitem.cost >= olditem->cost)
+				}
+				else if (newitem.cost >= olditem->cost)
 					break;
 			}
 			items[j] = *olditem;
