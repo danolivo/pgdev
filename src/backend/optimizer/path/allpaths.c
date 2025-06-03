@@ -1855,29 +1855,18 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 
 			/* Locate the right paths, if they are available. */
 			cheapest_startup =
-				get_cheapest_path_for_pathkeys(childrel->pathlist,
-											   pathkeys,
-											   NULL,
-											   STARTUP_COST,
-											   false);
+				get_cheapest_path_for_pathkeys_ext(root, childrel, pathkeys,
+												   NULL, STARTUP_COST, false);
 			cheapest_total =
-				get_cheapest_path_for_pathkeys(childrel->pathlist,
-											   pathkeys,
-											   NULL,
-											   TOTAL_COST,
-											   false);
+				get_cheapest_path_for_pathkeys_ext(root, childrel, pathkeys,
+												   NULL, TOTAL_COST, false);
 
 			/*
-			 * If we can't find any paths with the right order just use the
-			 * cheapest-total path; we'll have to sort it later.
+			 * In accordance to current planning logic there are no
+			 * parameterised paths under a merge append.
 			 */
-			if (cheapest_startup == NULL || cheapest_total == NULL)
-			{
-				cheapest_startup = cheapest_total =
-					childrel->cheapest_total_path;
-				/* Assert we do have an unparameterized path for this child */
-				Assert(cheapest_total->param_info == NULL);
-			}
+			Assert(cheapest_startup != NULL && cheapest_total != NULL);
+			Assert(cheapest_total->param_info == NULL);
 
 			/*
 			 * When building a fractional path, determine a cheapest
@@ -1904,21 +1893,17 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 					path_fraction /= childrel->rows;
 
 				cheapest_fractional =
-					get_cheapest_fractional_path_for_pathkeys(childrel->pathlist,
-															  pathkeys,
-															  NULL,
-															  path_fraction);
+					get_cheapest_fractional_path_for_pathkeys_ext(root,
+																  childrel,
+																  pathkeys,
+																  NULL,
+																  path_fraction);
 
 				/*
-				 * If we found no path with matching pathkeys, use the
-				 * cheapest total path instead.
-				 *
-				 * XXX We might consider partially sorted paths too (with an
-				 * incremental sort on top). But we'd have to build all the
-				 * incremental paths, do the costing etc.
+				 * In accordance to current planning logic there are no
+				 * parameterised fractional paths under a merge append.
 				 */
-				if (!cheapest_fractional)
-					cheapest_fractional = cheapest_total;
+				Assert(cheapest_fractional != NULL);
 			}
 
 			/*
