@@ -512,7 +512,7 @@ cost_gather_merge(GatherMergePath *path, PlannerInfo *root,
 	logN = LOG2(N);
 
 	/* Assumed cost per tuple comparison */
-	comparison_cost = 2.0 * cpu_operator_cost;
+	comparison_cost = 4.0 * cpu_operator_cost;
 
 	/* Heap creation cost */
 	startup_cost += comparison_cost * N * logN;
@@ -1965,7 +1965,7 @@ cost_tuplesort(Cost *startup_cost, Cost *run_cost,
 		 * factor is a bit higher than for quicksort.  Tweak it so that the
 		 * cost curve is continuous at the crossover point.
 		 */
-		*startup_cost = comparison_cost * tuples * LOG2(2.0 * output_tuples);
+		*startup_cost = 2.0 * comparison_cost * tuples * LOG2(2.0 * output_tuples);
 	}
 	else
 	{
@@ -2474,7 +2474,7 @@ cost_merge_append(Path *path, PlannerInfo *root,
 	logN = LOG2(N);
 
 	/* Assumed cost per tuple comparison */
-	comparison_cost = 2.0 * cpu_operator_cost;
+	comparison_cost = 4.0 * cpu_operator_cost;
 
 	/* Heap creation cost */
 	startup_cost += comparison_cost * N * logN;
