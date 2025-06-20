@@ -1171,13 +1171,15 @@ choose_custom_plan(CachedPlanSource *plansource, ParamListInfo boundParams)
 		return false;
 
 	/* Let settings force the decision */
-	if (plan_cache_mode == PLAN_CACHE_MODE_FORCE_GENERIC_PLAN)
+	if (plan_cache_mode == PLAN_CACHE_MODE_FORCE_GENERIC_PLAN ||
+		plan_cache_mode == PLAN_CACHE_MODE_FORCE_REF_GENERIC_PLAN)
 		return false;
 	if (plan_cache_mode == PLAN_CACHE_MODE_FORCE_CUSTOM_PLAN)
 		return true;
 
 	/* See if caller wants to force the decision */
-	if (plansource->cursor_options & CURSOR_OPT_GENERIC_PLAN)
+	if (plansource->cursor_options & CURSOR_OPT_GENERIC_PLAN ||
+		plansource->cursor_options & CURSOR_OPT_REF_GENERIC_PLAN)
 		return false;
 	if (plansource->cursor_options & CURSOR_OPT_CUSTOM_PLAN)
 		return true;
@@ -1308,7 +1310,24 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 		else
 		{
 			/* Build a new generic plan */
-			plan = BuildCachedPlan(plansource, qlist, NULL, queryEnv);
+			if (boundParams &&
+				(plansource->cursor_options & CURSOR_OPT_REF_GENERIC_PLAN ||
+				plan_cache_mode == PLAN_CACHE_MODE_FORCE_REF_GENERIC_PLAN ||
+				plan_cache_mode == PLAN_CACHE_MODE_REF_AUTO))
+			{
+				ParamListInfo paramLI = copyParamList(boundParams);
+
+				for (int i = 0; i < paramLI->numParams; i++)
+				{
+					paramLI->params[i].pflags = 0;
+				}
+
+				/* */
+				plan = BuildCachedPlan(plansource, qlist, paramLI, queryEnv);
+			}
+			else
+				plan = BuildCachedPlan(plansource, qlist, NULL, queryEnv);
+
 			/* Just make real sure plansource->gplan is clear */
 			ReleaseGenericPlan(plansource);
 			/* Link the new generic plan into the plansource */

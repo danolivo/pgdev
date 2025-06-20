@@ -192,3 +192,40 @@ SELECT name, statement, parameter_types FROM pg_prepared_statements
 ------+-----------+-----------------
 (0 rows)
 
+-- Trivial test to prove that referencing strategy of generic plan creation
+-- just works.
+CREATE TABLE test (x integer, y integer);
+INSERT INTO test (x,y) (SELECT x,x FROM generate_series(1,1000) AS x);
+CREATE INDEX ON test(x);
+VACUUM ANALYZE test;
+PREPARE tst (integer) AS SELECT * FROM test WHERE x < $1;
+\o /dev/null
+EXECUTE tst (1) \watch i=0 c=6
+
+\o
+EXPLAIN (COSTS OFF) -- Should watch a custom plan
+EXECUTE tst (1);
+             QUERY PLAN              
+-------------------------------------
+ Index Scan using test_x_idx on test
+   Index Cond: (x < 1)
+(2 rows)
+
+DEALLOCATE ALL;
+SET plan_cache_mode = 'ref_auto';
+PREPARE tst (integer) AS SELECT * FROM test WHERE x < $1;
+\o /dev/null
+EXECUTE tst (1) \watch i=0 c=6
+
+\o
+EXPLAIN (COSTS OFF)  -- Should get generic plan at the end
+EXECUTE tst (1);
+             QUERY PLAN              
+-------------------------------------
+ Index Scan using test_x_idx on test
+   Index Cond: (x < $1)
+(2 rows)
+
+RESET plan_cache_mode;
+DEALLOCATE ALL;
+DROP TABLE IF EXISTS test;

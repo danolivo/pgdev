@@ -406,7 +406,9 @@ static const struct config_enum_entry debug_parallel_query_options[] = {
 
 static const struct config_enum_entry plan_cache_mode_options[] = {
 	{"auto", PLAN_CACHE_MODE_AUTO, false},
+	{"ref_auto", PLAN_CACHE_MODE_REF_AUTO, false},
 	{"force_generic_plan", PLAN_CACHE_MODE_FORCE_GENERIC_PLAN, false},
+	{"force_ref_generic_plan", PLAN_CACHE_MODE_FORCE_REF_GENERIC_PLAN, false},
 	{"force_custom_plan", PLAN_CACHE_MODE_FORCE_CUSTOM_PLAN, false},
 	{NULL, 0, false}
 };

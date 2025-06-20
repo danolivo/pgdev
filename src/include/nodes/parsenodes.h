@@ -3388,6 +3388,7 @@ typedef struct SecLabelStmt
 #define CURSOR_OPT_GENERIC_PLAN 0x0200	/* force use of generic plan */
 #define CURSOR_OPT_CUSTOM_PLAN	0x0400	/* force use of custom plan */
 #define CURSOR_OPT_PARALLEL_OK	0x0800	/* parallel mode OK */
+#define CURSOR_OPT_REF_GENERIC_PLAN	0x1000	/* force use of generic plan (constants are treated as references) */
 
 typedef struct DeclareCursorStmt
 {
