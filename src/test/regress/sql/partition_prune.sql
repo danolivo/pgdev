@@ -1445,5 +1445,16 @@ select min(a) over (partition by a order by a) from part_abc where a >= stable_o
 union all
 select min(a) over (partition by a order by a) from part_abc where a >= stable_one() + 1 and d >= stable_one();
 
+-- Having a single snapshot planner may cast a stable function to constant and
+-- prune partitions before the execution phase
+begin transaction isolation level repeatable read;
+explain (costs off)
+select * from part_abc where a >= stable_one() + 1 and d <= stable_one();
+end;
+-- Having separate a planning and an execution snapshots planner may not be sure
+-- that stable functions will return exactly the same values.
+explain (costs off)
+select * from part_abc where a >= stable_one() + 1 and d <= stable_one();
+
 drop view part_abc_view;
 drop table part_abc;

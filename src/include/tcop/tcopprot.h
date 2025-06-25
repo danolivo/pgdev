@@ -66,7 +66,8 @@ extern PlannedStmt *pg_plan_query(Query *querytree, const char *query_string,
 								  ParamListInfo boundParams);
 extern List *pg_plan_queries(List *querytrees, const char *query_string,
 							 int cursorOptions,
-							 ParamListInfo boundParams);
+							 ParamListInfo boundParams,
+							 bool oneshot);
 
 extern void die(SIGNAL_ARGS);
 pg_noreturn extern void quickdie(SIGNAL_ARGS);

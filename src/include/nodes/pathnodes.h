@@ -101,6 +101,9 @@ typedef struct PlannerGlobal
 	/* Param values provided to planner() */
 	ParamListInfo boundParams pg_node_attr(read_write_ignore);
 
+	/* Are we planning a non-reusable plan? */
+	bool		oneshot;
+
 	/* Plans for SubPlan nodes */
 	List	   *subplans;
 

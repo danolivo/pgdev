@@ -15,6 +15,7 @@
 #define PARTPRUNE_H
 
 #include "nodes/execnodes.h"
+#include "nodes/pathnodes.h"
 #include "partitioning/partdefs.h"
 
 struct PlannerInfo;				/* avoid including pathnodes.h here */
@@ -75,6 +76,8 @@ extern int	make_partition_pruneinfo(struct PlannerInfo *root,
 									 List *subpaths,
 									 List *prunequal);
 extern Bitmapset *prune_append_rel_partitions(struct RelOptInfo *rel);
+extern Bitmapset *prune_append_rel_partitions_ext(PlannerInfo *root,
+												  RelOptInfo *rel);
 extern Bitmapset *get_matching_partitions(PartitionPruneContext *context,
 										  List *pruning_steps);
 

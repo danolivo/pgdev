@@ -1072,7 +1072,8 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	 * Generate the plan.
 	 */
 	plist = pg_plan_queries(qlist, plansource->query_string,
-							plansource->cursor_options, boundParams);
+							plansource->cursor_options, boundParams,
+							plansource->is_oneshot);
 
 	/* Release snapshot if we got one */
 	if (snapshot_set)

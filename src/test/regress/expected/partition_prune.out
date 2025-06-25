@@ -4799,5 +4799,46 @@ select min(a) over (partition by a order by a) from part_abc where a >= stable_o
                                  Filter: (d >= stable_one())
 (35 rows)
 
+-- Having a single snapshot planner may cast a stable function to constant and
+-- prune partitions before the execution phase
+begin transaction isolation level repeatable read;
+explain (costs off)
+select * from part_abc where a >= stable_one() + 1 and d <= stable_one();
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Append
+   ->  Seq Scan on part_abc_2 part_abc_1
+         Filter: ((a >= 2) AND (d <= 1))
+   ->  Bitmap Heap Scan on part_abc_3_1 part_abc_2
+         Recheck Cond: (a >= 2)
+         Filter: (d <= 1)
+         ->  Bitmap Index Scan on part_abc_3_1_a_idx
+               Index Cond: (a >= 2)
+   ->  Bitmap Heap Scan on part_abc_3_2 part_abc_3
+         Recheck Cond: (a >= 2)
+         Filter: (d <= 1)
+         ->  Bitmap Index Scan on part_abc_3_2_a_idx
+               Index Cond: (a >= 2)
+(13 rows)
+
+end;
+-- Having separate a planning and an execution snapshots planner may not be sure
+-- that stable functions will return exactly the same values.
+explain (costs off)
+select * from part_abc where a >= stable_one() + 1 and d <= stable_one();
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Append
+   Subplans Removed: 2
+   ->  Seq Scan on part_abc_2 part_abc_1
+         Filter: ((d <= stable_one()) AND (a >= (stable_one() + 1)))
+   ->  Index Scan using part_abc_3_1_a_idx on part_abc_3_1 part_abc_2
+         Index Cond: (a >= (stable_one() + 1))
+         Filter: (d <= stable_one())
+   ->  Index Scan using part_abc_3_2_a_idx on part_abc_3_2 part_abc_3
+         Index Cond: (a >= (stable_one() + 1))
+         Filter: (d <= stable_one())
+(10 rows)
+
 drop view part_abc_view;
 drop table part_abc;

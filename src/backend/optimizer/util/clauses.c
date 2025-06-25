@@ -20,6 +20,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/xact.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
@@ -65,6 +66,7 @@ typedef struct
 	List	   *active_fns;
 	Node	   *case_val;
 	bool		estimate;
+	bool		eager_optimisation; /* May we replace stable function with a constant? */
 } eval_const_expressions_context;
 
 typedef struct
@@ -2265,6 +2267,8 @@ eval_const_expressions(PlannerInfo *root, Node *node)
 	context.active_fns = NIL;	/* nothing being recursively simplified */
 	context.case_val = NULL;	/* no CASE being examined */
 	context.estimate = false;	/* safe transformations only */
+	context.eager_optimisation = (root != NULL) ?
+					root->glob->oneshot && IsolationUsesXactSnapshot() : false;
 	return eval_const_expressions_mutator(node, &context);
 }
 
@@ -4492,10 +4496,14 @@ evaluate_function(Oid funcid, Oid result_type, int32 result_typmod,
 	 * are merely stable; the risk that the result might change from planning
 	 * time to execution time is worth taking in preference to not being able
 	 * to estimate the value at all.
+	 * Also, the eager_optimisation flag tells us that the planning is followed
+	 * by immediate execution. Moreover, they both will be done with the same
+	 * visibility.
 	 */
 	if (funcform->provolatile == PROVOLATILE_IMMUTABLE)
 		 /* okay */ ;
-	else if (context->estimate && funcform->provolatile == PROVOLATILE_STABLE)
+	else if (funcform->provolatile == PROVOLATILE_STABLE &&
+			(context->estimate || context->eager_optimisation))
 		 /* okay */ ;
 	else
 		return NULL;

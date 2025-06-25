@@ -121,6 +121,12 @@ typedef struct GeneratePruningStepsContext
 	bool		contradictory;	/* clauses were proven self-contradictory */
 	/* Working state: */
 	int			next_step_id;
+
+	/*
+	 * May we prune assuming it is an one-shot query plan with exactly the same
+	 * visibility as it will be at the execution stage?
+	 */
+	bool		eager_pruning;
 } GeneratePruningStepsContext;
 
 /* The result of performing one PartitionPruneStep */
@@ -144,8 +150,8 @@ static List *make_partitionedrel_pruneinfo(PlannerInfo *root,
 										   Bitmapset *partrelids,
 										   int *relid_subplan_map,
 										   Bitmapset **matchedsubplans);
-static void gen_partprune_steps(RelOptInfo *rel, List *clauses,
-								PartClauseTarget target,
+static void gen_partprune_steps(PlannerInfo *root, RelOptInfo *rel,
+								List *clauses, PartClauseTarget target,
 								GeneratePruningStepsContext *context);
 static List *gen_partprune_steps_internal(GeneratePruningStepsContext *context,
 										  List *clauses);
@@ -545,7 +551,7 @@ make_partitionedrel_pruneinfo(PlannerInfo *root, RelOptInfo *parentrel,
 		 * pruning steps and detects whether there's any possibly-useful quals
 		 * that would require per-scan pruning.
 		 */
-		gen_partprune_steps(subpart, partprunequal, PARTTARGET_INITIAL,
+		gen_partprune_steps(root, subpart, partprunequal, PARTTARGET_INITIAL,
 							&context);
 
 		if (context.contradictory)
@@ -579,7 +585,7 @@ make_partitionedrel_pruneinfo(PlannerInfo *root, RelOptInfo *parentrel,
 		if (context.has_exec_param)
 		{
 			/* ... OK, we'd better think about it */
-			gen_partprune_steps(subpart, partprunequal, PARTTARGET_EXEC,
+			gen_partprune_steps(root, subpart, partprunequal, PARTTARGET_EXEC,
 								&context);
 
 			if (context.contradictory)
@@ -740,13 +746,16 @@ make_partitionedrel_pruneinfo(PlannerInfo *root, RelOptInfo *parentrel,
  * some subsidiary flags; see the GeneratePruningStepsContext typedef.
  */
 static void
-gen_partprune_steps(RelOptInfo *rel, List *clauses, PartClauseTarget target,
+gen_partprune_steps(PlannerInfo *root, RelOptInfo *rel, List *clauses,
+					PartClauseTarget target,
 					GeneratePruningStepsContext *context)
 {
 	/* Initialize all output values to zero/false/NULL */
 	memset(context, 0, sizeof(GeneratePruningStepsContext));
 	context->rel = rel;
 	context->target = target;
+	context->eager_pruning = (root != NULL) ?
+				(root->glob->oneshot && IsolationUsesXactSnapshot()) : false;
 
 	/*
 	 * If this partitioned table is in turn a partition, and it shares any
@@ -778,6 +787,12 @@ gen_partprune_steps(RelOptInfo *rel, List *clauses, PartClauseTarget target,
 Bitmapset *
 prune_append_rel_partitions(RelOptInfo *rel)
 {
+	return prune_append_rel_partitions_ext(NULL, rel);
+}
+
+Bitmapset *
+prune_append_rel_partitions_ext(PlannerInfo *root, RelOptInfo *rel)
+{
 	List	   *clauses = rel->baserestrictinfo;
 	List	   *pruning_steps;
 	GeneratePruningStepsContext gcontext;
@@ -801,7 +816,7 @@ prune_append_rel_partitions(RelOptInfo *rel)
 	 * If the clauses are found to be contradictory, we can return the empty
 	 * set.
 	 */
-	gen_partprune_steps(rel, clauses, PARTTARGET_PLANNER,
+	gen_partprune_steps(root, rel, clauses, PARTTARGET_PLANNER,
 						&gcontext);
 	if (gcontext.contradictory)
 		return NULL;
@@ -2092,7 +2107,7 @@ match_clause_to_partition_key(GeneratePruningStepsContext *context,
 			 * When pruning in the planner, we cannot prune with mutable
 			 * operators.
 			 */
-			if (context->target == PARTTARGET_PLANNER)
+			if (context->target == PARTTARGET_PLANNER && !context->eager_pruning)
 				return PARTCLAUSE_UNSUPPORTED;
 		}
 
@@ -2290,7 +2305,7 @@ match_clause_to_partition_key(GeneratePruningStepsContext *context,
 			 * When pruning in the planner, we cannot prune with mutable
 			 * operators.
 			 */
-			if (context->target == PARTTARGET_PLANNER)
+			if (context->target == PARTTARGET_PLANNER && !context->eager_pruning)
 				return PARTCLAUSE_UNSUPPORTED;
 		}
 

@@ -344,6 +344,16 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	glob->partition_directory = NULL;
 
 	/*
+	 * Record whether the plan will be used once and immediately by executor.
+	 * If this is a oneshot plan we can rely on current state of the DBMS.
+	 * Also, if the planner uses the same snapshot as the executor (REPEATABLE
+	 * READ transactions, as an example) it also may evaluate stable functions
+	 * in advance. Hence, it may lead to more eager planning-stage pruning as
+	 * well as less number of stable function calls.
+	 */
+	glob->oneshot = parse->oneshot;
+
+	/*
 	 * Assess whether it's feasible to use parallel mode for this query. We
 	 * can't do this in a standalone backend, or if the command will try to
 	 * modify any data, or if this is a cursor operation, or if GUCs are set

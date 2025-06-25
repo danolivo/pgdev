@@ -964,11 +964,14 @@ pg_plan_query(Query *querytree, const char *query_string, int cursorOptions,
  * For normal optimizable statements, invoke the planner.  For utility
  * statements, just make a wrapper PlannedStmt node.
  *
+ * Input parameter oneshot signals the planner that this plan will not be
+ * stored in the plan cache, nor used second time.
+ *
  * The result is a list of PlannedStmt nodes.
  */
 List *
 pg_plan_queries(List *querytrees, const char *query_string, int cursorOptions,
-				ParamListInfo boundParams)
+				ParamListInfo boundParams, bool oneshot)
 {
 	List	   *stmt_list = NIL;
 	ListCell   *query_list;
@@ -991,6 +994,7 @@ pg_plan_queries(List *querytrees, const char *query_string, int cursorOptions,
 		}
 		else
 		{
+			query->oneshot = oneshot;
 			stmt = pg_plan_query(query, query_string, cursorOptions,
 								 boundParams);
 		}
@@ -1190,7 +1194,7 @@ exec_simple_query(const char *query_string)
 															NULL, 0, NULL);
 
 		plantree_list = pg_plan_queries(querytree_list, query_string,
-										CURSOR_OPT_PARALLEL_OK, NULL);
+										CURSOR_OPT_PARALLEL_OK, NULL, true);
 
 		/*
 		 * Done with the snapshot used for parsing/planning.

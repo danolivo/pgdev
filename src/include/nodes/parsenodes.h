@@ -123,6 +123,9 @@ typedef struct Query
 	/* where did I come from? */
 	QuerySource querySource pg_node_attr(query_jumble_ignore);
 
+	/* can plan potentially be used more than once? */
+	bool		oneshot;
+
 	/*
 	 * query identifier (can be set by plugins); ignored for equal, as it
 	 * might not be set; also not stored.  This is the result of the query
