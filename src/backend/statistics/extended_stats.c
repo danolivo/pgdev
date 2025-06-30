@@ -80,7 +80,8 @@ static void statext_store(Oid statOid, bool inh,
 						  MVNDistinct *ndistinct, MVDependencies *dependencies,
 						  MCVList *mcv, Datum exprs, VacAttrStats **stats);
 static int	statext_compute_stattarget(int stattarget,
-									   int nattrs, VacAttrStats **stats);
+									   int nattrs, VacAttrStats **stats,
+									   bool is_temp);
 
 /* Information needed to analyze a single simple expression. */
 typedef struct AnlExprData
@@ -183,7 +184,8 @@ BuildRelationExtStatistics(Relation onerel, bool inh, double totalrows,
 		/* compute statistics target for this statistics object */
 		stattarget = statext_compute_stattarget(stat->stattarget,
 												bms_num_members(stat->columns),
-												stats);
+												stats,
+												RelationUsesLocalBuffers(onerel));
 
 		/*
 		 * Don't rebuild statistics objects with statistics target set to 0
@@ -304,7 +306,8 @@ ComputeExtStatisticsRows(Relation onerel,
 		 * object itself, and for its attributes.
 		 */
 		stattarget = statext_compute_stattarget(stat->stattarget,
-												nattrs, stats);
+												nattrs, stats,
+												RelationUsesLocalBuffers(onerel));
 
 		/* Use the largest value for all statistics objects. */
 		if (stattarget > result)
@@ -341,7 +344,8 @@ ComputeExtStatisticsRows(Relation onerel,
  * set in default_statistics_target.
  */
 static int
-statext_compute_stattarget(int stattarget, int nattrs, VacAttrStats **stats)
+statext_compute_stattarget(int stattarget, int nattrs, VacAttrStats **stats,
+						   bool is_temp)
 {
 	int			i;
 
@@ -370,7 +374,8 @@ statext_compute_stattarget(int stattarget, int nattrs, VacAttrStats **stats)
 	 * default target.
 	 */
 	if (stattarget < 0)
-		stattarget = default_statistics_target;
+		stattarget = is_temp ?	default_statistics_target_temp_tables :
+								default_statistics_target;
 
 	/* As this point we should have a valid statistics target. */
 	Assert((stattarget >= 0) && (stattarget <= MAX_STATISTICS_TARGET));
