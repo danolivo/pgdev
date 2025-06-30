@@ -883,10 +883,11 @@ SELECT name FROM tab_settings_flags
 SELECT name FROM tab_settings_flags
   WHERE category ~ '^Query Tuning' AND NOT explain
   ORDER BY 1;
-           name            
----------------------------
+                 name                  
+---------------------------------------
  default_statistics_target
-(1 row)
+ default_statistics_target_temp_tables
+(2 rows)
 
 -- Runtime-computed GUCs should be part of the preset category.
 SELECT name FROM tab_settings_flags

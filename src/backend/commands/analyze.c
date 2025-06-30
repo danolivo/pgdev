@@ -70,6 +70,9 @@ typedef struct AnlIndexData
 /* Default statistics target (GUC parameter) */
 int			default_statistics_target = 100;
 
+/* Default statistics target for temporary tables */
+int			default_statistics_target_temp_tables = 100;
+
 /* A few variables that don't seem worth passing around as parameters */
 static MemoryContext anl_context = NULL;
 static BufferAccessStrategy vac_strategy;
@@ -1070,6 +1073,8 @@ examine_attribute(Relation onerel, int attnum, Node *index_expr)
 	if (attstattarget == 0)
 		return NULL;
 
+	if (attstattarget < 0 && RelationUsesLocalBuffers(onerel))
+		attstattarget = default_statistics_target_temp_tables;
 	/*
 	 * Create the VacAttrStats struct.
 	 */

@@ -464,6 +464,7 @@
 # - Other Planner Options -
 
 #default_statistics_target = 100	# range 1-10000
+#default_statistics_target_temp_tables = 1 # range 1-10000
 #constraint_exclusion = partition	# on, off, or partition
 #cursor_tuple_fraction = 0.1		# range 0.0-1.0
 #from_collapse_limit = 8

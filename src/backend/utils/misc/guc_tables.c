@@ -2185,6 +2185,16 @@ struct config_int ConfigureNamesInt[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"default_statistics_target_temp_tables", PGC_USERSET, QUERY_TUNING_OTHER,
+			gettext_noop("Sets the default statistics target for temporary tables."),
+			gettext_noop("This applies to table columns that have not had a "
+						 "column-specific target set via ALTER TABLE SET STATISTICS.")
+		},
+		&default_statistics_target_temp_tables,
+		100, 1, MAX_STATISTICS_TARGET,
+		NULL, NULL, NULL
+	},
+	{
 		{"from_collapse_limit", PGC_USERSET, QUERY_TUNING_OTHER,
 			gettext_noop("Sets the FROM-list size beyond which subqueries "
 						 "are not collapsed."),

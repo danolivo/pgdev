@@ -297,6 +297,7 @@ typedef struct VacDeadItemsInfo
 
 /* GUC parameters */
 extern PGDLLIMPORT int default_statistics_target;	/* PGDLLIMPORT for PostGIS */
+extern PGDLLIMPORT int default_statistics_target_temp_tables;
 extern PGDLLIMPORT int vacuum_freeze_min_age;
 extern PGDLLIMPORT int vacuum_freeze_table_age;
 extern PGDLLIMPORT int vacuum_multixact_freeze_min_age;

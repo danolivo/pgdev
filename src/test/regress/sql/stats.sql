@@ -925,4 +925,46 @@ SELECT * FROM check_estimated_rows('SELECT * FROM table_fillfactor');
 
 DROP TABLE table_fillfactor;
 
+SET default_statistics_target_temp_tables = 10;
+CREATE TEMP TABLE tmp_test_stattarget (x1 int, x2 int);
+INSERT INTO tmp_test_stattarget (x1,x2) (
+  SELECT x%11, x%41 FROM generate_series(1,1024) AS x);
+INSERT INTO tmp_test_stattarget (x1,x2) (
+  SELECT x, -x FROM generate_series(42,256) AS x);
+VACUUM ANALYZE tmp_test_stattarget;
+
+-- Should see two attributes with NULL values in the attstattarget field
+SELECT c.relname,a.attnum,a.attname,a.attstattarget
+FROM pg_attribute a, pg_class c
+WHERE a.attrelid = c.oid AND c.relname = 'tmp_test_stattarget' AND a.attnum > 0
+ORDER BY a.attnum;
+-- ... but statistic slot should contain no more than 10-elem-length arrays.
+SELECT staattnum, array_length(stanumbers1,1), array_length(stanumbers2,1),
+  array_length(stanumbers3,1), array_length(stanumbers4,1),
+  array_length(stanumbers5,1),
+  array_length(stavalues1,1), array_length(stavalues2,1),
+  array_length(stavalues3,1), array_length(stavalues4,1),
+  array_length(stavalues5,1)
+FROM pg_statistic s JOIN pg_class c ON (starelid = c.oid)
+WHERE c.relname = 'tmp_test_stattarget';
+
+-- ALTER TABLE may overrun default limit for temporary table statistics
+ALTER TABLE tmp_test_stattarget ALTER COLUMN x1 SET STATISTICS 11;
+ALTER TABLE tmp_test_stattarget ALTER COLUMN x2 SET STATISTICS 12;
+VACUUM ANALYZE tmp_test_stattarget;
+-- Should see 11 and 12 in the attstattarget field
+SELECT c.relname,a.attnum,a.attname,a.attstattarget
+FROM pg_attribute a, pg_class c
+WHERE a.attrelid = c.oid AND c.relname = 'tmp_test_stattarget' AND a.attnum > 0
+ORDER BY a.attnum;
+-- statistic slot should contain 11 and 12 elem-length arrays correspondingly.
+SELECT staattnum, array_length(stanumbers1,1), array_length(stanumbers2,1),
+  array_length(stanumbers3,1), array_length(stanumbers4,1),
+  array_length(stanumbers5,1),
+  array_length(stavalues1,1), array_length(stavalues2,1),
+  array_length(stavalues3,1), array_length(stavalues4,1),
+  array_length(stavalues5,1)
+FROM pg_statistic s JOIN pg_class c ON (starelid = c.oid)
+WHERE c.relname = 'tmp_test_stattarget';
+
 -- End of Stats Test
