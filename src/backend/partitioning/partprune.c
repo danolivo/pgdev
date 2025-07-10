@@ -121,6 +121,8 @@ typedef struct GeneratePruningStepsContext
 	bool		contradictory;	/* clauses were proven self-contradictory */
 	/* Working state: */
 	int			next_step_id;
+
+	PlannerInfo *root;
 } GeneratePruningStepsContext;
 
 /* The result of performing one PartitionPruneStep */
@@ -144,8 +146,8 @@ static List *make_partitionedrel_pruneinfo(PlannerInfo *root,
 										   Bitmapset *partrelids,
 										   int *relid_subplan_map,
 										   Bitmapset **matchedsubplans);
-static void gen_partprune_steps(RelOptInfo *rel, List *clauses,
-								PartClauseTarget target,
+static void gen_partprune_steps(PlannerInfo *root, RelOptInfo *rel,
+								List *clauses, PartClauseTarget target,
 								GeneratePruningStepsContext *context);
 static List *gen_partprune_steps_internal(GeneratePruningStepsContext *context,
 										  List *clauses);
@@ -545,7 +547,7 @@ make_partitionedrel_pruneinfo(PlannerInfo *root, RelOptInfo *parentrel,
 		 * pruning steps and detects whether there's any possibly-useful quals
 		 * that would require per-scan pruning.
 		 */
-		gen_partprune_steps(subpart, partprunequal, PARTTARGET_INITIAL,
+		gen_partprune_steps(root, subpart, partprunequal, PARTTARGET_INITIAL,
 							&context);
 
 		if (context.contradictory)
@@ -579,7 +581,7 @@ make_partitionedrel_pruneinfo(PlannerInfo *root, RelOptInfo *parentrel,
 		if (context.has_exec_param)
 		{
 			/* ... OK, we'd better think about it */
-			gen_partprune_steps(subpart, partprunequal, PARTTARGET_EXEC,
+			gen_partprune_steps(root, subpart, partprunequal, PARTTARGET_EXEC,
 								&context);
 
 			if (context.contradictory)
@@ -740,11 +742,13 @@ make_partitionedrel_pruneinfo(PlannerInfo *root, RelOptInfo *parentrel,
  * some subsidiary flags; see the GeneratePruningStepsContext typedef.
  */
 static void
-gen_partprune_steps(RelOptInfo *rel, List *clauses, PartClauseTarget target,
+gen_partprune_steps(PlannerInfo *root, RelOptInfo *rel, List *clauses,
+					PartClauseTarget target,
 					GeneratePruningStepsContext *context)
 {
 	/* Initialize all output values to zero/false/NULL */
 	memset(context, 0, sizeof(GeneratePruningStepsContext));
+	context->root = root;
 	context->rel = rel;
 	context->target = target;
 
@@ -778,6 +782,12 @@ gen_partprune_steps(RelOptInfo *rel, List *clauses, PartClauseTarget target,
 Bitmapset *
 prune_append_rel_partitions(RelOptInfo *rel)
 {
+	return prune_append_rel_partitions_ext(NULL, rel);
+}
+
+Bitmapset *
+prune_append_rel_partitions_ext(PlannerInfo *root, RelOptInfo *rel)
+{
 	List	   *clauses = rel->baserestrictinfo;
 	List	   *pruning_steps;
 	GeneratePruningStepsContext gcontext;
@@ -801,8 +811,7 @@ prune_append_rel_partitions(RelOptInfo *rel)
 	 * If the clauses are found to be contradictory, we can return the empty
 	 * set.
 	 */
-	gen_partprune_steps(rel, clauses, PARTTARGET_PLANNER,
-						&gcontext);
+	gen_partprune_steps(root, rel, clauses, PARTTARGET_PLANNER, &gcontext);
 	if (gcontext.contradictory)
 		return NULL;
 	pruning_steps = gcontext.steps;
@@ -2367,6 +2376,23 @@ match_clause_to_partition_key(GeneratePruningStepsContext *context,
 		}
 		else
 		{
+			/*
+			 * PGPro report to the caller.
+			 * It is hard to redesign the pruning state machine allowing it
+			 * to consider unknown-number sets of constants. But custom plan
+			 * type is free from this flaw. So, signalling to the plan caller
+			 * we let it to decide on re-planning, if necessary.
+			 *
+			 * Be careful and check NULL root pointer: someone may use the
+			 * prune_append_rel_partitions routine in a module.
+			 */
+			if (context->root)
+			{
+				if (context->root->glob->plan_info == NULL)
+					context->root->glob->plan_info = makeNode(PGProPlannerReport);
+				context->root->glob->plan_info->partprune_failed = true;
+			}
+
 			/* Give up on any other clause types. */
 			return PARTCLAUSE_UNSUPPORTED;
 		}

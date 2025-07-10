@@ -137,6 +137,14 @@ ResourceOwnerForgetPlanCacheRef(ResourceOwner owner, CachedPlan *plan)
 /* GUC parameter */
 int			plan_cache_mode = PLAN_CACHE_MODE_AUTO;
 
+choose_query_plan_hook_type choose_query_plan_hook = NULL;
+static choose_query_plan_hook_type prev_choose_query_plan_hook = NULL;
+static CachedPlan *avoid_unsuccessful_partprune(CachedPlanSource *plansource,
+												List *qlist,
+												ParamListInfo boundParams,
+												QueryEnvironment *queryEnv,
+												bool *customplan);
+
 /*
  * InitPlanCache: initialize module during InitPostgres.
  *
@@ -153,6 +161,9 @@ InitPlanCache(void)
 	CacheRegisterSyscacheCallback(AMOPOPID, PlanCacheSysCallback, (Datum) 0);
 	CacheRegisterSyscacheCallback(FOREIGNSERVEROID, PlanCacheSysCallback, (Datum) 0);
 	CacheRegisterSyscacheCallback(FOREIGNDATAWRAPPEROID, PlanCacheSysCallback, (Datum) 0);
+
+	prev_choose_query_plan_hook = choose_query_plan_hook;
+	choose_query_plan_hook = avoid_unsuccessful_partprune;
 }
 
 /*
@@ -1350,10 +1361,22 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 		}
 	}
 
+	if (choose_query_plan_hook)
+	{
+		/*
+		 * Let a module to choose plan type and/or provide specific cached plan.
+		 * It must set the customplan to stay consistent with the plan type
+		 * returned.
+		 */
+		plan = (*choose_query_plan_hook) (plansource, qlist, boundParams,
+										  queryEnv, &customplan);
+	}
+
 	if (customplan)
 	{
 		/* Build a custom plan */
-		plan = BuildCachedPlan(plansource, qlist, boundParams, queryEnv);
+		if (plan == NULL)
+			plan = BuildCachedPlan(plansource, qlist, boundParams, queryEnv);
 		/* Accumulate total costs of custom plans */
 		plansource->total_custom_cost += cached_plan_cost(plan, true);
 
@@ -2355,4 +2378,63 @@ static void
 ResOwnerReleaseCachedPlan(Datum res)
 {
 	ReleaseCachedPlan((CachedPlan *) DatumGetPointer(res), NULL);
+}
+
+/*
+ * Here we need to check if partition pruning has been rejected because an
+ * incoming parameter provides an array of values and that's why Postgres can't
+ * contruct finite number of 'partprune steps'.
+ */
+static CachedPlan *
+avoid_unsuccessful_partprune(CachedPlanSource *plansource, List *qlist,
+							 ParamListInfo boundParams,
+							 QueryEnvironment *queryEnv, bool *customplan)
+{
+	CachedPlan *plan = NULL;
+	ListCell   *lc;
+	double		avg_custom_cost;
+
+	if (likely(*customplan))
+		return NULL;
+
+	Assert(plansource->gplan != NULL);
+
+	foreach(lc, plansource->gplan->stmt_list)
+	{
+		PlannedStmt *stmt = lfirst_node(PlannedStmt, lc);
+
+		if (stmt->plan_info == NULL || !stmt->plan_info->partprune_failed)
+			continue;
+
+		break;
+	}
+
+	if (lc == NULL)
+		return plansource->gplan;
+
+	/*
+	 * At least one statement contains signs of possible rejection in
+	 * partition pruning. Let's try custom plan and compare costs of the generic
+	 * and custom plans.
+	 */
+	plan = BuildCachedPlan(plansource, qlist, boundParams, queryEnv);
+	/*
+	 * Save the result into the statistics. We have at least this small profit
+	 * having spent cycles in planning.
+	 */
+	plansource->total_custom_cost += cached_plan_cost(plan, true);
+	plansource->num_custom_plans++;
+
+	avg_custom_cost = plansource->total_custom_cost / plansource->num_custom_plans;
+	if (plansource->generic_cost < avg_custom_cost)
+	{
+		*customplan = false;
+		return plansource->gplan;
+	}
+	else
+	{
+		Assert(!(*customplan));
+		*customplan = true;
+		return plan;
+	}
 }

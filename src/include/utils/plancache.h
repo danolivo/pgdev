@@ -196,6 +196,13 @@ typedef struct CachedExpression
 	dlist_node	node;			/* link in global list of CachedExpressions */
 } CachedExpression;
 
+typedef CachedPlan *(*choose_query_plan_hook_type) (CachedPlanSource *plansource,
+													List *qlist,
+													ParamListInfo boundParams,
+													QueryEnvironment *queryEnv,
+													bool *customplan);
+extern PGDLLIMPORT choose_query_plan_hook_type choose_query_plan_hook;
+
 
 extern void InitPlanCache(void);
 extern void ResetPlanCache(void);

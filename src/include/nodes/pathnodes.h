@@ -80,6 +80,7 @@ typedef enum UpperRelationKind
 	/* NB: UPPERREL_FINAL must be last enum entry; it's used to size arrays */
 } UpperRelationKind;
 
+
 /*----------
  * PlannerGlobal
  *		Global information for planning/optimization
@@ -179,6 +180,8 @@ typedef struct PlannerGlobal
 
 	/* partition descriptors */
 	PartitionDirectory partition_directory pg_node_attr(read_write_ignore);
+
+	PGProPlannerReport *plan_info;
 } PlannerGlobal;
 
 /* macro for fetching the Plan associated with a SubPlan node */

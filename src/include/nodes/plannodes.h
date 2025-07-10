@@ -28,6 +28,7 @@
  * ----------------------------------------------------------------
  */
 
+
 /* ----------------
  *		PlannedStmt node
  *
@@ -136,6 +137,9 @@ typedef struct PlannedStmt
 	ParseLoc	stmt_location;
 	/* length in bytes; 0 means "rest of string" */
 	ParseLoc	stmt_len;
+
+	/* Insights on special cases were happened during the planning */
+	struct PGProPlannerReport *plan_info;
 } PlannedStmt;
 
 /* macro for fetching the Plan associated with a SubPlan node */
