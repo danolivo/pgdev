@@ -342,6 +342,7 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	glob->transientPlan = false;
 	glob->dependsOnRole = false;
 	glob->partition_directory = NULL;
+	glob->pgpro_ext = NIL;
 
 	/*
 	 * Assess whether it's feasible to use parallel mode for this query. We
@@ -581,6 +582,7 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	result->utilityStmt = parse->utilityStmt;
 	result->stmt_location = parse->stmt_location;
 	result->stmt_len = parse->stmt_len;
+	result->pgpro_ext = list_copy_deep(glob->pgpro_ext);
 
 	result->jitFlags = PGJIT_NONE;
 	if (jit_enabled && jit_above_cost >= 0 &&

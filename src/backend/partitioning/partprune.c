@@ -121,6 +121,13 @@ typedef struct GeneratePruningStepsContext
 	bool		contradictory;	/* clauses were proven self-contradictory */
 	/* Working state: */
 	int			next_step_id;
+
+	/*
+	 * Let pruning machine to have an access to the planning structures.
+	 * At the moment it is needed just to let them report pruning issues to
+	 * the PlannerGlobal.
+	 */
+	PlannerInfo *root;
 } GeneratePruningStepsContext;
 
 /* The result of performing one PartitionPruneStep */
@@ -144,8 +151,8 @@ static List *make_partitionedrel_pruneinfo(PlannerInfo *root,
 										   Bitmapset *partrelids,
 										   int *relid_subplan_map,
 										   Bitmapset **matchedsubplans);
-static void gen_partprune_steps(RelOptInfo *rel, List *clauses,
-								PartClauseTarget target,
+static void gen_partprune_steps(PlannerInfo *root, RelOptInfo *rel,
+								List *clauses, PartClauseTarget target,
 								GeneratePruningStepsContext *context);
 static List *gen_partprune_steps_internal(GeneratePruningStepsContext *context,
 										  List *clauses);
@@ -204,6 +211,7 @@ static void partkey_datum_from_expr(PartitionPruneContext *context,
 									Expr *expr, int stateidx,
 									Datum *value, bool *isnull);
 
+static bool ReportPGProPlannerPrune(PlannerInfo *root);
 
 /*
  * make_partition_pruneinfo
@@ -545,7 +553,7 @@ make_partitionedrel_pruneinfo(PlannerInfo *root, RelOptInfo *parentrel,
 		 * pruning steps and detects whether there's any possibly-useful quals
 		 * that would require per-scan pruning.
 		 */
-		gen_partprune_steps(subpart, partprunequal, PARTTARGET_INITIAL,
+		gen_partprune_steps(root, subpart, partprunequal, PARTTARGET_INITIAL,
 							&context);
 
 		if (context.contradictory)
@@ -579,7 +587,7 @@ make_partitionedrel_pruneinfo(PlannerInfo *root, RelOptInfo *parentrel,
 		if (context.has_exec_param)
 		{
 			/* ... OK, we'd better think about it */
-			gen_partprune_steps(subpart, partprunequal, PARTTARGET_EXEC,
+			gen_partprune_steps(root, subpart, partprunequal, PARTTARGET_EXEC,
 								&context);
 
 			if (context.contradictory)
@@ -740,11 +748,13 @@ make_partitionedrel_pruneinfo(PlannerInfo *root, RelOptInfo *parentrel,
  * some subsidiary flags; see the GeneratePruningStepsContext typedef.
  */
 static void
-gen_partprune_steps(RelOptInfo *rel, List *clauses, PartClauseTarget target,
+gen_partprune_steps(PlannerInfo *root, RelOptInfo *rel, List *clauses,
+					PartClauseTarget target,
 					GeneratePruningStepsContext *context)
 {
 	/* Initialize all output values to zero/false/NULL */
 	memset(context, 0, sizeof(GeneratePruningStepsContext));
+	context->root = root;
 	context->rel = rel;
 	context->target = target;
 
@@ -778,6 +788,12 @@ gen_partprune_steps(RelOptInfo *rel, List *clauses, PartClauseTarget target,
 Bitmapset *
 prune_append_rel_partitions(RelOptInfo *rel)
 {
+	return prune_append_rel_partitions_ext(NULL, rel);
+}
+
+Bitmapset *
+prune_append_rel_partitions_ext(PlannerInfo *root, RelOptInfo *rel)
+{
 	List	   *clauses = rel->baserestrictinfo;
 	List	   *pruning_steps;
 	GeneratePruningStepsContext gcontext;
@@ -801,8 +817,7 @@ prune_append_rel_partitions(RelOptInfo *rel)
 	 * If the clauses are found to be contradictory, we can return the empty
 	 * set.
 	 */
-	gen_partprune_steps(rel, clauses, PARTTARGET_PLANNER,
-						&gcontext);
+	gen_partprune_steps(root, rel, clauses, PARTTARGET_PLANNER, &gcontext);
 	if (gcontext.contradictory)
 		return NULL;
 	pruning_steps = gcontext.steps;
@@ -2367,6 +2382,15 @@ match_clause_to_partition_key(GeneratePruningStepsContext *context,
 		}
 		else
 		{
+			/*
+			 * PGPro report to the caller.
+			 * It is hard to redesign the pruning state machine allowing it
+			 * to consider unknown-number sets of constants. But custom plan
+			 * type is free from this flaw. So, signalling to the plan caller
+			 * we let it to decide on re-planning, if necessary.
+			 */
+			ReportPGProPlannerPrune(context->root);
+
 			/* Give up on any other clause types. */
 			return PARTCLAUSE_UNSUPPORTED;
 		}
@@ -3812,4 +3836,259 @@ partkey_datum_from_expr(PartitionPruneContext *context,
 		ectx = context->exprcontext;
 		*value = ExecEvalExprSwitchContext(exprstate, ectx, isnull);
 	}
+}
+
+/* -----------------------------------------------------------------------------
+ *
+ * Optimiser's stuff to report planning issues to the plancache choice hook
+ *
+ * -----------------------------------------------------------------------------
+ */
+
+#include "nodes/extensible.h"
+
+#define PGPRO_PRUNE "pgpro_prune"
+
+/*
+ * it is beneficial to have two different structures for reports and decisions.
+ * But for now, for the sake of simplicity, union them in a single
+ * extensible node.
+ */
+typedef struct PGProPlannerNodePrune
+{
+	ExtensibleNode	node;
+
+	union
+	{
+		int partprune_failed;
+		bool generic;
+	} data;
+
+	/* Referenced value of a plan or negative value, if not initialised */
+	double generic_cost;
+} PGProPlannerNodePrune;
+
+static void
+PGProPlannerNodePruneCopy(struct ExtensibleNode *enew,
+						  const struct ExtensibleNode *eold)
+{
+	PGProPlannerNodePrune *new = (PGProPlannerNodePrune *) enew;
+	PGProPlannerNodePrune *old = (PGProPlannerNodePrune *) eold;
+
+	new->data = old->data;
+	new->generic_cost = old->generic_cost;
+}
+
+static const ExtensibleNodeMethods method =
+{
+	.extnodename = PGPRO_PRUNE,
+	.node_size = sizeof(PGProPlannerNodePrune),
+	.nodeCopy =  PGProPlannerNodePruneCopy,
+	.nodeEqual = NULL,
+	.nodeOut = NULL,
+	.nodeRead = NULL,
+};
+
+static PGProPlannerNodePrune *
+get_rpt(List *lst)
+{
+	PGProPlannerNodePrune  *node = NULL;
+	ListCell			   *lc;
+
+	foreach(lc, lst)
+	{
+		ExtensibleNode *n = lfirst_node(ExtensibleNode, lc);
+
+		if(strcmp(n->extnodename, PGPRO_PRUNE) != 0)
+			continue;
+
+		node = (PGProPlannerNodePrune *) n;
+		break;
+	}
+	return node;
+}
+
+/*
+ * Report to the PlannerGlobal (eventually to the PlannedStmt) that the case
+ * of failed pruning takes place. It is caused by an issue that pruning machine
+ * must build all the pruning clauses at the planning time.
+  *
+ * Be careful and check NULL root pointer: someone may use the
+ * prune_append_rel_partitions routine in a module.
+ */
+static bool
+ReportPGProPlannerPrune(PlannerInfo *root)
+{
+	PGProPlannerNodePrune  *node = NULL;
+
+	if (root == NULL)
+		return false;
+
+	if (GetExtensibleNodeMethods(PGPRO_PRUNE, true) == NULL)
+		RegisterExtensibleNodeMethods(&method);
+
+	node = get_rpt(root->glob->pgpro_ext);
+
+	if (node == NULL)
+	{
+		node = (PGProPlannerNodePrune *) newNode(sizeof(PGProPlannerNodePrune),
+												 T_ExtensibleNode);
+		node->node.extnodename = PGPRO_PRUNE;
+		node->generic_cost = -1.; /* Must be negative for a report */
+
+		root->glob->pgpro_ext = lappend(root->glob->pgpro_ext, node);
+		node->data.partprune_failed = 1;
+	}
+	else
+		node->data.partprune_failed++;
+	return true;
+}
+
+/*
+ * Here we need to check if partition pruning has been rejected because an
+ * incoming parameter provides an array of values and that's why Postgres can't
+ * contruct finite number of 'partprune steps'.
+ */
+CachedPlan *
+avoid_unsuccessful_partprune(CachedPlanSource *plansource, List *qlist,
+							 ParamListInfo boundParams, CachedPlan *plan,
+							 QueryEnvironment *queryEnv, bool *customplan)
+{
+	PGProPlannerNodePrune  *decision = NULL;
+	PGProPlannerNodePrune  *report = NULL;
+	bool					do_custom = false;
+	MemoryContext			ctx;
+	ListCell			   *lc;
+
+	if (likely(*customplan))
+		/* Custom plan always prunes no worse than the generic one. */
+		goto next_hook;
+
+	/* Alternative behavior for the case Postgres has made a decision */
+	foreach(lc, plansource->pgpro_decisions)
+	{
+		ExtensibleNode *n = lfirst_node(ExtensibleNode, lc);
+
+		if(strcmp(n->extnodename, PGPRO_PRUNE) != 0)
+			continue;
+
+		/* We have previously-made solution */
+		decision = (PGProPlannerNodePrune *) n;
+		Assert(decision->generic_cost >= 0.);
+
+		/*
+		 * Detect significant changes on invalidation.
+		 * Looking for a balance between keeping current decision and dropping
+		 * it on each invalidation it makes sense to introduce an empirical
+		 * rule: 10% cost change may be a good reason to discover new decision.
+		 */
+		if (fabs(decision->generic_cost - plansource->generic_cost) / plansource->generic_cost > 0.1)
+		{
+			plansource->pgpro_decisions =
+						foreach_delete_current(plansource->pgpro_decisions, lc);
+			pfree(decision);
+			decision = NULL;
+			/* Have no chance to find one more decision of this type */
+			break;
+		}
+
+		do_custom = !decision->data.generic;
+
+		elog(DEBUG2, "PRM: existing decision: '%s' plan", do_custom ? "custom" : "generic");
+
+		if (do_custom && plancache_choice_hook)
+		{
+			/*
+			 * There are more hooks existing. Although we have our decision it
+			 * is necessary to call them too. So, prepare custom plan beforehand.
+			 */
+			plan = BuildCachedPlan(plansource, qlist, boundParams, queryEnv);
+			*customplan = true;
+		}
+
+		if (plancache_choice_hook)
+			plan = (*plancache_choice_hook) (plansource, qlist, boundParams,
+											 plan, queryEnv, customplan);
+
+		return plan;
+	}
+
+	/* Meaningless development invariants. May be removed in production */
+	Assert(decision == NULL);
+	Assert(plansource->gplan != NULL);
+
+	/*
+	 * We didn't decide on this statement yet. Pass through the generic
+	 * plan's statements looking for an issue report.
+	 */
+	foreach(lc, plan->stmt_list)
+	{
+		PlannedStmt   *stmt = lfirst_node(PlannedStmt, lc);
+
+		report = get_rpt(stmt->pgpro_ext);
+		if (report == NULL)
+			continue;
+
+		/* Effective value all the time should be positive now */
+		Assert(report->data.partprune_failed > 0);
+
+		do_custom = (report->data.partprune_failed == 0) ? false : true;
+		elog(DEBUG2, "PRM: planner has reported it has issues with partition pruning");
+		break;
+	}
+
+	if (report == NULL)
+		/* No reports - just go the the next hook in the chain */
+		goto next_hook;
+
+	if (do_custom)
+	{
+		CachedPlan   *new_plan = NULL;
+
+		/*
+		 * At least one statement contains signs of possible rejection in
+		 * partition pruning. Let's try custom plan and compare costs of the
+		 * generic and custom plans.
+		 */
+		new_plan = BuildCachedPlan(plansource, qlist, boundParams, queryEnv);
+
+		/* Work out a decision in a cost-based manner */
+		if (plansource->generic_cost < cached_plan_cost(new_plan, true))
+		{
+			*customplan = false;
+			plan = plansource->gplan;
+			elog(DEBUG2, "PRM: generic plan seems cheaper");
+		}
+		else
+		{
+			Assert(!(*customplan));
+			*customplan = true;
+			plan = new_plan;
+			elog(DEBUG2, "PRM: custom plan seems cheaper");
+		}
+	}
+
+next_hook:
+	if (plancache_choice_hook)
+		plan = (*plancache_choice_hook) (plansource, qlist, boundParams,
+										 plan, queryEnv, customplan);
+
+	if (report == NULL)
+		return plan;
+
+	ctx = MemoryContextSwitchTo(plansource->context);
+	decision = (PGProPlannerNodePrune *)
+					newNode(sizeof(PGProPlannerNodePrune), T_ExtensibleNode);
+	decision->node.extnodename = PGPRO_PRUNE;
+	decision->generic_cost = plansource->generic_cost;
+	plansource->pgpro_decisions = lappend(plansource->pgpro_decisions, decision);
+	MemoryContextSwitchTo(ctx);
+
+	/*
+	 * Now, analyse the result and save the decision.
+	 * TODO: may be elaborated later
+	 */
+	decision->data.generic = !(*customplan);
+	elog(DEBUG2, "PRM: final decision: '%s' plan", decision->data.generic ? "generic" : "custom");
+	return plan;
 }

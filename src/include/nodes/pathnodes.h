@@ -179,6 +179,13 @@ typedef struct PlannerGlobal
 
 	/* partition descriptors */
 	PartitionDirectory partition_directory pg_node_attr(read_write_ignore);
+
+	/*
+	 * An extension or subsystem may add to this list its data to let planning
+	 * hooks process this information somehow. This list is copied into the
+	 * PlannedStmt at the end of the planning.
+	 */
+	List	   *pgpro_ext pg_node_attr(equal_ignore, query_jumble_ignore, read_write_ignore, read_as(0));
 } PlannerGlobal;
 
 /* macro for fetching the Plan associated with a SubPlan node */

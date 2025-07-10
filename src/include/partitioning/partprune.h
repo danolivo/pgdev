@@ -16,6 +16,7 @@
 
 #include "nodes/execnodes.h"
 #include "partitioning/partdefs.h"
+#include "utils/plancache.h"
 
 struct PlannerInfo;				/* avoid including pathnodes.h here */
 struct RelOptInfo;
@@ -75,7 +76,15 @@ extern int	make_partition_pruneinfo(struct PlannerInfo *root,
 									 List *subpaths,
 									 List *prunequal);
 extern Bitmapset *prune_append_rel_partitions(struct RelOptInfo *rel);
+extern Bitmapset *prune_append_rel_partitions_ext(struct PlannerInfo *root,
+												  struct RelOptInfo *rel);
 extern Bitmapset *get_matching_partitions(PartitionPruneContext *context,
 										  List *pruning_steps);
+extern CachedPlan *avoid_unsuccessful_partprune(CachedPlanSource *plansource,
+												List *qlist,
+												ParamListInfo boundParams,
+												CachedPlan *plan,
+												QueryEnvironment *queryEnv,
+												bool *customplan);
 
 #endif							/* PARTPRUNE_H */

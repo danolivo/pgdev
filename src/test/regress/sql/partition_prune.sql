@@ -1447,3 +1447,44 @@ select min(a) over (partition by a order by a) from part_abc where a >= stable_o
 
 drop view part_abc_view;
 drop table part_abc;
+
+-- Check replanning on a failed pruning caused by parameter array
+CREATE TABLE array_prune (id int) PARTITION BY HASH (id);
+CREATE TABLE array_prune_t0
+  PARTITION OF array_prune FOR VALUES WITH (modulus 2, remainder 0)
+  WITH (autovacuum_enabled = 'false');
+CREATE TABLE array_prune_t1
+  PARTITION OF array_prune FOR VALUES WITH (modulus 2, remainder 1)
+  WITH (autovacuum_enabled = 'false');
+SET plan_cache_mode TO force_generic_plan;
+
+PREPARE test (int[]) AS SELECT * FROM array_prune WHERE id = ANY($1);
+PREPARE test1 (int, int) AS SELECT * FROM array_prune WHERE id = ANY(ARRAY[$1,$2]);
+
+INSERT INTO array_prune (id) (VALUES (1), (2), (3));
+ANALYZE array_prune;
+
+-- First explain should expose non-pruned generic plan because of execution cost
+-- less than the planning one
+EXPLAIN (COSTS OFF) EXECUTE test(ARRAY[1,2]);
+EXPLAIN (COSTS OFF) EXECUTE test1(1,2);
+
+-- Add data into the table to increase execution cost
+INSERT INTO array_prune (id) SELECT 3 FROM generate_series(1,1E3);
+ANALYZE array_prune;
+
+-- There should be custom planning-stage pruned plan
+EXPLAIN (COSTS OFF) EXECUTE test(ARRAY[1,2]);
+TRUNCATE array_prune;
+-- A little suspicious test: the table invalidation has happened but statistics
+-- stays the same and there are not a lot of difference in costs of custom and
+-- generic plan. Should see previous 'custom' decision.
+EXPLAIN (COSTS OFF) EXECUTE test(ARRAY[1,2]);
+ANALYZE array_prune;
+-- After the statistics invalidation new cost-based decision should shift to
+-- a generic plan
+EXPLAIN (COSTS OFF) EXECUTE test(ARRAY[1,2]);
+
+DEALLOCATE ALL;
+RESET plan_cache_mode;
+DROP TABLE array_prune CASCADE;

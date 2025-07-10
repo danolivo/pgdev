@@ -63,6 +63,7 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "parser/analyze.h"
+#include "partitioning/partprune.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/lmgr.h"
 #include "tcop/pquery.h"
@@ -94,11 +95,8 @@ static bool BuildingPlanRequiresSnapshot(CachedPlanSource *plansource);
 static List *RevalidateCachedQuery(CachedPlanSource *plansource,
 								   QueryEnvironment *queryEnv);
 static bool CheckCachedPlan(CachedPlanSource *plansource);
-static CachedPlan *BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
-								   ParamListInfo boundParams, QueryEnvironment *queryEnv);
 static bool choose_custom_plan(CachedPlanSource *plansource,
 							   ParamListInfo boundParams);
-static double cached_plan_cost(CachedPlan *plan, bool include_planner);
 static Query *QueryListGetPrimaryStmt(List *stmts);
 static void AcquireExecutorLocks(List *stmt_list, bool acquire);
 static void AcquirePlannerLocks(List *stmt_list, bool acquire);
@@ -136,6 +134,8 @@ ResourceOwnerForgetPlanCacheRef(ResourceOwner owner, CachedPlan *plan)
 
 /* GUC parameter */
 int			plan_cache_mode = PLAN_CACHE_MODE_AUTO;
+
+plancache_choice_hook_type plancache_choice_hook = NULL;
 
 /*
  * InitPlanCache: initialize module during InitPostgres.
@@ -242,6 +242,7 @@ CreateCachedPlan(RawStmt *raw_parse_tree,
 	plansource->total_custom_cost = 0;
 	plansource->num_generic_plans = 0;
 	plansource->num_custom_plans = 0;
+	plansource->pgpro_decisions = NIL;
 
 	MemoryContextSwitchTo(oldcxt);
 
@@ -1015,7 +1016,7 @@ CheckCachedPlan(CachedPlanSource *plansource)
  * is in a child memory context, which typically should get reparented
  * (unless this is a one-shot plan, in which case we don't copy the plan).
  */
-static CachedPlan *
+CachedPlan *
 BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 				ParamListInfo boundParams, QueryEnvironment *queryEnv)
 {
@@ -1211,7 +1212,7 @@ choose_custom_plan(CachedPlanSource *plansource, ParamListInfo boundParams)
  * the plan.  (We must factor that into the cost of using a custom plan, but
  * we don't count it for a generic plan.)
  */
-static double
+double
 cached_plan_cost(CachedPlan *plan, bool include_planner)
 {
 	double		result = 0;
@@ -1350,10 +1351,19 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 		}
 	}
 
+	/*
+	 * Let a module to choose plan type and/or provide specific cached plan.
+	 * It must set the customplan to stay consistent with the plan type
+	 * returned.
+	 */
+	plan = avoid_unsuccessful_partprune(plansource, qlist, boundParams,
+										plan, queryEnv, &customplan);
+
 	if (customplan)
 	{
 		/* Build a custom plan */
-		plan = BuildCachedPlan(plansource, qlist, boundParams, queryEnv);
+		if (plan == NULL)
+			plan = BuildCachedPlan(plansource, qlist, boundParams, queryEnv);
 		/* Accumulate total costs of custom plans */
 		plansource->total_custom_cost += cached_plan_cost(plan, true);
 
@@ -2324,6 +2334,7 @@ ResetPlanCache(void)
 			continue;
 
 		plansource->is_valid = false;
+		/* Do not clear pgpro_decisions here. Let modules decide on their own */
 		if (plansource->gplan)
 			plansource->gplan->is_valid = false;
 	}
