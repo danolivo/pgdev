@@ -1187,16 +1187,16 @@ choose_custom_plan(CachedPlanSource *plansource, ParamListInfo boundParams)
 	if (!StmtPlanRequiresRevalidation(plansource))
 		return false;
 
-	/* Let settings force the decision */
-	if (plan_cache_mode == PLAN_CACHE_MODE_FORCE_GENERIC_PLAN)
-		return false;
-	if (plan_cache_mode == PLAN_CACHE_MODE_FORCE_CUSTOM_PLAN)
-		return true;
-
 	/* See if caller wants to force the decision */
 	if (plansource->cursor_options & CURSOR_OPT_GENERIC_PLAN)
 		return false;
 	if (plansource->cursor_options & CURSOR_OPT_CUSTOM_PLAN)
+		return true;
+
+	/* Let settings force the decision */
+	if (plan_cache_mode == PLAN_CACHE_MODE_FORCE_GENERIC_PLAN)
+		return false;
+	if (plan_cache_mode == PLAN_CACHE_MODE_FORCE_CUSTOM_PLAN)
 		return true;
 
 	/* Generate custom plans until we have done at least 5 (arbitrary) */
