@@ -342,7 +342,7 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	glob->transientPlan = false;
 	glob->dependsOnRole = false;
 	glob->partition_directory = NULL;
-	glob->plan_info = makeNode(PGProPlannerReport); /* alocate it now just to be in the proper context */
+	glob->PGProPlannerNodeList = NIL;
 
 	/*
 	 * Assess whether it's feasible to use parallel mode for this query. We
@@ -582,7 +582,7 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	result->utilityStmt = parse->utilityStmt;
 	result->stmt_location = parse->stmt_location;
 	result->stmt_len = parse->stmt_len;
-	result->plan_info = glob->plan_info == NULL ? glob->plan_info : copyObject(glob->plan_info);
+	result->PGProPlannerNodeList = list_copy_deep(glob->PGProPlannerNodeList);
 
 	result->jitFlags = PGJIT_NONE;
 	if (jit_enabled && jit_above_cost >= 0 &&

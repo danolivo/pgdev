@@ -2371,23 +2371,5 @@ typedef struct OnConflictExpr
 	List	   *exclRelTlist;	/* tlist of the EXCLUDED pseudo relation */
 } OnConflictExpr;
 
-/*
- * This is stored into the PlannerGlobal and, after the end of the optimisation,
- * into the PlannedStmt node to let the caller understand which optimisations
- * have been applied and which not.
- *
- * The NULL pointer means Postgres has never stuck into the feedback code.
- *
- * This is designed to signal the caller that it may attempt to change settings
- * and start optimisation process again in attempt to obtain better plan.
- */
-typedef struct PGProPlannerReport
-{
-	pg_node_attr(no_equal, no_query_jumble)
-
-	NodeTag		type;
-
-	bool partprune_failed;
-} PGProPlannerReport;
 
 #endif							/* PRIMNODES_H */

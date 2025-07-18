@@ -63,6 +63,7 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "parser/analyze.h"
+#include "partitioning/partprune.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/lmgr.h"
 #include "tcop/pquery.h"
@@ -94,11 +95,8 @@ static bool BuildingPlanRequiresSnapshot(CachedPlanSource *plansource);
 static List *RevalidateCachedQuery(CachedPlanSource *plansource,
 								   QueryEnvironment *queryEnv);
 static bool CheckCachedPlan(CachedPlanSource *plansource);
-static CachedPlan *BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
-								   ParamListInfo boundParams, QueryEnvironment *queryEnv);
 static bool choose_custom_plan(CachedPlanSource *plansource,
 							   ParamListInfo boundParams);
-static double cached_plan_cost(CachedPlan *plan, bool include_planner);
 static Query *QueryListGetPrimaryStmt(List *stmts);
 static void AcquireExecutorLocks(List *stmt_list, bool acquire);
 static void AcquirePlannerLocks(List *stmt_list, bool acquire);
@@ -137,13 +135,7 @@ ResourceOwnerForgetPlanCacheRef(ResourceOwner owner, CachedPlan *plan)
 /* GUC parameter */
 int			plan_cache_mode = PLAN_CACHE_MODE_AUTO;
 
-choose_query_plan_hook_type choose_query_plan_hook = NULL;
-static choose_query_plan_hook_type prev_choose_query_plan_hook = NULL;
-static CachedPlan *avoid_unsuccessful_partprune(CachedPlanSource *plansource,
-												List *qlist,
-												ParamListInfo boundParams,
-												QueryEnvironment *queryEnv,
-												bool *customplan);
+plancache_choice_hook_type plancache_choice_hook = NULL;
 
 /*
  * InitPlanCache: initialize module during InitPostgres.
@@ -161,9 +153,6 @@ InitPlanCache(void)
 	CacheRegisterSyscacheCallback(AMOPOPID, PlanCacheSysCallback, (Datum) 0);
 	CacheRegisterSyscacheCallback(FOREIGNSERVEROID, PlanCacheSysCallback, (Datum) 0);
 	CacheRegisterSyscacheCallback(FOREIGNDATAWRAPPEROID, PlanCacheSysCallback, (Datum) 0);
-
-	prev_choose_query_plan_hook = choose_query_plan_hook;
-	choose_query_plan_hook = avoid_unsuccessful_partprune;
 }
 
 /*
@@ -253,6 +242,7 @@ CreateCachedPlan(RawStmt *raw_parse_tree,
 	plansource->total_custom_cost = 0;
 	plansource->num_generic_plans = 0;
 	plansource->num_custom_plans = 0;
+	plansource->ext = NIL;
 
 	MemoryContextSwitchTo(oldcxt);
 
@@ -1026,7 +1016,7 @@ CheckCachedPlan(CachedPlanSource *plansource)
  * is in a child memory context, which typically should get reparented
  * (unless this is a one-shot plan, in which case we don't copy the plan).
  */
-static CachedPlan *
+CachedPlan *
 BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 				ParamListInfo boundParams, QueryEnvironment *queryEnv)
 {
@@ -1222,7 +1212,7 @@ choose_custom_plan(CachedPlanSource *plansource, ParamListInfo boundParams)
  * the plan.  (We must factor that into the cost of using a custom plan, but
  * we don't count it for a generic plan.)
  */
-static double
+double
 cached_plan_cost(CachedPlan *plan, bool include_planner)
 {
 	double		result = 0;
@@ -1361,16 +1351,13 @@ GetCachedPlan(CachedPlanSource *plansource, ParamListInfo boundParams,
 		}
 	}
 
-	if (choose_query_plan_hook)
-	{
-		/*
-		 * Let a module to choose plan type and/or provide specific cached plan.
-		 * It must set the customplan to stay consistent with the plan type
-		 * returned.
-		 */
-		plan = (*choose_query_plan_hook) (plansource, qlist, boundParams,
-										  queryEnv, &customplan);
-	}
+	/*
+	 * Let a module to choose plan type and/or provide specific cached plan.
+	 * It must set the customplan to stay consistent with the plan type
+	 * returned.
+	 */
+	plan = avoid_unsuccessful_partprune(plansource, qlist, boundParams,
+										plan, queryEnv, &customplan);
 
 	if (customplan)
 	{
@@ -2347,6 +2334,7 @@ ResetPlanCache(void)
 			continue;
 
 		plansource->is_valid = false;
+		plansource->ext = NIL;
 		if (plansource->gplan)
 			plansource->gplan->is_valid = false;
 	}
@@ -2379,62 +2367,35 @@ ResOwnerReleaseCachedPlan(Datum res)
 {
 	ReleaseCachedPlan((CachedPlan *) DatumGetPointer(res), NULL);
 }
-
 /*
- * Here we need to check if partition pruning has been rejected because an
- * incoming parameter provides an array of values and that's why Postgres can't
- * contruct finite number of 'partprune steps'.
- */
-static CachedPlan *
-avoid_unsuccessful_partprune(CachedPlanSource *plansource, List *qlist,
-							 ParamListInfo boundParams,
-							 QueryEnvironment *queryEnv, bool *customplan)
+PGProPlannerNode *
+get_provider_node(List *lst, const char *providerName)
 {
-	CachedPlan *plan = NULL;
-	ListCell   *lc;
-	double		avg_custom_cost;
+	ListCell *lc;
 
-	if (likely(*customplan))
-		return NULL;
-
-	Assert(plansource->gplan != NULL);
-
-	foreach(lc, plansource->gplan->stmt_list)
+	foreach (lc, lst)
 	{
-		PlannedStmt *stmt = lfirst_node(PlannedStmt, lc);
+		PGProPlannerNode *node = (PGProPlannerNode *) lfirst(lc);
 
-		if (stmt->plan_info == NULL || !stmt->plan_info->partprune_failed)
-			continue;
-
-		break;
+		Assert(node->magic == PGPRO_PLANNER_MAGIC);
+		if (strcmp(providerName, node->providerName) == 0)
+			return node;
 	}
 
-	if (lc == NULL)
-		return plansource->gplan;
-
-	/*
-	 * At least one statement contains signs of possible rejection in
-	 * partition pruning. Let's try custom plan and compare costs of the generic
-	 * and custom plans.
-	 */
-	plan = BuildCachedPlan(plansource, qlist, boundParams, queryEnv);
-	/*
-	 * Save the result into the statistics. We have at least this small profit
-	 * having spent cycles in planning.
-	 */
-	plansource->total_custom_cost += cached_plan_cost(plan, true);
-	plansource->num_custom_plans++;
-
-	avg_custom_cost = plansource->total_custom_cost / plansource->num_custom_plans;
-	if (plansource->generic_cost < avg_custom_cost)
-	{
-		*customplan = false;
-		return plansource->gplan;
-	}
-	else
-	{
-		Assert(!(*customplan));
-		*customplan = true;
-		return plan;
-	}
+	return NULL;
 }
+
+PGProPlannerNode *
+make_provider_node(const char *providerName, size_t size)
+{
+	PGProPlannerNode *node = palloc0(size);
+
+	Assert(size >= sizeof(PGProPlannerNode));
+
+	node->magic = PGPRO_PLANNER_MAGIC;
+	node->providerName = pstrdup(providerName);
+	return node;
+}
+
+PGProPlannerNode *add_provider_node(List *lst, PGProPlannerNode *node);
+*/

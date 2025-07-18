@@ -206,6 +206,7 @@ static void partkey_datum_from_expr(PartitionPruneContext *context,
 									Expr *expr, int stateidx,
 									Datum *value, bool *isnull);
 
+static bool ReportPGProPlannerPrune(PlannerInfo *root);
 
 /*
  * make_partition_pruneinfo
@@ -2382,16 +2383,8 @@ match_clause_to_partition_key(GeneratePruningStepsContext *context,
 			 * to consider unknown-number sets of constants. But custom plan
 			 * type is free from this flaw. So, signalling to the plan caller
 			 * we let it to decide on re-planning, if necessary.
-			 *
-			 * Be careful and check NULL root pointer: someone may use the
-			 * prune_append_rel_partitions routine in a module.
 			 */
-			if (context->root)
-			{
-				if (context->root->glob->plan_info == NULL)
-					context->root->glob->plan_info = makeNode(PGProPlannerReport);
-				context->root->glob->plan_info->partprune_failed = true;
-			}
+			ReportPGProPlannerPrune(context->root);
 
 			/* Give up on any other clause types. */
 			return PARTCLAUSE_UNSUPPORTED;
@@ -3838,4 +3831,204 @@ partkey_datum_from_expr(PartitionPruneContext *context,
 		ectx = context->exprcontext;
 		*value = ExecEvalExprSwitchContext(exprstate, ectx, isnull);
 	}
+}
+
+/* -----------------------------------------------------------------------------
+ *
+ * Optimiser's stuff to report planning issues to the plancache choice hook
+ *
+ * -----------------------------------------------------------------------------
+ */
+
+#include "nodes/extensible.h"
+
+#define PGPRO_PRUNE "pgpro_prune"
+
+typedef struct PGProPlannerNodePrune
+{
+	ExtensibleNode	node;
+
+	union
+	{
+		int partprune_failed;
+		bool generic;
+	} data;
+} PGProPlannerNodePrune;
+
+static void
+PGProPlannerNodePruneCopy(struct ExtensibleNode *enew,
+						  const struct ExtensibleNode *eold)
+{
+	PGProPlannerNodePrune *new = (PGProPlannerNodePrune *) enew;
+	PGProPlannerNodePrune *old = (PGProPlannerNodePrune *) eold;
+
+	new->data = old->data;
+}
+
+static const ExtensibleNodeMethods method =
+{
+	.extnodename = PGPRO_PRUNE,
+	.node_size = sizeof(PGProPlannerNodePrune),
+	.nodeCopy =  PGProPlannerNodePruneCopy,
+	.nodeEqual = NULL,
+	.nodeOut = NULL,
+	.nodeRead = NULL,
+};
+
+static PGProPlannerNodePrune *
+get_rpt(List *lst)
+{
+	PGProPlannerNodePrune  *node = NULL;
+	ListCell			   *lc;
+
+	foreach(lc, lst)
+	{
+		ExtensibleNode *n = lfirst_node(ExtensibleNode, lc);
+
+		if(strcmp(n->extnodename, PGPRO_PRUNE) != 0)
+			continue;
+
+		node = (PGProPlannerNodePrune *) n;
+		break;
+	}
+	return node;
+}
+
+/*
+ * Report to the PlannerGlobal (eventually to the PlannedStmt) that the case
+ * of failed pruning takes place. It is caused by an issue that pruning machine
+ * must build all the pruning clauses at the planning time.
+  *
+ * Be careful and check NULL root pointer: someone may use the
+ * prune_append_rel_partitions routine in a module.
+ */
+static bool
+ReportPGProPlannerPrune(PlannerInfo *root)
+{
+	PGProPlannerNodePrune  *node = NULL;
+
+	if (root == NULL)
+		return false;
+
+	if (GetExtensibleNodeMethods(PGPRO_PRUNE, true) == NULL)
+		RegisterExtensibleNodeMethods(&method);
+
+	node = get_rpt(root->glob->PGProPlannerNodeList);
+
+	if (node == NULL)
+	{
+		node = (PGProPlannerNodePrune *) newNode(sizeof(PGProPlannerNodePrune),
+												 T_ExtensibleNode);
+		node->node.extnodename = PGPRO_PRUNE;
+
+		root->glob->PGProPlannerNodeList =
+								lappend(root->glob->PGProPlannerNodeList, node);
+		node->data.partprune_failed = 1;
+	}
+	else
+		node->data.partprune_failed++;
+	return true;
+}
+
+/*
+ * Here we need to check if partition pruning has been rejected because an
+ * incoming parameter provides an array of values and that's why Postgres can't
+ * contruct finite number of 'partprune steps'.
+ */
+CachedPlan *
+avoid_unsuccessful_partprune(CachedPlanSource *plansource, List *qlist,
+							 ParamListInfo boundParams, CachedPlan *plan,
+							 QueryEnvironment *queryEnv, bool *customplan)
+{
+	CachedPlan			   *new_plan = NULL;
+	ListCell			   *lc;
+	bool					do_custom;
+	PGProPlannerNodePrune  *node = NULL;
+
+	if (likely(*customplan))
+		/* Custom plan always prunes no worse than the generic one. */
+		goto next_hook;
+
+	/* Check already made dscision */
+	foreach(lc, plansource->ext)
+	{
+		ExtensibleNode *n = lfirst_node(ExtensibleNode, lc);
+
+		if(strcmp(n->extnodename, PGPRO_PRUNE) != 0)
+			continue;
+
+		/* We have previously-made solution */
+		node = (PGProPlannerNodePrune *) n;
+		do_custom = node->data.generic;
+		break;
+	}
+
+	if (node == NULL)
+	{
+		/* We didn't decide on this statement before. Find out a report */
+		Assert(plansource->gplan != NULL);
+
+		foreach(lc, plansource->gplan->stmt_list)
+		{
+			PlannedStmt   *stmt = lfirst_node(PlannedStmt, lc);
+
+			node = get_rpt(stmt->PGProPlannerNodeList);
+			if (node == NULL)
+				continue;
+
+			do_custom = node->data.generic ? false : true;
+			break;
+		}
+	}
+
+	if (!do_custom)
+	{
+		Assert(*customplan == false);
+		plan = plansource->gplan;
+	}
+	else
+	{
+		/*
+		 * At least one statement contains signs of possible rejection in
+		 * partition pruning. Let's try custom plan and compare costs of the
+		 * generic and custom plans.
+		 */
+		new_plan = BuildCachedPlan(plansource, qlist, boundParams, queryEnv);
+
+		if (plansource->generic_cost < cached_plan_cost(plan, true))
+		{
+			*customplan = false;
+			plan = plansource->gplan;
+		}
+		else
+		{
+			Assert(!(*customplan));
+			*customplan = true;
+			plan = new_plan;
+		}
+	}
+
+next_hook:
+	if (plancache_choice_hook)
+		plan = (*plancache_choice_hook) (plansource, qlist, boundParams,
+										 plan, queryEnv, customplan);
+
+	if (node == NULL)
+	{
+		MemoryContext ctx;
+
+		ctx = MemoryContextSwitchTo(plansource->context);
+		node = (PGProPlannerNodePrune *) newNode(sizeof(PGProPlannerNodePrune),
+												 T_ExtensibleNode);
+		node->node.extnodename = PGPRO_PRUNE;
+		plansource->ext = lappend(plansource->ext, node);
+		MemoryContextSwitchTo(ctx);
+	}
+
+	/*
+	 * Now, analyse the result and save the decision.
+	 * TODO: may be elaborated later
+	 */
+	node->data.generic = *customplan;
+	return plan;
 }

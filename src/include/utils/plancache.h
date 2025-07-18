@@ -144,6 +144,12 @@ typedef struct CachedPlanSource
 	double		total_custom_cost;	/* total cost of custom plans so far */
 	int64		num_custom_plans;	/* # of custom plans included in total */
 	int64		num_generic_plans;	/* # of generic plans */
+
+	/*
+	 * Should contain only extensible nodes added by extensions to remember
+	 * decisions have made around this specific entry.
+	 */
+	List *ext;
 } CachedPlanSource;
 
 /*
@@ -196,14 +202,6 @@ typedef struct CachedExpression
 	dlist_node	node;			/* link in global list of CachedExpressions */
 } CachedExpression;
 
-typedef CachedPlan *(*choose_query_plan_hook_type) (CachedPlanSource *plansource,
-													List *qlist,
-													ParamListInfo boundParams,
-													QueryEnvironment *queryEnv,
-													bool *customplan);
-extern PGDLLIMPORT choose_query_plan_hook_type choose_query_plan_hook;
-
-
 extern void InitPlanCache(void);
 extern void ResetPlanCache(void);
 
@@ -248,6 +246,10 @@ extern CachedPlan *GetCachedPlan(CachedPlanSource *plansource,
 								 ParamListInfo boundParams,
 								 ResourceOwner owner,
 								 QueryEnvironment *queryEnv);
+extern CachedPlan *BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
+								   ParamListInfo boundParams,
+								   QueryEnvironment *queryEnv);
+extern double cached_plan_cost(CachedPlan *plan, bool include_planner);
 extern void ReleaseCachedPlan(CachedPlan *plan, ResourceOwner owner);
 
 extern bool CachedPlanAllowsSimpleValidityCheck(CachedPlanSource *plansource,
@@ -259,5 +261,31 @@ extern bool CachedPlanIsSimplyValid(CachedPlanSource *plansource,
 
 extern CachedExpression *GetCachedExpression(Node *expr);
 extern void FreeCachedExpression(CachedExpression *cexpr);
+
+
+/* -----------------------------------------------------------------------------
+ *
+ * PGPro planner report and re-plan stuff.
+ *
+ * -------------------------------------------------------------------------- */
+
+/*
+ * This hook should utilise the extension list, located inside the PlannedStmt.
+ *
+ * This list may be NIL, if no one reported any issues there.
+ *
+ * This is designed to signal the caller that it may attempt to change settings
+ * and re-start optimisation process in attempt to obtain better plan.
+ */
+
+typedef CachedPlan *(*plancache_choice_hook_type) (CachedPlanSource *plansource,
+													List *qlist,
+													ParamListInfo boundParams,
+													CachedPlan *plan,
+													QueryEnvironment *queryEnv,
+													bool *customplan);
+extern PGDLLIMPORT plancache_choice_hook_type plancache_choice_hook;
+
+/* -------------------------------------------------------------------------- */
 
 #endif							/* PLANCACHE_H */
