@@ -55,6 +55,7 @@ ExecInitGather(Gather *node, EState *estate, int eflags)
 	GatherState *gatherstate;
 	Plan	   *outerNode;
 	TupleDesc	tupDesc;
+	volatile bool prev_InsideGatherInitPhase;
 
 	/* Gather node doesn't have innerPlan node. */
 	Assert(innerPlan(node) == NULL);
@@ -83,7 +84,23 @@ ExecInitGather(Gather *node, EState *estate, int eflags)
 	 * now initialize outer plan
 	 */
 	outerNode = outerPlan(node);
-	outerPlanState(gatherstate) = ExecInitNode(outerNode, estate, eflags);
+	/*
+	 * Sync temporary tables to the disk. It is necessary to do any time because
+	 * it is possible to get an accidental access to a temp relation inside a
+	 * stored procedure.
+	 */
+	prev_InsideGatherInitPhase = InsideGatherInitPhase;
+	InsideGatherInitPhase = true;
+	PG_TRY();
+	{
+		outerPlanState(gatherstate) = ExecInitNode(outerNode, estate, eflags);
+	}
+	PG_FINALLY();
+	{
+		InsideGatherInitPhase = prev_InsideGatherInitPhase;
+	}
+	PG_END_TRY();
+
 	tupDesc = ExecGetResultType(outerPlanState(gatherstate));
 
 	/*

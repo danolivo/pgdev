@@ -63,8 +63,10 @@
  */
 #include "postgres.h"
 
+#include "access/parallel.h"
 #include "access/xlogutils.h"
 #include "lib/ilist.h"
+#include "optimizer/optimizer.h"
 #include "miscadmin.h"
 #include "storage/aio.h"
 #include "storage/bufmgr.h"
@@ -651,6 +653,8 @@ smgrzeroextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 {
 	HOLD_INTERRUPTS();
 
+	Assert(!IsParallelWorker());
+
 	smgrsw[reln->smgr_which].smgr_zeroextend(reln, forknum, blocknum,
 											 nblocks, skipFsync);
 
@@ -792,6 +796,7 @@ smgrwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		   const void **buffers, BlockNumber nblocks, bool skipFsync)
 {
 	HOLD_INTERRUPTS();
+	Assert(!IsParallelWorker());
 	smgrsw[reln->smgr_which].smgr_writev(reln, forknum, blocknum,
 										 buffers, nblocks, skipFsync);
 	RESUME_INTERRUPTS();
@@ -876,6 +881,8 @@ smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 			 BlockNumber *old_nblocks, BlockNumber *nblocks)
 {
 	int			i;
+
+	Assert(!IsParallelWorker());
 
 	/*
 	 * Get rid of any buffers for the about-to-be-deleted blocks. bufmgr will

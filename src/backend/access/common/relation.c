@@ -23,6 +23,7 @@
 #include "access/relation.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "executor/execParallel.h"
 #include "pgstat.h"
 #include "storage/lmgr.h"
 #include "utils/inval.h"
@@ -43,6 +44,7 @@
  *		expected to check whether the relkind is something it can handle.
  * ----------------
  */
+#include "storage/bufmgr.h"
 Relation
 relation_open(Oid relationId, LOCKMODE lockmode)
 {
@@ -68,9 +70,22 @@ relation_open(Oid relationId, LOCKMODE lockmode)
 		   IsBootstrapProcessingMode() ||
 		   CheckRelationLockedByMe(r, AccessShareLock, true));
 
-	/* Make note that we've accessed a temporary relation */
-	if (RelationUsesLocalBuffers(r))
+	if (RelationUsesLocalBuffers(r) && RELKIND_HAS_STORAGE(r->rd_rel->relkind))
+	{
 		MyXactFlags |= XACT_FLAGS_ACCESSEDTEMPNAMESPACE;
+
+		/*
+		 * We are opening a temporary object which has a storage.
+		 * If it happens inside a parallel section of the query plan, we need to
+		 * flush all dirty buffers beforehand.
+		 */
+		if (InsideGatherInitPhase)
+		{
+			Assert(!IsParallelWorker());
+
+			FlushRelationBuffers(r);
+		}
+	}
 
 	pgstat_init_relation(r);
 

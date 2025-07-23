@@ -607,16 +607,12 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 		case RTE_RELATION:
 
 			/*
-			 * Currently, parallel workers can't access the leader's temporary
-			 * tables.  We could possibly relax this if we wrote all of its
-			 * local buffers at the start of the query and made no changes
-			 * thereafter (maybe we could allow hint bit changes), and if we
-			 * taught the workers to read them.  Writing a large number of
-			 * temporary buffers could be expensive, though, and we don't have
-			 * the rest of the necessary infrastructure right now anyway.  So
-			 * for now, bail out if we see a temporary table.
+			 * Writing a large number of temporary buffers could be expensive.
+			 * So, do it if it's really necessary.
+			 * XXX: Could we allow hint bit changes?
 			 */
-			if (get_rel_persistence(rte->relid) == RELPERSISTENCE_TEMP)
+			if (get_rel_persistence(rte->relid) == RELPERSISTENCE_TEMP &&
+				!enable_parallel_temptables)
 				return;
 
 			/*

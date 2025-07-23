@@ -418,6 +418,7 @@
 #enable_nestloop = on
 #enable_parallel_append = on
 #enable_parallel_hash = on
+#enable_parallel_temptables = on
 #enable_partition_pruning = on
 #enable_partitionwise_join = off
 #enable_partitionwise_aggregate = off
@@ -433,6 +434,7 @@
 
 #seq_page_cost = 1.0			# measured on an arbitrary scale
 #random_page_cost = 4.0			# same scale as above
+#write_page_cost = 5.0			# same scale as above
 #cpu_tuple_cost = 0.01			# same scale as above
 #cpu_index_tuple_cost = 0.005		# same scale as above
 #cpu_operator_cost = 0.0025		# same scale as above

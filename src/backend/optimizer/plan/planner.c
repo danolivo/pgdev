@@ -6978,12 +6978,9 @@ plan_create_index_workers(Oid tableOid, Oid indexOid)
 
 	/*
 	 * Determine if it's safe to proceed.
-	 *
-	 * Currently, parallel workers can't access the leader's temporary tables.
-	 * Furthermore, any index predicate or index expressions must be parallel
-	 * safe.
 	 */
-	if (heap->rd_rel->relpersistence == RELPERSISTENCE_TEMP ||
+	if ((heap->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
+		!enable_parallel_temptables) ||
 		!is_parallel_safe(root, (Node *) RelationGetIndexExpressions(index)) ||
 		!is_parallel_safe(root, (Node *) RelationGetIndexPredicate(index)))
 	{

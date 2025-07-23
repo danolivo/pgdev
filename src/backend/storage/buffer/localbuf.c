@@ -17,6 +17,7 @@
 
 #include "access/parallel.h"
 #include "executor/instrument.h"
+#include "optimizer/optimizer.h"
 #include "pgstat.h"
 #include "storage/aio.h"
 #include "storage/buf_internals.h"
@@ -184,6 +185,7 @@ FlushLocalBuffer(BufferDesc *bufHdr, SMgrRelation reln)
 	instr_time	io_start;
 	Page		localpage = (char *) LocalBufHdrGetBlock(bufHdr);
 
+	Assert(!IsParallelWorker());
 	Assert(LocalRefCount[-BufferDescriptorGetBuffer(bufHdr) - 1] > 0);
 
 	/*
@@ -227,6 +229,18 @@ GetLocalVictimBuffer(void)
 	BufferDesc *bufHdr;
 
 	ResourceOwnerEnlarge(CurrentResourceOwner);
+
+	if (IsParallelWorker() && !enable_parallel_temptables)
+			/*
+			 * Be careful with the 'parallel temp rel scan' feature: detect
+			 * if writing happens when the feature disabled.
+			 * XXX: what if the GUC value will be changed inside a parallel
+			 * worker? Don't panic, just error: it may be avoided by disabling
+			 * partial paths.
+			 */
+			 ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("read-only parallel worker attempts to write pages")));
 
 	/*
 	 * Need to get a new buffer.  We use a clock sweep algorithm (essentially
@@ -492,6 +506,12 @@ MarkLocalBufferDirty(Buffer buffer)
 	BufferDesc *bufHdr;
 	uint32		buf_state;
 
+	/*
+	 * It may be called in parallel worker caused by the parallel temp table
+	 * scan feature. It’s fine as long as we disable writing 'dirty' pages down
+	 * to the disk.
+	 */
+
 	Assert(BufferIsLocal(buffer));
 
 #ifdef LBDEBUG
@@ -729,19 +749,6 @@ InitLocalBuffers(void)
 	HASHCTL		info;
 	int			i;
 
-	/*
-	 * Parallel workers can't access data in temporary tables, because they
-	 * have no visibility into the local buffers of their leader.  This is a
-	 * convenient, low-cost place to provide a backstop check for that.  Note
-	 * that we don't wish to prevent a parallel worker from accessing catalog
-	 * metadata about a temp table, so checks at higher levels would be
-	 * inappropriate.
-	 */
-	if (IsParallelWorker())
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
-				 errmsg("cannot access temporary tables during a parallel operation")));
-
 	/* Allocate and zero buffer headers and auxiliary arrays */
 	LocalBufferDescriptors = (BufferDesc *) calloc(nbufs, sizeof(BufferDesc));
 	LocalBufferBlockPointers = (Block *) calloc(nbufs, sizeof(Block));
@@ -787,6 +794,8 @@ InitLocalBuffers(void)
 
 	if (!LocalBufHash)
 		elog(ERROR, "could not initialize local buffer hash table");
+
+	Assert(MyBackendType == B_BACKEND || MyBackendType == B_BG_WORKER);
 
 	/* Initialization done, mark buffers allocated */
 	NLocBuffer = nbufs;

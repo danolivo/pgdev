@@ -970,6 +970,17 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"enable_parallel_temptables", PGC_BACKEND, QUERY_TUNING_METHOD,
+			gettext_noop("Enables parallel workers in queries involving temporary tables."),
+			gettext_noop("Alpha version of the feature. Use after full testing only - "
+						 "can strike performance on frequent temporary table updates"),
+			GUC_EXPLAIN
+		},
+		&enable_parallel_temptables,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"enable_partition_pruning", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables plan-time and execution-time partition pruning."),
 			gettext_noop("Allows the query planner and executor to compare partition "
@@ -3889,6 +3900,17 @@ struct config_real ConfigureNamesReal[] =
 		},
 		&random_page_cost,
 		DEFAULT_RANDOM_PAGE_COST, 0, DBL_MAX,
+		NULL, NULL, NULL
+	},
+	{
+		{"write_page_cost", PGC_USERSET, QUERY_TUNING_COST,
+			gettext_noop("Sets the planner's estimate of the cost of a "
+						 "disk page flushing."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&write_page_cost,
+		DEFAULT_WRITE_PAGE_COST, 0, DBL_MAX,
 		NULL, NULL, NULL
 	},
 	{

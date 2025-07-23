@@ -37,6 +37,7 @@
 #include <sys/file.h>
 #include <unistd.h>
 
+#include "access/parallel.h"
 #include "access/tableam.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
@@ -48,6 +49,7 @@
 #include "executor/instrument.h"
 #include "lib/binaryheap.h"
 #include "miscadmin.h"
+#include "optimizer/optimizer.h"
 #include "pg_trace.h"
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
@@ -4947,29 +4949,41 @@ FlushRelationBuffers(Relation rel)
 			{
 				ErrorContextCallback errcallback;
 
-				/* Setup error traceback support for ereport() */
-				errcallback.callback = local_buffer_write_error_callback;
-				errcallback.arg = bufHdr;
-				errcallback.previous = error_context_stack;
-				error_context_stack = &errcallback;
+				if (!IsParallelWorker())
+				{
+					/* Setup error traceback support for ereport() */
+					errcallback.callback = local_buffer_write_error_callback;
+					errcallback.arg = bufHdr;
+					errcallback.previous = error_context_stack;
+					error_context_stack = &errcallback;
 
-				/* Make sure we can handle the pin */
-				ReservePrivateRefCountEntry();
-				ResourceOwnerEnlarge(CurrentResourceOwner);
+					/* Make sure we can handle the pin */
+					ReservePrivateRefCountEntry();
+					ResourceOwnerEnlarge(CurrentResourceOwner);
 
-				/*
-				 * Pin/unpin mostly to make valgrind work, but it also seems
-				 * like the right thing to do.
-				 */
-				PinLocalBuffer(bufHdr, false);
+					/*
+					 * Pin/unpin mostly to make valgrind work, but it also seems
+					 * like the right thing to do.
+					 */
+					PinLocalBuffer(bufHdr, false);
 
 
-				FlushLocalBuffer(bufHdr, srel);
+					FlushLocalBuffer(bufHdr, srel);
 
-				UnpinLocalBuffer(BufferDescriptorGetBuffer(bufHdr));
+					UnpinLocalBuffer(BufferDescriptorGetBuffer(bufHdr));
 
-				/* Pop the error context stack */
-				error_context_stack = errcallback.previous;
+					/* Pop the error context stack */
+					error_context_stack = errcallback.previous;
+				}
+				else if (!enable_parallel_temptables)
+					/*
+					 * Be careful with the 'parallel temp rel scan' feature:
+					 * detect if writing happens when the feature disabled.
+					 * XXX: what if the GUC value will be changed inside a
+					 * parallel worker? Don't panic, just error: it may be
+					 * avoided by disabling partial paths.
+					 */
+					elog(ERROR, "read-only parallel worker attempts to write pages");
 			}
 		}
 
