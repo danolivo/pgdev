@@ -1497,9 +1497,6 @@ register_dirty_segment(SMgrRelation reln, ForkNumber forknum, MdfdVec *seg)
 
 	INIT_MD_FILETAG(tag, reln->smgr_rlocator.locator, forknum, seg->mdfd_segno);
 
-	/* Temp relations should never be fsync'd */
-	Assert(!SmgrIsTemp(reln));
-
 	if (!RegisterSyncRequest(&tag, SYNC_REQUEST, false /* retryOnError */ ))
 	{
 		instr_time	io_start;

@@ -88,6 +88,7 @@
 #include "access/amapi.h"
 #include "access/htup_details.h"
 #include "access/tsmapi.h"
+#include "catalog/pg_class.h"
 #include "executor/executor.h"
 #include "executor/nodeAgg.h"
 #include "executor/nodeHash.h"
@@ -104,6 +105,7 @@
 #include "optimizer/plancat.h"
 #include "optimizer/restrictinfo.h"
 #include "parser/parsetree.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
 #include "utils/spccache.h"
@@ -129,6 +131,7 @@
 
 double		seq_page_cost = DEFAULT_SEQ_PAGE_COST;
 double		random_page_cost = DEFAULT_RANDOM_PAGE_COST;
+double		write_page_cost = DEFAULT_WRITE_PAGE_COST;
 double		cpu_tuple_cost = DEFAULT_CPU_TUPLE_COST;
 double		cpu_index_tuple_cost = DEFAULT_CPU_INDEX_TUPLE_COST;
 double		cpu_operator_cost = DEFAULT_CPU_OPERATOR_COST;
@@ -159,6 +162,7 @@ bool		enable_gathermerge = true;
 bool		enable_partitionwise_join = false;
 bool		enable_partitionwise_aggregate = false;
 bool		enable_parallel_append = true;
+bool		enable_parallel_temptables = true;
 bool		enable_parallel_hash = true;
 bool		enable_partition_pruning = true;
 bool		enable_presorted_aggregate = true;
@@ -432,6 +436,44 @@ cost_samplescan(Path *path, PlannerInfo *root,
 	path->total_cost = startup_cost + run_cost;
 }
 
+static Cost
+calculate_temp_flush_cost(PlannerInfo *root, RelOptInfo *rel)
+{
+	int	i = -1;
+	int	nbufs = 0;
+
+	if (!enable_parallel_temptables)
+		return 0.0;
+
+	while ((i = bms_next_member(rel->relids, i)) > 0)
+	{
+		RangeTblEntry *rte = root->simple_rte_array[i];
+		int relnbufs;
+
+		if (!rte || !OidIsValid(rte->relid) ||
+			get_rel_persistence(rte->relid) != RELPERSISTENCE_TEMP)
+			continue;
+
+		if (rel->pages < 0.001 * num_temp_buffers)
+			/* All relation fit the buffers */
+			relnbufs = rel->pages;
+		else
+			/*
+			 * Predict number of pages to flush as 10% of the relation size.
+			 * Don't predict all the buffer filled by the only one relation.
+			 */
+			relnbufs = (rel->pages < num_temp_buffers)?
+									0.5 * rel->pages : 0.5 * num_temp_buffers;
+
+		/* Assume 50% of relation pages need to be flushed */
+		nbufs += 0.5 * relnbufs;
+	}
+
+	if (nbufs > num_temp_buffers)
+		nbufs = num_temp_buffers;
+	return write_page_cost * nbufs;
+}
+
 /*
  * cost_gather
  *	  Determines and returns the cost of gather path.
@@ -464,6 +506,7 @@ cost_gather(GatherPath *path, PlannerInfo *root,
 
 	/* Parallel setup and communication cost. */
 	startup_cost += parallel_setup_cost;
+	startup_cost += calculate_temp_flush_cost(root, rel);
 	run_cost += parallel_tuple_cost * path->path.rows;
 
 	path->path.disabled_nodes = path->subpath->disabled_nodes;
@@ -530,6 +573,7 @@ cost_gather_merge(GatherMergePath *path, PlannerInfo *root,
 	 * For lack of a better idea, charge an extra 5%.
 	 */
 	startup_cost += parallel_setup_cost;
+	startup_cost += calculate_temp_flush_cost(root, rel);
 	run_cost += parallel_tuple_cost * path->path.rows * 1.05;
 
 	path->path.disabled_nodes = input_disabled_nodes

@@ -114,6 +114,8 @@ typedef struct FixedParallelState
  */
 int			ParallelWorkerNumber = -1;
 
+bool		InsideGatherInitPhase = false;
+
 /* Is there a parallel message pending which we need to receive? */
 volatile sig_atomic_t ParallelMessagePending = false;
 

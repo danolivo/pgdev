@@ -69,6 +69,7 @@ ExecInitGatherMerge(GatherMerge *node, EState *estate, int eflags)
 	GatherMergeState *gm_state;
 	Plan	   *outerNode;
 	TupleDesc	tupDesc;
+	volatile bool prev_InsideGatherInitPhase;
 
 	/* Gather merge node doesn't have innerPlan node. */
 	Assert(innerPlan(node) == NULL);
@@ -102,7 +103,24 @@ ExecInitGatherMerge(GatherMerge *node, EState *estate, int eflags)
 	 * now initialize outer plan
 	 */
 	outerNode = outerPlan(node);
-	outerPlanState(gm_state) = ExecInitNode(outerNode, estate, eflags);
+
+	/*
+	 * It is hard to imagine that one Gather will be inserted into subtree under
+	 * another one. But functions may execute queries which in turn may be
+	 * executed in parallel. XXX: this case should be discovered.
+	 */
+	prev_InsideGatherInitPhase = InsideGatherInitPhase;
+	InsideGatherInitPhase = true;
+
+	PG_TRY();
+	{
+		outerPlanState(gm_state) = ExecInitNode(outerNode, estate, eflags);
+	}
+	PG_FINALLY();
+	{
+		InsideGatherInitPhase = prev_InsideGatherInitPhase;
+	}
+	PG_END_TRY();
 
 	/*
 	 * Leader may access ExecProcNode result directly (if

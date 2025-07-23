@@ -23,6 +23,7 @@
 /* If you change these, update backend/utils/misc/postgresql.conf.sample */
 #define DEFAULT_SEQ_PAGE_COST  1.0
 #define DEFAULT_RANDOM_PAGE_COST  4.0
+#define DEFAULT_WRITE_PAGE_COST	5.0
 #define DEFAULT_CPU_TUPLE_COST	0.01
 #define DEFAULT_CPU_INDEX_TUPLE_COST 0.005
 #define DEFAULT_CPU_OPERATOR_COST  0.0025

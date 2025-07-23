@@ -81,6 +81,7 @@ extern Selectivity clauselist_selectivity_ext(PlannerInfo *root,
 /* widely used cost parameters */
 extern PGDLLIMPORT double seq_page_cost;
 extern PGDLLIMPORT double random_page_cost;
+extern PGDLLIMPORT double write_page_cost;
 extern PGDLLIMPORT double cpu_tuple_cost;
 extern PGDLLIMPORT double cpu_index_tuple_cost;
 extern PGDLLIMPORT double cpu_operator_cost;
@@ -88,6 +89,12 @@ extern PGDLLIMPORT double parallel_tuple_cost;
 extern PGDLLIMPORT double parallel_setup_cost;
 extern PGDLLIMPORT double recursive_worktable_factor;
 extern PGDLLIMPORT int effective_cache_size;
+
+/*
+ * Allow parallel workers over temporary tables. Put it here because it should
+ * impact cost calculation.
+ */
+extern PGDLLIMPORT bool enable_parallel_temptables;
 
 extern double clamp_row_est(double nrows);
 extern int32 clamp_width_est(int64 tuple_width);
