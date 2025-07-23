@@ -3847,6 +3847,8 @@ partkey_datum_from_expr(PartitionPruneContext *context,
 
 #include "nodes/extensible.h"
 
+#include "math.h"
+
 #define PGPRO_PRUNE "pgpro_prune"
 
 /*
@@ -3890,7 +3892,7 @@ static const ExtensibleNodeMethods method =
 };
 
 static PGProPlannerNodePrune *
-get_rpt(List *lst)
+get_pruning_report(List *lst)
 {
 	PGProPlannerNodePrune  *node = NULL;
 	ListCell			   *lc;
@@ -3927,7 +3929,7 @@ ReportPGProPlannerPrune(PlannerInfo *root)
 	if (GetExtensibleNodeMethods(PGPRO_PRUNE, true) == NULL)
 		RegisterExtensibleNodeMethods(&method);
 
-	node = get_rpt(root->glob->pgpro_ext);
+	node = get_pruning_report(root->glob->pgpro_ext);
 
 	if (node == NULL)
 	{
@@ -3992,23 +3994,26 @@ avoid_unsuccessful_partprune(CachedPlanSource *plansource, List *qlist,
 			break;
 		}
 
-		do_custom = !decision->data.generic;
+		*customplan = !decision->data.generic;
 
-		elog(DEBUG2, "PRM: existing decision: '%s' plan", do_custom ? "custom" : "generic");
+		elog(DEBUG2, "PRM: existing decision: '%s' plan",
+			 (*customplan) ? "custom" : "generic");
 
-		if (do_custom && plancache_choice_hook)
+		if (*customplan && plancache_choice_hook)
 		{
 			/*
 			 * There are more hooks existing. Although we have our decision it
 			 * is necessary to call them too. So, prepare custom plan beforehand.
 			 */
 			plan = BuildCachedPlan(plansource, qlist, boundParams, queryEnv);
-			*customplan = true;
 		}
 
+		/* Let another caller to change a decision */
 		if (plancache_choice_hook)
 			plan = (*plancache_choice_hook) (plansource, qlist, boundParams,
 											 plan, queryEnv, customplan);
+
+		/* XXX: Do we need to cleanup previously built custom plan? */
 
 		return plan;
 	}
@@ -4025,7 +4030,7 @@ avoid_unsuccessful_partprune(CachedPlanSource *plansource, List *qlist,
 	{
 		PlannedStmt   *stmt = lfirst_node(PlannedStmt, lc);
 
-		report = get_rpt(stmt->pgpro_ext);
+		report = get_pruning_report(stmt->pgpro_ext);
 		if (report == NULL)
 			continue;
 
