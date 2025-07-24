@@ -138,7 +138,7 @@ typedef struct PlannedStmt
 	ParseLoc	stmt_len;
 
 	/* Insights on special cases were happened during the planning */
-	List	   *pgpro_ext pg_node_attr(equal_ignore, query_jumble_ignore, read_write_ignore, read_as(0));
+	List	   *pgpro_ext pg_node_attr(equal_ignore, query_jumble_ignore);
 } PlannedStmt;
 
 /* macro for fetching the Plan associated with a SubPlan node */

@@ -3881,14 +3881,83 @@ PGProPlannerNodePruneCopy(struct ExtensibleNode *enew,
 	new->generic_cost = old->generic_cost;
 }
 
+#define strtobool(x)  ((*(x) == 't') ? true : false)
+
+#define nullable_string(token,length)  \
+	((length) == 0 ? NULL : debackslash(token, length))
+
+#define booltostr(x)  ((x) ? "true" : "false")
+
+#define WRITE_FLOAT_FIELD(fldname,format) \
+	appendStringInfo(str, " :" CppAsString(fldname) " " format, node->fldname)
+#define WRITE_BOOL_FIELD(fldname) \
+	appendStringInfo(str, " :" CppAsString(fldname) " %s", \
+					 booltostr(node->fldname))
+#define WRITE_INT_FIELD(fldname) \
+	appendStringInfo(str, " :" CppAsString(fldname) " %d", node->fldname)
+
+static void
+PGProPlannerNodePruneOut(struct StringInfoData *str, const struct ExtensibleNode *enode)
+{
+	PGProPlannerNodePrune *node = (PGProPlannerNodePrune *) enode;
+
+	WRITE_FLOAT_FIELD(generic_cost, "%.4f");
+
+	if (node->generic_cost >= 0.)
+	{
+		/* It is a decision*/
+		WRITE_BOOL_FIELD(data.generic);
+	}
+	else
+	{
+		/* Report */
+		WRITE_INT_FIELD(data.partprune_failed);
+	}
+}
+
+#include "nodes/readfuncs.h"
+#define READ_FLOAT_FIELD(fldname) \
+	token = pg_strtok(&length);		/* skip :fldname */ \
+	token = pg_strtok(&length);		/* get field value */ \
+	node->fldname = atof(token)
+#define READ_BOOL_FIELD(fldname) \
+	token = pg_strtok(&length);		/* skip :fldname */ \
+	token = pg_strtok(&length);		/* get field value */ \
+	node->fldname = strtobool(token)
+#define READ_INT_FIELD(fldname) \
+	token = pg_strtok(&length);		/* skip :fldname */ \
+	token = pg_strtok(&length);		/* get field value */ \
+	node->fldname = atoi(token)
+
+static void
+PGProPlannerNodePruneRead(struct ExtensibleNode *enode)
+{
+	PGProPlannerNodePrune  *node = (PGProPlannerNodePrune *) enode;
+	const char			   *token;
+	int						length;
+
+	READ_FLOAT_FIELD(generic_cost);
+
+	if (node->generic_cost >= 0.)
+	{
+		/* It is a decision*/
+		READ_BOOL_FIELD(data.generic);
+	}
+	else
+	{
+		/* Report */
+		READ_INT_FIELD(data.partprune_failed);
+	}
+}
+
 static const ExtensibleNodeMethods method =
 {
 	.extnodename = PGPRO_PRUNE,
 	.node_size = sizeof(PGProPlannerNodePrune),
 	.nodeCopy =  PGProPlannerNodePruneCopy,
 	.nodeEqual = NULL,
-	.nodeOut = NULL,
-	.nodeRead = NULL,
+	.nodeOut = PGProPlannerNodePruneOut,
+	.nodeRead = PGProPlannerNodePruneRead,
 };
 
 static PGProPlannerNodePrune *
@@ -3949,7 +4018,7 @@ ReportPGProPlannerPrune(PlannerInfo *root)
 /*
  * Here we need to check if partition pruning has been rejected because an
  * incoming parameter provides an array of values and that's why Postgres can't
- * contruct finite number of 'partprune steps'.
+ * construct finite number of 'partprune steps'.
  */
 CachedPlan *
 avoid_unsuccessful_partprune(CachedPlanSource *plansource, List *qlist,
