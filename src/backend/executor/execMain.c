@@ -1637,7 +1637,7 @@ ExecutePlan(QueryDesc *queryDesc,
 	bool		use_parallel_mode;
 	TupleTableSlot *slot;
 	uint64		current_tuple_count;
-
+GetCurrentTransactionId();
 	/*
 	 * initialize local variables
 	 */

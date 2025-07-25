@@ -367,7 +367,7 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	 */
 	if ((cursorOptions & CURSOR_OPT_PARALLEL_OK) != 0 &&
 		IsUnderPostmaster &&
-		parse->commandType == CMD_SELECT &&
+		/*parse->commandType == CMD_SELECT &&*/
 		!parse->hasModifyingCTE &&
 		max_parallel_workers_per_gather > 0 &&
 		!IsParallelWorker())
@@ -1824,6 +1824,8 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 	final_rel->userid = current_rel->userid;
 	final_rel->useridiscurrent = current_rel->useridiscurrent;
 	final_rel->fdwroutine = current_rel->fdwroutine;
+
+	generate_useful_gather_paths(root, current_rel, true);
 
 	/*
 	 * Generate paths for the final_rel.  Insert all surviving paths, with
