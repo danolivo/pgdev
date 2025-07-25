@@ -1874,16 +1874,17 @@ analyze matest0;
 analyze matest1;
 explain (costs off)
 select * from matest0 where a < 100 order by a;
-                QUERY PLAN                 
--------------------------------------------
- Sort
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Merge Append
    Sort Key: matest0.a
-   ->  Append
-         ->  Seq Scan on matest0 matest0_1
-               Filter: (a < 100)
+   ->  Index Only Scan using matest0_pkey on matest0 matest0_1
+         Index Cond: (a < 100)
+   ->  Sort
+         Sort Key: matest0_2.a
          ->  Seq Scan on matest1 matest0_2
                Filter: (a < 100)
-(7 rows)
+(8 rows)
 
 drop table matest0 cascade;
 NOTICE:  drop cascades to table matest1

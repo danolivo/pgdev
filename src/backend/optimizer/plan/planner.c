@@ -5313,8 +5313,6 @@ create_ordered_paths(PlannerInfo *root,
 																	root->sort_pathkeys,
 																	presorted_keys,
 																	limit_tuples);
-
-		//	sorted_path->total_cost += 1E9;
 		}
 
 		/*

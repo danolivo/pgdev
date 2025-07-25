@@ -2412,16 +2412,19 @@ EXPLAIN (COSTS OFF)
 SELECT c collate "C", count(c) FROM pagg_tab3 GROUP BY c collate "C" ORDER BY 1;
                        QUERY PLAN                       
 --------------------------------------------------------
- Sort
+ Merge Append
    Sort Key: ((pagg_tab3.c)::text) COLLATE "C"
-   ->  Append
+   ->  Sort
+         Sort Key: ((pagg_tab3.c)::text) COLLATE "C"
          ->  HashAggregate
                Group Key: (pagg_tab3.c)::text
                ->  Seq Scan on pagg_tab3_p2 pagg_tab3
+   ->  Sort
+         Sort Key: ((pagg_tab3_1.c)::text) COLLATE "C"
          ->  HashAggregate
                Group Key: (pagg_tab3_1.c)::text
                ->  Seq Scan on pagg_tab3_p1 pagg_tab3_1
-(9 rows)
+(12 rows)
 
 SELECT c collate "C", count(c) FROM pagg_tab3 GROUP BY c collate "C" ORDER BY 1;
  c | count 
