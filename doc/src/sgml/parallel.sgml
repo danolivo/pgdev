@@ -153,6 +153,9 @@ EXPLAIN SELECT * FROM pgbench_accounts WHERE filler LIKE '%x%';
             <para><command>CREATE TABLE ... AS</command></para>
           </listitem>
           <listitem>
+            <para><command>INSERT INTO ... SELECT ...</command></para>
+          </listitem>
+          <listitem>
             <para><command>SELECT INTO</command></para>
           </listitem>
           <listitem>

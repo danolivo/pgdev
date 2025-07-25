@@ -89,6 +89,7 @@ test: rules psql psql_crosstab psql_pipeline amutils stats_ext collate.linux.utf
 # ----------
 test: select_parallel
 test: write_parallel
+test: insert_parallel
 test: vacuum_parallel
 
 # Run this alone, because concurrent DROP TABLE would make non-superuser

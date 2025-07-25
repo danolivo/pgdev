@@ -55,4 +55,6 @@ extern Query *inline_set_returning_function(PlannerInfo *root,
 
 extern Bitmapset *pull_paramids(Expr *expr);
 
+extern bool is_parallel_allowed_for_modify(Query *parse);
+
 #endif							/* CLAUSES_H */
