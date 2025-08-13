@@ -110,3 +110,16 @@ SELECT * FROM vegetables WHERE genus = 'daucus';
 -- Also test a case that involves a write.
 EXPLAIN (RANGE_TABLE, COSTS OFF)
 INSERT INTO vegetables (name, genus) VALUES ('broccoflower', 'brassica');
+
+-- A test case for the number of groups used in cost estimation of
+-- an incremental sort node
+CREATE TABLE incremental_groups (x integer, y integer);
+INSERT INTO incremental_groups (x,y)
+  SELECT gs,gs FROM generate_series(1,1000) AS gs;
+VACUUM ANALYZE incremental_groups;
+CREATE INDEX ON incremental_groups (x);
+
+EXPLAIN (COSTS OFF, PLAN_DETAILS)
+SELECT * FROM incremental_groups ORDER BY x, y LIMIT 10;
+
+DROP TABLE incremental_groups;

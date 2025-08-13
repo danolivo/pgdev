@@ -3525,6 +3525,7 @@ contain_placeholder_references_context
 convert_testexpr_context
 copy_data_dest_cb
 copy_data_source_cb
+copy_path_info_hook_type
 core_YYSTYPE
 core_yy_extra_type
 core_yyscan_t

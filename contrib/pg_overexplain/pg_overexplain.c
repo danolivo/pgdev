@@ -16,10 +16,15 @@
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
 #include "fmgr.h"
+#include "nodes/extensible.h"
+#include "nodes/readfuncs.h"
+#include "optimizer/optimizer.h"
+#include "optimizer/planmain.h"
 #include "parser/parsetree.h"
 #include "storage/lock.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/selfuncs.h"
 
 PG_MODULE_MAGIC_EXT(
 					.name = "pg_overexplain",
@@ -30,6 +35,7 @@ typedef struct
 {
 	bool		debug;
 	bool		range_table;
+	bool		plan_details;
 } overexplain_options;
 
 static overexplain_options *overexplain_ensure_options(ExplainState *es);
@@ -37,6 +43,10 @@ static void overexplain_debug_handler(ExplainState *es, DefElem *opt,
 									  ParseState *pstate);
 static void overexplain_range_table_handler(ExplainState *es, DefElem *opt,
 											ParseState *pstate);
+static void overexplain_plan_details_handler(ExplainState *es, DefElem *opt,
+											 ParseState *pstate);
+static void overexplain_copy_path_info_hook(PlannerInfo *root,
+											Plan *dest, Path *src);
 static void overexplain_per_node_hook(PlanState *planstate, List *ancestors,
 									  const char *relationship,
 									  const char *plan_name,
@@ -50,6 +60,7 @@ static void overexplain_per_plan_hook(PlannedStmt *plannedstmt,
 static void overexplain_debug(PlannedStmt *plannedstmt, ExplainState *es);
 static void overexplain_range_table(PlannedStmt *plannedstmt,
 									ExplainState *es);
+static void overexplain_node_plan_details(Plan *plan, ExplainState *es);
 static void overexplain_alias(const char *qlabel, Alias *alias,
 							  ExplainState *es);
 static void overexplain_bitmapset(const char *qlabel, Bitmapset *bms,
@@ -58,8 +69,89 @@ static void overexplain_intlist(const char *qlabel, List *list,
 								ExplainState *es);
 
 static int	es_extension_id;
+static copy_path_info_hook_type prev_copy_path_info_hook;
 static explain_per_node_hook_type prev_explain_per_node_hook;
 static explain_per_plan_hook_type prev_explain_per_plan_hook;
+
+/*
+ * The extension's ExtensibleNode stuff to store planner data into the Plan node
+ * XXX: there are a lot of stuff that must be copied each time we want to
+ * introduce an extensible node. Maybe just export all that macroses?
+ */
+typedef struct OverExplainNode
+{
+	ExtensibleNode	node;
+
+	double		input_groups;
+} OverExplainNode;
+
+
+#define strtobool(x)  ((*(x) == 't') ? true : false)
+
+#define nullable_string(token,length)  \
+	((length) == 0 ? NULL : debackslash(token, length))
+
+#define booltostr(x)  ((x) ? "true" : "false")
+
+
+static void
+OEnodeCopy(struct ExtensibleNode *enew, const struct ExtensibleNode *eold)
+{
+	OverExplainNode *new = (OverExplainNode *) enew;
+	OverExplainNode *old = (OverExplainNode *) eold;
+
+	new->input_groups = old->input_groups;
+
+	enew = (ExtensibleNode *) new;
+}
+
+static bool
+OEnodeEqual(const struct ExtensibleNode *a, const struct ExtensibleNode *b)
+{
+	OverExplainNode *a1 = (OverExplainNode *) a;
+	OverExplainNode *b1 = (OverExplainNode *) b;
+
+	return (a1->input_groups == b1->input_groups);
+}
+
+
+/* Write a float field --- caller must give format to define precision */
+#define WRITE_FLOAT_FIELD(fldname,format) \
+	appendStringInfo(str, " :" CppAsString(fldname) " " format, node->fldname)
+
+static void
+OEnodeOut(struct StringInfoData *str, const struct ExtensibleNode *enode)
+{
+	OverExplainNode *node = (OverExplainNode *) enode;
+
+	WRITE_FLOAT_FIELD(input_groups, "%.0f");
+}
+
+/* Read a float field */
+#define READ_FLOAT_FIELD(fldname) \
+	token = pg_strtok(&length);		/* skip :fldname */ \
+	token = pg_strtok(&length);		/* get field value */ \
+	node->fldname = atof(token)
+
+static void
+OEnodeRead(struct ExtensibleNode *enode)
+{
+	OverExplainNode	   *node = (OverExplainNode *) enode;
+	const char		   *token;
+	int					length;
+
+	READ_FLOAT_FIELD(input_groups);
+}
+
+static const ExtensibleNodeMethods method =
+{
+	.extnodename = "pg_overexplain",
+	.node_size = sizeof(OverExplainNode),
+	.nodeCopy =  OEnodeCopy,
+	.nodeEqual = OEnodeEqual,
+	.nodeOut = OEnodeOut,
+	.nodeRead = OEnodeRead
+};
 
 /*
  * Initialization we do when this module is loaded.
@@ -74,12 +166,19 @@ _PG_init(void)
 	RegisterExtensionExplainOption("debug", overexplain_debug_handler);
 	RegisterExtensionExplainOption("range_table",
 								   overexplain_range_table_handler);
+	RegisterExtensionExplainOption("plan_details",
+								   overexplain_plan_details_handler);
+
+	prev_copy_path_info_hook = copy_path_info_hook;
+	copy_path_info_hook = overexplain_copy_path_info_hook;
 
 	/* Use the per-node and per-plan hooks to make our options do something. */
 	prev_explain_per_node_hook = explain_per_node_hook;
 	explain_per_node_hook = overexplain_per_node_hook;
 	prev_explain_per_plan_hook = explain_per_plan_hook;
 	explain_per_plan_hook = overexplain_per_plan_hook;
+
+	RegisterExtensibleNodeMethods(&method);
 }
 
 /*
@@ -123,6 +222,18 @@ overexplain_range_table_handler(ExplainState *es, DefElem *opt,
 	overexplain_options *options = overexplain_ensure_options(es);
 
 	options->range_table = defGetBoolean(opt);
+}
+
+/*
+ * Parse handler for EXPLAIN (PLAN_DETAILS).
+ */
+static void
+overexplain_plan_details_handler(ExplainState *es, DefElem *opt,
+									  ParseState *pstate)
+{
+	overexplain_options *options = overexplain_ensure_options(es);
+
+	options->plan_details = defGetBoolean(opt);
 }
 
 /*
@@ -240,6 +351,13 @@ overexplain_per_node_hook(PlanState *planstate, List *ancestors,
 				break;
 		}
 	}
+
+	/*
+	 * If the "plan_details" option was specified, display information about
+	 * the node planning decisions.
+	 */
+	if (options->plan_details)
+		overexplain_node_plan_details(plan, es);
 }
 
 /*
@@ -669,6 +787,99 @@ overexplain_range_table(PlannedStmt *plannedstmt, ExplainState *es)
 
 	/* Close group, we're all done */
 	ExplainCloseGroup("Range Table", "Range Table", false, es);
+}
+
+/*
+ * Provide detailed information about planning decision has been made by the
+ * optimiser
+ */
+static void
+overexplain_node_plan_details(Plan *plan, ExplainState *es)
+{
+	if (!IsA(plan, IncrementalSort) || plan->extlist == NIL)
+		return;
+
+	/*
+	 * Pass through the extension list. By convention, each element must be
+	 * an extensible node that enables the owner's identification.
+	 */
+	foreach_node(ExtensibleNode, enode, plan->extlist)
+	{
+		OverExplainNode *data;
+
+		if (strcmp(enode->extnodename, "pg_overexplain") != 0)
+			continue;
+
+		/* Add the information to the explain */
+		data = (OverExplainNode *) enode;
+		ExplainPropertyFloat("Estimated Groups", NULL, data->input_groups, 0, es);
+	}
+
+	return;
+}
+
+/*
+ * Gather/calculate necessary optimisation information about the path and
+ * store it into the Plan node.
+ *
+ * At the moment here is an adopted copy of the optimiser code that allows
+ * the extension to calculate real numbers used during optimisation phase.
+ */
+static void
+overexplain_copy_path_info_hook(PlannerInfo *root, Plan *dest, Path *src)
+{
+	IncrementalSortPath *sort_path;
+	double input_tuples;
+	double		input_groups;
+	ListCell *lc;
+	List	   *presortedExprs = NIL;
+	bool		unknown_varno = false;
+	OverExplainNode *data = (OverExplainNode *) newNode(sizeof(OverExplainNode),
+														T_ExtensibleNode);
+
+	if (!IsA(src, IncrementalSortPath))
+		return;
+
+	sort_path = (IncrementalSortPath *) src;
+	Assert(sort_path->spath.subpath->pathkeys != NIL);
+
+	input_tuples = sort_path->spath.subpath->rows;
+
+	if (input_tuples < 2.0)
+		input_tuples = 2.0;
+	input_groups = Min(input_tuples, DEFAULT_NUM_DISTINCT);
+
+	foreach(lc, sort_path->spath.subpath->pathkeys)
+	{
+		PathKey    *key = (PathKey *) lfirst(lc);
+		EquivalenceMember *member = (EquivalenceMember *)
+			linitial(key->pk_eclass->ec_members);
+
+		/*
+		 * Check if the expression contains Var with "varno 0" so that we
+		 * don't call estimate_num_groups in that case.
+		 */
+		if (bms_is_member(0, pull_varnos(root, (Node *) member->em_expr)))
+		{
+			unknown_varno = true;
+			break;
+		}
+
+		/* expression not containing any Vars with "varno 0" */
+		presortedExprs = lappend(presortedExprs, member->em_expr);
+
+		if (foreach_current_index(lc) + 1 >= sort_path->nPresortedCols)
+			break;
+	}
+
+	/* Estimate the number of groups with equal presorted keys. */
+	if (!unknown_varno)
+		input_groups = estimate_num_groups(root, presortedExprs, input_tuples,
+										   NULL, NULL);
+
+	data->node.extnodename = "pg_overexplain";
+	data->input_groups = input_groups;
+	dest->extlist = lappend(dest->extlist, data);
 }
 
 /*

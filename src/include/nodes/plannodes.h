@@ -239,6 +239,12 @@ typedef struct Plan
 	 */
 	Bitmapset  *extParam;
 	Bitmapset  *allParam;
+
+	/*
+	 * Is intended to store all additional information needed to an extension
+	 * during or after execution phase.
+	 */
+	List	   *extlist;
 } Plan;
 
 /* ----------------
