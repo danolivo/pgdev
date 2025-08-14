@@ -411,6 +411,13 @@ static const struct config_enum_entry plan_cache_mode_options[] = {
 	{NULL, 0, false}
 };
 
+static const struct config_enum_entry selectivity_model_options[] = {
+	{"independent",SELMODEL_INDEPENDENT, false},
+	{"partial", SELMODEL_EXPONENTIAL_BACKOFF, false},
+	{"minimum", SELMODEL_MIN_SELECTIVITY, false},
+	{NULL, 0, false}
+};
+
 static const struct config_enum_entry password_encryption_options[] = {
 	{"md5", PASSWORD_TYPE_MD5, false},
 	{"scram-sha-256", PASSWORD_TYPE_SCRAM_SHA_256, false},
@@ -5359,6 +5366,17 @@ struct config_enum ConfigureNamesEnum[] =
 		},
 		&plan_cache_mode,
 		PLAN_CACHE_MODE_AUTO, plan_cache_mode_options,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"selectivity_model", PGC_USERSET, QUERY_TUNING_OTHER,
+			gettext_noop("Setup the correlation model in selectivity estimations"),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&selectivity_model,
+		SELMODEL_INDEPENDENT, selectivity_model_options,
 		NULL, NULL, NULL
 	},
 

@@ -6516,6 +6516,34 @@ SELECT * FROM parent WHERE key = 2400;
       </listitem>
      </varlistentry>
 
+     <varlistentry id="selectivity-model" xreflabel="selectivity_model">
+      <term><varname>selectivity_model</varname> (<type>enum</type>)
+      <indexterm>
+       <primary><varname>selectivity_model</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        In absence of extra infoormation, a selectivity estimation over a set of
+        clauses may be done according to different conjectures.
+        This parameter allows to explicitly choose specific technique.
+        The allowed values are <literal>independent</literal> (the default),
+        <literal>partial</literal> and <literal>minimum</literal>.
+        The <literal>independent</literal> value is the Postgres default method.
+        It means that selectivities of different clauses multiplies.
+        The <literal>minimum</literal> option reflects a full dependency conjecture. Here
+        selectivity estimation machinery should choose minimum value across all
+        clauses' estimations.
+        The <literal>partial</literal> option lies in between of these edges.
+        It means that after calculation, the selectivities of each clause are
+        sorted in ascending order. Next, it corrects each value by exponentiating it
+        to the degree of 1/(2^i), where i is the position of the specific selectivity
+        value in the list (starting from zero). At the end, the obtained values multiply.
+        This is exactly the same algorithm as described in SQL Server as 'Exponential Back-off'.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-recursive-worktable-factor" xreflabel="recursive_worktable_factor">
       <term><varname>recursive_worktable_factor</varname> (<type>floating point</type>)
       <indexterm>

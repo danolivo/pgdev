@@ -76,6 +76,29 @@ extern Selectivity clauselist_selectivity_ext(PlannerInfo *root,
 											  SpecialJoinInfo *sjinfo,
 											  bool use_extended_stats);
 
+typedef struct SelectivityEstimator
+{
+	bool		isOr;
+	int			model;
+	int			iteration;
+	Selectivity	s1;
+	List		*values; /* List of Selectivities */
+} SelectivityEstimator;
+
+/* possible values for selectivity_model */
+typedef enum
+{
+	SELMODEL_INDEPENDENT,
+	SELMODEL_EXPONENTIAL_BACKOFF,
+	SELMODEL_MIN_SELECTIVITY,
+} SelectivityModel;
+
+extern PGDLLIMPORT int selectivity_model;
+
+extern SelectivityEstimator *estimator_begin(Selectivity s1, bool isOr);
+extern void estimator_add(SelectivityEstimator *estimator, Selectivity s1);
+extern Selectivity estimator_end(SelectivityEstimator *estimator);
+
 /* in path/costsize.c: */
 
 /* widely used cost parameters */

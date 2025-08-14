@@ -1144,10 +1144,15 @@ clauselist_apply_dependencies(PlannerInfo *root, List *clauses,
 	 * then the product of all the original (non-implied) probabilities and
 	 * the new conditional (implied) probabilities.
 	 */
-	s1 = 1.0;
-	for (i = 0; i < nattrs; i++)
-		s1 *= attr_sel[i];
+	{
+		SelectivityEstimator *estimator;
 
+		estimator = estimator_begin(1.0, false);
+		for (i = 0; i < nattrs; i++)
+			estimator_add(estimator, attr_sel[i]);
+
+		s1 = estimator_end(estimator);
+	}
 	CLAMP_PROBABILITY(s1);
 
 	pfree(attr_sel);

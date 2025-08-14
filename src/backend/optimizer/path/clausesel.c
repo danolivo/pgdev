@@ -14,6 +14,8 @@
  */
 #include "postgres.h"
 
+#include "math.h"
+
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
@@ -38,6 +40,8 @@ typedef struct RangeQueryClause
 	Selectivity hibound;		/* Selectivity of a var < something clause */
 } RangeQueryClause;
 
+int selectivity_model = SELMODEL_INDEPENDENT;
+
 static void addRangeClause(RangeQueryClause **rqlist, Node *clause,
 						   bool varonleft, bool isLTsel, Selectivity s2);
 static RelOptInfo *find_single_rel_for_clauses(PlannerInfo *root,
@@ -52,6 +56,122 @@ static Selectivity clauselist_selectivity_or(PlannerInfo *root,
 /****************************************************************************
  *		ROUTINES TO COMPUTE SELECTIVITIES
  ****************************************************************************/
+
+/*
+ * To apply different conjectures of selectivity estimation we need some
+ * minimal iterator-like stuff.
+ * isOr should be false if estimator applied to a conjunction.
+ */
+
+SelectivityEstimator *
+estimator_begin(Selectivity s1, bool isOr)
+{
+	SelectivityEstimator *estimator = palloc(sizeof(SelectivityEstimator));
+
+	estimator->isOr = isOr;
+	estimator->model = selectivity_model;
+	estimator->iteration = 0;
+	estimator->s1 = s1;
+	estimator->values = NIL;
+
+	/* TODO: Review the code and write tests in advance */
+	if (estimator->isOr && estimator->model == SELMODEL_EXPONENTIAL_BACKOFF)
+		estimator->model = SELMODEL_INDEPENDENT;
+
+	return estimator;
+}
+
+void
+estimator_add(SelectivityEstimator *estimator, Selectivity s1)
+{
+	Assert(estimator->iteration >= 0 && estimator->s1 >= 0.);
+
+	estimator->iteration++;
+
+	if (estimator->model == SELMODEL_INDEPENDENT)
+	{
+		if (!estimator->isOr)
+			estimator->s1 *= s1;
+		else
+			estimator->s1 = estimator->s1 + s1 - estimator->s1 * s1;
+	}
+	else if (estimator->model == SELMODEL_EXPONENTIAL_BACKOFF)
+	{
+		Selectivity *s = palloc(sizeof(Selectivity));
+
+		/*
+		 * We should remember all the elements until the end of estimation to
+		 * sort them before the calculation.
+		 */
+		*s = s1;
+		estimator->values = lappend(estimator->values, s);
+
+	}
+	else if (estimator->model == SELMODEL_MIN_SELECTIVITY)
+	{
+		if (!estimator->isOr)
+			estimator->s1 = Min(estimator->s1, s1);
+		else
+			estimator->s1 = Max(estimator->s1, s1);
+	}
+	else
+	{
+		Assert(0);
+	}
+}
+
+/*
+ * list_sort comparator for sorting a list into ascending Selectivity order.
+ */
+static int
+list_sel_cmp(const ListCell *p1, const ListCell *p2)
+{
+	Selectivity			v1 = *(Selectivity *) lfirst(p1);
+	Selectivity			v2 = *(Selectivity *) lfirst(p2);
+
+	return (v1 > v2) - (v1 < v2);
+}
+
+Selectivity
+estimator_end(SelectivityEstimator *estimator)
+{
+	Selectivity s1 = estimator->s1;
+
+	Assert(estimator->iteration >= 0 && estimator->s1 >= 0.);
+
+	if (estimator->model == SELMODEL_EXPONENTIAL_BACKOFF &&
+		estimator->values != NIL)
+	{
+		ListCell *lc;
+		int i = 0;
+
+		list_sort(estimator->values, list_sel_cmp);
+
+		foreach(lc, estimator->values)
+		{
+			Selectivity s = *(Selectivity *) lfirst(lc);
+
+			/*
+			 * To compute disjunction we use conjunction according to the
+			 * formula:
+			 * p1 AND p2 == !(!p1 AND !p2)
+			 */
+
+			if (estimator->isOr)
+				s = 1. - s;
+			s1 *= pow(s, 1. / (1 << i));
+			i++;
+		}
+
+		if (estimator->isOr)
+			s1 = 1. - s1;
+
+		list_free_deep(estimator->values);
+	}
+
+	pfree(estimator);
+	return s1;
+}
 
 /*
  * clauselist_selectivity -
@@ -121,6 +241,7 @@ clauselist_selectivity_ext(PlannerInfo *root,
 						   SpecialJoinInfo *sjinfo,
 						   bool use_extended_stats)
 {
+	SelectivityEstimator *estimator;
 	Selectivity s1 = 1.0;
 	RelOptInfo *rel;
 	Bitmapset  *estimatedclauses = NULL;
@@ -153,7 +274,11 @@ clauselist_selectivity_ext(PlannerInfo *root,
 		s1 = statext_clauselist_selectivity(root, clauses, varRelid,
 											jointype, sjinfo, rel,
 											&estimatedclauses, false);
+
+		estimator = estimator_begin(s1, false);
 	}
+	else
+		estimator = estimator_begin(1.0, false);
 
 	/*
 	 * Apply normal selectivity estimates for remaining clauses. We'll be
@@ -194,7 +319,7 @@ clauselist_selectivity_ext(PlannerInfo *root,
 			rinfo = (RestrictInfo *) clause;
 			if (rinfo->pseudoconstant)
 			{
-				s1 = s1 * s2;
+				estimator_add(estimator, s2);
 				continue;
 			}
 			clause = (Node *) rinfo->clause;
@@ -252,7 +377,7 @@ clauselist_selectivity_ext(PlannerInfo *root,
 						break;
 					default:
 						/* Just merge the selectivity in generically */
-						s1 = s1 * s2;
+						estimator_add(estimator, s2);
 						break;
 				}
 				continue;		/* drop to loop bottom */
@@ -260,7 +385,7 @@ clauselist_selectivity_ext(PlannerInfo *root,
 		}
 
 		/* Not the right form, so treat it generically. */
-		s1 = s1 * s2;
+		estimator_add(estimator, s2);
 	}
 
 	/*
@@ -322,15 +447,15 @@ clauselist_selectivity_ext(PlannerInfo *root,
 				}
 			}
 			/* Merge in the selectivity of the pair of clauses */
-			s1 *= s2;
+			estimator_add(estimator, s2);
 		}
 		else
 		{
 			/* Only found one of a pair, merge it in generically */
 			if (rqlist->have_lobound)
-				s1 *= rqlist->lobound;
+				estimator_add(estimator, rqlist->lobound);
 			else
-				s1 *= rqlist->hibound;
+				estimator_add(estimator, rqlist->hibound);
 		}
 		/* release storage and advance */
 		rqnext = rqlist->next;
@@ -338,7 +463,7 @@ clauselist_selectivity_ext(PlannerInfo *root,
 		rqlist = rqnext;
 	}
 
-	return s1;
+	return estimator_end(estimator);
 }
 
 /*
@@ -363,6 +488,7 @@ clauselist_selectivity_or(PlannerInfo *root,
 						  SpecialJoinInfo *sjinfo,
 						  bool use_extended_stats)
 {
+	SelectivityEstimator *estimator;
 	Selectivity s1 = 0.0;
 	RelOptInfo *rel;
 	Bitmapset  *estimatedclauses = NULL;
@@ -395,6 +521,7 @@ clauselist_selectivity_or(PlannerInfo *root,
 	 *
 	 * XXX is this too conservative?
 	 */
+	estimator = estimator_begin(s1, true);
 	listidx = -1;
 	foreach(lc, clauses)
 	{
@@ -412,10 +539,10 @@ clauselist_selectivity_or(PlannerInfo *root,
 		s2 = clause_selectivity_ext(root, (Node *) lfirst(lc), varRelid,
 									jointype, sjinfo, use_extended_stats);
 
-		s1 = s1 + s2 - s1 * s2;
+		estimator_add(estimator, s2);
 	}
 
-	return s1;
+	return estimator_end(estimator);
 }
 
 /*
@@ -623,7 +750,6 @@ treat_as_join_clause(PlannerInfo *root, Node *clause, RestrictInfo *rinfo,
 			return (NumRelids(root, clause) > 1);
 	}
 }
-
 
 /*
  * clause_selectivity -

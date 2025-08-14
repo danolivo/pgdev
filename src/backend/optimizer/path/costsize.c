@@ -1165,7 +1165,7 @@ void
 cost_bitmap_and_node(BitmapAndPath *path, PlannerInfo *root)
 {
 	Cost		totalCost;
-	Selectivity selec;
+	SelectivityEstimator *estimator;
 	ListCell   *l;
 
 	/*
@@ -1178,7 +1178,7 @@ cost_bitmap_and_node(BitmapAndPath *path, PlannerInfo *root)
 	 * definitely too simplistic?
 	 */
 	totalCost = 0.0;
-	selec = 1.0;
+	estimator = estimator_begin(1.0, false);
 	foreach(l, path->bitmapquals)
 	{
 		Path	   *subpath = (Path *) lfirst(l);
@@ -1187,13 +1187,14 @@ cost_bitmap_and_node(BitmapAndPath *path, PlannerInfo *root)
 
 		cost_bitmap_tree_node(subpath, &subCost, &subselec);
 
-		selec *= subselec;
+		estimator_add(estimator, subselec);
 
 		totalCost += subCost;
 		if (l != list_head(path->bitmapquals))
 			totalCost += 100.0 * cpu_operator_cost;
 	}
-	path->bitmapselectivity = selec;
+
+	path->bitmapselectivity = estimator_end(estimator);
 	path->path.rows = 0;		/* per above, not used */
 	path->path.disabled_nodes = 0;
 	path->path.startup_cost = totalCost;
@@ -5325,6 +5326,7 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
 	double		outer_tuples = path->outerjoinpath->rows;
 	double		inner_tuples = path->innerjoinpath->rows;
 	SpecialJoinInfo sjinfo;
+	SelectivityEstimator *estimator;
 	Selectivity selec = 1.0;
 	ListCell   *l;
 
@@ -5335,13 +5337,17 @@ approx_tuple_count(PlannerInfo *root, JoinPath *path, List *quals)
 					  path->innerjoinpath->parent->relids);
 
 	/* Get the approximate selectivity */
+	estimator = estimator_begin(selec, false);
 	foreach(l, quals)
 	{
 		Node	   *qual = (Node *) lfirst(l);
 
 		/* Note that clause_selectivity will be able to cache its result */
-		selec *= clause_selectivity(root, qual, 0, JOIN_INNER, &sjinfo);
+		selec = clause_selectivity(root, qual, 0, JOIN_INNER, &sjinfo);
+		estimator_add(estimator, selec);
 	}
+
+	selec = estimator_end(estimator);
 
 	/* Apply it to the input relation sizes */
 	tuples = selec * outer_tuples * inner_tuples;

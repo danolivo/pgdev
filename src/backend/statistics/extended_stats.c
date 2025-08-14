@@ -1699,12 +1699,15 @@ statext_mcv_clauselist_selectivity(PlannerInfo *root, List *clauses, int varReli
 	Bitmapset **list_attnums;	/* attnums extracted from the clause */
 	List	  **list_exprs;		/* expressions matched to any statistic */
 	int			listidx;
-	Selectivity sel = (is_or) ? 0.0 : 1.0;
+	SelectivityEstimator *estimator;
+
 	RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
+
+	estimator = estimator_begin((is_or) ? 0.0 : 1.0, is_or);
 
 	/* check if there's any stats that might be useful for us. */
 	if (!has_stats_of_kind(rel->statlist, STATS_EXT_MCV))
-		return sel;
+		return estimator_end(estimator);
 
 	list_attnums = (Bitmapset **) palloc(sizeof(Bitmapset *) *
 										 list_length(clauses));
@@ -1932,7 +1935,7 @@ statext_mcv_clauselist_selectivity(PlannerInfo *root, List *clauses, int varReli
 			 * result.  We treat the results from each separate statistics
 			 * object as independent of one another.
 			 */
-			sel = sel + stat_sel - sel * stat_sel;
+			estimator_add(estimator, stat_sel);
 		}
 		else					/* Implicitly-ANDed list of clauses */
 		{
@@ -1966,11 +1969,11 @@ statext_mcv_clauselist_selectivity(PlannerInfo *root, List *clauses, int varReli
 												 mcv_totalsel);
 
 			/* Factor this into the overall result */
-			sel *= stat_sel;
+			estimator_add(estimator, stat_sel);
 		}
 	}
 
-	return sel;
+	return estimator_end(estimator);
 }
 
 /*
@@ -1983,18 +1986,21 @@ statext_clauselist_selectivity(PlannerInfo *root, List *clauses, int varRelid,
 							   RelOptInfo *rel, Bitmapset **estimatedclauses,
 							   bool is_or)
 {
+	SelectivityEstimator *estimator;
 	Selectivity sel;
 
 	/* First, try estimating clauses using a multivariate MCV list. */
 	sel = statext_mcv_clauselist_selectivity(root, clauses, varRelid, jointype,
 											 sjinfo, rel, estimatedclauses, is_or);
 
+	estimator = estimator_begin(sel, false);
+
 	/*
 	 * Functional dependencies only work for clauses connected by AND, so for
 	 * OR clauses we're done.
 	 */
 	if (is_or)
-		return sel;
+		return estimator_end(estimator);
 
 	/*
 	 * Then, apply functional dependencies on the remaining clauses by calling
@@ -2009,11 +2015,11 @@ statext_clauselist_selectivity(PlannerInfo *root, List *clauses, int varRelid,
 	 * two columns, while functional dependencies can only provide information
 	 * about the overall strength of the dependency.
 	 */
-	sel *= dependencies_clauselist_selectivity(root, clauses, varRelid,
+	sel = dependencies_clauselist_selectivity(root, clauses, varRelid,
 											   jointype, sjinfo, rel,
 											   estimatedclauses);
-
-	return sel;
+	estimator_add(estimator, sel);
+	return estimator_end(estimator);
 }
 
 /*
