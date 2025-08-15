@@ -25,10 +25,65 @@
 #include "catalog/namespace.h"
 #include "executor/execParallel.h"
 #include "pgstat.h"
+#include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "utils/inval.h"
 #include "utils/syscache.h"
 
+static void flush_temp_storage(Relation rel);
+
+/*
+ * Recursively pass through all relations somehow connected to this one.
+ * For example, indexes or toast tables.
+ */
+static void
+walk_relation_dependencies(Relation rel, LOCKMODE lockmode)
+{
+	Relation drel;
+
+	if (rel->rd_indexlist)
+	{
+		ListCell *lc;
+
+		foreach(lc, rel->rd_indexlist)
+		{
+			Oid indexoid = lfirst_oid(lc);
+
+			drel = index_open(indexoid, lockmode);
+
+			flush_temp_storage(drel);
+
+			index_close(drel, lockmode);
+		}
+	}
+
+	if (OidIsValid(rel->rd_rel->reltoastrelid))
+	{
+		/* XXX: Check rd_toastoid */
+		drel = relation_open(rel->rd_rel->reltoastrelid, lockmode);
+		flush_temp_storage(drel);
+		relation_close(drel, lockmode);
+	}
+}
+
+/*
+ * Flush temporary relation buffers and recursively do the same with all
+ * temporary dependants.
+ *
+ * XXX: If query uses kinda IndexOnlyScan, should we touch here heap table as
+ * well?
+ */
+static void
+flush_temp_storage(Relation rel)
+{
+	Assert(CheckRelationOidLockedByMe(RelationGetRelid(rel), AccessShareLock, true));
+
+	if (RelationUsesLocalBuffers(rel) &&
+		RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+		FlushRelationBuffers(rel);
+
+	walk_relation_dependencies(rel, AccessShareLock);
+}
 
 /* ----------------
  *		relation_open - open any relation by relation OID
@@ -44,7 +99,6 @@
  *		expected to check whether the relkind is something it can handle.
  * ----------------
  */
-#include "storage/bufmgr.h"
 Relation
 relation_open(Oid relationId, LOCKMODE lockmode)
 {
@@ -77,13 +131,15 @@ relation_open(Oid relationId, LOCKMODE lockmode)
 		/*
 		 * We are opening a temporary object which has a storage.
 		 * If it happens inside a parallel section of the query plan, we need to
-		 * flush all dirty buffers beforehand.
+		 * flush *all* pages of all related temporary relations beforehand,
+		 * because parallel workers can try to read any page of relation
+		 * from disk.
 		 */
 		if (InsideGatherInitPhase)
 		{
 			Assert(!IsParallelWorker());
 
-			FlushRelationBuffers(r);
+			flush_temp_storage(r);
 		}
 	}
 
