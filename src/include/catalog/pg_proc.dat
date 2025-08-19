@@ -12288,6 +12288,28 @@
   prorettype => 'bool', proargtypes => 'regclass',
   prosrc => 'pg_relation_is_publishable' },
 
+# Sandbox for discoveries on temporary relations and buffers
+{ oid => '8328',
+  descr => 'flush a relation',
+  proname => 'pg_flush_relation', provolatile => 's',
+  prorettype => 'void', proargtypes => 'regclass',
+  prosrc => 'pg_flush_relation' },
+{ oid => '8329',
+  descr => 'flush all temporary buffers',
+  proname => 'pg_flush_local_buffers', provolatile => 's',
+  prorettype => 'int4', proargtypes => '',
+  prosrc => 'pg_flush_local_buffers' },
+{ oid => '8330',
+  descr => 'calculate number of dirty temporary buffers',
+  proname => 'pg_dirty_local_buffers', provolatile => 's',
+  prorettype => 'int4', proargtypes => '',
+  prosrc => 'pg_dirty_local_buffers' },
+{ oid => '8331',
+  descr => 'calculate number of dirty temporary buffers',
+  proname => 'pg_scan_temp_relation', provolatile => 's',
+  prorettype => 'void', proargtypes => 'regclass',
+  prosrc => 'pg_scan_temp_relation' },
+
 # rls
 { oid => '3298',
   descr => 'row security for current context active on table by table oid',

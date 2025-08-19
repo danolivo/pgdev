@@ -7443,3 +7443,111 @@ const PgAioHandleCallbacks aio_local_buffer_readv_cb = {
 	.complete_local = local_buffer_readv_complete,
 	.report = buffer_readv_report,
 };
+
+#include "access/relation.h"
+#include "utils/builtins.h"
+#include "utils/syscache.h"
+
+/*
+ * Explicitly flush shared or local buffers of the relation to the disk
+ */
+Datum
+pg_flush_relation(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Relation	rel;
+
+	rel = relation_open(relid, ExclusiveLock);
+	FlushRelationBuffers(rel);
+	relation_close(rel, ExclusiveLock);
+	PG_RETURN_VOID();
+}
+
+Datum
+pg_scan_temp_relation(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Relation	rel;
+	BlockNumber nblocks;
+	BlockNumber	i;
+
+	rel = relation_open(relid, ExclusiveLock);
+
+	if (!RelationUsesLocalBuffers(rel))
+	{
+		elog(WARNING, "function intended to be used with temporary objects only");
+		relation_close(rel, ExclusiveLock);
+		PG_RETURN_VOID();
+	}
+
+	nblocks = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
+
+	for (i = 0; i < nblocks; i++)
+	{
+		Buffer buf;
+
+		buf = ReadBuffer(rel, i);
+		ReleaseBuffer(buf);
+	}
+
+	relation_close(rel, ExclusiveLock);
+	PG_RETURN_VOID();
+}
+
+/*
+ * Flush all dirty pages in temporary buffers to the disk
+ */
+Datum
+pg_flush_local_buffers(PG_FUNCTION_ARGS)
+{
+	int			i;
+	int			flushed_pages = 0;
+
+	for (i = 0; i < NLocBuffer; i++)
+	{
+		BufferDesc *bufHdr = GetLocalBufferDescriptor(i);
+		uint32		buf_state;
+
+		if (LocalBufHdrGetBlock(bufHdr) == NULL)
+			continue;
+
+		buf_state = pg_atomic_read_u32(&bufHdr->state);
+
+		if ((buf_state &  (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
+		{
+			PinLocalBuffer(bufHdr, false);
+			FlushLocalBuffer(bufHdr, NULL);
+			UnpinLocalBuffer(BufferDescriptorGetBuffer(bufHdr));
+			flushed_pages++;
+		}
+	}
+
+	PG_RETURN_INT32(flushed_pages);
+}
+
+/*
+ * Show how much dirty pages contain temporary buffers. Just for statistics,
+ * don't flush them!
+ */
+Datum
+pg_dirty_local_buffers(PG_FUNCTION_ARGS)
+{
+	int			i;
+	int			dirty_pages = 0;
+
+	for (i = 0; i < NLocBuffer; i++)
+	{
+		BufferDesc *bufHdr = GetLocalBufferDescriptor(i);
+		uint32		buf_state;
+
+		if (LocalBufHdrGetBlock(bufHdr) == NULL)
+			continue;
+
+		buf_state = pg_atomic_read_u32(&bufHdr->state);
+
+		if ((buf_state &  (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
+			dirty_pages++;
+	}
+
+	PG_RETURN_INT32(dirty_pages);
+}
