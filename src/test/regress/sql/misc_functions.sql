@@ -412,5 +412,20 @@ CREATE FUNCTION test_relpath()
     LANGUAGE C;
 SELECT test_relpath();
 
+CREATE FUNCTION prepare_spi_plan(text, text, VARIADIC text[])
+RETURNS bigint
+    AS :'regresslib', 'prepare_spi_plan'
+    LANGUAGE C;
+
+CREATE FUNCTION execute_spi_plan(bigint, text, "any")
+RETURNS SETOF record
+    AS :'regresslib', 'execute_spi_plan'
+    LANGUAGE C STRICT;
+
+CREATE FUNCTION free_spi_plan(bigint)
+RETURNS void
+    AS :'regresslib', 'free_spi_plan'
+    LANGUAGE C STRICT;
+
 -- pg_replication_origin.roname limit
 SELECT pg_replication_origin_create('regress_' || repeat('a', 505));

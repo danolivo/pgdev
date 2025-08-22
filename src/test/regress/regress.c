@@ -42,9 +42,11 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/geo_decls.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/typcache.h"
+#include "utils/varlena.h"
 
 #define EXPECT_TRUE(expr)	\
 	do { \
@@ -1026,5 +1028,202 @@ test_relpath(PG_FUNCTION_ARGS)
 		elog(WARNING, "maximum length relpath is if length %zu instead of %zu",
 			 strlen(rpath.str), REL_PATH_STR_MAXLEN);
 
+	PG_RETURN_VOID();
+}
+
+static int
+setup_cursor_options(const char *options_string)
+{
+	List	   *optionLst = NIL;
+	ListCell   *lc;
+	int			cursorOptions = 0;
+
+	if (!SplitIdentifierString(pstrdup(options_string), ',', &optionLst))
+		/* syntax error in option list */
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("parameter \"%s\" must be a list of parameters",
+						"cursor_options")));
+
+	foreach(lc, optionLst)
+	{
+		const char *option = (const char *) lfirst(lc);
+
+		if (pg_strcasecmp(option, "fast_plan") == 0)
+			cursorOptions |= CURSOR_OPT_FAST_PLAN;
+		else if (pg_strcasecmp(option, "generic_plan") == 0)
+			cursorOptions |= CURSOR_OPT_GENERIC_PLAN;
+		else if (pg_strcasecmp(option, "custom_plan") == 0)
+			cursorOptions |= CURSOR_OPT_CUSTOM_PLAN;
+		else if (pg_strcasecmp(option, "parallel_ok") == 0)
+			cursorOptions |= CURSOR_OPT_PARALLEL_OK;
+		else
+			ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("unknown cursor option %s", option)));
+	}
+
+	list_free(optionLst);
+	return cursorOptions;
+}
+
+ /*
+  * Prepare a plan cache entry for incoming parameterised query with specific
+  * set of cursor options.
+  *
+  * cursor_options string may contain any combination of the following values:
+  * 'fast_plan', 'generic_plan', 'custom_plan', or 'parallel_ok'.
+  *
+  * Returns internal pointer to saved SPI plan.
+  */
+PG_FUNCTION_INFO_V1(prepare_spi_plan);
+Datum
+prepare_spi_plan(PG_FUNCTION_ARGS)
+{
+	const char *query_text;
+	int			cursorOptions = 0;
+	ArrayType  *arr;
+	Datum	   *elements = NULL;
+	bool	   *nulls = NULL;
+	Oid			element_type = InvalidOid;
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	int			nitems;
+	int			i;
+	Oid		   *argtypes;
+	SPIPlanPtr	result;
+
+	Assert(PG_NARGS() == 3 && get_fn_expr_variadic(fcinfo->flinfo));
+
+	/* Check supplied arguments */
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("query text cannot be null")));
+	query_text = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	if (PG_ARGISNULL(2))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("list of parameters canot be null")));
+
+	if (!PG_ARGISNULL(1))
+	{
+		char   *options = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+		cursorOptions = setup_cursor_options(options);
+	}
+
+	/* Prepare the Oid array of the query parameters */
+
+	arr = PG_GETARG_ARRAYTYPE_P(2);
+	element_type = ARR_ELEMTYPE(arr);
+	get_typlenbyvalalign(element_type, &elmlen, &elmbyval, &elmalign);
+
+	/* Extract all array elements */
+	deconstruct_array(arr, element_type, elmlen, elmbyval, elmalign,
+					  &elements, &nulls, &nitems);
+
+	argtypes = palloc(nitems * sizeof(Oid));
+	for (i = 0; i < nitems; i++)
+	{
+		const char *typname;
+
+		if (nulls[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("type name cannot be NULL")));
+
+		typname = TextDatumGetCString(elements[i]);
+		argtypes[i] = DirectFunctionCall1Coll(regtypein,
+											  InvalidOid,
+											  CStringGetDatum(typname));
+	}
+
+	/* Create plancache entry and save the plan */
+	SPI_connect();
+	result = SPI_prepare_cursor(query_text, nitems, argtypes, cursorOptions);
+	result = SPI_saveplan(result);
+	SPI_finish();
+	PG_RETURN_POINTER(result);
+}
+
+PG_FUNCTION_INFO_V1(execute_spi_plan);
+Datum
+execute_spi_plan(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo  *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	SPIPlanPtr		plan = (SPIPlanPtr) PG_GETARG_POINTER(0);
+	int				nargs = PG_NARGS();
+	Datum		   *values;
+	char		   *Nulls;
+	int				spirc;
+	int				i;
+
+	if (!SPI_plan_is_valid(plan))
+		PG_RETURN_NULL();
+
+	Assert(!get_fn_expr_variadic(fcinfo->flinfo));
+
+	/*
+	 * Caller wants to change cursor options. Update it for each statement.
+	 */
+	if (!PG_ARGISNULL(1))
+	{
+		char 	   *options = text_to_cstring(PG_GETARG_TEXT_PP(1));
+		List	   *plansources = SPI_plan_get_plan_sources(plan);
+		int			cursorOptions = 0;
+		ListCell   *lc;
+
+		cursorOptions = setup_cursor_options(options);
+
+		foreach(lc, plansources)
+		{
+			CachedPlanSource *src = lfirst(lc);
+
+			src->cursor_options = cursorOptions;
+		}
+	}
+
+	values = palloc((nargs - 2) * sizeof(Datum));
+	Nulls = palloc((nargs - 2) * sizeof(char *));
+	for (i = 2; i < nargs; i++)
+	{
+		if (!PG_ARGISNULL(i))
+		{
+			Nulls[i - 2] = ' ';
+			values[i - 2] = PG_GETARG_DATUM(i);
+		}
+		else
+			Nulls[i - 2] = 'n';
+	}
+
+	SPI_connect();
+	spirc = SPI_execute_plan(plan, values, Nulls, false, 0);
+	if (spirc <= 0)
+		elog(ERROR, "failed to execute the SPI plan %d", spirc);
+
+	rsinfo->expectedDesc = SPI_tuptable->tupdesc;
+	InitMaterializedSRF(fcinfo, MAT_SRF_USE_EXPECTED_DESC | MAT_SRF_BLESS);
+
+	for (i = 0; i < SPI_processed; i++)
+	{
+		tuplestore_puttuple(rsinfo->setResult, SPI_tuptable->vals[i]);
+	}
+
+	SPI_finish();
+
+	return (Datum) 0;
+}
+
+PG_FUNCTION_INFO_V1(free_spi_plan);
+Datum
+free_spi_plan(PG_FUNCTION_ARGS)
+{
+	SPIPlanPtr plan = (SPIPlanPtr) PG_GETARG_POINTER(0);
+
+	SPI_connect();
+	SPI_freeplan(plan);
+	SPI_finish();
 	PG_RETURN_VOID();
 }

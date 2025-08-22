@@ -223,3 +223,22 @@ select name, generic_plans, custom_plans from pg_prepared_statements
   where  name = 'test_mode_pp';
 
 drop table test_mode;
+
+-- Check the interference between plan_cache_mode and cursor_options
+-- EXPLAIN (COSTS OFF, GENERIC_PLAN)
+
+SELECT prepare_spi_plan(NULL, NULL, NULL); -- ERROR
+SELECT prepare_spi_plan(
+  'EXPLAIN (COSTS OFF) SELECT * FROM pcachetest WHERE q1 = $1',
+  NULL, 'integer') AS p1 \gset
+SELECT prepare_spi_plan(
+  'SELECT * FROM pcachetest WHERE q1 = $1 OR q1 = $2',
+  NULL, 'integer', NULL); --ERROR
+SELECT prepare_spi_plan(
+  'SELECT * FROM pcachetest WHERE q1 = $1 OR q1 = 3',
+  NULL, 'integer', 'numeric') AS p2 \gset
+
+SELECT execute_spi_plan(:p1, 'generic_plan', 42);
+
+SELECT free_spi_plan(:p1);
+SELECT free_spi_plan(:p2);
