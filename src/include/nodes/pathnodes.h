@@ -928,6 +928,10 @@ typedef struct RelOptInfo
 	bool		consider_param_startup;
 	/* consider parallel paths? */
 	bool		consider_parallel;
+	/* If the rel is allowed to be processed in parallel, does it need to flush
+	 * temporary buffers?
+	 */
+	bool		needs_temp_flushing;
 
 	/*
 	 * default result targetlist for Paths scanning this relation; list of

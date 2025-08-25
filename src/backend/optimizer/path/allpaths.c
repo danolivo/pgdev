@@ -758,6 +758,7 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 
 	/* We have a winner. */
 	rel->consider_parallel = true;
+	rel->needs_temp_flushing = true;
 }
 
 /*

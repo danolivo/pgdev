@@ -1038,3 +1038,34 @@ AtProcExit_LocalBuffers(void)
 	 */
 	CheckForLocalBufferLeaks();
 }
+
+/*
+ * Flush each temporary buffer page to the disk.
+ *
+ * It is costly operation needed solely to let temporary tables, indexes and
+ * 'toasts' participate in a parallel query plan.
+ */
+void
+FlushAllLocalBuffers(void)
+{
+	int                     i;
+
+	for (i = 0; i < NLocBuffer; i++)
+	{
+		BufferDesc *bufHdr = GetLocalBufferDescriptor(i);
+		uint32		buf_state;
+
+		if (LocalBufHdrGetBlock(bufHdr) == NULL)
+			continue;
+
+		buf_state = pg_atomic_read_u32(&bufHdr->state);
+
+		/* XXX only valid dirty pages need to be flushed? */
+		if ((buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
+		{
+			PinLocalBuffer(bufHdr, false);
+			FlushLocalBuffer(bufHdr, NULL);
+			UnpinLocalBuffer(BufferDescriptorGetBuffer(bufHdr));
+		}
+	}
+}

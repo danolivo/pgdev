@@ -676,12 +676,15 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 	 */
 	if (es->summary && es->analyze)
 	{
-		ExplainPropertyFloat("Temp Buffers Allocated", "MB",
-							 bufs_allocated * BLCKSZ / (1024. * 1024.),
-							 0, es);
-		ExplainPropertyFloat("Dirty temp pages", NULL,
-							 dirtied_buffers,
-							 0, es);
+		if (es->verbose)
+		{
+			ExplainPropertyFloat("Temp Buffers Allocated", "MB",
+								 bufs_allocated * BLCKSZ / (1024. * 1024.),
+								 0, es);
+			ExplainPropertyFloat("Dirty temp pages", NULL,
+								 dirtied_buffers,
+								 0, es);
+		}
 		ExplainPropertyFloat("Execution Time", "ms", 1000.0 * totaltime, 3,
 							 es);
 	}
