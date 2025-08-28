@@ -970,6 +970,16 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"extended_parallel_processing", PGC_BACKEND, QUERY_TUNING_METHOD,
+			gettext_noop("Enable extra features of parallel pocessing."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&extended_parallel_processing,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"enable_partition_pruning", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables plan-time and execution-time partition pruning."),
 			gettext_noop("Allows the query planner and executor to compare partition "

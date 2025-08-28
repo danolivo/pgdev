@@ -203,7 +203,7 @@ typedef struct Plan
 	/* engage parallel-aware logic? */
 	bool		parallel_aware;
 	/* OK to use as part of parallel plan? */
-	bool		parallel_safe;
+	ParallelSafe	parallel_safe;
 
 	/*
 	 * information needed for asynchronous execution

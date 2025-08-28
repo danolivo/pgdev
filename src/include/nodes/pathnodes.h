@@ -931,7 +931,7 @@ typedef struct RelOptInfo
 	/* If the rel is allowed to be processed in parallel, does it need to flush
 	 * temporary buffers?
 	 */
-	bool		needs_temp_flushing;
+	bool		needs_temp_safety;
 
 	/*
 	 * default result targetlist for Paths scanning this relation; list of
@@ -1824,7 +1824,7 @@ typedef struct Path
 	/* engage parallel-aware logic? */
 	bool		parallel_aware;
 	/* OK to use as part of parallel plan? */
-	bool		parallel_safe;
+	ParallelSafe	parallel_safe;
 	/* desired # of workers; 0 = not parallel */
 	int			parallel_workers;
 
