@@ -105,6 +105,7 @@
 #include "optimizer/plancat.h"
 #include "optimizer/restrictinfo.h"
 #include "parser/parsetree.h"
+#include "storage/bufmgr.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
 #include "utils/spccache.h"
@@ -130,6 +131,7 @@
 
 double		seq_page_cost = DEFAULT_SEQ_PAGE_COST;
 double		random_page_cost = DEFAULT_RANDOM_PAGE_COST;
+double		write_page_cost = DEFAULT_WRITE_PAGE_COST;
 double		cpu_tuple_cost = DEFAULT_CPU_TUPLE_COST;
 double		cpu_index_tuple_cost = DEFAULT_CPU_INDEX_TUPLE_COST;
 double		cpu_operator_cost = DEFAULT_CPU_OPERATOR_COST;
@@ -452,6 +454,10 @@ cost_gather(GatherPath *path, PlannerInfo *root,
 	startup_cost += parallel_setup_cost;
 	run_cost += parallel_tuple_cost * path->path.rows;
 
+	/* The leader flushes dirty temp buffers before launching workers. */
+	if (path->subpath->needs_temp_flush)
+		startup_cost += tempbuf_flush_extra_cost();
+
 	path->path.disabled_nodes = path->subpath->disabled_nodes
 		+ ((rel->pgs_mask & PGS_GATHER) != 0 ? 0 : 1);
 	path->path.startup_cost = startup_cost;
@@ -518,6 +524,10 @@ cost_gather_merge(GatherMergePath *path, PlannerInfo *root,
 	 */
 	startup_cost += parallel_setup_cost;
 	run_cost += parallel_tuple_cost * path->path.rows * 1.05;
+
+	/* The leader flushes dirty temp buffers before launching workers. */
+	if (path->subpath->needs_temp_flush)
+		startup_cost += tempbuf_flush_extra_cost();
 
 	path->path.disabled_nodes = path->subpath->disabled_nodes
 		+ ((rel->pgs_mask & PGS_GATHER_MERGE) != 0 ? 0 : 1);
@@ -6886,4 +6896,27 @@ compute_gather_rows(Path *path)
 	Assert(path->parallel_workers > 0);
 
 	return clamp_row_est(path->rows * get_parallel_divisor(path));
+}
+
+/*
+ * tempbuf_flush_extra_cost
+ *	  Estimate the cost of flushing dirty temp buffers before launching
+ *	  parallel workers.
+ *
+ * Before launching parallel workers, the leader must flush all dirty pages
+ * in its local buffers so that every worker sees the same data on disk.
+ * It is hard to tell in advance which temporary tables, indexes and TOAST
+ * relations the parallel subtree is going to touch (a function called from
+ * it may scan temporary tables too), so all dirty local buffers get flushed.
+ * This is a one-time startup cost charged to Gather and Gather Merge; it
+ * keeps small queries from paying for an expensive flush.
+ */
+Cost
+tempbuf_flush_extra_cost(void)
+{
+	if (!enable_parallel_temp_scan)
+		return 0.0;
+
+	Assert(dirtied_localbufs >= 0);
+	return write_page_cost * dirtied_localbufs;
 }
