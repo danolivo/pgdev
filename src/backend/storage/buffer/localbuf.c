@@ -189,6 +189,12 @@ FlushLocalBuffer(BufferDesc *bufHdr, SMgrRelation reln)
 	instr_time	io_start;
 	Page		localpage = (char *) LocalBufHdrGetBlock(bufHdr);
 
+	/*
+	 * Parallel temp table scan allows an access to temp tables. So, to be
+	 * paranoid enough we should check it each time, flushing local buffer.
+	 */
+	Assert(!IsParallelWorker());
+
 	Assert(LocalRefCount[-BufferDescriptorGetBuffer(bufHdr) - 1] > 0);
 
 	/*
@@ -750,19 +756,6 @@ InitLocalBuffers(void)
 	HASHCTL		info;
 	int			i;
 
-	/*
-	 * Parallel workers can't access data in temporary tables, because they
-	 * have no visibility into the local buffers of their leader.  This is a
-	 * convenient, low-cost place to provide a backstop check for that.  Note
-	 * that we don't wish to prevent a parallel worker from accessing catalog
-	 * metadata about a temp table, so checks at higher levels would be
-	 * inappropriate.
-	 */
-	if (IsParallelWorker())
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
-				 errmsg("cannot access temporary tables during a parallel operation")));
-
 	/* Allocate and zero buffer headers and auxiliary arrays */
 	LocalBufferDescriptors = (BufferDesc *) calloc(nbufs, sizeof(BufferDesc));
 	LocalBufferBlockPointers = (Block *) calloc(nbufs, sizeof(Block));
@@ -1039,4 +1032,37 @@ AtProcExit_LocalBuffers(void)
 	 * drop the temp rels.
 	 */
 	CheckForLocalBufferLeaks();
+}
+
+/*
+ * Flush each temporary buffer page to the disk.
+ *
+ * It is costly operation needed solely to let temporary tables, indexes and
+ * 'toasts' participate in a parallel query plan.
+ */
+void
+FlushAllLocalBuffers(void)
+{
+	int                     i;
+
+	for (i = 0; i < NLocBuffer; i++)
+	{
+		BufferDesc *bufHdr = GetLocalBufferDescriptor(i);
+		uint32		buf_state;
+
+		if (LocalBufHdrGetBlock(bufHdr) == NULL)
+			continue;
+
+		buf_state = pg_atomic_read_u32(&bufHdr->state);
+
+		/* XXX only valid dirty pages need to be flushed? */
+		if ((buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
+		{
+			PinLocalBuffer(bufHdr, false);
+			FlushLocalBuffer(bufHdr, NULL);
+			UnpinLocalBuffer(BufferDescriptorGetBuffer(bufHdr));
+		}
+	}
+
+	Assert(dirtied_localbufs == 0);
 }

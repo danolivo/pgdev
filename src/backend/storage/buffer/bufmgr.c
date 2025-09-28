@@ -5112,6 +5112,12 @@ FlushRelationBuffers(Relation rel)
 	}
 }
 
+void
+FlushAllBuffers(void)
+{
+	FlushAllLocalBuffers();
+}
+
 /* ---------------------------------------------------------------------
  *		FlushRelationsAllBuffers
  *

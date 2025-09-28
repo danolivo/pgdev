@@ -542,6 +542,7 @@ extern void TerminateLocalBufferIO(BufferDesc *bufHdr, bool clear_dirty,
 								   uint32 set_flag_bits, bool release_aio);
 extern bool StartLocalBufferIO(BufferDesc *bufHdr, bool forInput, bool nowait);
 extern void FlushLocalBuffer(BufferDesc *bufHdr, SMgrRelation reln);
+extern void FlushAllLocalBuffers(void);
 extern void InvalidateLocalBuffer(BufferDesc *bufHdr, bool check_unreferenced);
 extern void DropRelationLocalBuffers(RelFileLocator rlocator,
 									 ForkNumber *forkNum, int nforks,

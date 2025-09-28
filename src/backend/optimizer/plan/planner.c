@@ -514,6 +514,7 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 		gather->num_workers = 1;
 		gather->single_copy = true;
 		gather->invisible = (debug_parallel_query == DEBUG_PARALLEL_REGRESS);
+		gather->process_temp_tables = (best_path->parallel_safe == NEEDS_TEMP_FLUSH);
 
 		/* Transfer any initPlans to the new top node */
 		gather->plan.initPlan = top_plan->initPlan;
