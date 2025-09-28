@@ -22,6 +22,7 @@
 #include "lib/binaryheap.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
+#include "storage/bufmgr.h"
 
 /*
  * When we read tuples from workers, it's a good idea to read several at once
@@ -204,6 +205,13 @@ ExecGatherMerge(PlanState *pstate)
 		if (gm->num_workers > 0 && estate->es_use_parallel_mode)
 		{
 			ParallelContext *pcxt;
+
+			/* The same as in the ExecGather */
+			if (gm->process_temp_tables && !estate->es_tempbufs_flushed)
+			{
+				FlushAllBuffers();
+				estate->es_tempbufs_flushed = true;
+			}
 
 			/* Initialize, or re-initialize, shared state needed by workers. */
 			if (!node->pei)
