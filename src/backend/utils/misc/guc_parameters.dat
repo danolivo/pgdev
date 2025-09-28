@@ -3502,6 +3502,15 @@
   max => 'MAX_KILOBYTES',
 },
 
+
+{ name => 'write_page_cost', type => 'real', context => 'PGC_USERSET', group => 'QUERY_TUNING_COST',
+  short_desc => 'Sets the planner\'s estimate of the cost of a disk page flushing.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'write_page_cost',
+  boot_val => 'DEFAULT_WRITE_PAGE_COST',
+  min => '0',
+  max => 'DBL_MAX',
+},
 { name => 'xmlbinary', type => 'enum', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
   short_desc => 'Sets how binary values are to be encoded in XML.',
   variable => 'xmlbinary',
