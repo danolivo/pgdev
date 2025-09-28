@@ -757,7 +757,7 @@ typedef struct EState
 
 	bool		es_use_parallel_mode;	/* can we use parallel workers? */
 
-	bool		es_need_temptables_flush;	/* Do we still need to flush dirty temp pages? */
+	bool		es_tempbufs_flushed;	/* dirty temp buffers already flushed? */
 
 	int			es_parallel_workers_to_launch;	/* number of workers to
 												 * launch. */
