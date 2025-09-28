@@ -43,6 +43,10 @@ typedef struct
 
 int			NLocBuffer = 0;		/* until buffers are initialized */
 
+
+int allocated_localbufs = 0;
+int dirtied_localbufs = 0;
+
 BufferDesc *LocalBufferDescriptors = NULL;
 Block	   *LocalBufferBlockPointers = NULL;
 int32	   *LocalRefCount = NULL;
@@ -507,7 +511,10 @@ MarkLocalBufferDirty(Buffer buffer)
 	buf_state = pg_atomic_read_u32(&bufHdr->state);
 
 	if (!(buf_state & BM_DIRTY))
+	{
 		pgBufferUsage.local_blks_dirtied++;
+		dirtied_localbufs++;
+	}
 
 	buf_state |= BM_DIRTY;
 
@@ -568,6 +575,12 @@ TerminateLocalBufferIO(BufferDesc *bufHdr, bool clear_dirty, uint32 set_flag_bit
 	/* Clear earlier errors, if this IO failed, it'll be marked again */
 	buf_state &= ~BM_IO_ERROR;
 
+	if (buf_state & BM_DIRTY)
+	{
+		Assert(dirtied_localbufs > 0);
+		dirtied_localbufs--;
+	}
+
 	if (clear_dirty)
 		buf_state &= ~BM_DIRTY;
 
@@ -606,6 +619,12 @@ InvalidateLocalBuffer(BufferDesc *bufHdr, bool check_unreferenced)
 	int			bufid = -buffer - 1;
 	uint32		buf_state;
 	LocalBufferLookupEnt *hresult;
+
+	if (pg_atomic_read_u32(&bufHdr->state) & BM_DIRTY)
+	{
+		Assert(dirtied_localbufs > 0);
+		dirtied_localbufs--;
+	}
 
 	/*
 	 * It's possible that we started IO on this buffer before e.g. aborting
@@ -945,6 +964,7 @@ GetLocalBufferStorage(void)
 	this_buf = cur_block + next_buf_in_block * BLCKSZ;
 	next_buf_in_block++;
 	total_bufs_allocated++;
+	allocated_localbufs++;
 
 	/*
 	 * Caller's PinLocalBuffer() was too early for Valgrind updates, so do it
