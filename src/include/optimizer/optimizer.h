@@ -72,6 +72,7 @@ extern Selectivity clauselist_selectivity_ext(PlannerInfo *root,
 /* widely used cost parameters */
 extern PGDLLIMPORT double seq_page_cost;
 extern PGDLLIMPORT double random_page_cost;
+extern PGDLLIMPORT double write_page_cost;
 extern PGDLLIMPORT double cpu_tuple_cost;
 extern PGDLLIMPORT double cpu_index_tuple_cost;
 extern PGDLLIMPORT double cpu_operator_cost;

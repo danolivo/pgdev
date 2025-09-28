@@ -2774,6 +2774,9 @@ apply_projection_to_path(PlannerInfo *root,
 	if ((IsA(path, GatherPath) || IsA(path, GatherMergePath)) &&
 		is_parallel_safe(root, (Node *) target->exprs, NULL))
 	{
+		Path	  **subpathp;
+		Path	   *oldsubpath;
+
 		/*
 		 * We always use create_projection_path here, even if the subpath is
 		 * projection-capable, so as to avoid modifying the subpath in place.
@@ -2785,24 +2788,28 @@ apply_projection_to_path(PlannerInfo *root,
 		 * the target evaluation will happen in workers.
 		 */
 		if (IsA(path, GatherPath))
-		{
-			GatherPath *gpath = (GatherPath *) path;
-
-			gpath->subpath = (Path *)
-				create_projection_path(root,
-									   gpath->subpath->parent,
-									   gpath->subpath,
-									   target);
-		}
+			subpathp = &((GatherPath *) path)->subpath;
 		else
-		{
-			GatherMergePath *gmpath = (GatherMergePath *) path;
+			subpathp = &((GatherMergePath *) path)->subpath;
 
-			gmpath->subpath = (Path *)
-				create_projection_path(root,
-									   gmpath->subpath->parent,
-									   gmpath->subpath,
-									   target);
+		oldsubpath = *subpathp;
+		*subpathp = (Path *) create_projection_path(root,
+													oldsubpath->parent,
+													oldsubpath,
+													target);
+
+		/*
+		 * If the target made the subpath require a temp buffers flush that
+		 * the Gather was costed without, charge it now: the flush is a
+		 * one-time startup cost of the Gather (see cost_gather).
+		 */
+		if ((*subpathp)->parallel_safe == NEEDS_TEMP_FLUSH &&
+			oldsubpath->parallel_safe != NEEDS_TEMP_FLUSH)
+		{
+			Cost		flush_cost = tempbuf_flush_extra_cost();
+
+			path->startup_cost += flush_cost;
+			path->total_cost += flush_cost;
 		}
 	}
 	else if (path->parallel_safe &&
