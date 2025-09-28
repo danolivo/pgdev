@@ -1009,7 +1009,7 @@ SS_process_ctes(PlannerInfo *root)
 		 * CTE scans are not considered for parallelism (cf
 		 * set_rel_consider_parallel).
 		 */
-		splan->parallel_safe = false;
+		splan->parallel_safe = PARALLEL_UNSAFE;
 		splan->setParam = NIL;
 		splan->parParam = NIL;
 		splan->args = NIL;
@@ -2308,7 +2308,7 @@ SS_charge_for_initplans(PlannerInfo *root, RelOptInfo *final_rel)
 		path->startup_cost += initplan_cost;
 		path->total_cost += initplan_cost;
 		if (unsafe_initplans)
-			path->parallel_safe = false;
+			path->parallel_safe = PARALLEL_UNSAFE;
 	}
 
 	/*

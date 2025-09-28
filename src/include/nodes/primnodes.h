@@ -1051,6 +1051,18 @@ typedef struct SubLink
 } SubLink;
 
 /*
+ * Start from zero and put NEEDS_TEMP_FLUSH as a first positive value.
+ * In this case if someone still uses true/false values for this type it just
+ * causes more temp buffers flushes without an error.
+ */
+typedef enum ParallelSafe
+{
+	PARALLEL_UNSAFE = 0,
+	NEEDS_TEMP_FLUSH,
+	PARALLEL_SAFE,
+} ParallelSafe;
+
+/*
  * SubPlan - executable expression node for a subplan (sub-SELECT)
  *
  * The planner replaces SubLink nodes in expression trees with SubPlan
@@ -1114,7 +1126,7 @@ typedef struct SubPlan
 	bool		unknownEqFalse; /* true if it's okay to return FALSE when the
 								 * spec result is UNKNOWN; this allows much
 								 * simpler handling of null values */
-	bool		parallel_safe;	/* is the subplan parallel-safe? */
+	ParallelSafe	parallel_safe;	/* is the subplan parallel-safe? */
 	/* Note: parallel_safe does not consider contents of testexpr or args */
 	/* Information for passing params into and out of the subselect: */
 	/* setParam and parParam are lists of integers (param IDs) */

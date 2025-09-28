@@ -1024,6 +1024,13 @@
   boot_val => '"$system"',
 },
 
+{ name => 'extended_parallel_processing', type => 'bool', context => 'PGC_BACKEND', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Enable extra features of parallel pocessing.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'extended_parallel_processing',
+  boot_val => 'true',
+},
+
 { name => 'external_pid_file', type => 'string', context => 'PGC_POSTMASTER', group => 'FILE_LOCATIONS',
   short_desc => 'Writes the postmaster PID to the specified file.',
   flags => 'GUC_SUPERUSER_ONLY',

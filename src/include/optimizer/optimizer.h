@@ -80,6 +80,12 @@ extern PGDLLIMPORT double parallel_setup_cost;
 extern PGDLLIMPORT double recursive_worktable_factor;
 extern PGDLLIMPORT int effective_cache_size;
 
+/*
+ * Enable extended feature of parallel query processing such as parallel
+ * temporary tables scan.
+ */
+extern PGDLLIMPORT bool extended_parallel_processing;
+
 extern double clamp_row_est(double nrows);
 extern int32 clamp_width_est(int64 tuple_width);
 
