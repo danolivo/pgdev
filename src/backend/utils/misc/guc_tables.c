@@ -799,6 +799,18 @@ struct config_bool ConfigureNamesBool[] =
 		true,
 		NULL, NULL, NULL
 	},
+
+	{
+		{"extended_parallel_processing", PGC_BACKEND, QUERY_TUNING_METHOD,
+			gettext_noop("Enables extra features of parallel pocessing."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&extended_parallel_processing,
+		true,
+		NULL, NULL, NULL
+	},
+
 	{
 		{"enable_indexscan", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of index-scan plans."),
@@ -3889,6 +3901,16 @@ struct config_real ConfigureNamesReal[] =
 		},
 		&random_page_cost,
 		DEFAULT_RANDOM_PAGE_COST, 0, DBL_MAX,
+		NULL, NULL, NULL
+	},
+	{
+		{"write_page_cost", PGC_USERSET, QUERY_TUNING_COST,
+			gettext_noop("Sets the planner's estimate of the cost of a disk page flushing."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&write_page_cost,
+		DEFAULT_WRITE_PAGE_COST, 0, DBL_MAX,
 		NULL, NULL, NULL
 	},
 	{
