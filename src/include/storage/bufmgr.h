@@ -190,6 +190,7 @@ extern PGDLLIMPORT char *BufferBlocks;
 
 /* in localbuf.c */
 extern PGDLLIMPORT int NLocBuffer;
+extern PGDLLIMPORT int dirtied_localbufs;
 extern PGDLLIMPORT Block *LocalBufferBlockPointers;
 extern PGDLLIMPORT int32 *LocalRefCount;
 
