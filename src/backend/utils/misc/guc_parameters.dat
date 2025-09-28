@@ -2359,6 +2359,15 @@
   max => 'DBL_MAX',
 },
 
+{ name => 'write_page_cost', type => 'real', context => 'PGC_USERSET', group => 'QUERY_TUNING_COST',
+  short_desc => 'Sets the planner\'s estimate of the cost of a disk page flushing.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'write_page_cost',
+  boot_val => 'DEFAULT_WRITE_PAGE_COST',
+  min => '0',
+  max => 'DBL_MAX',
+},
+
 { name => 'cpu_tuple_cost', type => 'real', context => 'PGC_USERSET', group => 'QUERY_TUNING_COST',
   short_desc => 'Sets the planner\'s estimate of the cost of processing each tuple (row).',
   flags => 'GUC_EXPLAIN',
