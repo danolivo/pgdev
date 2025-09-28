@@ -40,6 +40,13 @@
   boot_val => 'true',
 },
 
+{ name => 'extended_parallel_processing', type => 'bool', context => 'PGC_BACKEND', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Enable extra features of parallel pocessing.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'extended_parallel_processing',
+  boot_val => 'true',
+},
+
 { name => 'enable_indexscan', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
   short_desc => 'Enables the planner\'s use of index-scan plans.',
   flags => 'GUC_EXPLAIN',
