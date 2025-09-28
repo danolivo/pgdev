@@ -43,6 +43,7 @@ typedef struct
 	LocalBufferBlockPointers[-((bufHdr)->buf_id + 2)]
 
 int			NLocBuffer = 0;		/* until buffers are initialized */
+int			dirtied_localbufs = 0;	/* number of dirty local buffers */
 
 BufferDesc *LocalBufferDescriptors = NULL;
 Block	   *LocalBufferBlockPointers = NULL;
@@ -518,7 +519,10 @@ MarkLocalBufferDirty(Buffer buffer)
 	buf_state = pg_atomic_read_u64(&bufHdr->state);
 
 	if (!(buf_state & BM_DIRTY))
+	{
 		pgBufferUsage.local_blks_dirtied++;
+		dirtied_localbufs++;
+	}
 
 	buf_state |= BM_DIRTY;
 
@@ -594,6 +598,12 @@ TerminateLocalBufferIO(BufferDesc *bufHdr, bool clear_dirty, uint64 set_flag_bit
 	/* Clear earlier errors, if this IO failed, it'll be marked again */
 	buf_state &= ~BM_IO_ERROR;
 
+	if (buf_state & BM_DIRTY)
+	{
+		Assert(dirtied_localbufs > 0);
+		dirtied_localbufs--;
+	}
+
 	if (clear_dirty)
 		buf_state &= ~BM_DIRTY;
 
@@ -632,6 +642,12 @@ InvalidateLocalBuffer(BufferDesc *bufHdr, bool check_unreferenced)
 	int			bufid = -buffer - 1;
 	uint64		buf_state;
 	LocalBufferLookupEnt *hresult;
+
+	if (pg_atomic_read_u64(&bufHdr->state) & BM_DIRTY)
+	{
+		Assert(dirtied_localbufs > 0);
+		dirtied_localbufs--;
+	}
 
 	/*
 	 * It's possible that we started IO on this buffer before e.g. aborting
