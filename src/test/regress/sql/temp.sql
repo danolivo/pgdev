@@ -418,3 +418,42 @@ SELECT count(*), max(a) max_a, min(a) min_a, max(cnt) max_cnt FROM test_temp;
 
 -- cleanup
 DROP FUNCTION test_temp_pin(int, int);
+
+-- Test visibility of a temporary table tuples in parallel workers
+-- Although explain prints the number of workers planned and launched, In this
+-- case it shouldn't cause test results float because the debugging
+-- option force usage of at least single worker (normally no one is needed here
+-- and we don't expect more than one worker.
+CREATE TEMP TABLE test AS (SELECT x FROM generate_series(1,100) AS x);
+VACUUM ANALYZE test;
+
+SET max_parallel_workers_per_gather = 1;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET debug_parallel_query = 'on';
+
+-- Temp buffers will not be seen without flushing dirty buffers
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM test;
+
+-- Check temporary indexes too
+CREATE INDEX idx1 ON test(x);
+SET enable_seqscan = 'off';
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT * FROM test;
+
+RESET enable_seqscan;
+
+-- a view doesn't have a storage - it shouldn't cause issues.
+CREATE TEMP TABLE table_a (id integer);
+CREATE TEMP VIEW view_a AS SELECT * FROM table_a;
+SELECT view_a FROM view_a;
+
+RESET debug_parallel_query;
+RESET min_parallel_index_scan_size;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
