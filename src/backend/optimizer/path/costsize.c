@@ -164,6 +164,8 @@ bool		enable_partition_pruning = true;
 bool		enable_presorted_aggregate = true;
 bool		enable_async_append = true;
 
+bool extended_parallel_processing = true;
+
 typedef struct
 {
 	PlannerInfo *root;
