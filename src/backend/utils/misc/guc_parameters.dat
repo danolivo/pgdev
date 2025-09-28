@@ -981,6 +981,13 @@
   boot_val => 'true',
 },
 
+{ name => 'enable_parallel_temp_scan', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Enables the planner\'s use of parallel scans of temporary relations.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'enable_parallel_temp_scan',
+  boot_val => 'true',
+},
+
 { name => 'enable_partition_pruning', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
   short_desc => 'Enables plan-time and execution-time partition pruning.',
   long_desc => 'Allows the query planner and executor to compare partition bounds to conditions in the query to determine which partitions must be scanned.',

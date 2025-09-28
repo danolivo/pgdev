@@ -1035,6 +1035,7 @@ create_seqscan_path(PlannerInfo *root, RelOptInfo *rel,
 													 required_outer);
 	pathnode->parallel_aware = (parallel_workers > 0);
 	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->needs_temp_flush = rel->needs_temp_safety;
 	pathnode->parallel_workers = parallel_workers;
 	pathnode->pathkeys = NIL;	/* seqscan has unordered result */
 
@@ -1059,6 +1060,7 @@ create_samplescan_path(PlannerInfo *root, RelOptInfo *rel, Relids required_outer
 													 required_outer);
 	pathnode->parallel_aware = false;
 	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->needs_temp_flush = rel->needs_temp_safety;
 	pathnode->parallel_workers = 0;
 	pathnode->pathkeys = NIL;	/* samplescan has unordered result */
 
@@ -1111,6 +1113,7 @@ create_index_path(PlannerInfo *root,
 														  required_outer);
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety;
 	pathnode->path.parallel_workers = 0;
 	pathnode->path.pathkeys = pathkeys;
 
@@ -1162,6 +1165,7 @@ create_bitmap_heap_path(PlannerInfo *root,
 														  required_outer);
 	pathnode->path.parallel_aware = (parallel_degree > 0);
 	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety;
 	pathnode->path.parallel_workers = parallel_degree;
 	pathnode->path.pathkeys = NIL;	/* always unordered */
 
@@ -1214,6 +1218,7 @@ create_bitmap_and_path(PlannerInfo *root,
 	 */
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety;
 	pathnode->path.parallel_workers = 0;
 
 	pathnode->path.pathkeys = NIL;	/* always unordered */
@@ -1266,6 +1271,7 @@ create_bitmap_or_path(PlannerInfo *root,
 	 */
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety;
 	pathnode->path.parallel_workers = 0;
 
 	pathnode->path.pathkeys = NIL;	/* always unordered */
@@ -1295,6 +1301,7 @@ create_tidscan_path(PlannerInfo *root, RelOptInfo *rel, List *tidquals,
 														  required_outer);
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety;
 	pathnode->path.parallel_workers = 0;
 	pathnode->path.pathkeys = NIL;	/* always unordered */
 
@@ -1325,6 +1332,7 @@ create_tidrangescan_path(PlannerInfo *root, RelOptInfo *rel,
 														  required_outer);
 	pathnode->path.parallel_aware = (parallel_workers > 0);
 	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety;
 	pathnode->path.parallel_workers = parallel_workers;
 	pathnode->path.pathkeys = NIL;	/* always unordered */
 
@@ -1389,6 +1397,7 @@ create_append_path(PlannerInfo *root,
 
 	pathnode->path.parallel_aware = parallel_aware;
 	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety;
 	pathnode->path.parallel_workers = parallel_workers;
 	pathnode->path.pathkeys = pathkeys;
 
@@ -1431,6 +1440,7 @@ create_append_path(PlannerInfo *root,
 
 		pathnode->path.parallel_safe = pathnode->path.parallel_safe &&
 			subpath->parallel_safe;
+		pathnode->path.needs_temp_flush |= subpath->needs_temp_flush;
 
 		/* All child paths must have same parameterization */
 		Assert(bms_equal(PATH_REQ_OUTER(subpath), required_outer));
@@ -1550,6 +1560,7 @@ create_merge_append_path(PlannerInfo *root,
 	pathnode->path.param_info = NULL;
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety;
 	pathnode->path.parallel_workers = 0;
 	pathnode->path.pathkeys = pathkeys;
 	pathnode->subpaths = subpaths;
@@ -1583,6 +1594,7 @@ create_merge_append_path(PlannerInfo *root,
 		pathnode->path.rows += subpath->rows;
 		pathnode->path.parallel_safe = pathnode->path.parallel_safe &&
 			subpath->parallel_safe;
+		pathnode->path.needs_temp_flush |= subpath->needs_temp_flush;
 
 		if (!pathkeys_count_contained_in(pathkeys, subpath->pathkeys,
 										 &presorted_keys))
@@ -1676,6 +1688,7 @@ create_group_result_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->path.param_info = NULL;	/* there are no other rels... */
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety;
 	pathnode->path.parallel_workers = 0;
 	pathnode->path.pathkeys = NIL;
 	pathnode->quals = havingqual;
@@ -1726,6 +1739,8 @@ create_material_path(RelOptInfo *rel, Path *subpath, bool enabled)
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety ||
+		subpath->needs_temp_flush;
 	pathnode->path.parallel_workers = subpath->parallel_workers;
 	pathnode->path.pathkeys = subpath->pathkeys;
 
@@ -1762,6 +1777,8 @@ create_memoize_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety ||
+		subpath->needs_temp_flush;
 	pathnode->path.parallel_workers = subpath->parallel_workers;
 	pathnode->path.pathkeys = subpath->pathkeys;
 
@@ -1924,6 +1941,8 @@ create_subqueryscan_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety ||
+		subpath->needs_temp_flush;
 	pathnode->path.parallel_workers = subpath->parallel_workers;
 	pathnode->path.pathkeys = pathkeys;
 	pathnode->subpath = subpath;
@@ -1952,6 +1971,7 @@ create_functionscan_path(PlannerInfo *root, RelOptInfo *rel,
 													 required_outer);
 	pathnode->parallel_aware = false;
 	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->needs_temp_flush = rel->needs_temp_safety;
 	pathnode->parallel_workers = 0;
 	pathnode->pathkeys = pathkeys;
 
@@ -1978,6 +1998,7 @@ create_tablefuncscan_path(PlannerInfo *root, RelOptInfo *rel,
 													 required_outer);
 	pathnode->parallel_aware = false;
 	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->needs_temp_flush = rel->needs_temp_safety;
 	pathnode->parallel_workers = 0;
 	pathnode->pathkeys = NIL;	/* result is always unordered */
 
@@ -2004,6 +2025,7 @@ create_valuesscan_path(PlannerInfo *root, RelOptInfo *rel,
 													 required_outer);
 	pathnode->parallel_aware = false;
 	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->needs_temp_flush = rel->needs_temp_safety;
 	pathnode->parallel_workers = 0;
 	pathnode->pathkeys = NIL;	/* result is always unordered */
 
@@ -2030,6 +2052,7 @@ create_ctescan_path(PlannerInfo *root, RelOptInfo *rel,
 													 required_outer);
 	pathnode->parallel_aware = false;
 	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->needs_temp_flush = rel->needs_temp_safety;
 	pathnode->parallel_workers = 0;
 	pathnode->pathkeys = pathkeys;
 
@@ -2056,6 +2079,7 @@ create_namedtuplestorescan_path(PlannerInfo *root, RelOptInfo *rel,
 													 required_outer);
 	pathnode->parallel_aware = false;
 	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->needs_temp_flush = rel->needs_temp_safety;
 	pathnode->parallel_workers = 0;
 	pathnode->pathkeys = NIL;	/* result is always unordered */
 
@@ -2082,6 +2106,7 @@ create_resultscan_path(PlannerInfo *root, RelOptInfo *rel,
 													 required_outer);
 	pathnode->parallel_aware = false;
 	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->needs_temp_flush = rel->needs_temp_safety;
 	pathnode->parallel_workers = 0;
 	pathnode->pathkeys = NIL;	/* result is always unordered */
 
@@ -2108,6 +2133,7 @@ create_worktablescan_path(PlannerInfo *root, RelOptInfo *rel,
 													 required_outer);
 	pathnode->parallel_aware = false;
 	pathnode->parallel_safe = rel->consider_parallel;
+	pathnode->needs_temp_flush = rel->needs_temp_safety;
 	pathnode->parallel_workers = 0;
 	pathnode->pathkeys = NIL;	/* result is always unordered */
 
@@ -2151,6 +2177,7 @@ create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
 														  required_outer);
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety;
 	pathnode->path.parallel_workers = 0;
 	pathnode->path.rows = rows;
 	pathnode->path.disabled_nodes = disabled_nodes;
@@ -2205,6 +2232,7 @@ create_foreign_join_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->path.param_info = NULL;	/* XXX see above */
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety;
 	pathnode->path.parallel_workers = 0;
 	pathnode->path.rows = rows;
 	pathnode->path.disabled_nodes = disabled_nodes;
@@ -2254,6 +2282,7 @@ create_foreign_upper_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->path.param_info = NULL;
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety;
 	pathnode->path.parallel_workers = 0;
 	pathnode->path.rows = rows;
 	pathnode->path.disabled_nodes = disabled_nodes;
@@ -2419,6 +2448,8 @@ create_nestloop_path(PlannerInfo *root,
 	pathnode->jpath.path.parallel_aware = false;
 	pathnode->jpath.path.parallel_safe = joinrel->consider_parallel &&
 		outer_path->parallel_safe && inner_path->parallel_safe;
+	pathnode->jpath.path.needs_temp_flush = joinrel->needs_temp_safety ||
+		outer_path->needs_temp_flush || inner_path->needs_temp_flush;
 	/* This is a foolish way to estimate parallel_workers, but for now... */
 	pathnode->jpath.path.parallel_workers = outer_path->parallel_workers;
 	pathnode->jpath.path.pathkeys = pathkeys;
@@ -2485,6 +2516,8 @@ create_mergejoin_path(PlannerInfo *root,
 	pathnode->jpath.path.parallel_aware = false;
 	pathnode->jpath.path.parallel_safe = joinrel->consider_parallel &&
 		outer_path->parallel_safe && inner_path->parallel_safe;
+	pathnode->jpath.path.needs_temp_flush = joinrel->needs_temp_safety ||
+		outer_path->needs_temp_flush || inner_path->needs_temp_flush;
 	/* This is a foolish way to estimate parallel_workers, but for now... */
 	pathnode->jpath.path.parallel_workers = outer_path->parallel_workers;
 	pathnode->jpath.path.pathkeys = pathkeys;
@@ -2551,6 +2584,8 @@ create_hashjoin_path(PlannerInfo *root,
 		joinrel->consider_parallel && parallel_hash;
 	pathnode->jpath.path.parallel_safe = joinrel->consider_parallel &&
 		outer_path->parallel_safe && inner_path->parallel_safe;
+	pathnode->jpath.path.needs_temp_flush = joinrel->needs_temp_safety ||
+		outer_path->needs_temp_flush || inner_path->needs_temp_flush;
 	/* This is a foolish way to estimate parallel_workers, but for now... */
 	pathnode->jpath.path.parallel_workers = outer_path->parallel_workers;
 
@@ -2617,9 +2652,12 @@ create_projection_path(PlannerInfo *root,
 	pathnode->path.pathtarget = target;
 	pathnode->path.param_info = get_wrapper_parampathinfo(subpath);
 	pathnode->path.parallel_aware = false;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety ||
+		subpath->needs_temp_flush;
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe &&
-		is_parallel_safe(root, (Node *) target->exprs);
+		is_parallel_safe(root, (Node *) target->exprs,
+						 &pathnode->path.needs_temp_flush);
 	pathnode->path.parallel_workers = subpath->parallel_workers;
 	/* Projection does not change the sort order */
 	pathnode->path.pathkeys = subpath->pathkeys;
@@ -2729,7 +2767,7 @@ apply_projection_to_path(PlannerInfo *root,
 	 * parallel-safe in the target expressions, then we can't.
 	 */
 	if ((IsA(path, GatherPath) || IsA(path, GatherMergePath)) &&
-		is_parallel_safe(root, (Node *) target->exprs))
+		is_parallel_safe(root, (Node *) target->exprs, NULL))
 	{
 		/*
 		 * We always use create_projection_path here, even if the subpath is
@@ -2763,7 +2801,7 @@ apply_projection_to_path(PlannerInfo *root,
 		}
 	}
 	else if (path->parallel_safe &&
-			 !is_parallel_safe(root, (Node *) target->exprs))
+			 !is_parallel_safe(root, (Node *) target->exprs, NULL))
 	{
 		/*
 		 * We're inserting a parallel-restricted target list into a path
@@ -2801,9 +2839,12 @@ create_set_projection_path(PlannerInfo *root,
 	/* For now, assume we are above any joins, so no parameterization */
 	pathnode->path.param_info = NULL;
 	pathnode->path.parallel_aware = false;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety ||
+		subpath->needs_temp_flush;
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe &&
-		is_parallel_safe(root, (Node *) target->exprs);
+		is_parallel_safe(root, (Node *) target->exprs,
+						 &pathnode->path.needs_temp_flush);
 	pathnode->path.parallel_workers = subpath->parallel_workers;
 	/* Projection does not change the sort order XXX? */
 	pathnode->path.pathkeys = subpath->pathkeys;
@@ -2874,6 +2915,8 @@ create_incremental_sort_path(PlannerInfo *root,
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety ||
+		subpath->needs_temp_flush;
 	pathnode->path.parallel_workers = subpath->parallel_workers;
 	pathnode->path.pathkeys = pathkeys;
 
@@ -2922,6 +2965,8 @@ create_sort_path(PlannerInfo *root,
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety ||
+		subpath->needs_temp_flush;
 	pathnode->path.parallel_workers = subpath->parallel_workers;
 	pathnode->path.pathkeys = pathkeys;
 
@@ -2968,6 +3013,8 @@ create_group_path(PlannerInfo *root,
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety ||
+		subpath->needs_temp_flush;
 	pathnode->path.parallel_workers = subpath->parallel_workers;
 	/* Group doesn't change sort ordering */
 	pathnode->path.pathkeys = subpath->pathkeys;
@@ -3023,6 +3070,8 @@ create_unique_path(PlannerInfo *root,
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety ||
+		subpath->needs_temp_flush;
 	pathnode->path.parallel_workers = subpath->parallel_workers;
 	/* Unique doesn't change the input ordering */
 	pathnode->path.pathkeys = subpath->pathkeys;
@@ -3089,6 +3138,8 @@ create_agg_path(PlannerInfo *root,
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety ||
+		subpath->needs_temp_flush;
 	pathnode->path.parallel_workers = subpath->parallel_workers;
 
 	if (aggstrategy == AGG_SORTED)
@@ -3173,6 +3224,8 @@ create_groupingsets_path(PlannerInfo *root,
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety ||
+		subpath->needs_temp_flush;
 	pathnode->path.parallel_workers = subpath->parallel_workers;
 	pathnode->subpath = subpath;
 
@@ -3351,6 +3404,7 @@ create_minmaxagg_path(PlannerInfo *root,
 		initplan_cost += mminfo->pathcost;
 		if (!mminfo->path->parallel_safe)
 			pathnode->path.parallel_safe = false;
+		pathnode->path.needs_temp_flush |= mminfo->path->needs_temp_flush;
 	}
 
 	/* add tlist eval cost for each output row, plus cpu_tuple_cost */
@@ -3380,8 +3434,10 @@ create_minmaxagg_path(PlannerInfo *root,
 	 */
 	if (pathnode->path.parallel_safe)
 		pathnode->path.parallel_safe =
-			is_parallel_safe(root, (Node *) target->exprs) &&
-			is_parallel_safe(root, (Node *) quals);
+			is_parallel_safe(root, (Node *) target->exprs,
+							 &pathnode->path.needs_temp_flush) &&
+			is_parallel_safe(root, (Node *) quals,
+							 &pathnode->path.needs_temp_flush);
 
 	return pathnode;
 }
@@ -3428,6 +3484,8 @@ create_windowagg_path(PlannerInfo *root,
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety ||
+		subpath->needs_temp_flush;
 	pathnode->path.parallel_workers = subpath->parallel_workers;
 	/* WindowAgg preserves the input sort order */
 	pathnode->path.pathkeys = subpath->pathkeys;
@@ -3498,6 +3556,8 @@ create_setop_path(PlannerInfo *root,
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		leftpath->parallel_safe && rightpath->parallel_safe;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety ||
+		leftpath->needs_temp_flush || rightpath->needs_temp_flush;
 	pathnode->path.parallel_workers =
 		leftpath->parallel_workers + rightpath->parallel_workers;
 	/* SetOp preserves the input sort order if in sort mode */
@@ -3626,6 +3686,8 @@ create_recursiveunion_path(PlannerInfo *root,
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		leftpath->parallel_safe && rightpath->parallel_safe;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety ||
+		leftpath->needs_temp_flush || rightpath->needs_temp_flush;
 	/* Foolish, but we'll do it like joins for now: */
 	pathnode->path.parallel_workers = leftpath->parallel_workers;
 	/* RecursiveUnion result is always unsorted */
@@ -3831,6 +3893,8 @@ create_limit_path(PlannerInfo *root, RelOptInfo *rel,
 	pathnode->path.parallel_aware = false;
 	pathnode->path.parallel_safe = rel->consider_parallel &&
 		subpath->parallel_safe;
+	pathnode->path.needs_temp_flush = rel->needs_temp_safety ||
+		subpath->needs_temp_flush;
 	pathnode->path.parallel_workers = subpath->parallel_workers;
 	pathnode->path.rows = subpath->rows;
 	pathnode->path.disabled_nodes = subpath->disabled_nodes;

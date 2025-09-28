@@ -1520,7 +1520,8 @@ postgresGetForeignPlan(PlannerInfo *root,
 			 * a Result node atop the plan tree.
 			 */
 			outer_plan = change_plan_targetlist(outer_plan, fdw_scan_tlist,
-												best_path->path.parallel_safe);
+												best_path->path.parallel_safe,
+												best_path->path.needs_temp_flush);
 		}
 	}
 

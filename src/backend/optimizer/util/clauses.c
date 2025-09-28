@@ -98,6 +98,7 @@ typedef struct
 	char		max_hazard;		/* worst proparallel hazard found so far */
 	char		max_interesting;	/* worst proparallel hazard of interest */
 	List	   *safe_param_ids; /* PARAM_EXEC Param IDs to treat as safe */
+	bool		hasTempObject;
 } max_parallel_hazard_context;
 
 /*
@@ -816,6 +817,7 @@ max_parallel_hazard(Query *parse)
 	context.max_hazard = PROPARALLEL_SAFE;
 	context.max_interesting = PROPARALLEL_UNSAFE;
 	context.safe_param_ids = NIL;
+	context.hasTempObject = false;
 	(void) max_parallel_hazard_walker((Node *) parse, &context);
 	return context.max_hazard;
 }
@@ -826,13 +828,17 @@ max_parallel_hazard(Query *parse)
  *
  * root->glob->maxParallelHazard must previously have been set to the
  * result of max_parallel_hazard() on the whole query.
+ *
+ * Expression may contain a reference to subplan that employs temporary
+ * relations. That's why the flag needs_temp_flush is introduced.
  */
 bool
-is_parallel_safe(PlannerInfo *root, Node *node)
+is_parallel_safe(PlannerInfo *root, Node *node, bool *needs_temp_flush)
 {
 	max_parallel_hazard_context context;
 	PlannerInfo *proot;
 	ListCell   *l;
+	bool		is_safe;
 
 	/*
 	 * Even if the original querytree contained nothing unsafe, we need to
@@ -847,6 +853,7 @@ is_parallel_safe(PlannerInfo *root, Node *node)
 	context.max_hazard = PROPARALLEL_SAFE;
 	context.max_interesting = PROPARALLEL_RESTRICTED;
 	context.safe_param_ids = NIL;
+	context.hasTempObject = false;
 
 	/*
 	 * The params that refer to the same or parent query level are considered
@@ -864,7 +871,18 @@ is_parallel_safe(PlannerInfo *root, Node *node)
 		}
 	}
 
-	return !max_parallel_hazard_walker(node, &context);
+	is_safe = !max_parallel_hazard_walker(node, &context);
+
+	/*
+	 * If the expression is parallel-safe, detect whether it needs temp buffers
+	 * to be flushed before the execution starts.  Don't bother if the
+	 * expression is unsafe - it can't be executed by parallel workers anyway.
+	 * Some callers are interested only in the safety verdict; they pass NULL.
+	 */
+	if (needs_temp_flush && is_safe && context.hasTempObject)
+		*needs_temp_flush = true;
+
+	return is_safe;
 }
 
 /* core logic for all parallel-hazard checks */
@@ -986,6 +1004,7 @@ max_parallel_hazard_walker(Node *node, max_parallel_hazard_context *context)
 			max_parallel_hazard_test(PROPARALLEL_RESTRICTED, context))
 			return true;
 		save_safe_param_ids = context->safe_param_ids;
+		context->hasTempObject |= subplan->needs_temp_flush;
 		context->safe_param_ids = list_concat_copy(context->safe_param_ids,
 												   subplan->paramIds);
 		if (max_parallel_hazard_walker(subplan->testexpr, context))

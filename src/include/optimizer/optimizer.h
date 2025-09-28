@@ -80,6 +80,8 @@ extern PGDLLIMPORT double parallel_setup_cost;
 extern PGDLLIMPORT double recursive_worktable_factor;
 extern PGDLLIMPORT int effective_cache_size;
 
+extern PGDLLIMPORT bool enable_parallel_temp_scan;
+
 extern double clamp_row_est(double nrows);
 extern int32 clamp_width_est(int64 tuple_width);
 

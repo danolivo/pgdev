@@ -355,6 +355,7 @@ build_subplan(PlannerInfo *root, Plan *plan, Path *path,
 	splan->useHashTable = false;
 	splan->unknownEqFalse = unknownEqFalse;
 	splan->parallel_safe = plan->parallel_safe;
+	splan->needs_temp_flush = plan->needs_temp_flush;
 	splan->setParam = NIL;
 	splan->parParam = NIL;
 	splan->args = NIL;
@@ -3404,6 +3405,7 @@ SS_make_initplan_from_plan(PlannerInfo *root,
 	get_first_col_type(plan, &node->firstColType, &node->firstColTypmod,
 					   &node->firstColCollation);
 	node->parallel_safe = plan->parallel_safe;
+	node->needs_temp_flush = plan->needs_temp_flush;
 	node->setParam = list_make1_int(prm->paramid);
 
 	root->init_plans = lappend(root->init_plans, node);

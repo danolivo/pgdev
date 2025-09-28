@@ -219,6 +219,8 @@ typedef struct Plan
 	bool		parallel_aware;
 	/* OK to use as part of parallel plan? */
 	bool		parallel_safe;
+	/* if parallel-safe, must temp buffers be flushed before workers start? */
+	bool		needs_temp_flush;
 
 	/*
 	 * information needed for asynchronous execution
@@ -1366,6 +1368,8 @@ typedef struct Gather
 	bool		single_copy;
 	/* suppress EXPLAIN display (for testing)? */
 	bool		invisible;
+	/* flush temp buffers before launching workers? */
+	bool		process_temp_tables;
 
 	/*
 	 * param id's of initplans which are referred at gather or one of its
@@ -1387,6 +1391,9 @@ typedef struct GatherMerge
 
 	/* ID of Param that signals a rescan, or -1 */
 	int			rescan_param;
+
+	/* flush temp buffers before launching workers? */
+	bool		process_temp_tables;
 
 	/* remaining fields are just like the sort-key info in struct Sort */
 
