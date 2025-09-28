@@ -99,7 +99,8 @@ static Plan *create_projection_plan(PlannerInfo *root,
 									ProjectionPath *best_path,
 									int flags);
 static Plan *inject_projection_plan(Plan *subplan, List *tlist,
-									bool parallel_safe);
+									bool parallel_safe,
+									bool needs_temp_flush);
 static Sort *create_sort_plan(PlannerInfo *root, SortPath *best_path, int flags);
 static IncrementalSort *create_incrementalsort_plan(PlannerInfo *root,
 													IncrementalSortPath *best_path, int flags);
@@ -1071,6 +1072,7 @@ create_gating_plan(PlannerInfo *root, Path *path, Plan *plan,
 
 	/* Gating quals could be unsafe, so better use the Path's safety flag */
 	gplan->plan.parallel_safe = path->parallel_safe;
+	gplan->plan.needs_temp_flush = path->needs_temp_flush;
 
 	return &gplan->plan;
 }
@@ -1449,7 +1451,8 @@ create_append_plan(PlannerInfo *root, AppendPath *best_path, int flags)
 	{
 		tlist = list_copy_head(plan->plan.targetlist, orig_tlist_length);
 		return inject_projection_plan((Plan *) plan, tlist,
-									  plan->plan.parallel_safe);
+									  plan->plan.parallel_safe,
+									  plan->plan.needs_temp_flush);
 	}
 	else
 		return (Plan *) plan;
@@ -1626,7 +1629,8 @@ create_merge_append_plan(PlannerInfo *root, MergeAppendPath *best_path,
 	if (tlist_was_changed && (flags & (CP_EXACT_TLIST | CP_SMALL_TLIST)))
 	{
 		tlist = list_copy_head(plan->targetlist, orig_tlist_length);
-		return inject_projection_plan(plan, tlist, plan->parallel_safe);
+		return inject_projection_plan(plan, tlist, plan->parallel_safe,
+									  plan->needs_temp_flush);
 	}
 	else
 		return plan;
@@ -1944,6 +1948,7 @@ create_projection_plan(PlannerInfo *root, ProjectionPath *best_path, int flags)
 		plan->plan_rows = best_path->path.rows;
 		plan->plan_width = best_path->path.pathtarget->width;
 		plan->parallel_safe = best_path->path.parallel_safe;
+		plan->needs_temp_flush = best_path->path.needs_temp_flush;
 		/* ... but don't change subplan's parallel_aware flag */
 	}
 	else
@@ -1964,11 +1969,13 @@ create_projection_plan(PlannerInfo *root, ProjectionPath *best_path, int flags)
  * projection step as part of the tree generated for some Path node.
  * We should try to get rid of this in favor of doing it more honestly.
  *
- * One reason it's ugly is we have to be told the right parallel_safe marking
- * to apply (since the tlist might be unsafe even if the child plan is safe).
+ * One reason it's ugly is we have to be told the right parallel_safe and
+ * needs_temp_flush markings to apply (since the tlist might be unsafe even if
+ * the child plan is safe).
  */
 static Plan *
-inject_projection_plan(Plan *subplan, List *tlist, bool parallel_safe)
+inject_projection_plan(Plan *subplan, List *tlist, bool parallel_safe,
+					   bool needs_temp_flush)
 {
 	Plan	   *plan;
 
@@ -1983,6 +1990,7 @@ inject_projection_plan(Plan *subplan, List *tlist, bool parallel_safe)
 	 */
 	copy_plan_costsize(plan, subplan);
 	plan->parallel_safe = parallel_safe;
+	plan->needs_temp_flush = needs_temp_flush;
 
 	return plan;
 }
@@ -1996,11 +2004,13 @@ inject_projection_plan(Plan *subplan, List *tlist, bool parallel_safe)
  * a Result node is needed to compute the new tlist, but we can optimize
  * some cases.
  *
- * In most cases, tlist_parallel_safe can just be passed as the parallel_safe
- * flag of the FDW's own Path node.
+ * In most cases, tlist_parallel_safe and tlist_needs_temp_flush can just be
+ * passed as the parallel_safe and needs_temp_flush flags of the FDW's own Path
+ * node.
  */
 Plan *
-change_plan_targetlist(Plan *subplan, List *tlist, bool tlist_parallel_safe)
+change_plan_targetlist(Plan *subplan, List *tlist, bool tlist_parallel_safe,
+					   bool tlist_needs_temp_flush)
 {
 	/*
 	 * If the top plan node can't do projections and its existing target list
@@ -2011,12 +2021,15 @@ change_plan_targetlist(Plan *subplan, List *tlist, bool tlist_parallel_safe)
 		!tlist_same_exprs(tlist, subplan->targetlist))
 		subplan = inject_projection_plan(subplan, tlist,
 										 subplan->parallel_safe &&
-										 tlist_parallel_safe);
+										 tlist_parallel_safe,
+										 subplan->needs_temp_flush ||
+										 tlist_needs_temp_flush);
 	else
 	{
 		/* Else we can just replace the plan node's tlist */
 		subplan->targetlist = tlist;
 		subplan->parallel_safe &= tlist_parallel_safe;
+		subplan->needs_temp_flush |= tlist_needs_temp_flush;
 	}
 	return subplan;
 }
@@ -2443,6 +2456,7 @@ create_minmaxagg_plan(PlannerInfo *root, MinMaxAggPath *best_path)
 		sqplan->plan_width = mminfo->path->pathtarget->width;
 		sqplan->parallel_aware = false;
 		sqplan->parallel_safe = mminfo->path->parallel_safe;
+		sqplan->needs_temp_flush = mminfo->path->needs_temp_flush;
 
 		/* Convert the plan into an InitPlan in the outer query. */
 		SS_make_initplan_from_plan(root, subroot, sqplan, mminfo->param);
@@ -3223,6 +3237,7 @@ create_bitmap_subplan(PlannerInfo *root, Path *bitmapqual,
 		plan->plan_width = 0;	/* meaningless */
 		plan->parallel_aware = false;
 		plan->parallel_safe = apath->path.parallel_safe;
+		plan->needs_temp_flush = apath->path.needs_temp_flush;
 		*qual = subquals;
 		*indexqual = subindexquals;
 		*indexECs = subindexECs;
@@ -3287,6 +3302,7 @@ create_bitmap_subplan(PlannerInfo *root, Path *bitmapqual,
 			plan->plan_width = 0;	/* meaningless */
 			plan->parallel_aware = false;
 			plan->parallel_safe = opath->path.parallel_safe;
+			plan->needs_temp_flush = opath->path.needs_temp_flush;
 		}
 
 		/*
@@ -3334,6 +3350,7 @@ create_bitmap_subplan(PlannerInfo *root, Path *bitmapqual,
 		plan->plan_width = 0;	/* meaningless */
 		plan->parallel_aware = false;
 		plan->parallel_safe = ipath->path.parallel_safe;
+		plan->needs_temp_flush = ipath->path.needs_temp_flush;
 		/* Extract original index clauses, actual index quals, relevant ECs */
 		subquals = NIL;
 		subindexquals = NIL;
@@ -4211,6 +4228,7 @@ create_nestloop_plan(PlannerInfo *root,
 	List	   *nestParams;
 	List	   *outer_tlist;
 	bool		outer_parallel_safe;
+	bool		outer_needs_temp_flush;
 	Relids		saveOuterRels = root->curOuterRels;
 	ListCell   *lc;
 
@@ -4324,6 +4342,7 @@ create_nestloop_plan(PlannerInfo *root,
 	 */
 	outer_tlist = outer_plan->targetlist;
 	outer_parallel_safe = outer_plan->parallel_safe;
+	outer_needs_temp_flush = outer_plan->needs_temp_flush;
 	foreach(lc, nestParams)
 	{
 		NestLoopParam *nlp = (NestLoopParam *) lfirst(lc);
@@ -4360,11 +4379,13 @@ create_nestloop_plan(PlannerInfo *root,
 		outer_tlist = lappend(outer_tlist, tle);
 		/* ... and track whether tlist is (still) parallel-safe */
 		if (outer_parallel_safe)
-			outer_parallel_safe = is_parallel_safe(root, (Node *) phv);
+			outer_parallel_safe = is_parallel_safe(root, (Node *) phv,
+												   &outer_needs_temp_flush);
 	}
 	if (outer_tlist != outer_plan->targetlist)
 		outer_plan = change_plan_targetlist(outer_plan, outer_tlist,
-											outer_parallel_safe);
+											outer_parallel_safe,
+											outer_needs_temp_flush);
 
 	/* And finally, we can build the join plan node */
 	join_plan = make_nestloop(tlist,
@@ -5427,6 +5448,7 @@ copy_generic_path_info(Plan *dest, Path *src)
 	dest->plan_width = src->pathtarget->width;
 	dest->parallel_aware = src->parallel_aware;
 	dest->parallel_safe = src->parallel_safe;
+	dest->needs_temp_flush = src->needs_temp_flush;
 }
 
 /*
@@ -5445,6 +5467,7 @@ copy_plan_costsize(Plan *dest, Plan *src)
 	dest->parallel_aware = false;
 	/* Assume the inserted node is parallel-safe, if child plan is. */
 	dest->parallel_safe = src->parallel_safe;
+	dest->needs_temp_flush = src->needs_temp_flush;
 }
 
 /*
@@ -5478,6 +5501,7 @@ label_sort_with_costsize(PlannerInfo *root, Sort *plan, double limit_tuples)
 	plan->plan.plan_width = lefttree->plan_width;
 	plan->plan.parallel_aware = false;
 	plan->plan.parallel_safe = lefttree->parallel_safe;
+	plan->plan.needs_temp_flush = lefttree->needs_temp_flush;
 }
 
 /*
@@ -5510,6 +5534,7 @@ label_incrementalsort_with_costsize(PlannerInfo *root, IncrementalSort *plan,
 	plan->sort.plan.plan_width = lefttree->plan_width;
 	plan->sort.plan.parallel_aware = false;
 	plan->sort.plan.parallel_safe = lefttree->parallel_safe;
+	plan->sort.plan.needs_temp_flush = lefttree->needs_temp_flush;
 }
 
 /*
@@ -6340,7 +6365,8 @@ prepare_sort_from_pathkeys(PlannerInfo *root, Plan *lefttree, List *pathkeys,
 				/* copy needed so we don't modify input's tlist below */
 				tlist = copyObject(tlist);
 				lefttree = inject_projection_plan(lefttree, tlist,
-												  lefttree->parallel_safe);
+												  lefttree->parallel_safe,
+												  lefttree->needs_temp_flush);
 			}
 
 			/* Don't bother testing is_projection_capable_plan again */
@@ -6623,6 +6649,7 @@ materialize_finished_plan(Plan *subplan)
 	matplan->plan_width = subplan->plan_width;
 	matplan->parallel_aware = false;
 	matplan->parallel_safe = subplan->parallel_safe;
+	matplan->needs_temp_flush = subplan->needs_temp_flush;
 
 	return matplan;
 }
