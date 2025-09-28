@@ -69,6 +69,12 @@ static bool pathlist_is_reparameterizable_by_child(List *pathlist,
 int
 compare_path_costs(Path *path1, Path *path2, CostSelector criterion)
 {
+	Cost startup_cost1 = path1->startup_cost;
+	Cost startup_cost2 = path2->startup_cost;
+	Cost total_cost1 = path1->total_cost;
+	Cost total_cost2 = path2->total_cost;
+	Cost extra_cost = tempbuf_flush_extra_cost();
+
 	/* Number of disabled nodes, if different, trumps all else. */
 	if (unlikely(path1->disabled_nodes != path2->disabled_nodes))
 	{
@@ -78,35 +84,50 @@ compare_path_costs(Path *path1, Path *path2, CostSelector criterion)
 			return +1;
 	}
 
+	/*
+	 * Add an extra cost of temporary buffers flushing fofr the time
+	 * of comparison only.
+	 */
+	if (path1->parallel_safe == NEEDS_TEMP_FLUSH)
+	{
+		startup_cost1 += extra_cost;
+		total_cost1 += extra_cost;
+	}
+	if (path2->parallel_safe == NEEDS_TEMP_FLUSH)
+	{
+		startup_cost2 += extra_cost;
+		total_cost2 += extra_cost;
+	}
+
 	if (criterion == STARTUP_COST)
 	{
-		if (path1->startup_cost < path2->startup_cost)
+		if (startup_cost1 < startup_cost2)
 			return -1;
-		if (path1->startup_cost > path2->startup_cost)
+		if (startup_cost1 > startup_cost2)
 			return +1;
 
 		/*
 		 * If paths have the same startup cost (not at all unlikely), order
 		 * them by total cost.
 		 */
-		if (path1->total_cost < path2->total_cost)
+		if (total_cost1 < total_cost2)
 			return -1;
-		if (path1->total_cost > path2->total_cost)
+		if (total_cost1 > total_cost2)
 			return +1;
 	}
 	else
 	{
-		if (path1->total_cost < path2->total_cost)
+		if (total_cost1 < total_cost2)
 			return -1;
-		if (path1->total_cost > path2->total_cost)
+		if (total_cost1 > total_cost2)
 			return +1;
 
 		/*
 		 * If paths have the same total cost, order them by startup cost.
 		 */
-		if (path1->startup_cost < path2->startup_cost)
+		if (startup_cost1 < startup_cost2)
 			return -1;
-		if (path1->startup_cost > path2->startup_cost)
+		if (startup_cost1 > startup_cost2)
 			return +1;
 	}
 	return 0;
