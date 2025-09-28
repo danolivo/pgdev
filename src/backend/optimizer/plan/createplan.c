@@ -307,7 +307,8 @@ static Unique *make_unique_from_pathkeys(Plan *lefttree,
 										 List *pathkeys, int numCols,
 										 Relids relids);
 static Gather *make_gather(List *qptlist, List *qpqual,
-						   int nworkers, int rescan_param, bool single_copy, Plan *subplan);
+						   int nworkers, int rescan_param, bool single_copy,
+						   Plan *subplan, bool process_temp_tables);
 static SetOp *make_setop(SetOpCmd cmd, SetOpStrategy strategy,
 						 List *tlist, Plan *lefttree, Plan *righttree,
 						 List *groupList, Cardinality numGroups);
@@ -1789,12 +1790,14 @@ create_gather_plan(PlannerInfo *root, GatherPath *best_path)
 
 	tlist = build_path_tlist(root, &best_path->path);
 
+	Assert(best_path->subpath->parallel_safe > PARALLEL_UNSAFE);
 	gather_plan = make_gather(tlist,
 							  NIL,
 							  best_path->num_workers,
 							  assign_special_exec_param(root),
 							  best_path->single_copy,
-							  subplan);
+							  subplan,
+							  best_path->subpath->parallel_safe == NEEDS_TEMP_FLUSH);
 
 	copy_generic_path_info(&gather_plan->plan, &best_path->path);
 
@@ -1825,6 +1828,9 @@ create_gather_merge_plan(PlannerInfo *root, GatherMergePath *best_path)
 	gm_plan = makeNode(GatherMerge);
 	gm_plan->plan.targetlist = tlist;
 	gm_plan->num_workers = best_path->num_workers;
+	Assert(best_path->subpath->parallel_safe > PARALLEL_UNSAFE);
+	gm_plan->process_temp_tables =
+		(best_path->subpath->parallel_safe == NEEDS_TEMP_FLUSH);
 	copy_generic_path_info(&gm_plan->plan, &best_path->path);
 
 	/* Assign the rescan Param. */
@@ -6877,7 +6883,8 @@ make_gather(List *qptlist,
 			int nworkers,
 			int rescan_param,
 			bool single_copy,
-			Plan *subplan)
+			Plan *subplan,
+			bool process_temp_tables)
 {
 	Gather	   *node = makeNode(Gather);
 	Plan	   *plan = &node->plan;
@@ -6891,6 +6898,7 @@ make_gather(List *qptlist,
 	node->single_copy = single_copy;
 	node->invisible = false;
 	node->initParam = NULL;
+	node->process_temp_tables = process_temp_tables;
 
 	return node;
 }
