@@ -20,6 +20,7 @@
 #include "access/multixact.h"
 #include "access/transam.h"
 #include "access/visibilitymap.h"
+#include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "commands/vacuum.h"
@@ -293,6 +294,18 @@ heap_page_prune_opt(Relation relation, Buffer buffer, Buffer *vmbuffer,
 	 */
 	prune_xid = PageGetPruneXid(page);
 	if (!TransactionIdIsValid(prune_xid))
+		return;
+
+	/*
+	 * Opportunistic pruning dirties the buffer, which makes the page be
+	 * written back on eviction.  While a temporary relation is scanned inside
+	 * a parallel section, the leader and its workers each hold a private
+	 * local buffer pool over the same on-disk file, so such a write-back
+	 * would race with the other participants reading the file.  Pruning is
+	 * only an optimization, so just skip it in that case.  (Checked after
+	 * the prune_xid test above, which lets most pages out cheaply.)
+	 */
+	if (RelationUsesLocalBuffers(relation) && IsInParallelMode())
 		return;
 
 	/*

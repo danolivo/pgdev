@@ -17,6 +17,7 @@
 
 #include "access/parallel.h"
 #include "executor/instrument.h"
+#include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/aio.h"
 #include "storage/buf_internals.h"
@@ -129,6 +130,15 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 
 	InitBufferTag(&newTag, &smgr->smgr_rlocator.locator, forkNum, blockNum);
 
+	/*
+	 * A parallel worker reads a temporary relation from the on-disk file it
+	 * shares with the leader, so the leader must have flushed its dirty local
+	 * buffers before launching the workers.  The counter is inherited from
+	 * the leader at worker startup (see ParallelQueryMain), so a non-zero
+	 * value here means the planner failed to request the flush.
+	 */
+	Assert(!IsParallelWorker() || dirtied_localbufs == 0);
+
 	/* Initialize local buffers if first request in this session */
 	if (LocalBufHash == NULL)
 		InitLocalBuffers();
@@ -185,6 +195,17 @@ FlushLocalBuffer(BufferDesc *bufHdr, SMgrRelation reln)
 {
 	instr_time	io_start;
 	Page		localpage = (char *) LocalBufHdrGetBlock(bufHdr);
+
+	/*
+	 * A parallel worker must never write a local buffer back to disk: it
+	 * shares the on-disk file of the temporary relation with the leader and
+	 * the other workers, and the write would race with their reads.  The
+	 * leader itself may flush (see FlushAllLocalBuffers), hence the check is
+	 * on IsParallelWorker(), not IsInParallelMode().  MarkLocalBufferDirty()
+	 * should have already prevented a worker from getting here.
+	 */
+	if (IsParallelWorker())
+		elog(ERROR, "cannot write a local buffer in a parallel worker");
 
 	Assert(LocalRefCount[-BufferDescriptorGetBuffer(bufHdr) - 1] > 0);
 
@@ -514,6 +535,23 @@ MarkLocalBufferDirty(Buffer buffer)
 
 	Assert(LocalRefCount[bufid] > 0);
 
+	/*
+	 * A parallel worker must never dirty a local buffer.  Workers only read
+	 * temporary relations, through a private local buffer pool backed by the
+	 * on-disk file they share with the leader and the other workers; a dirty
+	 * buffer would be written back on eviction and race with their reads.
+	 *
+	 * The leader is deliberately not covered: it legitimately writes
+	 * temporary relations while in a parallel section (CREATE TABLE AS or
+	 * SELECT INTO a temp table, the transient heap of REFRESH MATERIALIZED
+	 * VIEW, etc.).  Those relations are never scanned by the workers.  The
+	 * leader's read-time dirtying of the scanned temp tables - hint bits and
+	 * opportunistic pruning - is suppressed in MarkBufferDirtyHint() and
+	 * heap_page_prune_opt() instead.
+	 */
+	if (IsParallelWorker())
+		elog(ERROR, "cannot dirty a local buffer in a parallel worker");
+
 	bufHdr = GetLocalBufferDescriptor(bufid);
 
 	buf_state = pg_atomic_read_u64(&bufHdr->state);
@@ -770,19 +808,6 @@ InitLocalBuffers(void)
 	int			nbufs = num_temp_buffers;
 	HASHCTL		info;
 	int			i;
-
-	/*
-	 * Parallel workers can't access data in temporary tables, because they
-	 * have no visibility into the local buffers of their leader.  This is a
-	 * convenient, low-cost place to provide a backstop check for that.  Note
-	 * that we don't wish to prevent a parallel worker from accessing catalog
-	 * metadata about a temp table, so checks at higher levels would be
-	 * inappropriate.
-	 */
-	if (IsParallelWorker())
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
-				 errmsg("cannot access temporary tables during a parallel operation")));
 
 	/* Allocate and zero buffer headers and auxiliary arrays */
 	LocalBufferDescriptors = (BufferDesc *) calloc(nbufs, sizeof(BufferDesc));
@@ -1059,4 +1084,47 @@ AtProcExit_LocalBuffers(void)
 	 * drop the temp rels.
 	 */
 	CheckForLocalBufferLeaks();
+}
+
+/*
+ * Flush each temporary buffer page to the disk.
+ *
+ * It is costly operation needed solely to let temporary tables, indexes and
+ * 'toasts' participate in a parallel query plan.
+ */
+void
+FlushAllLocalBuffers(void)
+{
+	int			i;
+
+	/*
+	 * Nothing to do if no local buffer is dirty.  This also avoids scanning
+	 * a possibly huge (temp_buffers) descriptor array for nothing.
+	 */
+	if (dirtied_localbufs == 0)
+		return;
+
+	for (i = 0; i < NLocBuffer && dirtied_localbufs > 0; i++)
+	{
+		BufferDesc *bufHdr = GetLocalBufferDescriptor(i);
+		uint64		buf_state;
+
+		if (LocalBufHdrGetBlock(bufHdr) == NULL)
+			continue;
+
+		buf_state = pg_atomic_read_u64(&bufHdr->state);
+
+		/* XXX only valid dirty pages need to be flushed? */
+		if ((buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
+		{
+			/* Each write is a syscall; let a cancel request interrupt us. */
+			CHECK_FOR_INTERRUPTS();
+
+			PinLocalBuffer(bufHdr, false);
+			FlushLocalBuffer(bufHdr, NULL);
+			UnpinLocalBuffer(BufferDescriptorGetBuffer(bufHdr));
+		}
+	}
+
+	Assert(dirtied_localbufs == 0);
 }

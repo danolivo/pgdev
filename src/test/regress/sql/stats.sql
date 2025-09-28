@@ -850,6 +850,9 @@ SELECT :io_sum_local_after_evictions > :io_sum_local_before_evictions,
        :io_sum_local_after_writes > :io_sum_local_before_writes,
        :io_sum_local_after_extends > :io_sum_local_before_extends;
 
+-- Dirty a local buffer again: if the scan above ran in parallel, all dirty
+-- local buffers were already flushed before the workers were launched.
+INSERT INTO test_io_local VALUES (0, repeat('a', 200));
 -- Change the tablespaces so that the temporary table is rewritten to other
 -- local buffers, exercising a different codepath than standard local buffer
 -- writes.
