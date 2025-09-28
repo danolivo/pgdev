@@ -188,6 +188,11 @@ extern PGDLLIMPORT char *BufferBlocks;
 
 /* in localbuf.c */
 extern PGDLLIMPORT int NLocBuffer;
+
+/* Local buffer statistics */
+extern PGDLLIMPORT int allocated_localbufs;
+extern PGDLLIMPORT int dirtied_localbufs;
+
 extern PGDLLIMPORT Block *LocalBufferBlockPointers;
 extern PGDLLIMPORT int32 *LocalRefCount;
 
