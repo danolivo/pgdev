@@ -1035,6 +1035,8 @@ typedef struct RelOptInfo
 	bool		consider_param_startup;
 	/* consider parallel paths? */
 	bool		consider_parallel;
+	/* if parallel-safe, must temp buffers be flushed before workers start? */
+	bool		needs_temp_safety;
 	/* path generation strategy mask */
 	uint64		pgs_mask;
 
@@ -2016,7 +2018,7 @@ typedef struct Path
 	/* engage parallel-aware logic? */
 	bool		parallel_aware;
 	/* OK to use as part of parallel plan? */
-	bool		parallel_safe;
+	ParallelSafe	parallel_safe;
 	/* desired # of workers; 0 = not parallel */
 	int			parallel_workers;
 
