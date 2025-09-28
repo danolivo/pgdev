@@ -225,6 +225,7 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	rel->consider_startup = (root->tuple_fraction > 0);
 	rel->consider_param_startup = false;	/* might get changed later */
 	rel->consider_parallel = false; /* might get changed later */
+	rel->needs_temp_safety = false; /* might get changed later */
 	rel->reltarget = create_empty_pathtarget();
 	rel->pathlist = NIL;
 	rel->ppilist = NIL;
@@ -822,6 +823,7 @@ build_join_rel(PlannerInfo *root,
 	joinrel->consider_startup = (root->tuple_fraction > 0);
 	joinrel->consider_param_startup = false;
 	joinrel->consider_parallel = false;
+	joinrel->needs_temp_safety = false;
 	joinrel->reltarget = create_empty_pathtarget();
 	joinrel->pathlist = NIL;
 	joinrel->ppilist = NIL;
@@ -959,9 +961,13 @@ build_join_rel(PlannerInfo *root,
 	 * here.
 	 */
 	if (inner_rel->consider_parallel && outer_rel->consider_parallel &&
-		is_parallel_safe(root, (Node *) restrictlist) &&
-		is_parallel_safe(root, (Node *) joinrel->reltarget->exprs))
+		is_parallel_safe(root, (Node *) restrictlist, &joinrel->needs_temp_safety) &&
+		is_parallel_safe(root, (Node *) joinrel->reltarget->exprs, &joinrel->needs_temp_safety))
+	{
 		joinrel->consider_parallel = true;
+		joinrel->needs_temp_safety |=
+				(inner_rel->needs_temp_safety | outer_rel->needs_temp_safety);
+	}
 
 	/* Add the joinrel to the PlannerInfo. */
 	add_join_rel(root, joinrel);

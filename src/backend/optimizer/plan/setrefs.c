@@ -1582,7 +1582,7 @@ clean_up_removed_plan_level(Plan *parent, Plan *child)
 		child->startup_cost += initplan_cost;
 		child->total_cost += initplan_cost;
 		if (unsafe_initplans)
-			child->parallel_safe = false;
+			child->parallel_safe = PARALLEL_UNSAFE;
 
 		/*
 		 * Attach plans this way so that parent's initplans are processed

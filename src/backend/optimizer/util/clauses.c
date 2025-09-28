@@ -95,6 +95,7 @@ typedef struct
 	char		max_hazard;		/* worst proparallel hazard found so far */
 	char		max_interesting;	/* worst proparallel hazard of interest */
 	List	   *safe_param_ids; /* PARAM_EXEC Param IDs to treat as safe */
+	bool		hasTempObject;
 } max_parallel_hazard_context;
 
 static bool contain_agg_clause_walker(Node *node, void *context);
@@ -760,13 +761,17 @@ max_parallel_hazard(Query *parse)
  *
  * root->glob->maxParallelHazard must previously have been set to the
  * result of max_parallel_hazard() on the whole query.
+ *
+ * Expression may contain a reference to subplan that employs temporary
+ * relations. That's why the flag needs_temp_flush is introduced.
  */
 bool
-is_parallel_safe(PlannerInfo *root, Node *node)
+is_parallel_safe(PlannerInfo *root, Node *node, bool *needs_temp_flush)
 {
 	max_parallel_hazard_context context;
 	PlannerInfo *proot;
 	ListCell   *l;
+	bool		is_safe;
 
 	/*
 	 * Even if the original querytree contained nothing unsafe, we need to
@@ -798,7 +803,20 @@ is_parallel_safe(PlannerInfo *root, Node *node)
 		}
 	}
 
-	return !max_parallel_hazard_walker(node, &context);
+	is_safe = !max_parallel_hazard_walker(node, &context);
+
+	/*
+	 * If the expression is parallel-safe, detect if it needs temp buffers
+	 * flushing before the execution start. Don't care changing it if
+	 * the expression is unsafe - it can't be executed by parallel workers
+	 * anyway.
+	 * In some cases user is interested in only negative result to test an idea.
+	 * So, if incoming poointer is NULL, skip this step.
+	 */
+	if (needs_temp_flush && is_safe && context.hasTempObject)
+		*needs_temp_flush = NEEDS_TEMP_FLUSH;
+
+	return is_safe;
 }
 
 /* core logic for all parallel-hazard checks */
@@ -920,6 +938,8 @@ max_parallel_hazard_walker(Node *node, max_parallel_hazard_context *context)
 			max_parallel_hazard_test(PROPARALLEL_RESTRICTED, context))
 			return true;
 		save_safe_param_ids = context->safe_param_ids;
+		context->hasTempObject =
+			context->hasTempObject || (subplan->parallel_safe == NEEDS_TEMP_FLUSH);
 		context->safe_param_ids = list_concat_copy(context->safe_param_ids,
 												   subplan->paramIds);
 		if (max_parallel_hazard_walker(subplan->testexpr, context))
