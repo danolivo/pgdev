@@ -1,0 +1,1573 @@
+--
+-- Many examples here are also an evidence of the core pull-up technique limits
+-- That means some tests will change along further core improvements.
+--
+-- NOTE: Each explained test case should be followed by the executed one to
+-- check that the memoization machinery really works. Don't forget we need some
+-- produced tuples as an evidence!
+--
+LOAD 'pg_ext_planner';
+-- Don't trust default settings, remember installcheck
+SET pg_ext_planner.memoize_subplan = 'on';
+-- Put back any costing issues inventing memoization tests
+SET pg_ext_planner.force_memoize_subplan = 'on';
+-- Set random_page_cost to its default value since it can be different in a real cluster installation
+SET random_page_cost = 4.0;
+-- Set DateStyle for explain output
+SET DateStyle = 'ISO, YMD';
+CREATE TABLE sub_tbl (x bigint);
+INSERT INTO sub_tbl (x)
+  SELECT value FROM generate_series(1,100) AS value;
+CREATE TABLE upper_tbl (x bigint, y bigint, z numeric);
+INSERT INTO upper_tbl (x,y,z)
+  SELECT value % 5, value % 3, value FROM generate_series(1,10) AS value;
+VACUUM ANALYZE sub_tbl, upper_tbl;
+-- The core memoize switch off must disable our feature too.
+SET enable_memoize = 'off';
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u
+WHERE u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x);
+                    QUERY PLAN                    
+--------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Seq Scan on public.upper_tbl u
+         Output: u.x, u.y, u.z
+         Filter: ((u.y)::numeric < (SubPlan 1))
+         SubPlan 1
+           ->  Aggregate
+                 Output: avg(s.x)
+                 ->  Seq Scan on public.sub_tbl s
+                       Output: s.x
+                       Filter: (s.x = u.x)
+(11 rows)
+
+-- Set enable_memoize into 'on' value - in case the instance settings are different.
+SET enable_memoize = 'on';
+CREATE TABLE int_tbl(id int, val int);
+INSERT INTO int_tbl
+SELECT v.id
+     , g.val
+  FROM (VALUES(0, 10), (1, 41), (2, 11), (3, 71), (4, 121)) v(id, num)
+  JOIN generate_series(v.num, v.num + 20) AS g(val)
+    ON (1 = 1);
+CREATE INDEX int_tbl_id_ix ON int_tbl(id);
+VACUUM (ANALYZE) int_tbl;
+CREATE TABLE dt_tbl(id int, dt date);
+INSERT INTO dt_tbl
+SELECT v.id
+     , g.ts::date AS dt
+  FROM (VALUES (0, make_date(2016, 1, 14), 50),
+               (1, make_date(2017, 2, 19), 60),
+               (2, make_date(2018, 3, 10), 20),
+               (3, make_date(2019, 2, 28), 40),
+               (4, make_date(2020, 12, 28), 35),
+               (5, make_date(2021, 11, 22), 70),
+               (6, make_date(2022, 1, 20), 34),
+               (7, make_date(2023, 5, 1), 38),
+               (8, make_date(2024, 4, 1), 110),
+               (9, make_date(2013, 4, 1), 60)
+       ) v(id, dt, delta)
+  JOIN generate_series((v.dt - delta)::timestamp, v.dt::timestamp, interval '1 day') AS g(ts)
+    ON (1 = 1);
+CREATE INDEX dt_tbl_id_ix ON dt_tbl(id);
+VACUUM (ANALYZE) dt_tbl;
+CREATE TABLE main_tbl(id bigint, x bigint, y bigint, hundred int, thousand int, v int, dt date);
+INSERT INTO main_tbl
+SELECT g.val
+     , g.val % 9 AS x
+     , g.val % 5 AS y
+     , g.val % 100 + 1 AS hundred
+     , g.val % 1000 + 1 AS thousand
+     , CASE WHEN (g.val % 5) % 2 != 0 THEN i.sm ELSE i.sm - 10 END AS v
+     , v.dt - CASE WHEN (g.val % 9) % 2 = 0 THEN 0 ELSE 3 END AS ts
+  FROM generate_series(1, 3000) AS g(val)
+  JOIN (SELECT i.id, SUM(i.val) AS sm FROM int_tbl i GROUP BY i.id) i
+    ON i.id = g.val % 5
+  JOIN (VALUES (0, make_date(2016, 1, 14)),
+               (1, make_date(2017, 2, 19)),
+               (2, make_date(2018, 3, 10)),
+               (3, make_date(2019, 2, 28)),
+               (4, make_date(2020, 12, 28)),
+               (5, make_date(2021, 11, 22)),
+               (6, make_date(2022, 1, 20)),
+               (7, make_date(2023, 5, 1)),
+               (8, make_date(2024, 4, 1)),
+               (9, make_date(2013, 4, 1))
+       ) v(id, dt)
+    ON g.val % 9 = v.id;
+CREATE INDEX mt_id_ix ON main_tbl(id);
+CREATE INDEX mt_hundred_ix ON main_tbl(hundred);
+CREATE INDEX mt_thousand_ix ON main_tbl(thousand);
+CREATE INDEX mt_dt_ix ON main_tbl(dt);
+VACUUM (ANALYZE) main_tbl;
+-- Simple BitmapHeapPath with Subplan
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT m.id, m.x, m.y, m.hundred, m.thousand, m.v
+  FROM main_tbl m
+ WHERE m.thousand BETWEEN 175 AND 177
+   AND m.dt = (SELECT MAX(d.dt) FROM dt_tbl d WHERE d.id = m.x);
+                            QUERY PLAN                             
+-------------------------------------------------------------------
+ Bitmap Heap Scan on public.main_tbl m
+   Output: m.id, m.x, m.y, m.hundred, m.thousand, m.v
+   Recheck Cond: ((m.thousand >= 175) AND (m.thousand <= 177))
+   Filter: (m.dt = (SubPlan 1))
+   ->  Bitmap Index Scan on mt_thousand_ix
+         Index Cond: ((m.thousand >= 175) AND (m.thousand <= 177))
+   SubPlan 1
+     ->  Memoize
+           Output: (max(d.dt))
+           Cache Key: m.x
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: max(d.dt)
+                 ->  Bitmap Heap Scan on public.dt_tbl d
+                       Output: d.id, d.dt
+                       Recheck Cond: (d.id = m.x)
+                       ->  Bitmap Index Scan on dt_tbl_id_ix
+                             Index Cond: (d.id = m.x)
+(18 rows)
+
+SELECT m.id, m.x, m.y, m.hundred, m.thousand, m.v
+  FROM main_tbl m
+ WHERE m.thousand BETWEEN 175 AND 177
+   AND m.dt = (SELECT MAX(d.dt) FROM dt_tbl d WHERE d.id = m.x);
+  id  | x | y | hundred | thousand |  v   
+------+---+---+---------+----------+------
+  175 | 4 | 0 |      76 |      176 |  410
+ 1174 | 4 | 4 |      75 |      175 | 2741
+ 1176 | 6 | 1 |      77 |      177 | 1071
+ 2175 | 6 | 0 |      76 |      176 |  410
+(4 rows)
+
+-- Bitmap with Subplan in its target list
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT (SELECT sum(s.x) FROM sub_tbl s WHERE s.x=m.x) AS res
+  FROM main_tbl m
+ WHERE m.thousand BETWEEN 175 AND 177;
+                            QUERY PLAN                             
+-------------------------------------------------------------------
+ Bitmap Heap Scan on public.main_tbl m
+   Output: (SubPlan 1)
+   Recheck Cond: ((m.thousand >= 175) AND (m.thousand <= 177))
+   ->  Bitmap Index Scan on mt_thousand_ix
+         Index Cond: ((m.thousand >= 175) AND (m.thousand <= 177))
+   SubPlan 1
+     ->  Memoize
+           Output: (sum(s.x))
+           Cache Key: m.x
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: sum(s.x)
+                 ->  Seq Scan on public.sub_tbl s
+                       Output: s.x
+                       Filter: (s.x = m.x)
+(15 rows)
+
+SELECT (SELECT sum(s.x) FROM sub_tbl s WHERE s.x=m.x) AS res
+  FROM main_tbl m
+ WHERE m.thousand BETWEEN 175 AND 177;
+ res 
+-----
+   3
+   4
+   5
+   4
+   5
+   6
+   5
+   6
+   7
+(9 rows)
+
+-- BitmapAnd and Subplan
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT m.id, m.x, m.y, m.hundred, m.thousand, m.v
+  FROM main_tbl m
+ WHERE m.hundred IN (1, 2)
+   AND m.v = (SELECT SUM(i.val) FROM int_tbl i WHERE i.id = m.y)
+   AND m.dt BETWEEN '2021-11-19'::date AND '2021-11-20'::date;
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on public.main_tbl m
+   Output: m.id, m.x, m.y, m.hundred, m.thousand, m.v
+   Recheck Cond: ((m.dt >= '2021-11-19'::date) AND (m.dt <= '2021-11-20'::date) AND (m.hundred = ANY ('{1,2}'::integer[])))
+   Filter: (m.v = (SubPlan 1))
+   ->  BitmapAnd
+         ->  Bitmap Index Scan on mt_dt_ix
+               Index Cond: ((m.dt >= '2021-11-19'::date) AND (m.dt <= '2021-11-20'::date))
+         ->  Bitmap Index Scan on mt_hundred_ix
+               Index Cond: (m.hundred = ANY ('{1,2}'::integer[]))
+   SubPlan 1
+     ->  Memoize
+           Output: (sum(i.val))
+           Cache Key: m.y
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: sum(i.val)
+                 ->  Seq Scan on public.int_tbl i
+                       Output: i.id, i.val
+                       Filter: (i.id = m.y)
+(19 rows)
+
+SELECT m.id, m.x, m.y, m.hundred, m.thousand, m.v
+  FROM main_tbl m
+ WHERE m.hundred IN (1, 2)
+   AND m.v = (SELECT SUM(i.val) FROM int_tbl i WHERE i.id = m.y)
+   AND m.dt BETWEEN '2021-11-19'::date AND '2021-11-20'::date;
+  id  | x | y | hundred | thousand |  v   
+------+---+---+---------+----------+------
+  401 | 5 | 1 |       2 |      402 | 1071
+ 1301 | 5 | 1 |       2 |      302 | 1071
+ 2201 | 5 | 1 |       2 |      202 | 1071
+(3 rows)
+
+-- BitmapOr and Subplan
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT m.id, m.x, m.y, m.hundred, m.thousand, m.v
+  FROM main_tbl m
+ WHERE (m.hundred < 2 OR m.thousand < 3)
+   AND m.v = (SELECT SUM(i.val) FROM int_tbl i WHERE i.id = m.y);
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Bitmap Heap Scan on public.main_tbl m
+   Output: m.id, m.x, m.y, m.hundred, m.thousand, m.v
+   Recheck Cond: ((m.hundred < 2) OR (m.thousand < 3))
+   Filter: (m.v = (SubPlan 1))
+   ->  BitmapOr
+         ->  Bitmap Index Scan on mt_hundred_ix
+               Index Cond: (m.hundred < 2)
+         ->  Bitmap Index Scan on mt_thousand_ix
+               Index Cond: (m.thousand < 3)
+   SubPlan 1
+     ->  Memoize
+           Output: (sum(i.val))
+           Cache Key: m.y
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: sum(i.val)
+                 ->  Seq Scan on public.int_tbl i
+                       Output: i.id, i.val
+                       Filter: (i.id = m.y)
+(19 rows)
+
+SELECT m.id, m.x, m.y, m.hundred, m.thousand, m.v
+  FROM main_tbl m
+ WHERE (m.hundred < 2 OR m.thousand < 3)
+   AND m.v = (SELECT SUM(i.val) FROM int_tbl i WHERE i.id = m.y);
+  id  | x | y | hundred | thousand |  v   
+------+---+---+---------+----------+------
+    1 | 1 | 1 |       2 |        2 | 1071
+ 1001 | 2 | 1 |       2 |        2 | 1071
+ 2001 | 3 | 1 |       2 |        2 | 1071
+(3 rows)
+
+-- BitmapOr where each clause has its own subplan
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT m.*
+  FROM main_tbl m
+ WHERE (m.hundred = 35 AND m.v = (SELECT SUM(i.val) FROM int_tbl i WHERE i.id = m.y)) OR
+       (m.thousand = 175 AND m.dt = (SELECT MAX(d.dt) FROM dt_tbl d WHERE d.id = m.x));
+                                               QUERY PLAN                                                
+---------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on public.main_tbl m
+   Output: m.id, m.x, m.y, m.hundred, m.thousand, m.v, m.dt
+   Recheck Cond: ((m.hundred = 35) OR (m.thousand = 175))
+   Filter: (((m.hundred = 35) AND (m.v = (SubPlan 1))) OR ((m.thousand = 175) AND (m.dt = (SubPlan 2))))
+   ->  BitmapOr
+         ->  Bitmap Index Scan on mt_hundred_ix
+               Index Cond: (m.hundred = 35)
+         ->  Bitmap Index Scan on mt_thousand_ix
+               Index Cond: (m.thousand = 175)
+   SubPlan 1
+     ->  Memoize
+           Output: (sum(i.val))
+           Cache Key: m.y
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: sum(i.val)
+                 ->  Seq Scan on public.int_tbl i
+                       Output: i.id, i.val
+                       Filter: (i.id = m.y)
+   SubPlan 2
+     ->  Memoize
+           Output: (max(d.dt))
+           Cache Key: m.x
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: max(d.dt)
+                 ->  Bitmap Heap Scan on public.dt_tbl d
+                       Output: d.id, d.dt
+                       Recheck Cond: (d.id = m.x)
+                       ->  Bitmap Index Scan on dt_tbl_id_ix
+                             Index Cond: (d.id = m.x)
+(31 rows)
+
+SELECT m.*
+  FROM main_tbl m
+ WHERE (m.hundred = 35 AND m.v = (SELECT SUM(i.val) FROM int_tbl i WHERE i.id = m.y)) OR
+       (m.thousand = 175 AND m.dt = (SELECT MAX(d.dt) FROM dt_tbl d WHERE d.id = m.x));
+  id  | x | y | hundred | thousand |  v   |     dt     
+------+---+---+---------+----------+------+------------
+ 1174 | 4 | 4 |      75 |      175 | 2741 | 2020-12-28
+(1 row)
+
+-- BitmapAnd where each clause has its own subplan
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT m.thousand
+  FROM main_tbl m
+ WHERE (m.hundred BETWEEN 35 AND 55 AND m.v = (SELECT SUM(i.val) FROM int_tbl i WHERE i.id = m.y)) AND
+       (m.thousand BETWEEN 150 AND 170 AND m.dt = (SELECT MAX(d.dt) FROM dt_tbl d WHERE d.id = m.x));
+                                                QUERY PLAN                                                 
+-----------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on public.main_tbl m
+   Output: m.thousand
+   Recheck Cond: ((m.thousand >= 150) AND (m.thousand <= 170) AND (m.hundred >= 35) AND (m.hundred <= 55))
+   Filter: ((m.v = (SubPlan 1)) AND (m.dt = (SubPlan 2)))
+   ->  BitmapAnd
+         ->  Bitmap Index Scan on mt_thousand_ix
+               Index Cond: ((m.thousand >= 150) AND (m.thousand <= 170))
+         ->  Bitmap Index Scan on mt_hundred_ix
+               Index Cond: ((m.hundred >= 35) AND (m.hundred <= 55))
+   SubPlan 1
+     ->  Memoize
+           Output: (sum(i.val))
+           Cache Key: m.y
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: sum(i.val)
+                 ->  Seq Scan on public.int_tbl i
+                       Output: i.id, i.val
+                       Filter: (i.id = m.y)
+   SubPlan 2
+     ->  Memoize
+           Output: (max(d.dt))
+           Cache Key: m.x
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: max(d.dt)
+                 ->  Bitmap Heap Scan on public.dt_tbl d
+                       Output: d.id, d.dt
+                       Recheck Cond: (d.id = m.x)
+                       ->  Bitmap Index Scan on dt_tbl_id_ix
+                             Index Cond: (d.id = m.x)
+(31 rows)
+
+SELECT m.thousand
+  FROM main_tbl m
+ WHERE (m.hundred BETWEEN 35 AND 55 AND m.v = (SELECT SUM(i.val) FROM int_tbl i WHERE i.id = m.y)) AND
+       (m.thousand BETWEEN 150 AND 170 AND m.dt = (SELECT MAX(d.dt) FROM dt_tbl d WHERE d.id = m.x));
+ thousand 
+----------
+      154
+      152
+      152
+      154
+(4 rows)
+
+-- BitmapAnd and BitmapOr under it
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT m.*
+  FROM main_tbl m
+ WHERE m.hundred BETWEEN 42 AND 60
+   AND ((m.thousand BETWEEN 42 AND 46 AND m.dt = (SELECT MAX(d.dt) FROM dt_tbl d WHERE d.id = m.x)) OR
+        (m.thousand BETWEEN 59 AND 62 AND m.v = (SELECT SUM(i.val) FROM int_tbl i WHERE i.id = m.y)));
+                                                                         QUERY PLAN                                                                         
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on public.main_tbl m
+   Output: m.id, m.x, m.y, m.hundred, m.thousand, m.v, m.dt
+   Recheck Cond: ((((m.thousand >= 42) AND (m.thousand <= 46)) OR ((m.thousand >= 59) AND (m.thousand <= 62))) AND (m.hundred >= 42) AND (m.hundred <= 60))
+   Filter: (((m.thousand >= 42) AND (m.thousand <= 46) AND (m.dt = (SubPlan 1))) OR ((m.thousand >= 59) AND (m.thousand <= 62) AND (m.v = (SubPlan 2))))
+   ->  BitmapAnd
+         ->  BitmapOr
+               ->  Bitmap Index Scan on mt_thousand_ix
+                     Index Cond: ((m.thousand >= 42) AND (m.thousand <= 46))
+               ->  Bitmap Index Scan on mt_thousand_ix
+                     Index Cond: ((m.thousand >= 59) AND (m.thousand <= 62))
+         ->  Bitmap Index Scan on mt_hundred_ix
+               Index Cond: ((m.hundred >= 42) AND (m.hundred <= 60))
+   SubPlan 1
+     ->  Memoize
+           Output: (max(d.dt))
+           Cache Key: m.x
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: max(d.dt)
+                 ->  Bitmap Heap Scan on public.dt_tbl d
+                       Output: d.id, d.dt
+                       Recheck Cond: (d.id = m.x)
+                       ->  Bitmap Index Scan on dt_tbl_id_ix
+                             Index Cond: (d.id = m.x)
+   SubPlan 2
+     ->  Memoize
+           Output: (sum(i.val))
+           Cache Key: m.y
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: sum(i.val)
+                 ->  Seq Scan on public.int_tbl i
+                       Output: i.id, i.val
+                       Filter: (i.id = m.y)
+(34 rows)
+
+SELECT m.*
+  FROM main_tbl m
+ WHERE m.hundred BETWEEN 42 AND 60
+   AND ((m.thousand BETWEEN 42 AND 46 AND m.dt = (SELECT MAX(d.dt) FROM dt_tbl d WHERE d.id = m.x)) OR
+        (m.thousand BETWEEN 59 AND 62 AND m.v = (SELECT SUM(i.val) FROM int_tbl i WHERE i.id = m.y)));
+  id  | x | y | hundred | thousand |  v   |     dt     
+------+---+---+---------+----------+------+------------
+   42 | 6 | 2 |      43 |       43 |  431 | 2022-01-20
+   44 | 8 | 4 |      45 |       45 | 2741 | 2024-04-01
+   45 | 0 | 0 |      46 |       46 |  410 | 2016-01-14
+   58 | 4 | 3 |      59 |       59 | 1701 | 2020-12-28
+ 1041 | 6 | 1 |      42 |       42 | 1071 | 2022-01-20
+ 1043 | 8 | 3 |      44 |       44 | 1701 | 2024-04-01
+ 1044 | 0 | 4 |      45 |       45 | 2741 | 2016-01-14
+ 1058 | 5 | 3 |      59 |       59 | 1701 | 2021-11-19
+ 2042 | 8 | 2 |      43 |       43 |  431 | 2024-04-01
+ 2043 | 0 | 3 |      44 |       44 | 1701 | 2016-01-14
+ 2045 | 2 | 0 |      46 |       46 |  410 | 2018-03-10
+ 2058 | 6 | 3 |      59 |       59 | 1701 | 2022-01-20
+(12 rows)
+
+-- BitmapOr + BitmapAnd + BitmapOr
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT m.thousand
+  FROM main_tbl m
+ WHERE m.hundred = 42
+   AND (m.thousand = 42 AND m.v = (SELECT SUM(i.val) FROM int_tbl i WHERE i.id = m.y) OR
+        m.thousand = 842 AND m.dt = (SELECT MAX(d.dt) FROM dt_tbl d WHERE d.id = m.x)
+        ) OR
+        thousand = 10 AND m.v = (SELECT SUM(i.val) FROM int_tbl i WHERE i.id = m.y);
+                                                                                    QUERY PLAN                                                                                    
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Bitmap Heap Scan on public.main_tbl m
+   Output: m.thousand
+   Recheck Cond: (((m.hundred = 42) AND ((m.thousand = 42) OR (m.thousand = 842))) OR (m.thousand = 10))
+   Filter: (((m.hundred = 42) AND (((m.thousand = 42) AND (m.v = (SubPlan 1))) OR ((m.thousand = 842) AND (m.dt = (SubPlan 2))))) OR ((m.thousand = 10) AND (m.v = (SubPlan 3))))
+   ->  BitmapOr
+         ->  BitmapAnd
+               ->  Bitmap Index Scan on mt_hundred_ix
+                     Index Cond: (m.hundred = 42)
+               ->  BitmapOr
+                     ->  Bitmap Index Scan on mt_thousand_ix
+                           Index Cond: (m.thousand = 42)
+                     ->  Bitmap Index Scan on mt_thousand_ix
+                           Index Cond: (m.thousand = 842)
+         ->  Bitmap Index Scan on mt_thousand_ix
+               Index Cond: (m.thousand = 10)
+   SubPlan 1
+     ->  Memoize
+           Output: (sum(i.val))
+           Cache Key: m.y
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: sum(i.val)
+                 ->  Seq Scan on public.int_tbl i
+                       Output: i.id, i.val
+                       Filter: (i.id = m.y)
+   SubPlan 2
+     ->  Memoize
+           Output: (max(d.dt))
+           Cache Key: m.x
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: max(d.dt)
+                 ->  Bitmap Heap Scan on public.dt_tbl d
+                       Output: d.id, d.dt
+                       Recheck Cond: (d.id = m.x)
+                       ->  Bitmap Index Scan on dt_tbl_id_ix
+                             Index Cond: (d.id = m.x)
+   SubPlan 3
+     ->  Memoize
+           Output: (sum(i_1.val))
+           Cache Key: m.y
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: sum(i_1.val)
+                 ->  Seq Scan on public.int_tbl i_1
+                       Output: i_1.id, i_1.val
+                       Filter: (i_1.id = m.y)
+(47 rows)
+
+SELECT m.thousand
+  FROM main_tbl m
+ WHERE m.hundred = 42
+   AND (m.thousand = 42 AND m.v = (SELECT SUM(i.val) FROM int_tbl i WHERE i.id = m.y) OR
+        m.thousand = 842 AND m.dt = (SELECT MAX(d.dt) FROM dt_tbl d WHERE d.id = m.x)
+        ) OR
+        thousand = 10 AND m.v = (SELECT SUM(i.val) FROM int_tbl i WHERE i.id = m.y);
+ thousand 
+----------
+       42
+      842
+       42
+       42
+      842
+(5 rows)
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u
+WHERE u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x);
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Seq Scan on public.upper_tbl u
+         Output: u.x, u.y, u.z
+         Filter: ((u.y)::numeric < (SubPlan 1))
+         SubPlan 1
+           ->  Memoize
+                 Output: (avg(s.x))
+                 Cache Key: u.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s.x)
+                       ->  Seq Scan on public.sub_tbl s
+                             Output: s.x
+                             Filter: (s.x = u.x)
+(15 rows)
+
+SELECT count(*) FROM upper_tbl u
+WHERE u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x);
+ count 
+-------
+     6
+(1 row)
+
+-- Check ANY SubPlan inside a HAVING qual
+EXPLAIN (COSTS OFF)
+SELECT val.name FROM (VALUES ('pg_index', 1), ('pg_fake', 1), ('pg_class', 1)) AS val(name, num)
+GROUP BY val.name
+HAVING val.name IN (
+  SELECT relname FROM pg_class s WHERE val.name LIKE '%_%');
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ HashAggregate
+   Group Key: "*VALUES*".column1
+   Filter: (ANY ("*VALUES*".column1 = (SubPlan 1).col1))
+   ->  Values Scan on "*VALUES*"
+   SubPlan 1
+     ->  Memoize
+           Cache Key: "*VALUES*".column1
+           Cache Mode: binary
+           ->  Result
+                 One-Time Filter: ("*VALUES*".column1 ~~ '%_%'::text)
+                 ->  Seq Scan on pg_class s
+(11 rows)
+
+SELECT val.name FROM (VALUES ('pg_index', 1), ('pg_fake', 1), ('pg_class', 1)) AS val(name, num)
+GROUP BY val.name
+HAVING val.name IN (
+  SELECT relname FROM pg_class s WHERE val.name LIKE '%_%');
+   name   
+----------
+ pg_index
+ pg_class
+(2 rows)
+
+-- Create partial index with single condition
+CREATE INDEX idx1 ON upper_tbl (z) WHERE (z <= 1);
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u
+WHERE u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND u.z=1;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Index Scan using idx1 on public.upper_tbl u
+         Output: u.x, u.y, u.z
+         Index Cond: (u.z = '1'::numeric)
+         Filter: ((u.y)::numeric < (SubPlan 1))
+         SubPlan 1
+           ->  Memoize
+                 Output: (avg(s.x))
+                 Cache Key: u.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s.x)
+                       ->  Seq Scan on public.sub_tbl s
+                             Output: s.x
+                             Filter: (s.x = u.x)
+(16 rows)
+
+SELECT count(*) FROM upper_tbl u
+WHERE u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND u.z=1;
+ count 
+-------
+     0
+(1 row)
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u
+WHERE u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND u.z<=1;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Index Scan using idx1 on public.upper_tbl u
+         Output: u.x, u.y, u.z
+         Filter: ((u.y)::numeric < (SubPlan 1))
+         SubPlan 1
+           ->  Memoize
+                 Output: (avg(s.x))
+                 Cache Key: u.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s.x)
+                       ->  Seq Scan on public.sub_tbl s
+                             Output: s.x
+                             Filter: (s.x = u.x)
+(15 rows)
+
+SELECT count(*) FROM upper_tbl u
+WHERE u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND u.z<=1;
+ count 
+-------
+     0
+(1 row)
+
+DROP INDEX idx1;
+-- Create partial index with multiple conditions
+CREATE INDEX idx1 ON upper_tbl (z) WHERE (y>=3 and z>=11);
+INSERT INTO upper_tbl (x,y,z) VALUES (5,3,11);
+INSERT INTO upper_tbl (x,y,z) VALUES (5,3,12);
+INSERT INTO upper_tbl (x,y,z) VALUES (5,3,11);
+ANALYZE upper_tbl;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u
+WHERE u.y > (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND u.y=3 and u.z=11;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Index Scan using idx1 on public.upper_tbl u
+         Output: u.x, u.y, u.z
+         Index Cond: (u.z = '11'::numeric)
+         Filter: ((u.y = 3) AND ((u.y)::numeric > (SubPlan 1)))
+         SubPlan 1
+           ->  Memoize
+                 Output: (avg(s.x))
+                 Cache Key: u.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s.x)
+                       ->  Seq Scan on public.sub_tbl s
+                             Output: s.x
+                             Filter: (s.x = u.x)
+(16 rows)
+
+SELECT count(*) FROM upper_tbl u
+WHERE u.y > (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND u.y=3 and u.z=11;
+ count 
+-------
+     0
+(1 row)
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u
+WHERE u.y > (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND u.y=3 and u.z>=11;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Index Scan using idx1 on public.upper_tbl u
+         Output: u.x, u.y, u.z
+         Filter: ((u.y = 3) AND ((u.y)::numeric > (SubPlan 1)))
+         SubPlan 1
+           ->  Memoize
+                 Output: (avg(s.x))
+                 Cache Key: u.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s.x)
+                       ->  Seq Scan on public.sub_tbl s
+                             Output: s.x
+                             Filter: (s.x = u.x)
+(15 rows)
+
+SELECT count(*) FROM upper_tbl u
+WHERE u.y > (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND u.y=3 and u.z>=11;
+ count 
+-------
+     0
+(1 row)
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u
+WHERE u.y > (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND u.y=3 and u.z>12;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Index Scan using idx1 on public.upper_tbl u
+         Output: u.x, u.y, u.z
+         Index Cond: (u.z > '12'::numeric)
+         Filter: ((u.y = 3) AND ((u.y)::numeric > (SubPlan 1)))
+         SubPlan 1
+           ->  Memoize
+                 Output: (avg(s.x))
+                 Cache Key: u.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s.x)
+                       ->  Seq Scan on public.sub_tbl s
+                             Output: s.x
+                             Filter: (s.x = u.x)
+(16 rows)
+
+SELECT count(*) FROM upper_tbl u
+WHERE u.y > (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND u.y=3 and u.z>12;
+ count 
+-------
+     0
+(1 row)
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u
+WHERE u.y > (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND u.y>=3 and u.z=11;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Index Scan using idx1 on public.upper_tbl u
+         Output: u.x, u.y, u.z
+         Index Cond: (u.z = '11'::numeric)
+         Filter: ((u.y)::numeric > (SubPlan 1))
+         SubPlan 1
+           ->  Memoize
+                 Output: (avg(s.x))
+                 Cache Key: u.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s.x)
+                       ->  Seq Scan on public.sub_tbl s
+                             Output: s.x
+                             Filter: (s.x = u.x)
+(16 rows)
+
+SELECT count(*) FROM upper_tbl u
+WHERE u.y > (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND u.y>=3 and u.z=11;
+ count 
+-------
+     0
+(1 row)
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u join sub_tbl on sub_tbl.x = u.y
+WHERE u.y > (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND u.y>=3 and u.z=11;
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Hash Join
+         Hash Cond: (sub_tbl.x = u.y)
+         ->  Seq Scan on public.sub_tbl
+               Output: sub_tbl.x
+         ->  Hash
+               Output: u.y
+               ->  Index Scan using idx1 on public.upper_tbl u
+                     Output: u.y
+                     Index Cond: (u.z = '11'::numeric)
+                     Filter: ((u.y)::numeric > (SubPlan 1))
+                     SubPlan 1
+                       ->  Memoize
+                             Output: (avg(s.x))
+                             Cache Key: u.x
+                             Cache Mode: binary
+                             ->  Aggregate
+                                   Output: avg(s.x)
+                                   ->  Seq Scan on public.sub_tbl s
+                                         Output: s.x
+                                         Filter: (s.x = u.x)
+(22 rows)
+
+DROP INDEX idx1;
+-- Index Only Scan by idx2
+CREATE INDEX idx1 ON upper_tbl (x);
+CREATE INDEX idx2 ON upper_tbl (y);
+CREATE INDEX idx3 ON upper_tbl (z);
+set enable_seqscan = off;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT t.y, (SELECT sum(t2.y) AS res FROM upper_tbl t2 WHERE t2.x = t.y) FROM upper_tbl t;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Index Only Scan using idx2 on public.upper_tbl t
+   Output: t.y, (SubPlan 1)
+   SubPlan 1
+     ->  Memoize
+           Output: (sum(t2.y))
+           Cache Key: t.y
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: sum(t2.y)
+                 ->  Index Scan using idx1 on public.upper_tbl t2
+                       Output: t2.x, t2.y, t2.z
+                       Index Cond: (t2.x = t.y)
+(12 rows)
+
+SELECT t.y, (SELECT sum(t2.y) AS res FROM upper_tbl t2 WHERE t2.x = t.y) FROM upper_tbl t;
+ y | res 
+---+-----
+ 0 |   3
+ 0 |   3
+ 0 |   3
+ 1 |   1
+ 1 |   1
+ 1 |   1
+ 1 |   1
+ 2 |   3
+ 2 |   3
+ 2 |   3
+ 3 |   2
+ 3 |   2
+ 3 |   2
+(13 rows)
+
+reset enable_seqscan;
+-- Memoize with Index Scan by idx3
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u
+WHERE u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND u.z=1;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Index Scan using idx3 on public.upper_tbl u
+         Output: u.x, u.y, u.z
+         Index Cond: (u.z = '1'::numeric)
+         Filter: ((u.y)::numeric < (SubPlan 1))
+         SubPlan 1
+           ->  Memoize
+                 Output: (avg(s.x))
+                 Cache Key: u.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s.x)
+                       ->  Seq Scan on public.sub_tbl s
+                             Output: s.x
+                             Filter: (s.x = u.x)
+(16 rows)
+
+SELECT count(*) FROM upper_tbl u
+WHERE u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND u.z=1;
+ count 
+-------
+     0
+(1 row)
+
+explain (costs off)
+select * from
+  upper_tbl t1 left join
+  (select x as q1, 42 as q2 from upper_tbl t2) ss
+  on t1.y = ss.q1
+where
+  1 = (select 1 from upper_tbl t3 where ss.q2 is not null limit 1)
+order by 1,2;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Sort
+   Sort Key: t1.x, t1.y
+   ->  Hash Left Join
+         Hash Cond: (t1.y = t2.x)
+         Filter: (1 = (SubPlan 1))
+         ->  Seq Scan on upper_tbl t1
+         ->  Hash
+               ->  Seq Scan on upper_tbl t2
+         SubPlan 1
+           ->  Memoize
+                 Cache Key: (42)
+                 Cache Mode: binary
+                 ->  Limit
+                       ->  Result
+                             One-Time Filter: ((42) IS NOT NULL)
+                             ->  Seq Scan on upper_tbl t3
+(16 rows)
+
+select * from
+  upper_tbl t1 left join
+  (select x as q1, 42 as q2 from upper_tbl t2) ss
+  on t1.y = ss.q1
+where
+  1 = (select 1 from upper_tbl t3 where ss.q2 is not null limit 1)
+order by 1,2;
+ x | y | z  | q1 | q2 
+---+---+----+----+----
+ 0 | 1 | 10 |  1 | 42
+ 0 | 1 | 10 |  1 | 42
+ 0 | 2 |  5 |  2 | 42
+ 0 | 2 |  5 |  2 | 42
+ 1 | 0 |  6 |  0 | 42
+ 1 | 0 |  6 |  0 | 42
+ 1 | 1 |  1 |  1 | 42
+ 1 | 1 |  1 |  1 | 42
+ 2 | 1 |  7 |  1 | 42
+ 2 | 1 |  7 |  1 | 42
+ 2 | 2 |  2 |  2 | 42
+ 2 | 2 |  2 |  2 | 42
+ 3 | 0 |  3 |  0 | 42
+ 3 | 0 |  3 |  0 | 42
+ 3 | 2 |  8 |  2 | 42
+ 3 | 2 |  8 |  2 | 42
+ 4 | 0 |  9 |  0 | 42
+ 4 | 0 |  9 |  0 | 42
+ 4 | 1 |  4 |  1 | 42
+ 4 | 1 |  4 |  1 | 42
+ 5 | 3 | 11 |  3 | 42
+ 5 | 3 | 11 |  3 | 42
+ 5 | 3 | 12 |  3 | 42
+ 5 | 3 | 12 |  3 | 42
+ 5 | 3 | 11 |  3 | 42
+ 5 | 3 | 11 |  3 | 42
+(26 rows)
+
+DROP INDEX idx1;
+DROP INDEX idx2;
+DROP INDEX idx3;
+DELETE FROM upper_tbl WHERE x >= 5;
+-- exercise rescan code path via a repeatedly-evaluated subquery
+explain (costs off)
+SELECT
+    ARRAY(SELECT f.i FROM (
+        (SELECT d + g.i FROM generate_series(4, 30, 3) d ORDER BY 1)
+        UNION ALL
+        (SELECT d + g.i FROM generate_series(0, 30, 5) d ORDER BY 1)
+    ) f(i)
+    ORDER BY f.i LIMIT 10)
+FROM generate_series(1, 3) g(i);
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Function Scan on generate_series g
+   SubPlan 1
+     ->  Memoize
+           Cache Key: g.i
+           Cache Mode: binary
+           ->  Limit
+                 ->  Merge Append
+                       Sort Key: ((d.d + g.i))
+                       ->  Sort
+                             Sort Key: ((d.d + g.i))
+                             ->  Function Scan on generate_series d
+                       ->  Sort
+                             Sort Key: ((d_1.d + g.i))
+                             ->  Function Scan on generate_series d_1
+(14 rows)
+
+-- Do not memoize a subplan containing grouping sets
+explain (costs off)
+  select v.c, (select count(*) from upper_tbl group by () having v.c)
+    from (values (false),(true)) v(c) order by v.c;
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Sort
+   Sort Key: "*VALUES*".column1
+   ->  Values Scan on "*VALUES*"
+         SubPlan 1
+           ->  Aggregate
+                 Group Key: ()
+                 Filter: "*VALUES*".column1
+                 ->  Result
+                       One-Time Filter: "*VALUES*".column1
+                       ->  Seq Scan on upper_tbl
+(10 rows)
+
+-- use limit to force Subplan usage
+explain (costs off)
+select * from upper_tbl o where exists
+  (select 1 from upper_tbl i where i.x=o.x limit 0);
+                 QUERY PLAN                  
+---------------------------------------------
+ Seq Scan on upper_tbl o
+   Filter: EXISTS(SubPlan 1)
+   SubPlan 1
+     ->  Memoize
+           Cache Key: o.x
+           Cache Mode: binary
+           ->  Limit
+                 ->  Seq Scan on upper_tbl i
+                       Filter: (x = o.x)
+(9 rows)
+
+-- No memoize since we change upper_tbl data
+CREATE VIEW rw_view1 AS
+  SELECT * FROM upper_tbl b
+  WHERE EXISTS(SELECT 1 FROM upper_tbl r WHERE r.x = b.x)
+  WITH CHECK OPTION;
+EXPLAIN (costs off) INSERT INTO rw_view1 VALUES (5, null, null);
+           QUERY PLAN            
+---------------------------------
+ Insert on upper_tbl b
+   ->  Result
+   SubPlan 1
+     ->  Seq Scan on upper_tbl r
+           Filter: (x = b.x)
+(5 rows)
+
+EXPLAIN (costs off) UPDATE rw_view1 SET x = x + 5;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Update on upper_tbl b
+   ->  Hash Join
+         Hash Cond: (b.x = r.x)
+         ->  Seq Scan on upper_tbl b
+         ->  Hash
+               ->  HashAggregate
+                     Group Key: r.x
+                     ->  Seq Scan on upper_tbl r
+   SubPlan 1
+     ->  Seq Scan on upper_tbl r_1
+           Filter: (x = b.x)
+(11 rows)
+
+DROP view rw_view1;
+-- Index Scan with memoize
+CREATE INDEX idx1 ON upper_tbl (z);
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u
+WHERE u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND u.z=1;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Index Scan using idx1 on public.upper_tbl u
+         Output: u.x, u.y, u.z
+         Index Cond: (u.z = '1'::numeric)
+         Filter: ((u.y)::numeric < (SubPlan 1))
+         SubPlan 1
+           ->  Memoize
+                 Output: (avg(s.x))
+                 Cache Key: u.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s.x)
+                       ->  Seq Scan on public.sub_tbl s
+                             Output: s.x
+                             Filter: (s.x = u.x)
+(16 rows)
+
+-- Bitmap Heap Scan with memoize
+SET enable_indexscan = 'off';
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u
+WHERE u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND u.z=1;
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Bitmap Heap Scan on public.upper_tbl u
+         Recheck Cond: (u.z = '1'::numeric)
+         Filter: ((u.y)::numeric < (SubPlan 1))
+         ->  Bitmap Index Scan on idx1
+               Index Cond: (u.z = '1'::numeric)
+         SubPlan 1
+           ->  Memoize
+                 Output: (avg(s.x))
+                 Cache Key: u.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s.x)
+                       ->  Seq Scan on public.sub_tbl s
+                             Output: s.x
+                             Filter: (s.x = u.x)
+(17 rows)
+
+RESET enable_indexscan;
+DROP INDEX idx1;
+--
+-- Multiple subplans in the expression
+--
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u
+WHERE
+  u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND
+  (u.y + 1) < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x);
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Seq Scan on public.upper_tbl u
+         Output: u.x, u.y, u.z
+         Filter: (((u.y)::numeric < (SubPlan 1)) AND (((u.y + 1))::numeric < (SubPlan 2)))
+         SubPlan 1
+           ->  Memoize
+                 Output: (avg(s.x))
+                 Cache Key: u.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s.x)
+                       ->  Seq Scan on public.sub_tbl s
+                             Output: s.x
+                             Filter: (s.x = u.x)
+         SubPlan 2
+           ->  Memoize
+                 Output: (avg(s_1.x))
+                 Cache Key: u.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s_1.x)
+                       ->  Seq Scan on public.sub_tbl s_1
+                             Output: s_1.x
+                             Filter: (s_1.x = u.x)
+(25 rows)
+
+SELECT count(*) FROM upper_tbl u
+WHERE
+  u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND
+  (u.y + 1) < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x);
+ count 
+-------
+     3
+(1 row)
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u
+WHERE u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) OR (
+  (u.y + 1) < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND
+  (u.y - 1) < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x)
+);
+                                                             QUERY PLAN                                                              
+-------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Seq Scan on public.upper_tbl u
+         Output: u.x, u.y, u.z
+         Filter: (((u.y)::numeric < (SubPlan 1)) OR ((((u.y + 1))::numeric < (SubPlan 2)) AND (((u.y - 1))::numeric < (SubPlan 3))))
+         SubPlan 1
+           ->  Memoize
+                 Output: (avg(s.x))
+                 Cache Key: u.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s.x)
+                       ->  Seq Scan on public.sub_tbl s
+                             Output: s.x
+                             Filter: (s.x = u.x)
+         SubPlan 2
+           ->  Memoize
+                 Output: (avg(s_1.x))
+                 Cache Key: u.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s_1.x)
+                       ->  Seq Scan on public.sub_tbl s_1
+                             Output: s_1.x
+                             Filter: (s_1.x = u.x)
+         SubPlan 3
+           ->  Memoize
+                 Output: (avg(s_2.x))
+                 Cache Key: u.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s_2.x)
+                       ->  Seq Scan on public.sub_tbl s_2
+                             Output: s_2.x
+                             Filter: (s_2.x = u.x)
+(35 rows)
+
+SELECT count(*) FROM upper_tbl u
+WHERE u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) OR (
+  (u.y + 1) < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) AND
+  (u.y - 1) < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x)
+);
+ count 
+-------
+     6
+(1 row)
+
+-- Just a bit more complicated: with mixed vars and exprs
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u
+WHERE u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) OR (
+  (u.x + 1) < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.y) AND
+  (u.y - 1) < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x/2)
+);
+                                                             QUERY PLAN                                                              
+-------------------------------------------------------------------------------------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Seq Scan on public.upper_tbl u
+         Output: u.x, u.y, u.z
+         Filter: (((u.y)::numeric < (SubPlan 1)) OR ((((u.x + 1))::numeric < (SubPlan 2)) AND (((u.y - 1))::numeric < (SubPlan 3))))
+         SubPlan 1
+           ->  Memoize
+                 Output: (avg(s.x))
+                 Cache Key: u.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s.x)
+                       ->  Seq Scan on public.sub_tbl s
+                             Output: s.x
+                             Filter: (s.x = u.x)
+         SubPlan 2
+           ->  Memoize
+                 Output: (avg(s_1.x))
+                 Cache Key: u.y
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s_1.x)
+                       ->  Seq Scan on public.sub_tbl s_1
+                             Output: s_1.x
+                             Filter: (s_1.x = u.y)
+         SubPlan 3
+           ->  Memoize
+                 Output: (avg(s_2.x))
+                 Cache Key: u.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s_2.x)
+                       ->  Seq Scan on public.sub_tbl s_2
+                             Output: s_2.x
+                             Filter: (s_2.x = (u.x / 2))
+(35 rows)
+
+SELECT count(*) FROM upper_tbl u
+WHERE u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) OR (
+  (u.x + 1) < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.y) AND
+  (u.y - 1) < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x/2)
+);
+ count 
+-------
+     6
+(1 row)
+
+-- TODO: Memoize multi-level references
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM upper_tbl u
+WHERE u.y < (SELECT avg(s.x) FROM sub_tbl s
+  WHERE s.x < (SELECT avg(u2.x) FROM upper_tbl u2
+    WHERE u.x <> s.x OR u2.x < u.y));
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Seq Scan on public.upper_tbl u
+   Output: u.x, u.y, u.z
+   Filter: ((u.y)::numeric < (SubPlan 2))
+   SubPlan 2
+     ->  Memoize
+           Output: (avg(s.x))
+           Cache Key: u.x, u.y
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: avg(s.x)
+                 ->  Seq Scan on public.sub_tbl s
+                       Output: s.x
+                       Filter: ((s.x)::numeric < (SubPlan 1))
+                       SubPlan 1
+                         ->  Aggregate
+                               Output: avg(u2.x)
+                               ->  Seq Scan on public.upper_tbl u2
+                                     Output: u2.x, u2.y, u2.z
+                                     Filter: ((u.x <> s.x) OR (u2.x < u.y))
+(19 rows)
+
+ -- Check result's consistency among executions with enabled and disabled feature
+SET pg_ext_planner.memoize_subplan = 'off';
+SELECT * FROM upper_tbl u
+WHERE u.y < (SELECT avg(s.x) FROM sub_tbl s
+  WHERE s.x < (SELECT avg(u2.x) FROM upper_tbl u2
+    WHERE u.x <> s.x OR u2.x < u.y));
+ x | y | z 
+---+---+---
+ 3 | 0 | 3
+ 4 | 0 | 9
+(2 rows)
+
+SET pg_ext_planner.memoize_subplan = 'on';
+SELECT * FROM upper_tbl u
+WHERE u.y < (SELECT avg(s.x) FROM sub_tbl s
+  WHERE s.x < (SELECT avg(u2.x) FROM upper_tbl u2
+    WHERE u.x <> s.x OR u2.x < u.y));
+ x | y | z 
+---+---+---
+ 3 | 0 | 3
+ 4 | 0 | 9
+(2 rows)
+
+-- Don't memoize subplan which refers an upper-level parent except the immediate
+-- one. XXX: may we redesign that part?
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM upper_tbl u
+WHERE
+  u.y < (
+    SELECT avg(s.x) FROM sub_tbl s
+    WHERE s.x < (
+      SELECT avg(u2.x) FROM upper_tbl u2
+      WHERE u.x <> s.x OR u2.x < u.y)) OR
+        u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x < u.z);
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Seq Scan on public.upper_tbl u
+   Output: u.x, u.y, u.z
+   Filter: (((u.y)::numeric < (SubPlan 2)) OR ((u.y)::numeric < (SubPlan 3)))
+   SubPlan 2
+     ->  Memoize
+           Output: (avg(s.x))
+           Cache Key: u.x, u.y
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: avg(s.x)
+                 ->  Seq Scan on public.sub_tbl s
+                       Output: s.x
+                       Filter: ((s.x)::numeric < (SubPlan 1))
+                       SubPlan 1
+                         ->  Aggregate
+                               Output: avg(u2.x)
+                               ->  Seq Scan on public.upper_tbl u2
+                                     Output: u2.x, u2.y, u2.z
+                                     Filter: ((u.x <> s.x) OR (u2.x < u.y))
+   SubPlan 3
+     ->  Memoize
+           Output: (avg(s_1.x))
+           Cache Key: u.z
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: avg(s_1.x)
+                 ->  Seq Scan on public.sub_tbl s_1
+                       Output: s_1.x
+                       Filter: ((s_1.x)::numeric < u.z)
+(29 rows)
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT * FROM upper_tbl u
+WHERE
+  u.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x < u.z) OR
+  u.y < (SELECT avg(s.x) FROM sub_tbl s
+  WHERE s.x < (SELECT avg(u2.x) FROM upper_tbl u2
+    WHERE u.x <> s.x OR u2.x < u.y));
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Seq Scan on public.upper_tbl u
+   Output: u.x, u.y, u.z
+   Filter: (((u.y)::numeric < (SubPlan 1)) OR ((u.y)::numeric < (SubPlan 3)))
+   SubPlan 1
+     ->  Memoize
+           Output: (avg(s.x))
+           Cache Key: u.z
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: avg(s.x)
+                 ->  Seq Scan on public.sub_tbl s
+                       Output: s.x
+                       Filter: ((s.x)::numeric < u.z)
+   SubPlan 3
+     ->  Memoize
+           Output: (avg(s_1.x))
+           Cache Key: u.x, u.y
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: avg(s_1.x)
+                 ->  Seq Scan on public.sub_tbl s_1
+                       Output: s_1.x
+                       Filter: ((s_1.x)::numeric < (SubPlan 2))
+                       SubPlan 2
+                         ->  Aggregate
+                               Output: avg(u2.x)
+                               ->  Seq Scan on public.upper_tbl u2
+                                     Output: u2.x, u2.y, u2.z
+                                     Filter: ((u.x <> s_1.x) OR (u2.x < u.y))
+(29 rows)
+
+-- Subplan inside a target list
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x) FROM upper_tbl u;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Seq Scan on public.upper_tbl u
+   Output: (SubPlan 1)
+   SubPlan 1
+     ->  Memoize
+           Output: (avg(s.x))
+           Cache Key: u.x
+           Cache Mode: binary
+           ->  Aggregate
+                 Output: avg(s.x)
+                 ->  Seq Scan on public.sub_tbl s
+                       Output: s.x
+                       Filter: (s.x = u.x)
+(12 rows)
+
+-- Subplan in a JOIN clause
+SET enable_material = 'off';
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u1, upper_tbl u2
+WHERE u1.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u2.x) AND
+  u1.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u1.x);
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Nested Loop
+         Join Filter: ((u1.y)::numeric < (SubPlan 1))
+         ->  Seq Scan on public.upper_tbl u1
+               Output: u1.x, u1.y, u1.z
+               Filter: ((u1.y)::numeric < (SubPlan 2))
+               SubPlan 2
+                 ->  Memoize
+                       Output: (avg(s_1.x))
+                       Cache Key: u1.x
+                       Cache Mode: binary
+                       ->  Aggregate
+                             Output: avg(s_1.x)
+                             ->  Seq Scan on public.sub_tbl s_1
+                                   Output: s_1.x
+                                   Filter: (s_1.x = u1.x)
+         ->  Seq Scan on public.upper_tbl u2
+               Output: u2.x, u2.y, u2.z
+         SubPlan 1
+           ->  Memoize
+                 Output: (avg(s.x))
+                 Cache Key: u2.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s.x)
+                       ->  Seq Scan on public.sub_tbl s
+                             Output: s.x
+                             Filter: (s.x = u2.x)
+(29 rows)
+
+SET enable_nestloop = 'off';
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u1, upper_tbl u2
+WHERE
+  u1.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u2.x) AND -- Join filter
+  u1.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u1.x) AND -- Scan filter
+  u1.y = (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u2.x); -- Join clause
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Hash Join
+         Hash Cond: ((u1.y)::numeric = (SubPlan 3))
+         Join Filter: ((u1.y)::numeric < (SubPlan 1))
+         ->  Seq Scan on public.upper_tbl u1
+               Output: u1.x, u1.y, u1.z
+               Filter: ((u1.y)::numeric < (SubPlan 2))
+               SubPlan 2
+                 ->  Memoize
+                       Output: (avg(s_1.x))
+                       Cache Key: u1.x
+                       Cache Mode: binary
+                       ->  Aggregate
+                             Output: avg(s_1.x)
+                             ->  Seq Scan on public.sub_tbl s_1
+                                   Output: s_1.x
+                                   Filter: (s_1.x = u1.x)
+         ->  Hash
+               Output: u2.x
+               ->  Seq Scan on public.upper_tbl u2
+                     Output: u2.x
+               SubPlan 3
+                 ->  Memoize
+                       Output: (avg(s_2.x))
+                       Cache Key: u2.x
+                       Cache Mode: binary
+                       ->  Aggregate
+                             Output: avg(s_2.x)
+                             ->  Seq Scan on public.sub_tbl s_2
+                                   Output: s_2.x
+                                   Filter: (s_2.x = u2.x)
+         SubPlan 1
+           ->  Memoize
+                 Output: (avg(s.x))
+                 Cache Key: u2.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s.x)
+                       ->  Seq Scan on public.sub_tbl s
+                             Output: s.x
+                             Filter: (s.x = u2.x)
+(42 rows)
+
+SET enable_hashjoin = 'off';
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u1, upper_tbl u2
+WHERE
+  u1.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u2.x) AND -- Join filter
+  u1.y < (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u1.x) AND -- Scan filter
+  u1.y = (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u2.x); -- Join clause
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Merge Join
+         Merge Cond: (((u1.y)::numeric) = ((SubPlan 3)))
+         Join Filter: (((u1.y)::numeric) < (SubPlan 1))
+         ->  Sort
+               Output: u1.y, ((u1.y)::numeric)
+               Sort Key: ((u1.y)::numeric)
+               ->  Seq Scan on public.upper_tbl u1
+                     Output: u1.y, u1.y
+                     Filter: ((u1.y)::numeric < (SubPlan 2))
+                     SubPlan 2
+                       ->  Memoize
+                             Output: (avg(s_1.x))
+                             Cache Key: u1.x
+                             Cache Mode: binary
+                             ->  Aggregate
+                                   Output: avg(s_1.x)
+                                   ->  Seq Scan on public.sub_tbl s_1
+                                         Output: s_1.x
+                                         Filter: (s_1.x = u1.x)
+         ->  Sort
+               Output: u2.x, ((SubPlan 3))
+               Sort Key: ((SubPlan 3))
+               ->  Seq Scan on public.upper_tbl u2
+                     Output: u2.x, (SubPlan 3)
+                     SubPlan 3
+                       ->  Memoize
+                             Output: (avg(s_2.x))
+                             Cache Key: u2.x
+                             Cache Mode: binary
+                             ->  Aggregate
+                                   Output: avg(s_2.x)
+                                   ->  Seq Scan on public.sub_tbl s_2
+                                         Output: s_2.x
+                                         Filter: (s_2.x = u2.x)
+         SubPlan 1
+           ->  Memoize
+                 Output: (avg(s.x))
+                 Cache Key: u2.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s.x)
+                       ->  Seq Scan on public.sub_tbl s
+                             Output: s.x
+                             Filter: (s.x = u2.x)
+(46 rows)
+
+--
+-- Check cost model
+--
+SET pg_ext_planner.force_memoize_subplan = 'off';
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT count(*) FROM upper_tbl u
+WHERE u.y = (SELECT avg(s.x) FROM sub_tbl s WHERE s.x=u.x);
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Aggregate
+   Output: count(*)
+   ->  Seq Scan on public.upper_tbl u
+         Output: u.x, u.y, u.z
+         Filter: ((u.y)::numeric = (SubPlan 1))
+         SubPlan 1
+           ->  Memoize
+                 Output: (avg(s.x))
+                 Cache Key: u.x
+                 Cache Mode: binary
+                 ->  Aggregate
+                       Output: avg(s.x)
+                       ->  Seq Scan on public.sub_tbl s
+                             Output: s.x
+                             Filter: (s.x = u.x)
+(15 rows)
+
+RESET enable_indexscan;
+RESET enable_material;
+RESET enable_nestloop;
+RESET enable_hashjoin;
+RESET pg_ext_planner.memoize_subplan;
+RESET pg_ext_planner.force_memoize_subplan;
+RESET random_page_cost;
+RESET DateStyle;
+DROP TABLE sub_tbl, upper_tbl, int_tbl, dt_tbl, main_tbl CASCADE;
