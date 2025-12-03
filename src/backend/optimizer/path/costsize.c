@@ -150,6 +150,7 @@ bool		enable_tidscan = true;
 bool		enable_sort = true;
 bool		enable_incremental_sort = true;
 bool		enable_hashagg = true;
+bool		enable_indexagg = true;
 bool		enable_nestloop = true;
 bool		enable_material = true;
 bool		enable_memoize = true;
@@ -1848,6 +1849,32 @@ cost_recursive_union(Path *runion, Path *nrterm, Path *rterm)
 									rterm->pathtarget->width);
 }
 
+/* 
+ * cost_tuplemerge
+ *		Determines and returns the cost of external merge used in tuplesort.
+ */
+static void
+cost_tuplemerge(double availMem, double input_bytes, double ntuples,
+				Cost comparison_cost, Cost *cost)
+{
+	double		npages = ceil(input_bytes / BLCKSZ);
+	double		nruns = input_bytes / availMem;
+	double		mergeorder = tuplesort_merge_order(availMem);
+	double		log_runs;
+	double		npageaccesses;
+
+	/* Compute logM(r) as log(r) / log(M) */
+	if (nruns > mergeorder)
+		log_runs = ceil(log(nruns) / log(mergeorder));
+	else
+		log_runs = 1.0;
+
+	npageaccesses = 2.0 * npages * log_runs;
+
+	/* Assume 3/4ths of accesses are sequential, 1/4th are not */
+	*cost += npageaccesses * (seq_page_cost * 0.75 + random_page_cost * 0.25);
+}
+
 /*
  * cost_tuplesort
  *	  Determines and returns the cost of sorting a relation using tuplesort,
@@ -1922,11 +1949,6 @@ cost_tuplesort(Cost *startup_cost, Cost *run_cost,
 		/*
 		 * We'll have to use a disk-based sort of all the tuples
 		 */
-		double		npages = ceil(input_bytes / BLCKSZ);
-		double		nruns = input_bytes / sort_mem_bytes;
-		double		mergeorder = tuplesort_merge_order(sort_mem_bytes);
-		double		log_runs;
-		double		npageaccesses;
 
 		/*
 		 * CPU costs
@@ -1936,16 +1958,8 @@ cost_tuplesort(Cost *startup_cost, Cost *run_cost,
 		*startup_cost = comparison_cost * tuples * LOG2(tuples);
 
 		/* Disk costs */
-
-		/* Compute logM(r) as log(r) / log(M) */
-		if (nruns > mergeorder)
-			log_runs = ceil(log(nruns) / log(mergeorder));
-		else
-			log_runs = 1.0;
-		npageaccesses = 2.0 * npages * log_runs;
-		/* Assume 3/4ths of accesses are sequential, 1/4th are not */
-		*startup_cost += npageaccesses *
-			(seq_page_cost * 0.75 + random_page_cost * 0.25);
+		cost_tuplemerge(sort_mem_bytes, input_bytes, tuples, comparison_cost,
+						startup_cost);
 	}
 	else if (tuples > 2 * output_tuples || input_bytes > sort_mem_bytes)
 	{
@@ -2770,7 +2784,7 @@ cost_agg(Path *path, PlannerInfo *root,
 		total_cost += cpu_tuple_cost * numGroups;
 		output_tuples = numGroups;
 	}
-	else
+	else if (aggstrategy == AGG_HASHED)
 	{
 		/* must be AGG_HASHED */
 		startup_cost = input_total_cost;
@@ -2788,6 +2802,50 @@ cost_agg(Path *path, PlannerInfo *root,
 		total_cost += cpu_tuple_cost * numGroups;
 		output_tuples = numGroups;
 	}
+	else
+	{
+		/* must be AGG_INDEX */
+		startup_cost = input_total_cost;
+		if (!enable_indexagg)
+			++disabled_nodes;
+
+		/* these matches AGG_HASHED */
+		startup_cost += aggcosts->transCost.startup;
+		startup_cost += aggcosts->transCost.per_tuple * input_tuples;
+		startup_cost += (cpu_operator_cost * numGroupCols) * input_tuples;
+		startup_cost += aggcosts->finalCost.startup;
+
+		/* cost of btree top-down traversal */
+		startup_cost +=   LOG2(numGroups)	/* amount of comparisons */
+						* (2.0 * cpu_operator_cost)	/* comparison cost */
+						* input_tuples;
+
+		total_cost = startup_cost;
+		total_cost += aggcosts->finalCost.per_tuple * numGroups;
+		total_cost += cpu_tuple_cost * numGroups;
+		output_tuples = numGroups;
+	}
+
+	/*
+	 * If there are quals (HAVING quals), account for their cost and
+	 * selectivity.  Process it before disk spill logic, because output
+	 * cardinality is required for AGG_INDEX.
+	 */
+	if (quals)
+	{
+		QualCost	qual_cost;
+
+		cost_qual_eval(&qual_cost, quals, root);
+		startup_cost += qual_cost.startup;
+		total_cost += qual_cost.startup + output_tuples * qual_cost.per_tuple;
+
+		output_tuples = clamp_row_est(output_tuples *
+									  clauselist_selectivity(root,
+															 quals,
+															 0,
+															 JOIN_INNER,
+															 NULL));
+	}
 
 	/*
 	 * Add the disk costs of hash aggregation that spills to disk.
@@ -2802,7 +2860,7 @@ cost_agg(Path *path, PlannerInfo *root,
 	 * Accrue writes (spilled tuples) to startup_cost and to total_cost;
 	 * accrue reads only to total_cost.
 	 */
-	if (aggstrategy == AGG_HASHED || aggstrategy == AGG_MIXED)
+	if (aggstrategy == AGG_HASHED || aggstrategy == AGG_MIXED || aggstrategy == AGG_INDEX)
 	{
 		double		pages;
 		double		pages_written = 0.0;
@@ -2814,6 +2872,7 @@ cost_agg(Path *path, PlannerInfo *root,
 		uint64		ngroups_limit;
 		int			num_partitions;
 		int			depth;
+		bool		canspill;
 
 		/*
 		 * Estimate number of batches based on the computed limits. If less
@@ -2823,8 +2882,9 @@ cost_agg(Path *path, PlannerInfo *root,
 		hashentrysize = hash_agg_entry_size(list_length(root->aggtransinfos),
 											input_width,
 											aggcosts->transitionSpace);
-		hash_agg_set_limits(hashentrysize, numGroups, 0, &mem_limit,
-							&ngroups_limit, &num_partitions);
+		agg_set_limits(hashentrysize, numGroups, 0, &mem_limit,
+					   &ngroups_limit, &num_partitions);
+		canspill = num_partitions != 0;
 
 		nbatches = Max((numGroups * hashentrysize) / mem_limit,
 					   numGroups / ngroups_limit);
@@ -2861,26 +2921,27 @@ cost_agg(Path *path, PlannerInfo *root,
 		spill_cost = depth * input_tuples * 2.0 * cpu_tuple_cost;
 		startup_cost += spill_cost;
 		total_cost += spill_cost;
-	}
 
-	/*
-	 * If there are quals (HAVING quals), account for their cost and
-	 * selectivity.
-	 */
-	if (quals)
-	{
-		QualCost	qual_cost;
+		/* 
+		 * IndexAgg requires final external merge stage, but only if spill
+		 * can occur, otherwise everything processed in memory.
+		 */
+		if (aggstrategy == AGG_INDEX && canspill)
+		{
+			double	output_bytes;
+			Cost	comparison_cost;
+			Cost	merge_cost = 0;
 
-		cost_qual_eval(&qual_cost, quals, root);
-		startup_cost += qual_cost.startup;
-		total_cost += qual_cost.startup + output_tuples * qual_cost.per_tuple;
+			/* size of all projected tuples */
+			output_bytes = path->pathtarget->width * output_tuples;
+			/* default comparison cost */
+			comparison_cost = 2.0 * cpu_operator_cost;
 
-		output_tuples = clamp_row_est(output_tuples *
-									  clauselist_selectivity(root,
-															 quals,
-															 0,
-															 JOIN_INNER,
-															 NULL));
+			cost_tuplemerge(work_mem, output_bytes, output_tuples,
+							comparison_cost, &merge_cost);
+			startup_cost += merge_cost;
+			total_cost += merge_cost;
+		}
 	}
 
 	path->rows = output_tuples;

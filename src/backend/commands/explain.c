@@ -134,7 +134,7 @@ static void show_recursive_union_info(RecursiveUnionState *rstate,
 									  ExplainState *es);
 static void show_memoize_info(MemoizeState *mstate, List *ancestors,
 							  ExplainState *es);
-static void show_hashagg_info(AggState *aggstate, ExplainState *es);
+static void show_agg_spill_info(AggState *aggstate, ExplainState *es);
 static void show_indexsearches_info(PlanState *planstate, ExplainState *es);
 static void show_tidbitmap_info(BitmapHeapScanState *planstate,
 								ExplainState *es);
@@ -1556,6 +1556,10 @@ ExplainNode(PlanState *planstate, List *ancestors,
 						pname = "MixedAggregate";
 						strategy = "Mixed";
 						break;
+					case AGG_INDEX:
+						pname = "IndexAggregate";
+						strategy = "Indexed";
+						break;
 					default:
 						pname = "Aggregate ???";
 						strategy = "???";
@@ -2200,7 +2204,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_Agg:
 			show_agg_keys(castNode(AggState, planstate), ancestors, es);
 			show_upper_qual(plan->qual, "Filter", planstate, ancestors, es);
-			show_hashagg_info((AggState *) planstate, es);
+			show_agg_spill_info((AggState *) planstate, es);
 			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 1,
 										   planstate, es);
@@ -2631,6 +2635,24 @@ show_agg_keys(AggState *astate, List *ancestors,
 
 		if (plan->groupingSets)
 			show_grouping_sets(outerPlanState(astate), plan, ancestors, es);
+		else if (plan->aggstrategy == AGG_INDEX)
+			{
+				Sort	*sort = astate->index_sort;
+
+				/* 
+				 * Index Agg reorders GROUP BY keys to match ORDER BY
+				 * so they must be the same, but we should show other
+				 * useful information about used ordering, such as direction.
+				 */
+				Assert(sort != NULL);
+				show_sort_group_keys(outerPlanState(astate), "Group Key",
+									 plan->numCols, 0,
+									 sort->sortColIdx,
+									 sort->sortOperators,
+									 sort->collations,
+									 sort->nullsFirst,
+									 ancestors, es);
+			}
 		else
 			show_sort_group_keys(outerPlanState(astate), "Group Key",
 								 plan->numCols, 0, plan->grpColIdx,
@@ -3735,47 +3757,67 @@ show_memoize_info(MemoizeState *mstate, List *ancestors, ExplainState *es)
 }
 
 /*
- * Show information on hash aggregate memory usage and batches.
+ * Show information on hash or index aggregate memory usage and batches.
  */
 static void
-show_hashagg_info(AggState *aggstate, ExplainState *es)
+show_agg_spill_info(AggState *aggstate, ExplainState *es)
 {
 	Agg		   *agg = (Agg *) aggstate->ss.ps.plan;
-	int64		memPeakKb = BYTES_TO_KILOBYTES(aggstate->hash_mem_peak);
+	int64		memPeakKb = BYTES_TO_KILOBYTES(aggstate->spill_mem_peak);
 
 	if (agg->aggstrategy != AGG_HASHED &&
-		agg->aggstrategy != AGG_MIXED)
+		agg->aggstrategy != AGG_MIXED &&
+		agg->aggstrategy != AGG_INDEX)
 		return;
 
 	if (es->format != EXPLAIN_FORMAT_TEXT)
 	{
 		if (es->costs)
 			ExplainPropertyInteger("Planned Partitions", NULL,
-								   aggstate->hash_planned_partitions, es);
+								   aggstate->spill_planned_partitions, es);
 
 		/*
 		 * During parallel query the leader may have not helped out.  We
 		 * detect this by checking how much memory it used.  If we find it
 		 * didn't do any work then we don't show its properties.
 		 */
-		if (es->analyze && aggstate->hash_mem_peak > 0)
+		if (es->analyze && aggstate->spill_mem_peak > 0)
 		{
 			ExplainPropertyInteger("HashAgg Batches", NULL,
-								   aggstate->hash_batches_used, es);
+								   aggstate->spill_batches_used, es);
 			ExplainPropertyInteger("Peak Memory Usage", "kB", memPeakKb, es);
 			ExplainPropertyInteger("Disk Usage", "kB",
-								   aggstate->hash_disk_used, es);
+								   aggstate->spill_disk_used, es);
+		}
+
+		if (   es->analyze
+			&& aggstate->aggstrategy == AGG_INDEX
+			&& aggstate->mergestate != NULL)
+		{
+			TuplesortInstrumentation stats;
+			const char *mergeMethod;
+			const char *spaceType;
+			int64 spaceUsed;
+			
+			tuplesort_get_stats(aggstate->mergestate, &stats);
+			mergeMethod = tuplesort_method_name(stats.sortMethod);
+			spaceType = tuplesort_space_type_name(stats.spaceType);
+			spaceUsed = stats.spaceUsed;
+
+			ExplainPropertyText("Merge Method", mergeMethod, es);
+			ExplainPropertyInteger("Merge Space Used", "kB", spaceUsed, es);
+			ExplainPropertyText("Merge Space Type", spaceType, es);
 		}
 	}
 	else
 	{
 		bool		gotone = false;
 
-		if (es->costs && aggstate->hash_planned_partitions > 0)
+		if (es->costs && aggstate->spill_planned_partitions > 0)
 		{
 			ExplainIndentText(es);
 			appendStringInfo(es->str, "Planned Partitions: %d",
-							 aggstate->hash_planned_partitions);
+							 aggstate->spill_planned_partitions);
 			gotone = true;
 		}
 
@@ -3784,7 +3826,7 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 		 * detect this by checking how much memory it used.  If we find it
 		 * didn't do any work then we don't show its properties.
 		 */
-		if (es->analyze && aggstate->hash_mem_peak > 0)
+		if (es->analyze && aggstate->spill_mem_peak > 0)
 		{
 			if (!gotone)
 				ExplainIndentText(es);
@@ -3792,15 +3834,42 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 				appendStringInfoSpaces(es->str, 2);
 
 			appendStringInfo(es->str, "Batches: %d  Memory Usage: " INT64_FORMAT "kB",
-							 aggstate->hash_batches_used, memPeakKb);
+							 aggstate->spill_batches_used, memPeakKb);
 			gotone = true;
 
 			/* Only display disk usage if we spilled to disk */
-			if (aggstate->hash_batches_used > 1)
+			if (aggstate->spill_batches_used > 1)
 			{
 				appendStringInfo(es->str, "  Disk Usage: " UINT64_FORMAT "kB",
-								 aggstate->hash_disk_used);
+								 aggstate->spill_disk_used);
 			}
+		}
+
+		/* For index aggregate show stats for final merging */
+		if (   es->analyze
+			&& aggstate->aggstrategy == AGG_INDEX
+			&& aggstate->mergestate != NULL)
+		{
+			TuplesortInstrumentation stats;
+			const char *mergeMethod;
+			const char *spaceType;
+			int64 spaceUsed;
+			
+			tuplesort_get_stats(aggstate->mergestate, &stats);
+			mergeMethod = tuplesort_method_name(stats.sortMethod);
+			spaceType = tuplesort_space_type_name(stats.spaceType);
+			spaceUsed = stats.spaceUsed;
+
+			/* 
+			 * If we are here that means that previous check (for mem peak) was
+			 * successfull (can not directly go to merge without any in-memory
+			 * operations).  Do not check other state and just start a new line.
+			 */
+			appendStringInfoChar(es->str, '\n');
+			ExplainIndentText(es);
+			appendStringInfo(es->str, "Merge Method: %s  %s: " INT64_FORMAT "kB",
+							 mergeMethod, spaceType, spaceUsed);
+			gotone = true;
 		}
 
 		if (gotone)

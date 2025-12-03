@@ -2158,6 +2158,8 @@ create_agg_plan(PlannerInfo *root, AggPath *best_path)
 	Plan	   *subplan;
 	List	   *tlist;
 	List	   *quals;
+	List	   *chain;
+	AttrNumber *grpColIdx;
 
 	/*
 	 * Agg can project, so no need to be terribly picky about child tlist, but
@@ -2169,17 +2171,24 @@ create_agg_plan(PlannerInfo *root, AggPath *best_path)
 
 	quals = order_qual_clauses(root, best_path->qual);
 
+	grpColIdx = extract_grouping_cols(best_path->groupClause, subplan->targetlist);
+
+	/* For index aggregation we should consider the desired sorting order. */
+	if (best_path->aggstrategy == AGG_INDEX)
+		chain = list_make1(make_sort_from_groupcols(best_path->groupClause, grpColIdx, subplan));
+	else
+		chain = NIL;
+
 	plan = make_agg(tlist, quals,
 					best_path->aggstrategy,
 					best_path->aggsplit,
 					list_length(best_path->groupClause),
-					extract_grouping_cols(best_path->groupClause,
-										  subplan->targetlist),
+					grpColIdx,
 					extract_grouping_ops(best_path->groupClause),
 					extract_grouping_collations(best_path->groupClause,
 												subplan->targetlist),
 					NIL,
-					NIL,
+					chain,
 					best_path->numGroups,
 					best_path->transitionSpace,
 					subplan);

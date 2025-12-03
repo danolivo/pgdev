@@ -3878,6 +3878,21 @@ create_grouping_paths(PlannerInfo *root,
 			 (gd ? gd->any_hashable : grouping_is_hashable(root->processed_groupClause))))
 			flags |= GROUPING_CAN_USE_HASH;
 
+		/* 
+		 * Determine whether we should consider index-based implementation of
+		 * grouping.
+		 * 
+		 * This is more restrictive since it not only must be sortable (for
+		 * purposes of Btree), but also must be hashable, so we can effectively
+		 * spill tuples and later process each batch.
+		 */
+		if (   gd == NULL
+			&& root->numOrderedAggs == 0
+			&& parse->groupClause != NIL
+			&& grouping_is_sortable(root->processed_groupClause)
+			&& grouping_is_hashable(root->processed_groupClause))
+			flags |= GROUPING_CAN_USE_INDEX;
+
 		/*
 		 * Determine whether partial aggregation is possible.
 		 */
@@ -7109,6 +7124,7 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 	ListCell   *lc;
 	bool		can_hash = (extra->flags & GROUPING_CAN_USE_HASH) != 0;
 	bool		can_sort = (extra->flags & GROUPING_CAN_USE_SORT) != 0;
+	bool		can_index = (extra->flags & GROUPING_CAN_USE_INDEX) != 0;
 	List	   *havingQual = (List *) extra->havingQual;
 	AggClauseCosts *agg_final_costs = &extra->agg_final_costs;
 	double		dNumGroups = 0;
@@ -7328,6 +7344,25 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 									 agg_final_costs,
 									 dNumFinalGroups));
 		}
+	}
+
+	if (can_index)
+	{
+		/* 
+		 * Generate IndexAgg path.
+		 */
+		Assert(!parse->groupingSets);
+		add_path(grouped_rel, (Path *)
+				 create_agg_path(root,
+								 grouped_rel,
+								 cheapest_path,
+								 grouped_rel->reltarget,
+								 AGG_INDEX,
+								 AGGSPLIT_SIMPLE,
+								 root->processed_groupClause,
+								 havingQual,
+								 agg_costs,
+								 dNumGroups));
 	}
 
 	/*

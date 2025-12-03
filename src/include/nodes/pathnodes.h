@@ -3518,7 +3518,8 @@ typedef struct JoinPathExtraData
  */
 #define GROUPING_CAN_USE_SORT       0x0001
 #define GROUPING_CAN_USE_HASH       0x0002
-#define GROUPING_CAN_PARTIAL_AGG	0x0004
+#define GROUPING_CAN_USE_INDEX		0x0004
+#define GROUPING_CAN_PARTIAL_AGG	0x0008
 
 /*
  * What kind of partitionwise aggregation is in use?

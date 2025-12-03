@@ -3030,6 +3030,15 @@ create_agg_path(PlannerInfo *root,
 		else
 			pathnode->path.pathkeys = subpath->pathkeys;	/* preserves order */
 	}
+	else if (aggstrategy == AGG_INDEX)
+	{
+		/* 
+		 * When using index aggregation all grouping columns will be used as
+		 * comparator keys, so output is always sorted.
+		 */
+		pathnode->path.pathkeys = make_pathkeys_for_sortclauses(root, groupClause,
+																root->processed_tlist);
+	}
 	else
 		pathnode->path.pathkeys = NIL;	/* output is unordered */
 
