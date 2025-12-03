@@ -900,7 +900,91 @@ typedef tuplehash_iterator TupleHashIterator;
 #define ScanTupleHashTable(htable, iter) \
 	tuplehash_iterate(htable->hashtab, iter)
 
+/* ---------------------------------------------------------------
+ * 				Tuple Btree index
+ *
+ * All-in-memory tuple Btree index used for grouping and aggregating.
+ * ---------------------------------------------------------------
+ */
 
+/* 
+ * Representation of tuple in index.  It stores both tuple and
+ * first key information.  If key abbreviation is used, then this
+ * first key stores abbreviated key.
+ */
+typedef struct TupleIndexEntryData
+{
+	MinimalTuple tuple;	/* actual stored tuple */
+	Datum	key1;		/* value of first key */
+	bool	isnull1;	/* first key is null */
+} TupleIndexEntryData;
+
+typedef TupleIndexEntryData *TupleIndexEntry;
+
+/* 
+ * Btree node of tuple index. Common for both internal and leaf nodes.
+ */
+typedef struct TupleIndexNodeData
+{
+	/* amount of tuples in the node */
+	int ntuples;
+
+/* 
+ * Maximal amount of tuples stored in tuple index node.
+ *
+ * NOTE: use 2^n - 1 count, so all all tuples will fully utilize cache lines
+ *       (except first because of 'ntuples' padding)
+ */
+#define TUPLE_INDEX_NODE_MAX_ENTRIES  63
+
+	/* 
+	 * array of tuples for this page.
+	 * 
+	 * for internal node these are separator keys.
+	 * for leaf nodes actual tuples.
+	 */
+	TupleIndexEntry tuples[TUPLE_INDEX_NODE_MAX_ENTRIES];
+
+	/* 
+	 * for internal nodes this is an array with size
+	 * TUPLE_INDEX_NODE_MAX_ENTRIES + 1 - pointers to nodes below.
+	 * 
+	 * for leaf nodes this is an array of 1 element - pointer to sibling
+	 * node required for iteration
+	 */
+	struct TupleIndexNodeData *pointers[FLEXIBLE_ARRAY_MEMBER];
+} TupleIndexNodeData;
+
+typedef TupleIndexNodeData *TupleIndexNode;
+
+typedef struct TupleIndexData
+{
+	TupleDesc	tupDesc;		/* descriptor for stored tuples */
+	TupleIndexNode root;		/* root of the tree */
+	int		height;				/* current tree height */
+	int		ntuples;			/* number of tuples in index */
+	int		nkeys;				/* amount of keys in tuple */
+	SortSupport	sortKeys;		/* support functions for key comparison */
+	MemoryContext	tuplecxt;	/* memory context containing tuples */
+	MemoryContext	nodecxt;	/* memory context containing index nodes */
+	Size	additionalsize;		/* size of additional data for tuple */
+	int		abbrevNext;			/* next time we should check abbreviation 
+									* optimization efficiency */
+	bool	abbrevUsed;			/* true if key abbreviation optimization
+									* was ever used */
+	Oid		abbrevSortOp;		/* sort operator for first key */
+} TupleIndexData;
+
+typedef struct TupleIndexData *TupleIndex;
+
+typedef struct TupleIndexIteratorData
+{
+	TupleIndexNode	cur_leaf;	/* current leaf node */
+	OffsetNumber	cur_idx;	/* index of tuple to return next */
+} TupleIndexIteratorData;
+
+typedef TupleIndexIteratorData *TupleIndexIterator;
+	
 /* ----------------------------------------------------------------
  *				 Expression State Nodes
  *

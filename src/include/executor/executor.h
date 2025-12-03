@@ -198,6 +198,71 @@ TupleHashEntryGetAdditional(TupleHashTable hashtable, TupleHashEntry entry)
 }
 #endif
 
+extern TupleIndex BuildTupleIndex(TupleDesc inputDesc,
+								  int nkeys,
+								  AttrNumber *attNums,
+								  Oid *sortOperators,
+								  Oid *sortCollations,
+								  bool *nullsFirstFlags,
+								  Size additionalsize,
+								  MemoryContext metacxt,
+								  MemoryContext tablecxt,
+								  MemoryContext nodecxt);
+extern TupleIndexEntry TupleIndexLookup(TupleIndex index, TupleTableSlot *search,
+		  								bool *is_new);
+extern void ResetTupleIndex(TupleIndex index);
+
+/* 
+ * Start iteration over tuples in index. Supports only ascending direction.
+ * During iterations no modifications are allowed, because it can break iterator.
+ */
+extern void	InitTupleIndexIterator(TupleIndex index, TupleIndexIterator iter);
+extern TupleIndexEntry TupleIndexIteratorNext(TupleIndexIterator iter);
+static inline void
+ResetTupleIndexIterator(TupleIndex index, TupleIndexIterator iter)
+{
+	InitTupleIndexIterator(index, iter);
+}
+
+#ifndef FRONTEND
+
+/* 
+ * Return size of the index entry. Useful for estimating memory usage.
+ */
+static inline size_t
+TupleIndexEntrySize(void)
+{
+	return sizeof(TupleIndexEntryData);
+}
+
+/* 
+ * Get a pointer to the additional space allocated for this entry. The
+ * memory will be maxaligned and zeroed.
+ * 
+ * The amount of space available is the additionalsize requested in the call
+ * to BuildTupleIndex(). If additionalsize was specified as zero, return
+ * NULL.
+ */
+static inline void *
+TupleIndexEntryGetAdditional(TupleIndex index, TupleIndexEntry entry)
+{
+if (index->additionalsize > 0)
+	return (char *) (entry->tuple) - index->additionalsize;
+else
+	return NULL;
+}
+
+/* 
+ * Return tuple from index entry
+ */
+static inline MinimalTuple
+TupleIndexEntryGetMinimalTuple(TupleIndexEntry entry)
+{
+	return entry->tuple;
+}
+
+#endif
+
 /*
  * prototypes from functions in execJunk.c
  */

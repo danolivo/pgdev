@@ -622,3 +622,646 @@ TupleHashTableMatch(struct tuplehash_hash *tb, MinimalTuple tuple1, MinimalTuple
 	econtext->ecxt_outertuple = slot1;
 	return !ExecQualAndReset(hashtable->cur_eq_func, econtext);
 }
+
+/*****************************************************************************
+ * 		Utility routines for all-in-memory btree index
+ * 
+ * These routines build btree index for grouping tuples together (eg, for
+ * index aggregation).  There is one entry for each not-distinct set of tuples
+ * presented.
+ *****************************************************************************/
+
+/* 
+ * Representation of searched entry in tuple index. This have
+ * separate representation to avoid necessary memory allocations
+ * to create MinimalTuple for TupleIndexEntry.
+ */
+typedef struct TupleIndexSearchEntryData
+{
+	TupleTableSlot *slot;		/* search TupleTableSlot */
+	Datum	key1;				/* first searched key data */
+	bool	isnull1;			/* first searched key is null */
+} TupleIndexSearchEntryData;
+
+typedef TupleIndexSearchEntryData *TupleIndexSearchEntry;
+
+/* 
+ * compare_index_tuple_tiebreak
+ * 		Perform full comparison of tuples without key abbreviation.
+ * 
+ * Invoked if first key (possibly abbreviated) can not decide comparison, so
+ * we have to compare all keys.
+ */
+static inline int
+compare_index_tuple_tiebreak(TupleIndex index, TupleIndexEntry left,
+							 TupleIndexSearchEntry right)
+{
+	HeapTupleData ltup;
+	SortSupport sortKey = index->sortKeys;
+	TupleDesc tupDesc = index->tupDesc;
+	AttrNumber	attno;
+	Datum		datum1,
+				datum2;
+	bool		isnull1,
+				isnull2;
+	int			cmp;
+
+	ltup.t_len = left->tuple->t_len + MINIMAL_TUPLE_OFFSET;
+	ltup.t_data = (HeapTupleHeader) ((char *) left->tuple - MINIMAL_TUPLE_OFFSET);
+	tupDesc = index->tupDesc;
+
+	if (sortKey->abbrev_converter)
+	{
+		attno = sortKey->ssup_attno;
+
+		datum1 = heap_getattr(&ltup, attno, tupDesc, &isnull1);
+		datum2 = slot_getattr(right->slot, attno, &isnull2);
+
+		cmp = ApplySortAbbrevFullComparator(datum1, isnull1,
+											datum2, isnull2,
+											sortKey);
+		if (cmp != 0)
+			return cmp;
+	}
+
+	sortKey++;
+	for (int nkey = 1; nkey < index->nkeys; nkey++, sortKey++)
+	{
+		attno = sortKey->ssup_attno;
+
+		datum1 = heap_getattr(&ltup, attno, tupDesc, &isnull1);
+		datum2 = slot_getattr(right->slot, attno, &isnull2);
+
+		cmp = ApplySortComparator(datum1, isnull1,
+								  datum2, isnull2,
+								  sortKey);
+		if (cmp != 0)
+			return cmp;
+	}
+	
+	return 0;
+}
+
+/* 
+ * compare_index_tuple
+ * 		Compare pair of tuples during index lookup
+ * 
+ * The comparison honors key abbreviation.
+ */
+static int
+compare_index_tuple(TupleIndex index,
+					TupleIndexEntry left,
+					TupleIndexSearchEntry right)
+{
+	SortSupport sortKey = &index->sortKeys[0];
+	int	cmp = 0;
+	
+	cmp = ApplySortComparator(left->key1, left->isnull1,
+							  right->key1, right->isnull1,
+							  sortKey);
+	if (cmp != 0)
+		return cmp;
+
+	return compare_index_tuple_tiebreak(index, left, right);
+}
+
+/* 
+ * tuple_index_node_bsearch
+ * 		Perform binary search in the index node.
+ * 
+ * On return, if 'found' is set to 'true', then exact match found and returned
+ * index is an index in tuples array.  Otherwise the value handled differently:
+ * - for internal nodes this is an index in 'pointers' array which to follow
+ * - for leaf nodes this is an index to which new entry must be inserted.
+ */
+static int
+tuple_index_node_bsearch(TupleIndex index, TupleIndexNode node,
+						 TupleIndexSearchEntry search, bool *found)
+{
+	int low;
+	int high;
+	
+	low = 0;
+	high = node->ntuples;
+	*found = false;
+
+	while (low < high)
+	{
+		OffsetNumber mid = (low + high) / 2;
+		TupleIndexEntry mid_entry = node->tuples[mid];
+		int cmp;
+
+		cmp = compare_index_tuple(index, mid_entry, search);
+		if (cmp == 0)
+		{
+			*found = true;
+			return mid;
+		}
+
+		if (cmp < 0)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+
+	return low;
+}
+
+static inline TupleIndexNode
+IndexLeafNodeGetNext(TupleIndexNode node)
+{
+	return node->pointers[0];
+}
+
+static inline void
+IndexLeafNodeSetNext(TupleIndexNode node, TupleIndexNode next)
+{
+	node->pointers[0] = next;
+}
+
+#define SizeofTupleIndexInternalNode \
+	  (offsetof(TupleIndexNodeData, pointers) \
+	+ (TUPLE_INDEX_NODE_MAX_ENTRIES + 1) * sizeof(TupleIndexNode))
+
+#define SizeofTupleIndexLeafNode \
+	offsetof(TupleIndexNodeData, pointers) + sizeof(TupleIndexNode)
+
+static inline TupleIndexNode
+AllocLeafIndexNode(TupleIndex index, TupleIndexNode next)
+{
+	TupleIndexNode leaf;
+	leaf = MemoryContextAllocZero(index->nodecxt, SizeofTupleIndexLeafNode);
+	IndexLeafNodeSetNext(leaf, next);
+	return leaf;
+}
+
+static inline TupleIndexNode
+AllocInternalIndexNode(TupleIndex index)
+{
+	return MemoryContextAllocZero(index->nodecxt, SizeofTupleIndexInternalNode);
+}
+
+/* 
+ * tuple_index_node_insert_at
+ * 		Insert new tuple in the node at specified index
+ * 
+ * This function is inserted when new tuple must be inserted in the node (both
+ * leaf and internal). For internal nodes 'pointer' must be also specified.
+ *
+ * Node must have free space available. It's up to caller to check if node
+ * is full and needs splitting. For split use 'tuple_index_perform_insert_split'.
+ */
+static inline void
+tuple_index_node_insert_at(TupleIndexNode node, bool is_leaf, int idx,
+						   TupleIndexEntry entry, TupleIndexNode pointer)
+{
+	int move_count;
+
+	Assert(node->ntuples < TUPLE_INDEX_NODE_MAX_ENTRIES);
+	Assert(0 <= idx && idx <= node->ntuples);
+	move_count = node->ntuples - idx;
+
+	if (move_count > 0)
+		memmove(&node->tuples[idx + 1], &node->tuples[idx],
+			move_count * sizeof(TupleIndexEntry));
+
+	node->tuples[idx] = entry;
+
+	if (!is_leaf)
+	{
+		Assert(pointer != NULL);
+
+		if (move_count > 0)
+			memmove(&node->pointers[idx + 2], &node->pointers[idx + 1],
+					move_count * sizeof(TupleIndexNode));
+		node->pointers[idx + 1] = pointer;
+	}
+
+	node->ntuples++;
+}
+
+/* 
+ * Insert tuple to full node with page split.
+ * 
+ * 'split_node_out' - new page containing nodes on right side
+ * 'split_tuple_out' - tuple, which sent to the parent node as new separator key
+ */
+static void
+tuple_index_insert_split(TupleIndex index, TupleIndexNode node, bool is_leaf,
+						 int insert_pos, TupleIndexNode *split_node_out,
+						 TupleIndexEntry *split_entry_out)
+{
+	TupleIndexNode split;
+	int split_tuple_idx;
+
+	Assert(node->ntuples == TUPLE_INDEX_NODE_MAX_ENTRIES);
+
+	if (is_leaf)
+	{
+		/* 
+		 * Max amount of tuples is kept odd, so we need to decide at
+		 * which index to perform page split. We know that split occurred
+		 * during insert, so left less entries to the page at which
+		 * insertion must occur.
+		 */
+		if (TUPLE_INDEX_NODE_MAX_ENTRIES / 2 < insert_pos)
+			split_tuple_idx = TUPLE_INDEX_NODE_MAX_ENTRIES / 2 + 1;
+		else
+			split_tuple_idx = TUPLE_INDEX_NODE_MAX_ENTRIES / 2;
+
+		split = AllocLeafIndexNode(index, IndexLeafNodeGetNext(node));
+		split->ntuples = node->ntuples - split_tuple_idx;
+		node->ntuples = split_tuple_idx;
+		memcpy(&split->tuples[0], &node->tuples[node->ntuples], 
+			   sizeof(TupleIndexEntry) * split->ntuples);
+		IndexLeafNodeSetNext(node, split);
+	}
+	else
+	{
+		/* 
+		 * After split on internal node split tuple will be removed.
+		 * Max amount of tuples is odd, so division by 2 will handle it.
+		 */
+		split_tuple_idx = TUPLE_INDEX_NODE_MAX_ENTRIES / 2;
+		split = AllocInternalIndexNode(index);
+		split->ntuples = split_tuple_idx;
+		node->ntuples = split_tuple_idx;
+		memcpy(&split->tuples[0], &node->tuples[split_tuple_idx + 1],
+				sizeof(TupleIndexEntry) * split->ntuples);
+		memcpy(&split->pointers[0], &node->pointers[split_tuple_idx + 1],
+				sizeof(TupleIndexNode) * (split->ntuples + 1));
+	}
+
+	*split_node_out = split;
+	*split_entry_out = node->tuples[split_tuple_idx];
+}
+
+static inline Datum
+mintup_getattr(MinimalTuple tup, TupleDesc tupdesc, AttrNumber attnum, bool *isnull)
+{
+	HeapTupleData htup;
+
+	htup.t_len = tup->t_len + MINIMAL_TUPLE_OFFSET;
+	htup.t_data = (HeapTupleHeader) ((char *) tup - MINIMAL_TUPLE_OFFSET);
+
+	return heap_getattr(&htup, attnum, tupdesc, isnull);
+}
+
+static TupleIndexEntry
+tuple_index_node_lookup(TupleIndex index,
+						TupleIndexNode node, int level,
+						TupleIndexSearchEntry search, bool *is_new,
+						TupleIndexNode *split_node_out,
+						TupleIndexEntry *split_entry_out)
+{
+	TupleIndexEntry entry;
+	int idx;
+	bool found;
+	bool is_leaf;
+
+	TupleIndexNode insert_pointer;
+	TupleIndexEntry insert_entry;
+	bool need_insert;
+
+	Assert(level >= 0);
+
+	idx = tuple_index_node_bsearch(index, node, search, &found);
+	if (found)
+	{
+		/* 
+		 * Both internal and leaf nodes store pointers to elements, so we can
+		 * safely return exact match found at each level.
+		 */
+		if (is_new)
+			*is_new = false;
+		return node->tuples[idx];
+	}
+
+	is_leaf = level == 0;
+	if (is_leaf)
+	{
+		MemoryContext oldcxt;
+
+		if (is_new == NULL)
+			return NULL;
+
+		oldcxt = MemoryContextSwitchTo(index->tuplecxt);
+
+		entry = palloc(sizeof(TupleIndexEntryData));
+		entry->tuple = ExecCopySlotMinimalTupleExtra(search->slot, index->additionalsize);
+
+		MemoryContextSwitchTo(oldcxt);
+
+		/* 
+		 * key1 in search tuple stored in TableTupleSlot which have it's own
+		 * lifetime, so we must not copy it.
+		 * 
+		 * But if key abbreviation is in use than we should copy it from search
+		 * tuple: this is safe (pass-by-value) and extra recalculation can
+		 * spoil statistics calculation.
+		 */
+		if (index->sortKeys->abbrev_converter)
+		{
+			entry->isnull1 = search->isnull1;
+			entry->key1 = search->key1;
+		}
+		else
+		{
+			SortSupport sortKey = &index->sortKeys[0];
+			entry->key1 = mintup_getattr(entry->tuple, index->tupDesc,
+										 sortKey->ssup_attno, &entry->isnull1);
+		}
+
+		index->ntuples++;
+
+		*is_new = true;
+		need_insert = true;
+		insert_pointer = NULL;
+		insert_entry = entry;
+	}
+	else
+	{
+		TupleIndexNode child_split_node = NULL;
+		TupleIndexEntry child_split_entry;
+
+		entry = tuple_index_node_lookup(index, node->pointers[idx], level - 1,
+										search, is_new,
+										&child_split_node, &child_split_entry);
+		if (entry == NULL)
+			return NULL;
+
+		if (child_split_node != NULL)
+		{
+			need_insert = true;
+			insert_pointer = child_split_node;
+			insert_entry = child_split_entry;
+		}
+		else
+			need_insert = false;
+	}
+	
+	if (need_insert)
+	{
+		Assert(insert_entry != NULL);
+
+		if (node->ntuples == TUPLE_INDEX_NODE_MAX_ENTRIES)
+		{
+			TupleIndexNode split_node;
+			TupleIndexEntry split_entry;
+
+			tuple_index_insert_split(index, node, is_leaf, idx,
+									 &split_node, &split_entry);
+
+			/* adjust insertion index if tuple is inserted to the splitted page */
+			if (node->ntuples < idx)
+			{
+				/* keep split tuple for leaf nodes and remove for internal */
+				if (is_leaf)
+					idx -= node->ntuples;
+				else
+					idx -= node->ntuples + 1;
+
+				node = split_node;
+			}
+
+			*split_node_out = split_node;
+			*split_entry_out = split_entry;
+		}
+
+		Assert(idx >= 0);
+		tuple_index_node_insert_at(node, is_leaf, idx, insert_entry, insert_pointer);
+	}
+
+	return entry;
+}
+
+static void
+remove_index_abbreviations(TupleIndex index)
+{
+	TupleIndexIteratorData iter;
+	TupleIndexEntry entry;
+	SortSupport sortKey = &index->sortKeys[0];
+
+	sortKey->comparator = sortKey->abbrev_full_comparator;
+	sortKey->abbrev_converter = NULL;
+	sortKey->abbrev_abort = NULL;
+	sortKey->abbrev_full_comparator = NULL;
+
+	/* now traverse all index entries and convert all existing keys */
+	InitTupleIndexIterator(index, &iter);
+	while ((entry = TupleIndexIteratorNext(&iter)) != NULL)
+		entry->key1 = mintup_getattr(entry->tuple, index->tupDesc,
+									 sortKey->ssup_attno, &entry->isnull1);
+}
+
+static inline void
+prepare_search_index_tuple(TupleIndex index, TupleTableSlot *slot,
+						   TupleIndexSearchEntry entry)
+{
+	SortSupport	sortKey;
+
+	sortKey = &index->sortKeys[0];
+
+	entry->slot = slot;
+	entry->key1 = slot_getattr(slot, sortKey->ssup_attno, &entry->isnull1);
+
+	/* NULL can not be abbreviated */
+	if (entry->isnull1)
+		return;
+
+	/* abbreviation is not used */
+	if (!sortKey->abbrev_converter)
+		return;
+
+	/* check if abbreviation should be removed */
+	if (index->abbrevNext <= index->ntuples)
+	{
+		index->abbrevNext *= 2;
+
+		if (sortKey->abbrev_abort(index->ntuples, sortKey))
+		{
+			remove_index_abbreviations(index);
+			return;
+		}
+	}
+
+	entry->key1 = sortKey->abbrev_converter(entry->key1, sortKey);
+}
+
+TupleIndexEntry
+TupleIndexLookup(TupleIndex index, TupleTableSlot *searchslot, bool *is_new)
+{
+	TupleIndexEntry entry;
+	TupleIndexSearchEntryData search_entry;
+	TupleIndexNode split_node = NULL;
+	TupleIndexEntry split_entry;
+	TupleIndexNode new_root;
+
+	prepare_search_index_tuple(index, searchslot, &search_entry);
+
+	entry = tuple_index_node_lookup(index, index->root, index->height,
+									&search_entry, is_new, &split_node, &split_entry);
+
+	if (entry == NULL)
+		return NULL;
+
+	if (split_node == NULL)
+		return entry;
+
+	/* root split */
+	new_root = AllocInternalIndexNode(index);
+	new_root->ntuples = 1;
+	new_root->tuples[0] = split_entry;
+	new_root->pointers[0] = index->root;
+	new_root->pointers[1] = split_node;
+	index->root = new_root;
+	index->height++;
+
+	return entry;
+}
+
+void
+InitTupleIndexIterator(TupleIndex index, TupleIndexIterator iter)
+{
+	TupleIndexNode min_node;
+	int level;
+
+	/* iterate to the left-most node */
+	min_node = index->root;
+	level = index->height;
+	while (level-- > 0)
+		min_node = min_node->pointers[0];
+
+	iter->cur_leaf = min_node;
+	iter->cur_idx = 0;
+}
+
+TupleIndexEntry
+TupleIndexIteratorNext(TupleIndexIterator iter)
+{
+	TupleIndexNode leaf = iter->cur_leaf;
+	TupleIndexEntry tuple;
+
+	if (leaf == NULL)
+		return NULL;
+
+	/* this also handles single empty root node case */
+	if (leaf->ntuples <= iter->cur_idx)
+	{
+		leaf = iter->cur_leaf = IndexLeafNodeGetNext(leaf);
+		if (leaf == NULL)
+			return NULL;
+		iter->cur_idx = 0;
+	}
+
+	tuple = leaf->tuples[iter->cur_idx];
+	iter->cur_idx++;
+	return tuple;
+}
+
+/* 
+ * Construct an empty TupleIndex
+ *
+ * inputDesc: tuple descriptor for input tuples
+ * nkeys: number of columns to be compared (length of next 4 arrays)
+ * attNums: attribute numbers used for grouping in sort order
+ * sortOperators: Oids of sort operator families used for comparisons
+ * sortCollations: collations used for comparisons
+ * nullsFirstFlags: strategy for handling NULL values
+ * additionalsize: size of data that may be stored along with the index entry
+ * 				   used for storing per-trans information during aggregation
+ * metacxt: memory context for TupleIndex itself
+ * tuplecxt: memory context for storing MinimalTuples
+ * nodecxt: memory context for storing index nodes
+ */
+TupleIndex
+BuildTupleIndex(TupleDesc inputDesc,
+				int nkeys,
+				AttrNumber *attNums,
+				Oid *sortOperators,
+				Oid *sortCollations,
+				bool *nullsFirstFlags,
+				Size additionalsize,
+				MemoryContext metacxt,
+				MemoryContext tuplecxt,
+				MemoryContext nodecxt)
+{
+	TupleIndex index;
+	MemoryContext oldcxt;
+
+	Assert(nkeys > 0);
+
+	additionalsize = MAXALIGN(additionalsize);
+
+	oldcxt = MemoryContextSwitchTo(metacxt);
+
+	index = (TupleIndex) palloc(sizeof(TupleIndexData));
+	index->tuplecxt = tuplecxt;
+	index->nodecxt = nodecxt;
+	index->additionalsize = additionalsize;
+	index->tupDesc = CreateTupleDescCopy(inputDesc);
+	index->root = AllocLeafIndexNode(index, NULL);
+	index->ntuples = 0;
+	index->height = 0;
+
+	index->nkeys = nkeys;
+	index->sortKeys = (SortSupport) palloc0(nkeys * sizeof(SortSupportData));
+
+	for (int i = 0; i < nkeys; ++i)
+	{
+		SortSupport sortKey = &index->sortKeys[i];
+
+		Assert(AttributeNumberIsValid(attNums[i]));
+		Assert(OidIsValid(sortOperators[i]));
+
+		sortKey->ssup_cxt = CurrentMemoryContext;
+		sortKey->ssup_collation = sortCollations[i];
+		sortKey->ssup_nulls_first = nullsFirstFlags[i];
+		sortKey->ssup_attno = attNums[i];
+		/* abbreviation applies only for the first key */
+		sortKey->abbreviate = i == 0;
+
+		PrepareSortSupportFromOrderingOp(sortOperators[i], sortKey);
+	}
+
+	/* Update abbreviation information */
+	if (index->sortKeys[0].abbrev_converter != NULL)
+	{
+		index->abbrevUsed = true;
+		index->abbrevNext = 10;
+		index->abbrevSortOp = sortOperators[0];
+	}
+	else
+		index->abbrevUsed = false;
+
+	MemoryContextSwitchTo(oldcxt);
+	return index;
+}
+
+/* 
+ * Resets contents of the index to be empty, preserving all the non-content
+ * state.
+ */
+void
+ResetTupleIndex(TupleIndex index)
+{
+	SortSupport ssup;
+
+	/* by this time indexcxt must be reset by the caller */
+	index->root = AllocLeafIndexNode(index, NULL);
+	index->height = 0;
+	index->ntuples = 0;
+	
+	if (!index->abbrevUsed)
+		return;
+
+	/* 
+	 * If key abbreviation is used then we must reset it's state.
+	 * All fields in SortSupport are already setup, but we should clean
+	 * some fields to make it look just if we setup this for the first time.
+	 */
+	ssup = &index->sortKeys[0];
+	ssup->comparator = NULL;
+	PrepareSortSupportFromOrderingOp(index->abbrevSortOp, ssup);
+}
+
