@@ -2830,6 +2830,7 @@ select count(*) from
 set enable_hashjoin = 0;
 set enable_nestloop = 0;
 set enable_hashagg = 0;
+set enable_indexagg = 0;
 --
 -- Check that we use the pathkeys from a prefix of the group by / order by
 -- clause for the join pathkeys when that prefix covers all join quals.  We
@@ -2857,6 +2858,7 @@ order by x.thousand desc, x.twothousand;
                      ->  Seq Scan on tenk1 x
 (13 rows)
 
+reset enable_indexagg;
 reset enable_hashagg;
 reset enable_nestloop;
 reset enable_hashjoin;
@@ -9534,23 +9536,20 @@ inner join (select distinct id from j3) j3 on j1.id = j3.id;
 explain (verbose, costs off)
 select * from j1
 inner join (select id from j3 group by id) j3 on j1.id = j3.id;
-               QUERY PLAN                
------------------------------------------
+            QUERY PLAN             
+-----------------------------------
  Nested Loop
    Output: j1.id, j3.id
    Inner Unique: true
    Join Filter: (j1.id = j3.id)
-   ->  Group
+   ->  IndexAggregate
          Output: j3.id
          Group Key: j3.id
-         ->  Sort
+         ->  Seq Scan on public.j3
                Output: j3.id
-               Sort Key: j3.id
-               ->  Seq Scan on public.j3
-                     Output: j3.id
    ->  Seq Scan on public.j1
          Output: j1.id
-(14 rows)
+(11 rows)
 
 drop table j1;
 drop table j2;
@@ -9867,16 +9866,14 @@ EXPLAIN (COSTS OFF)
 SELECT 1 FROM group_tbl t1
     LEFT JOIN (SELECT a c1, COALESCE(a, a) c2 FROM group_tbl t2) s ON TRUE
 GROUP BY s.c1, s.c2;
-                   QUERY PLAN                   
-------------------------------------------------
- Group
+                QUERY PLAN                 
+-------------------------------------------
+ IndexAggregate
    Group Key: t2.a, (COALESCE(t2.a, t2.a))
-   ->  Sort
-         Sort Key: t2.a, (COALESCE(t2.a, t2.a))
-         ->  Nested Loop Left Join
-               ->  Seq Scan on group_tbl t1
-               ->  Seq Scan on group_tbl t2
-(7 rows)
+   ->  Nested Loop Left Join
+         ->  Seq Scan on group_tbl t1
+         ->  Seq Scan on group_tbl t2
+(5 rows)
 
 DROP TABLE group_tbl;
 --

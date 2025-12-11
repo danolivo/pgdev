@@ -605,6 +605,7 @@ select count(*) from
 set enable_hashjoin = 0;
 set enable_nestloop = 0;
 set enable_hashagg = 0;
+set enable_indexagg = 0;
 
 --
 -- Check that we use the pathkeys from a prefix of the group by / order by
@@ -617,6 +618,7 @@ from tenk1 x inner join tenk1 y on x.thousand = y.thousand
 group by x.thousand, x.twothousand
 order by x.thousand desc, x.twothousand;
 
+reset enable_indexagg;
 reset enable_hashagg;
 reset enable_nestloop;
 reset enable_hashjoin;

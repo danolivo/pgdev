@@ -35,6 +35,7 @@ GROUP BY t1.a ORDER BY t1.a;
 
 -- Produce results with sorting aggregation
 SET enable_hashagg TO off;
+SET enable_indexagg TO off;
 
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT t1.a, avg(t2.c)
@@ -48,6 +49,25 @@ SELECT t1.a, avg(t2.c)
 GROUP BY t1.a ORDER BY t1.a;
 
 RESET enable_hashagg;
+RESET enable_indexagg;
+
+-- Produce results with index aggregation
+SET enable_hashagg TO off;
+SET enable_sort TO off;
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT t1.a, avg(t2.c)
+  FROM eager_agg_t1 t1
+  JOIN eager_agg_t2 t2 ON t1.b = t2.b
+GROUP BY t1.a ORDER BY t1.a;
+
+SELECT t1.a, avg(t2.c)
+  FROM eager_agg_t1 t1
+  JOIN eager_agg_t2 t2 ON t1.b = t2.b
+GROUP BY t1.a ORDER BY t1.a;
+
+RESET enable_hashagg;
+RESET enable_sort;
 
 
 --
@@ -71,6 +91,7 @@ GROUP BY t1.a ORDER BY t1.a;
 
 -- Produce results with sorting aggregation
 SET enable_hashagg TO off;
+SET enable_indexagg TO off;
 
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT t1.a, avg(t2.c + t3.c)
@@ -86,7 +107,27 @@ SELECT t1.a, avg(t2.c + t3.c)
 GROUP BY t1.a ORDER BY t1.a;
 
 RESET enable_hashagg;
+RESET enable_indexagg;
 
+-- Produce results with index aggregation
+SET enable_hashagg TO off;
+SET enable_sort TO off;
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT t1.a, avg(t2.c + t3.c)
+  FROM eager_agg_t1 t1
+  JOIN eager_agg_t2 t2 ON t1.b = t2.b
+  JOIN eager_agg_t3 t3 ON t2.a = t3.a
+GROUP BY t1.a ORDER BY t1.a;
+
+SELECT t1.a, avg(t2.c + t3.c)
+  FROM eager_agg_t1 t1
+  JOIN eager_agg_t2 t2 ON t1.b = t2.b
+  JOIN eager_agg_t3 t3 ON t2.a = t3.a
+GROUP BY t1.a ORDER BY t1.a;
+
+RESET enable_hashagg;
+RESET enable_sort;
 
 --
 -- Test that eager aggregation works for outer join

@@ -318,6 +318,7 @@ select count(*), generate_series(1,2) from tenk1 group by twenty;
 
 -- test gather merge with parallel leader participation disabled
 set parallel_leader_participation = off;
+set enable_indexagg = off;
 
 explain (costs off)
    select count(*) from tenk1 group by twenty;
@@ -328,6 +329,7 @@ reset parallel_leader_participation;
 
 --test rescan behavior of gather merge
 set enable_material = false;
+set enable_indexagg = false;
 
 explain (costs off)
 select * from
@@ -341,6 +343,7 @@ select * from
   right join (values (1),(2),(3)) v(x) on true;
 
 reset enable_material;
+reset enable_indexagg;
 
 reset enable_hashagg;
 

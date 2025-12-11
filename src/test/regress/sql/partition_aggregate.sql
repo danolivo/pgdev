@@ -55,8 +55,9 @@ EXPLAIN (COSTS OFF)
 SELECT c, sum(a) FROM pagg_tab WHERE c = 'x' GROUP BY c;
 SELECT c, sum(a) FROM pagg_tab WHERE c = 'x' GROUP BY c;
 
--- Test GroupAggregate paths by disabling hash aggregates.
+-- Test GroupAggregate paths by disabling hash and index aggregates.
 SET enable_hashagg TO false;
+SET enable_indexagg TO false;
 
 -- When GROUP BY clause matches full aggregation is performed for each partition.
 EXPLAIN (COSTS OFF)
@@ -81,6 +82,32 @@ EXPLAIN (COSTS OFF)
 SELECT count(*) FROM pagg_tab GROUP BY c ORDER BY c LIMIT 1;
 SELECT count(*) FROM pagg_tab GROUP BY c ORDER BY c LIMIT 1;
 
+RESET enable_hashagg;
+RESET enable_indexagg;
+
+-- Test IndexAggregate paths by disabling hash and group aggregates.
+SET enable_sort TO false;
+SET enable_hashagg TO false;
+
+-- When GROUP BY clause matches full aggregation is performed for each partition.
+EXPLAIN (COSTS OFF)
+SELECT c, sum(a), avg(b), count(*) FROM pagg_tab GROUP BY 1 HAVING avg(d) < 15 ORDER BY 1, 2, 3;
+SELECT c, sum(a), avg(b), count(*) FROM pagg_tab GROUP BY 1 HAVING avg(d) < 15 ORDER BY 1, 2, 3;
+
+-- When GROUP BY clause does not match; top finalize node is required
+EXPLAIN (COSTS OFF)
+SELECT a, sum(b), avg(b), count(*) FROM pagg_tab GROUP BY 1 HAVING avg(d) < 15 ORDER BY 1, 2, 3;
+SELECT a, sum(b), avg(b), count(*) FROM pagg_tab GROUP BY 1 HAVING avg(d) < 15 ORDER BY 1, 2, 3;
+
+-- Test partitionwise grouping without any aggregates
+EXPLAIN (COSTS OFF)
+SELECT c FROM pagg_tab GROUP BY c ORDER BY 1;
+SELECT c FROM pagg_tab GROUP BY c ORDER BY 1;
+EXPLAIN (COSTS OFF)
+SELECT a FROM pagg_tab WHERE a < 3 GROUP BY a ORDER BY 1;
+SELECT a FROM pagg_tab WHERE a < 3 GROUP BY a ORDER BY 1;
+
+RESET enable_sort;
 RESET enable_hashagg;
 
 -- ROLLUP, partitionwise aggregation does not apply
@@ -135,10 +162,12 @@ SELECT t2.y, sum(t1.y), count(*) FROM pagg_tab1 t1, pagg_tab2 t2 WHERE t1.x = t2
 -- When GROUP BY clause does not match; partial aggregation is performed for each partition.
 -- Also test GroupAggregate paths by disabling hash aggregates.
 SET enable_hashagg TO false;
+SET enable_indexagg TO false;
 EXPLAIN (COSTS OFF)
 SELECT t1.y, sum(t1.x), count(*) FROM pagg_tab1 t1, pagg_tab2 t2 WHERE t1.x = t2.y GROUP BY t1.y HAVING avg(t1.x) > 10 ORDER BY 1, 2, 3;
 SELECT t1.y, sum(t1.x), count(*) FROM pagg_tab1 t1, pagg_tab2 t2 WHERE t1.x = t2.y GROUP BY t1.y HAVING avg(t1.x) > 10 ORDER BY 1, 2, 3;
 RESET enable_hashagg;
+RESET enable_indexagg;
 
 -- Check with LEFT/RIGHT/FULL OUTER JOINs which produces NULL values for
 -- aggregation

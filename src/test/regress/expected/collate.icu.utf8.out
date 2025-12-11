@@ -2395,8 +2395,8 @@ SELECT upper(c collate case_insensitive), count(c) FROM pagg_tab3 GROUP BY c col
 --------------------------------------------------------------
  Sort
    Sort Key: (upper(pagg_tab3.c)) COLLATE case_insensitive
-   ->  Finalize HashAggregate
-         Group Key: pagg_tab3.c
+   ->  Finalize IndexAggregate
+         Group Key: pagg_tab3.c COLLATE case_insensitive
          ->  Append
                ->  Partial HashAggregate
                      Group Key: pagg_tab3.c
@@ -2613,20 +2613,20 @@ INSERT INTO pagg_tab6 (b, c) SELECT substr('cdCD', (i % 4) + 1 , 1), substr('cdC
 ANALYZE pagg_tab6;
 EXPLAIN (COSTS OFF)
 SELECT t1.c, count(t2.c) FROM pagg_tab5 t1 JOIN pagg_tab6 t2 ON t1.c = t2.c AND t1.c = t2.b GROUP BY 1 ORDER BY t1.c COLLATE "C";
-                      QUERY PLAN                       
--------------------------------------------------------
+                        QUERY PLAN                        
+----------------------------------------------------------
  Sort
    Sort Key: t1.c COLLATE "C"
    ->  Append
-         ->  HashAggregate
-               Group Key: t1.c
+         ->  IndexAggregate
+               Group Key: t1.c COLLATE case_insensitive
                ->  Nested Loop
                      Join Filter: (t1.c = t2.c)
                      ->  Seq Scan on pagg_tab6_p1 t2
                            Filter: (c = b)
                      ->  Seq Scan on pagg_tab5_p1 t1
-         ->  HashAggregate
-               Group Key: t1_1.c
+         ->  IndexAggregate
+               Group Key: t1_1.c COLLATE case_insensitive
                ->  Nested Loop
                      Join Filter: (t1_1.c = t2_1.c)
                      ->  Seq Scan on pagg_tab6_p2 t2_1

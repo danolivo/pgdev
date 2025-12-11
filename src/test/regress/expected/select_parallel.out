@@ -706,18 +706,16 @@ alter table tenk2 reset (parallel_workers);
 set enable_hashagg = false;
 explain (costs off)
    select count(*) from tenk1 group by twenty;
-                     QUERY PLAN                     
-----------------------------------------------------
+                  QUERY PLAN                  
+----------------------------------------------
  Finalize GroupAggregate
    Group Key: twenty
    ->  Gather Merge
          Workers Planned: 4
-         ->  Partial GroupAggregate
+         ->  Partial IndexAggregate
                Group Key: twenty
-               ->  Sort
-                     Sort Key: twenty
-                     ->  Parallel Seq Scan on tenk1
-(9 rows)
+               ->  Parallel Seq Scan on tenk1
+(7 rows)
 
 select count(*) from tenk1 group by twenty;
  count 
@@ -772,19 +770,17 @@ drop function sp_simple_func(integer);
 -- test handling of SRFs in targetlist (bug in 10.0)
 explain (costs off)
    select count(*), generate_series(1,2) from tenk1 group by twenty;
-                        QUERY PLAN                        
-----------------------------------------------------------
+                     QUERY PLAN                     
+----------------------------------------------------
  ProjectSet
    ->  Finalize GroupAggregate
          Group Key: twenty
          ->  Gather Merge
                Workers Planned: 4
-               ->  Partial GroupAggregate
+               ->  Partial IndexAggregate
                      Group Key: twenty
-                     ->  Sort
-                           Sort Key: twenty
-                           ->  Parallel Seq Scan on tenk1
-(10 rows)
+                     ->  Parallel Seq Scan on tenk1
+(8 rows)
 
 select count(*), generate_series(1,2) from tenk1 group by twenty;
  count | generate_series 
@@ -833,6 +829,7 @@ select count(*), generate_series(1,2) from tenk1 group by twenty;
 
 -- test gather merge with parallel leader participation disabled
 set parallel_leader_participation = off;
+set enable_indexagg = off;
 explain (costs off)
    select count(*) from tenk1 group by twenty;
                      QUERY PLAN                     
@@ -876,6 +873,7 @@ select count(*) from tenk1 group by twenty;
 reset parallel_leader_participation;
 --test rescan behavior of gather merge
 set enable_material = false;
+set enable_indexagg = false;
 explain (costs off)
 select * from
   (select string4, count(unique2)
@@ -917,6 +915,7 @@ select * from
 (12 rows)
 
 reset enable_material;
+reset enable_indexagg;
 reset enable_hashagg;
 -- check parallelized int8 aggregate (bug #14897)
 explain (costs off)

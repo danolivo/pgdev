@@ -150,7 +150,7 @@ EXPLAIN (COSTS OFF)
 SELECT c, sum(a) FROM pagg_tab WHERE 1 = 2 GROUP BY c;
              QUERY PLAN             
 ------------------------------------
- HashAggregate
+ IndexAggregate
    Group Key: c
    ->  Result
          Replaces: Scan on pagg_tab
@@ -177,8 +177,9 @@ SELECT c, sum(a) FROM pagg_tab WHERE c = 'x' GROUP BY c;
 ---+-----
 (0 rows)
 
--- Test GroupAggregate paths by disabling hash aggregates.
+-- Test GroupAggregate paths by disabling hash and index aggregates.
 SET enable_hashagg TO false;
+SET enable_indexagg TO false;
 -- When GROUP BY clause matches full aggregation is performed for each partition.
 EXPLAIN (COSTS OFF)
 SELECT c, sum(a), avg(b), count(*) FROM pagg_tab GROUP BY 1 HAVING avg(d) < 15 ORDER BY 1, 2, 3;
@@ -371,6 +372,150 @@ SELECT count(*) FROM pagg_tab GROUP BY c ORDER BY c LIMIT 1;
 (1 row)
 
 RESET enable_hashagg;
+RESET enable_indexagg;
+-- Test IndexAggregate paths by disabling hash and group aggregates.
+SET enable_sort TO false;
+SET enable_hashagg TO false;
+-- When GROUP BY clause matches full aggregation is performed for each partition.
+EXPLAIN (COSTS OFF)
+SELECT c, sum(a), avg(b), count(*) FROM pagg_tab GROUP BY 1 HAVING avg(d) < 15 ORDER BY 1, 2, 3;
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Sort
+   Disabled: true
+   Sort Key: pagg_tab.c, (sum(pagg_tab.a)), (avg(pagg_tab.b))
+   ->  Append
+         ->  IndexAggregate
+               Group Key: pagg_tab.c
+               Filter: (avg(pagg_tab.d) < '15'::numeric)
+               ->  Seq Scan on pagg_tab_p1 pagg_tab
+         ->  IndexAggregate
+               Group Key: pagg_tab_1.c
+               Filter: (avg(pagg_tab_1.d) < '15'::numeric)
+               ->  Seq Scan on pagg_tab_p2 pagg_tab_1
+         ->  IndexAggregate
+               Group Key: pagg_tab_2.c
+               Filter: (avg(pagg_tab_2.d) < '15'::numeric)
+               ->  Seq Scan on pagg_tab_p3 pagg_tab_2
+(16 rows)
+
+SELECT c, sum(a), avg(b), count(*) FROM pagg_tab GROUP BY 1 HAVING avg(d) < 15 ORDER BY 1, 2, 3;
+  c   | sum  |         avg         | count 
+------+------+---------------------+-------
+ 0000 | 2000 | 12.0000000000000000 |   250
+ 0001 | 2250 | 13.0000000000000000 |   250
+ 0002 | 2500 | 14.0000000000000000 |   250
+ 0006 | 2500 | 12.0000000000000000 |   250
+ 0007 | 2750 | 13.0000000000000000 |   250
+ 0008 | 2000 | 14.0000000000000000 |   250
+(6 rows)
+
+-- When GROUP BY clause does not match; top finalize node is required
+EXPLAIN (COSTS OFF)
+SELECT a, sum(b), avg(b), count(*) FROM pagg_tab GROUP BY 1 HAVING avg(d) < 15 ORDER BY 1, 2, 3;
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Sort
+   Disabled: true
+   Sort Key: pagg_tab.a, (sum(pagg_tab.b)), (avg(pagg_tab.b))
+   ->  Finalize GroupAggregate
+         Group Key: pagg_tab.a
+         Filter: (avg(pagg_tab.d) < '15'::numeric)
+         ->  Merge Append
+               Sort Key: pagg_tab.a
+               ->  Partial IndexAggregate
+                     Group Key: pagg_tab.a
+                     ->  Seq Scan on pagg_tab_p1 pagg_tab
+               ->  Partial IndexAggregate
+                     Group Key: pagg_tab_1.a
+                     ->  Seq Scan on pagg_tab_p2 pagg_tab_1
+               ->  Partial IndexAggregate
+                     Group Key: pagg_tab_2.a
+                     ->  Seq Scan on pagg_tab_p3 pagg_tab_2
+(17 rows)
+
+SELECT a, sum(b), avg(b), count(*) FROM pagg_tab GROUP BY 1 HAVING avg(d) < 15 ORDER BY 1, 2, 3;
+ a  | sum  |         avg         | count 
+----+------+---------------------+-------
+  0 | 1500 | 10.0000000000000000 |   150
+  1 | 1650 | 11.0000000000000000 |   150
+  2 | 1800 | 12.0000000000000000 |   150
+  3 | 1950 | 13.0000000000000000 |   150
+  4 | 2100 | 14.0000000000000000 |   150
+ 10 | 1500 | 10.0000000000000000 |   150
+ 11 | 1650 | 11.0000000000000000 |   150
+ 12 | 1800 | 12.0000000000000000 |   150
+ 13 | 1950 | 13.0000000000000000 |   150
+ 14 | 2100 | 14.0000000000000000 |   150
+(10 rows)
+
+-- Test partitionwise grouping without any aggregates
+EXPLAIN (COSTS OFF)
+SELECT c FROM pagg_tab GROUP BY c ORDER BY 1;
+                   QUERY PLAN                   
+------------------------------------------------
+ Merge Append
+   Sort Key: pagg_tab.c
+   ->  IndexAggregate
+         Group Key: pagg_tab.c
+         ->  Seq Scan on pagg_tab_p1 pagg_tab
+   ->  IndexAggregate
+         Group Key: pagg_tab_1.c
+         ->  Seq Scan on pagg_tab_p2 pagg_tab_1
+   ->  IndexAggregate
+         Group Key: pagg_tab_2.c
+         ->  Seq Scan on pagg_tab_p3 pagg_tab_2
+(11 rows)
+
+SELECT c FROM pagg_tab GROUP BY c ORDER BY 1;
+  c   
+------
+ 0000
+ 0001
+ 0002
+ 0003
+ 0004
+ 0005
+ 0006
+ 0007
+ 0008
+ 0009
+ 0010
+ 0011
+(12 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT a FROM pagg_tab WHERE a < 3 GROUP BY a ORDER BY 1;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Group
+   Group Key: pagg_tab.a
+   ->  Merge Append
+         Sort Key: pagg_tab.a
+         ->  Partial IndexAggregate
+               Group Key: pagg_tab.a
+               ->  Seq Scan on pagg_tab_p1 pagg_tab
+                     Filter: (a < 3)
+         ->  Partial IndexAggregate
+               Group Key: pagg_tab_1.a
+               ->  Seq Scan on pagg_tab_p2 pagg_tab_1
+                     Filter: (a < 3)
+         ->  Partial IndexAggregate
+               Group Key: pagg_tab_2.a
+               ->  Seq Scan on pagg_tab_p3 pagg_tab_2
+                     Filter: (a < 3)
+(16 rows)
+
+SELECT a FROM pagg_tab WHERE a < 3 GROUP BY a ORDER BY 1;
+ a 
+---
+ 0
+ 1
+ 2
+(3 rows)
+
+RESET enable_sort;
+RESET enable_hashagg;
 -- ROLLUP, partitionwise aggregation does not apply
 EXPLAIN (COSTS OFF)
 SELECT c, sum(a) FROM pagg_tab GROUP BY rollup(c) ORDER BY 1, 2;
@@ -554,6 +699,7 @@ SELECT t2.y, sum(t1.y), count(*) FROM pagg_tab1 t1, pagg_tab2 t2 WHERE t1.x = t2
 -- When GROUP BY clause does not match; partial aggregation is performed for each partition.
 -- Also test GroupAggregate paths by disabling hash aggregates.
 SET enable_hashagg TO false;
+SET enable_indexagg TO false;
 EXPLAIN (COSTS OFF)
 SELECT t1.y, sum(t1.x), count(*) FROM pagg_tab1 t1, pagg_tab2 t2 WHERE t1.x = t2.y GROUP BY t1.y HAVING avg(t1.x) > 10 ORDER BY 1, 2, 3;
                                QUERY PLAN                                
@@ -606,41 +752,40 @@ SELECT t1.y, sum(t1.x), count(*) FROM pagg_tab1 t1, pagg_tab2 t2 WHERE t1.x = t2
 (6 rows)
 
 RESET enable_hashagg;
+RESET enable_indexagg;
 -- Check with LEFT/RIGHT/FULL OUTER JOINs which produces NULL values for
 -- aggregation
 -- LEFT JOIN, should produce partial partitionwise aggregation plan as
 -- GROUP BY is on nullable column
 EXPLAIN (COSTS OFF)
 SELECT b.y, sum(a.y) FROM pagg_tab1 a LEFT JOIN pagg_tab2 b ON a.x = b.y GROUP BY b.y ORDER BY 1 NULLS LAST;
-                            QUERY PLAN                            
-------------------------------------------------------------------
- Finalize GroupAggregate
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Finalize IndexAggregate
    Group Key: b.y
-   ->  Sort
-         Sort Key: b.y
-         ->  Append
-               ->  Partial HashAggregate
-                     Group Key: b.y
-                     ->  Hash Left Join
-                           Hash Cond: (a.x = b.y)
-                           ->  Seq Scan on pagg_tab1_p1 a
-                           ->  Hash
-                                 ->  Seq Scan on pagg_tab2_p1 b
-               ->  Partial HashAggregate
-                     Group Key: b_1.y
-                     ->  Hash Left Join
-                           Hash Cond: (a_1.x = b_1.y)
-                           ->  Seq Scan on pagg_tab1_p2 a_1
-                           ->  Hash
-                                 ->  Seq Scan on pagg_tab2_p2 b_1
-               ->  Partial HashAggregate
-                     Group Key: b_2.y
-                     ->  Hash Right Join
-                           Hash Cond: (b_2.y = a_2.x)
-                           ->  Seq Scan on pagg_tab2_p3 b_2
-                           ->  Hash
-                                 ->  Seq Scan on pagg_tab1_p3 a_2
-(26 rows)
+   ->  Append
+         ->  Partial HashAggregate
+               Group Key: b.y
+               ->  Hash Left Join
+                     Hash Cond: (a.x = b.y)
+                     ->  Seq Scan on pagg_tab1_p1 a
+                     ->  Hash
+                           ->  Seq Scan on pagg_tab2_p1 b
+         ->  Partial HashAggregate
+               Group Key: b_1.y
+               ->  Hash Left Join
+                     Hash Cond: (a_1.x = b_1.y)
+                     ->  Seq Scan on pagg_tab1_p2 a_1
+                     ->  Hash
+                           ->  Seq Scan on pagg_tab2_p2 b_1
+         ->  Partial HashAggregate
+               Group Key: b_2.y
+               ->  Hash Right Join
+                     Hash Cond: (b_2.y = a_2.x)
+                     ->  Seq Scan on pagg_tab2_p3 b_2
+                     ->  Hash
+                           ->  Seq Scan on pagg_tab1_p3 a_2
+(24 rows)
 
 SELECT b.y, sum(a.y) FROM pagg_tab1 a LEFT JOIN pagg_tab2 b ON a.x = b.y GROUP BY b.y ORDER BY 1 NULLS LAST;
  y  | sum  
@@ -704,35 +849,33 @@ SELECT b.y, sum(a.y) FROM pagg_tab1 a RIGHT JOIN pagg_tab2 b ON a.x = b.y GROUP 
 -- GROUP BY is on nullable column
 EXPLAIN (COSTS OFF)
 SELECT a.x, sum(b.x) FROM pagg_tab1 a FULL OUTER JOIN pagg_tab2 b ON a.x = b.y GROUP BY a.x ORDER BY 1 NULLS LAST;
-                            QUERY PLAN                            
-------------------------------------------------------------------
- Finalize GroupAggregate
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Finalize IndexAggregate
    Group Key: a.x
-   ->  Sort
-         Sort Key: a.x
-         ->  Append
-               ->  Partial HashAggregate
-                     Group Key: a.x
-                     ->  Hash Full Join
-                           Hash Cond: (a.x = b.y)
-                           ->  Seq Scan on pagg_tab1_p1 a
-                           ->  Hash
-                                 ->  Seq Scan on pagg_tab2_p1 b
-               ->  Partial HashAggregate
-                     Group Key: a_1.x
-                     ->  Hash Full Join
-                           Hash Cond: (a_1.x = b_1.y)
-                           ->  Seq Scan on pagg_tab1_p2 a_1
-                           ->  Hash
-                                 ->  Seq Scan on pagg_tab2_p2 b_1
-               ->  Partial HashAggregate
-                     Group Key: a_2.x
-                     ->  Hash Full Join
-                           Hash Cond: (b_2.y = a_2.x)
-                           ->  Seq Scan on pagg_tab2_p3 b_2
-                           ->  Hash
-                                 ->  Seq Scan on pagg_tab1_p3 a_2
-(26 rows)
+   ->  Append
+         ->  Partial HashAggregate
+               Group Key: a.x
+               ->  Hash Full Join
+                     Hash Cond: (a.x = b.y)
+                     ->  Seq Scan on pagg_tab1_p1 a
+                     ->  Hash
+                           ->  Seq Scan on pagg_tab2_p1 b
+         ->  Partial HashAggregate
+               Group Key: a_1.x
+               ->  Hash Full Join
+                     Hash Cond: (a_1.x = b_1.y)
+                     ->  Seq Scan on pagg_tab1_p2 a_1
+                     ->  Hash
+                           ->  Seq Scan on pagg_tab2_p2 b_1
+         ->  Partial HashAggregate
+               Group Key: a_2.x
+               ->  Hash Full Join
+                     Hash Cond: (b_2.y = a_2.x)
+                     ->  Seq Scan on pagg_tab2_p3 b_2
+                     ->  Hash
+                           ->  Seq Scan on pagg_tab1_p3 a_2
+(24 rows)
 
 SELECT a.x, sum(b.x) FROM pagg_tab1 a FULL OUTER JOIN pagg_tab2 b ON a.x = b.y GROUP BY a.x ORDER BY 1 NULLS LAST;
  x  | sum  
@@ -839,16 +982,14 @@ SELECT a.x, b.y, count(*) FROM (SELECT * FROM pagg_tab1 WHERE x < 20) a FULL JOI
 -- Empty join relation because of empty outer side, no partitionwise agg plan
 EXPLAIN (COSTS OFF)
 SELECT a.x, a.y, count(*) FROM (SELECT * FROM pagg_tab1 WHERE x = 1 AND x = 2) a LEFT JOIN pagg_tab2 b ON a.x = b.y GROUP BY a.x, a.y ORDER BY 1, 2;
-                  QUERY PLAN                  
-----------------------------------------------
- GroupAggregate
+               QUERY PLAN               
+----------------------------------------
+ IndexAggregate
    Group Key: pagg_tab1.y
-   ->  Sort
-         Sort Key: pagg_tab1.y
-         ->  Result
-               Replaces: Join on b, pagg_tab1
-               One-Time Filter: false
-(7 rows)
+   ->  Result
+         Replaces: Join on b, pagg_tab1
+         One-Time Filter: false
+(5 rows)
 
 SELECT a.x, a.y, count(*) FROM (SELECT * FROM pagg_tab1 WHERE x = 1 AND x = 2) a LEFT JOIN pagg_tab2 b ON a.x = b.y GROUP BY a.x, a.y ORDER BY 1, 2;
  x | y | count 
@@ -869,7 +1010,7 @@ SELECT a, sum(b), avg(c), count(*) FROM pagg_tab_m GROUP BY a HAVING avg(c) < 22
 --------------------------------------------------------------------
  Sort
    Sort Key: pagg_tab_m.a, (sum(pagg_tab_m.b)), (avg(pagg_tab_m.c))
-   ->  Finalize HashAggregate
+   ->  Finalize IndexAggregate
          Group Key: pagg_tab_m.a
          Filter: (avg(pagg_tab_m.c) < '22'::numeric)
          ->  Append
@@ -1067,8 +1208,8 @@ RESET parallel_setup_cost;
 -- PARTITION KEY, thus we will have a partial aggregation for them.
 EXPLAIN (COSTS OFF)
 SELECT a, sum(b), count(*) FROM pagg_tab_ml GROUP BY a HAVING avg(b) < 3 ORDER BY 1, 2, 3;
-                                   QUERY PLAN                                    
----------------------------------------------------------------------------------
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
  Sort
    Sort Key: pagg_tab_ml.a, (sum(pagg_tab_ml.b)), (count(*))
    ->  Append
@@ -1076,31 +1217,27 @@ SELECT a, sum(b), count(*) FROM pagg_tab_ml GROUP BY a HAVING avg(b) < 3 ORDER B
                Group Key: pagg_tab_ml.a
                Filter: (avg(pagg_tab_ml.b) < '3'::numeric)
                ->  Seq Scan on pagg_tab_ml_p1 pagg_tab_ml
-         ->  Finalize GroupAggregate
+         ->  Finalize IndexAggregate
                Group Key: pagg_tab_ml_2.a
                Filter: (avg(pagg_tab_ml_2.b) < '3'::numeric)
-               ->  Sort
-                     Sort Key: pagg_tab_ml_2.a
-                     ->  Append
-                           ->  Partial HashAggregate
-                                 Group Key: pagg_tab_ml_2.a
-                                 ->  Seq Scan on pagg_tab_ml_p2_s1 pagg_tab_ml_2
-                           ->  Partial HashAggregate
-                                 Group Key: pagg_tab_ml_3.a
-                                 ->  Seq Scan on pagg_tab_ml_p2_s2 pagg_tab_ml_3
-         ->  Finalize GroupAggregate
+               ->  Append
+                     ->  Partial HashAggregate
+                           Group Key: pagg_tab_ml_2.a
+                           ->  Seq Scan on pagg_tab_ml_p2_s1 pagg_tab_ml_2
+                     ->  Partial HashAggregate
+                           Group Key: pagg_tab_ml_3.a
+                           ->  Seq Scan on pagg_tab_ml_p2_s2 pagg_tab_ml_3
+         ->  Finalize IndexAggregate
                Group Key: pagg_tab_ml_5.a
                Filter: (avg(pagg_tab_ml_5.b) < '3'::numeric)
-               ->  Sort
-                     Sort Key: pagg_tab_ml_5.a
-                     ->  Append
-                           ->  Partial HashAggregate
-                                 Group Key: pagg_tab_ml_5.a
-                                 ->  Seq Scan on pagg_tab_ml_p3_s1 pagg_tab_ml_5
-                           ->  Partial HashAggregate
-                                 Group Key: pagg_tab_ml_6.a
-                                 ->  Seq Scan on pagg_tab_ml_p3_s2 pagg_tab_ml_6
-(31 rows)
+               ->  Append
+                     ->  Partial HashAggregate
+                           Group Key: pagg_tab_ml_5.a
+                           ->  Seq Scan on pagg_tab_ml_p3_s1 pagg_tab_ml_5
+                     ->  Partial HashAggregate
+                           Group Key: pagg_tab_ml_6.a
+                           ->  Seq Scan on pagg_tab_ml_p3_s2 pagg_tab_ml_6
+(27 rows)
 
 SELECT a, sum(b), count(*) FROM pagg_tab_ml GROUP BY a HAVING avg(b) < 3 ORDER BY 1, 2, 3;
  a  | sum  | count 
@@ -1120,31 +1257,29 @@ SELECT a, sum(b), count(*) FROM pagg_tab_ml GROUP BY a HAVING avg(b) < 3 ORDER B
 -- PARTITION KEY
 EXPLAIN (COSTS OFF)
 SELECT b, sum(a), count(*) FROM pagg_tab_ml GROUP BY b ORDER BY 1, 2, 3;
-                                QUERY PLAN                                 
----------------------------------------------------------------------------
+                             QUERY PLAN                              
+---------------------------------------------------------------------
  Sort
    Sort Key: pagg_tab_ml.b, (sum(pagg_tab_ml.a)), (count(*))
-   ->  Finalize GroupAggregate
+   ->  Finalize IndexAggregate
          Group Key: pagg_tab_ml.b
-         ->  Sort
-               Sort Key: pagg_tab_ml.b
-               ->  Append
-                     ->  Partial HashAggregate
-                           Group Key: pagg_tab_ml.b
-                           ->  Seq Scan on pagg_tab_ml_p1 pagg_tab_ml
-                     ->  Partial HashAggregate
-                           Group Key: pagg_tab_ml_1.b
-                           ->  Seq Scan on pagg_tab_ml_p2_s1 pagg_tab_ml_1
-                     ->  Partial HashAggregate
-                           Group Key: pagg_tab_ml_2.b
-                           ->  Seq Scan on pagg_tab_ml_p2_s2 pagg_tab_ml_2
-                     ->  Partial HashAggregate
-                           Group Key: pagg_tab_ml_3.b
-                           ->  Seq Scan on pagg_tab_ml_p3_s1 pagg_tab_ml_3
-                     ->  Partial HashAggregate
-                           Group Key: pagg_tab_ml_4.b
-                           ->  Seq Scan on pagg_tab_ml_p3_s2 pagg_tab_ml_4
-(22 rows)
+         ->  Append
+               ->  Partial HashAggregate
+                     Group Key: pagg_tab_ml.b
+                     ->  Seq Scan on pagg_tab_ml_p1 pagg_tab_ml
+               ->  Partial HashAggregate
+                     Group Key: pagg_tab_ml_1.b
+                     ->  Seq Scan on pagg_tab_ml_p2_s1 pagg_tab_ml_1
+               ->  Partial HashAggregate
+                     Group Key: pagg_tab_ml_2.b
+                     ->  Seq Scan on pagg_tab_ml_p2_s2 pagg_tab_ml_2
+               ->  Partial HashAggregate
+                     Group Key: pagg_tab_ml_3.b
+                     ->  Seq Scan on pagg_tab_ml_p3_s1 pagg_tab_ml_3
+               ->  Partial HashAggregate
+                     Group Key: pagg_tab_ml_4.b
+                     ->  Seq Scan on pagg_tab_ml_p3_s2 pagg_tab_ml_4
+(20 rows)
 
 SELECT b, sum(a), count(*) FROM pagg_tab_ml GROUP BY b HAVING avg(a) < 15 ORDER BY 1, 2, 3;
  b |  sum  | count 

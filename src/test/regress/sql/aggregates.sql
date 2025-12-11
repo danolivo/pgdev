@@ -1392,6 +1392,7 @@ CREATE INDEX btg_x_y_idx ON btg(x, y);
 ANALYZE btg;
 
 SET enable_hashagg = off;
+SET enable_indexagg = off;
 SET enable_seqscan = off;
 
 -- Utilize the ordering of index scan to avoid a Sort operation
@@ -1623,12 +1624,100 @@ select v||'a', case v||'a' when 'aa' then 1 else 0 end, count(*)
 select v||'a', case when v||'a' = 'aa' then 1 else 0 end, count(*)
   from unnest(array['a','b']) u(v)
  group by v||'a' order by 1;
+ 
+--
+-- Index Aggregation tests
+--
+
+set enable_hashagg = false;
+set enable_sort = false;
+set enable_indexagg = true;
+set enable_indexscan = false;
+
+-- require ordered output
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT unique1, SUM(two) FROM tenk1
+GROUP BY 1
+ORDER BY 1
+LIMIT 10;
+
+SELECT unique1, SUM(two) FROM tenk1
+GROUP BY 1
+ORDER BY 1
+LIMIT 10;
+
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT even, sum(two) FROM tenk1
+GROUP BY 1
+ORDER BY 1
+LIMIT 10;
+
+SELECT even, sum(two) FROM tenk1
+GROUP BY 1
+ORDER BY 1
+LIMIT 10;
+
+-- multiple grouping columns
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT even, odd, sum(unique1) FROM tenk1
+GROUP BY 1, 2
+ORDER BY 1, 2
+LIMIT 10;
+
+SELECT even, odd, sum(unique1) FROM tenk1
+GROUP BY 1, 2
+ORDER BY 1, 2
+LIMIT 10;
+
+-- mixing columns between group by and order by
+begin;
+
+create temp table tmp(x int, y int);
+insert into tmp values (1, 8), (2, 7), (3, 6), (4, 5);
+
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT x, y, sum(x) FROM tmp
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+SELECT x, y, sum(x) FROM tmp
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT x, y, sum(x) FROM tmp
+GROUP BY 1, 2
+ORDER BY 2, 1;
+
+SELECT x, y, sum(x) FROM tmp
+GROUP BY 1, 2
+ORDER BY 2, 1;
+
+--
+-- Index Aggregation Spill tests
+--
+
+set enable_indexagg = true;
+set enable_sort=false;
+set enable_hashagg = false;
+set work_mem='64kB';
+
+select unique1, count(*), sum(twothousand) from tenk1
+group by unique1
+having sum(fivethous) > 4975
+order by sum(twothousand);
+
+set work_mem to default;
+set enable_sort to default;
+set enable_hashagg to default;
+set enable_indexagg to default;
 
 --
 -- Hash Aggregation Spill tests
 --
 
 set enable_sort=false;
+set enable_indexagg = false;
 set work_mem='64kB';
 
 select unique1, count(*), sum(twothousand) from tenk1
@@ -1657,6 +1746,7 @@ analyze agg_data_20k;
 -- Produce results with sorting.
 
 set enable_hashagg = false;
+set enable_indexagg = false;
 
 set jit_above_cost = 0;
 
@@ -1728,23 +1818,68 @@ select (g/2)::numeric as c1, array_agg(g::numeric) as c2, count(*) as c3
 set enable_sort = true;
 set work_mem to default;
 
+-- Produce results with index aggregation
+
+set enable_sort = false;
+set enable_hashagg = false;
+set enable_indexagg = true;
+
+set jit_above_cost = 0;
+
+explain (costs off)
+select g%10000 as c1, sum(g::numeric) as c2, count(*) as c3
+  from agg_data_20k group by g%10000;
+
+create table agg_index_1 as
+select g%10000 as c1, sum(g::numeric) as c2, count(*) as c3
+  from agg_data_20k group by g%10000;
+
+create table agg_index_2 as
+select * from
+  (values (100), (300), (500)) as r(a),
+  lateral (
+    select (g/2)::numeric as c1,
+           array_agg(g::numeric) as c2,
+	   count(*) as c3
+    from agg_data_2k
+    where g < r.a
+    group by g/2) as s;
+
+set jit_above_cost to default;
+
+create table agg_index_3 as
+select (g/2)::numeric as c1, sum(7::int4) as c2, count(*) as c3
+  from agg_data_2k group by g/2;
+
+create table agg_index_4 as
+select (g/2)::numeric as c1, array_agg(g::numeric) as c2, count(*) as c3
+  from agg_data_2k group by g/2;
+
 -- Compare group aggregation results to hash aggregation results
 
 (select * from agg_hash_1 except select * from agg_group_1)
   union all
-(select * from agg_group_1 except select * from agg_hash_1);
+(select * from agg_group_1 except select * from agg_hash_1)
+  union all
+(select * from agg_index_1 except select * from agg_group_1);
 
 (select * from agg_hash_2 except select * from agg_group_2)
   union all
-(select * from agg_group_2 except select * from agg_hash_2);
+(select * from agg_group_2 except select * from agg_hash_2)
+  union all
+(select * from agg_index_2 except select * from agg_group_2);
 
 (select * from agg_hash_3 except select * from agg_group_3)
   union all
-(select * from agg_group_3 except select * from agg_hash_3);
+(select * from agg_group_3 except select * from agg_hash_3)
+  union all
+(select * from agg_index_3 except select * from agg_group_3);
 
 (select * from agg_hash_4 except select * from agg_group_4)
   union all
-(select * from agg_group_4 except select * from agg_hash_4);
+(select * from agg_group_4 except select * from agg_hash_4)
+  union all
+(select * from agg_index_4 except select * from agg_group_4);
 
 drop table agg_group_1;
 drop table agg_group_2;
@@ -1754,3 +1889,7 @@ drop table agg_hash_1;
 drop table agg_hash_2;
 drop table agg_hash_3;
 drop table agg_hash_4;
+drop table agg_index_1;
+drop table agg_index_2;
+drop table agg_index_3;
+drop table agg_index_4;
