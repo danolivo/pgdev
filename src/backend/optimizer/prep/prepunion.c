@@ -949,6 +949,7 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 											AGGSPLIT_SIMPLE,
 											groupList,
 											NIL,
+											NIL,
 											NULL,
 											dNumGroups);
 			add_path(result_rel, path);
@@ -964,6 +965,7 @@ generate_union_paths(SetOperationStmt *op, PlannerInfo *root,
 												AGG_HASHED,
 												AGGSPLIT_SIMPLE,
 												groupList,
+												NIL,
 												NIL,
 												NULL,
 												dNumGroups);

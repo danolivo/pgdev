@@ -3446,6 +3446,7 @@ generate_grouped_paths(PlannerInfo *root, RelOptInfo *grouped_rel,
 	AggClauseCosts agg_costs;
 	bool		can_hash;
 	bool		can_sort;
+	bool		can_index;
 	Path	   *cheapest_total_path = NULL;
 	Path	   *cheapest_partial_path = NULL;
 	double		dNumGroups = 0;
@@ -3497,6 +3498,12 @@ generate_grouped_paths(PlannerInfo *root, RelOptInfo *grouped_rel,
 	Assert(root->numOrderedAggs == 0);
 	can_hash = (agg_info->group_clauses != NIL &&
 				grouping_is_hashable(agg_info->group_clauses));
+
+	/* 
+	 * Determine whether we should consider index-based implementations of
+	 * grouping.
+	 */
+	can_index = can_sort && can_hash;
 
 	/*
 	 * Consider whether we should generate partially aggregated non-partial
@@ -3615,6 +3622,7 @@ generate_grouped_paths(PlannerInfo *root, RelOptInfo *grouped_rel,
 											AGGSPLIT_INITIAL_SERIAL,
 											agg_info->group_clauses,
 											NIL,
+											NIL,
 											&agg_costs,
 											dNumGroups);
 
@@ -3691,6 +3699,7 @@ generate_grouped_paths(PlannerInfo *root, RelOptInfo *grouped_rel,
 											AGGSPLIT_INITIAL_SERIAL,
 											agg_info->group_clauses,
 											NIL,
+											NIL,
 											&agg_costs,
 											dNumPartialGroups);
 
@@ -3727,6 +3736,7 @@ generate_grouped_paths(PlannerInfo *root, RelOptInfo *grouped_rel,
 										AGGSPLIT_INITIAL_SERIAL,
 										agg_info->group_clauses,
 										NIL,
+										NIL,
 										&agg_costs,
 										dNumGroups);
 
@@ -3762,6 +3772,72 @@ generate_grouped_paths(PlannerInfo *root, RelOptInfo *grouped_rel,
 										AGGSPLIT_INITIAL_SERIAL,
 										agg_info->group_clauses,
 										NIL,
+										NIL,
+										&agg_costs,
+										dNumPartialGroups);
+
+		add_partial_path(grouped_rel, path);
+	}
+
+	if (can_index && cheapest_total_path != NULL)
+	{
+		Path	   *path;
+
+		/*
+		 * Since the path originates from a non-grouped relation that is
+		 * not aware of eager aggregation, we must ensure that it provides
+		 * the correct input for partial aggregation.
+		 */
+		path = (Path *) create_projection_path(root,
+											   grouped_rel,
+											   cheapest_total_path,
+											   agg_info->agg_input);
+		/*
+		 * qual is NIL because the HAVING clause cannot be evaluated until the
+		 * final value of the aggregate is known.
+		 */
+		path = (Path *) create_agg_path(root,
+										grouped_rel,
+										path,
+										agg_info->target,
+										AGG_INDEX,
+										AGGSPLIT_INITIAL_SERIAL,
+										agg_info->group_clauses,
+										NIL,
+										group_pathkeys,
+										&agg_costs,
+										dNumGroups);
+
+		add_path(grouped_rel, path);
+	}
+
+	if (can_index && cheapest_partial_path != NULL)
+	{
+		Path	   *path;
+
+		/*
+		 * Since the path originates from a non-grouped relation that is not
+		 * aware of eager aggregation, we must ensure that it provides the
+		 * correct input for partial aggregation.
+		 */
+		path = (Path *) create_projection_path(root,
+											   grouped_rel,
+											   cheapest_partial_path,
+											   agg_info->agg_input);
+
+		/*
+		 * qual is NIL because the HAVING clause cannot be evaluated until the
+		 * final value of the aggregate is known.
+		 */
+		path = (Path *) create_agg_path(root,
+										grouped_rel,
+										path,
+										agg_info->target,
+										AGG_INDEX,
+										AGGSPLIT_INITIAL_SERIAL,
+										agg_info->group_clauses,
+										NIL,
+										group_pathkeys,
 										&agg_costs,
 										dNumPartialGroups);
 

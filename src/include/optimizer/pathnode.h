@@ -235,6 +235,7 @@ extern AggPath *create_agg_path(PlannerInfo *root,
 								AggSplit aggsplit,
 								List *groupClause,
 								List *qual,
+								List *pathkeys,
 								const AggClauseCosts *aggcosts,
 								double numGroups);
 extern GroupingSetsPath *create_groupingsets_path(PlannerInfo *root,

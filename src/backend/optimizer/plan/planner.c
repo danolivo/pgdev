@@ -3889,6 +3889,7 @@ create_grouping_paths(PlannerInfo *root,
 		if (   gd == NULL
 			&& root->numOrderedAggs == 0
 			&& parse->groupClause != NIL
+			&& parse->groupingSets == NIL
 			&& grouping_is_sortable(root->processed_groupClause)
 			&& grouping_is_hashable(root->processed_groupClause))
 			flags |= GROUPING_CAN_USE_INDEX;
@@ -5031,6 +5032,7 @@ create_partial_distinct_paths(PlannerInfo *root, RelOptInfo *input_rel,
 										 AGGSPLIT_SIMPLE,
 										 root->processed_distinctClause,
 										 NIL,
+										 NIL,
 										 NULL,
 										 numDistinctRows));
 	}
@@ -5238,6 +5240,7 @@ create_final_distinct_paths(PlannerInfo *root, RelOptInfo *input_rel,
 								 AGG_HASHED,
 								 AGGSPLIT_SIMPLE,
 								 root->processed_distinctClause,
+								 NIL,
 								 NIL,
 								 NULL,
 								 numDistinctRows));
@@ -7210,6 +7213,7 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 											 AGGSPLIT_SIMPLE,
 											 info->clauses,
 											 havingQual,
+											 NIL,
 											 agg_costs,
 											 dNumGroups));
 				}
@@ -7281,6 +7285,7 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 												 AGGSPLIT_FINAL_DESERIAL,
 												 info->clauses,
 												 havingQual,
+												 NIL,
 												 agg_final_costs,
 												 dNumFinalGroups));
 					else
@@ -7322,6 +7327,7 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 									 AGGSPLIT_SIMPLE,
 									 root->processed_groupClause,
 									 havingQual,
+									 NIL,
 									 agg_costs,
 									 dNumGroups));
 		}
@@ -7341,6 +7347,7 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 									 AGGSPLIT_FINAL_DESERIAL,
 									 root->processed_groupClause,
 									 havingQual,
+									 NIL,
 									 agg_final_costs,
 									 dNumFinalGroups));
 		}
@@ -7348,10 +7355,10 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 
 	if (can_index)
 	{
-		/* 
-		 * Generate IndexAgg path.
-		 */
-		Assert(!parse->groupingSets);
+		List *pathkeys = make_pathkeys_for_sortclauses(root,
+													   root->processed_groupClause,
+													   root->processed_tlist);
+
 		add_path(grouped_rel, (Path *)
 				 create_agg_path(root,
 								 grouped_rel,
@@ -7361,8 +7368,29 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 								 AGGSPLIT_SIMPLE,
 								 root->processed_groupClause,
 								 havingQual,
+								 pathkeys,
 								 agg_costs,
 								 dNumGroups));
+		
+		/*
+		 * Instead of operating directly on the input relation, we can
+		 * consider finalizing a partially aggregated path.
+		 */
+		if (partially_grouped_rel != NULL)
+		{
+			add_path(grouped_rel, (Path *)
+					 create_agg_path(root,
+									 grouped_rel,
+									 cheapest_partially_grouped_path,
+									 grouped_rel->reltarget,
+									 AGG_INDEX,
+									 AGGSPLIT_FINAL_DESERIAL,
+									 root->processed_groupClause,
+									 havingQual,
+									 pathkeys,
+									 agg_final_costs,
+									 dNumFinalGroups));
+		}
 	}
 
 	/*
@@ -7411,6 +7439,7 @@ create_partial_grouping_paths(PlannerInfo *root,
 	ListCell   *lc;
 	bool		can_hash = (extra->flags & GROUPING_CAN_USE_HASH) != 0;
 	bool		can_sort = (extra->flags & GROUPING_CAN_USE_SORT) != 0;
+	bool		can_index = (extra->flags & GROUPING_CAN_USE_INDEX) != 0;
 
 	/*
 	 * Check whether any partially aggregated paths have been generated
@@ -7562,6 +7591,7 @@ create_partial_grouping_paths(PlannerInfo *root,
 											 AGGSPLIT_INITIAL_SERIAL,
 											 info->clauses,
 											 NIL,
+											 NIL,
 											 agg_partial_costs,
 											 dNumPartialGroups));
 				else
@@ -7620,6 +7650,7 @@ create_partial_grouping_paths(PlannerInfo *root,
 													 AGGSPLIT_INITIAL_SERIAL,
 													 info->clauses,
 													 NIL,
+													 NIL,
 													 agg_partial_costs,
 													 dNumPartialPartialGroups));
 				else
@@ -7651,6 +7682,7 @@ create_partial_grouping_paths(PlannerInfo *root,
 								 AGGSPLIT_INITIAL_SERIAL,
 								 root->processed_groupClause,
 								 NIL,
+								 NIL,
 								 agg_partial_costs,
 								 dNumPartialGroups));
 	}
@@ -7669,6 +7701,62 @@ create_partial_grouping_paths(PlannerInfo *root,
 										 AGGSPLIT_INITIAL_SERIAL,
 										 root->processed_groupClause,
 										 NIL,
+										 NIL,
+										 agg_partial_costs,
+										 dNumPartialPartialGroups));
+	}
+	
+	/*
+	 * Add a partially-grouped IndexAgg Path where possible
+	 */
+	if (can_index && cheapest_total_path != NULL)
+	{
+		List *pathkeys;
+
+		/* This should have been checked previously */
+		Assert(parse->hasAggs || parse->groupClause);
+		
+		pathkeys = make_pathkeys_for_sortclauses(root,
+												 root->processed_groupClause,
+												 root->processed_tlist);
+
+		add_path(partially_grouped_rel, (Path *)
+				 create_agg_path(root,
+								 partially_grouped_rel,
+								 cheapest_total_path,
+								 partially_grouped_rel->reltarget,
+								 AGG_INDEX,
+								 AGGSPLIT_INITIAL_SERIAL,
+								 root->processed_groupClause,
+								 NIL,
+								 pathkeys,
+								 agg_partial_costs,
+								 dNumPartialGroups));
+	}
+
+	/*
+	 * Now add a partially-grouped IndexAgg partial Path where possible
+	 */
+	if (can_index && cheapest_partial_path != NULL)
+	{
+		List *pathkeys;
+
+		/* This should have been checked previously */
+		Assert(parse->hasAggs || parse->groupClause);
+		
+		pathkeys = make_pathkeys_for_sortclauses(root,
+												 root->processed_groupClause,
+												 root->processed_tlist);
+		add_partial_path(partially_grouped_rel, (Path *)
+						  create_agg_path(root,
+										 partially_grouped_rel,
+										 cheapest_partial_path,
+										 partially_grouped_rel->reltarget,
+										 AGG_INDEX,
+										 AGGSPLIT_INITIAL_SERIAL,
+										 root->processed_groupClause,
+										 NIL,
+										 pathkeys,
 										 agg_partial_costs,
 										 dNumPartialPartialGroups));
 	}
@@ -8830,6 +8918,7 @@ create_final_unique_paths(PlannerInfo *root, RelOptInfo *input_rel,
 										AGGSPLIT_SIMPLE,
 										groupClause,
 										NIL,
+										NIL,
 										NULL,
 										unique_rel->rows);
 
@@ -8971,6 +9060,7 @@ create_partial_unique_paths(PlannerInfo *root, RelOptInfo *input_rel,
 										AGG_HASHED,
 										AGGSPLIT_SIMPLE,
 										groupClause,
+										NIL,
 										NIL,
 										NULL,
 										partial_unique_rel->rows);

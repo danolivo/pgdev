@@ -2988,6 +2988,7 @@ create_unique_path(PlannerInfo *root,
  * 'aggsplit' is the Agg node's aggregate-splitting mode
  * 'groupClause' is a list of SortGroupClause's representing the grouping
  * 'qual' is the HAVING quals if any
+ * 'pathkeys' for AGG_INDEX must be a list of PathKey used by this agg node
  * 'aggcosts' contains cost info about the aggregate functions to be computed
  * 'numGroups' is the estimated number of groups (1 if not grouping)
  */
@@ -3000,6 +3001,7 @@ create_agg_path(PlannerInfo *root,
 				AggSplit aggsplit,
 				List *groupClause,
 				List *qual,
+				List *pathkeys,
 				const AggClauseCosts *aggcosts,
 				double numGroups)
 {
@@ -3033,11 +3035,17 @@ create_agg_path(PlannerInfo *root,
 	else if (aggstrategy == AGG_INDEX)
 	{
 		/* 
-		 * When using index aggregation all grouping columns will be used as
-		 * comparator keys, so output is always sorted.
+		 * For IndexAgg we also must know used ordering just like for GroupAgg,
+		 * but for the latter this information is passed by child node, i.e.
+		 * Sort. But here we can not use make_pathkeys_for_sortclauses, because
+		 * in case of partial aggregates the node will contain different target
+		 * list and sortgroupref indexes, so this function will not find required
+		 * entries. So caller must build pathkeys for us.
+		 * 
+		 * NOTE: pathkeys CAN be NIL, i.e. if planner decided that all values
+		 * are same constant.
 		 */
-		pathnode->path.pathkeys = make_pathkeys_for_sortclauses(root, groupClause,
-																root->processed_tlist);
+		pathnode->path.pathkeys = pathkeys;
 	}
 	else
 		pathnode->path.pathkeys = NIL;	/* output is unordered */
