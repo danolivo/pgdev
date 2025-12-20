@@ -1,6 +1,6 @@
 -- Schema to demonstrate MergeAppend explicit sort optimization
 -- Two hash partitions with dual indexing scenario
-
+DROP TABLE IF EXISTS orders CASCADE;
 -- Create partitioned table
 CREATE TABLE orders (
     order_id SERIAL,
@@ -19,12 +19,8 @@ CREATE TABLE orders_p1 PARTITION OF orders
 
 -- Create indexes on both partitions
 -- Index for filtering by customer_id (high selectivity)
-CREATE INDEX orders_p0_customer_idx ON orders_p0(customer_id);
-CREATE INDEX orders_p1_customer_idx ON orders_p1(customer_id);
-
--- Index for ordering by order_date (low selectivity for WHERE clause)
-CREATE INDEX orders_p0_date_idx ON orders_p0(order_date);
-CREATE INDEX orders_p1_date_idx ON orders_p1(order_date);
+CREATE INDEX orders_customer_idx ON orders(customer_id);
+CREATE INDEX orders_date_idx ON orders(order_date);
 
 -- Populate with test data
 -- Customer distribution: most orders spread across many customers
@@ -32,13 +28,13 @@ CREATE INDEX orders_p1_date_idx ON orders_p1(order_date);
 INSERT INTO orders (customer_id, order_date, amount, status)
 SELECT
     CASE
-        WHEN i % 100 = 0 THEN 12345  -- Target customer: 1% of data
-        ELSE (i % 10000) + 1         -- Other customers: 99% of data
+        WHEN i % 1000000 = 0 THEN 12345  -- Target customer: 1% of data
+        ELSE (i % 100000) + 1         -- Other customers: 99% of data
     END,
     CURRENT_DATE - (i % 365),
     (random() * 1000)::numeric(10,2),
     CASE WHEN random() < 0.5 THEN 'completed' ELSE 'pending' END
-FROM generate_series(1, 100000) i;
+FROM generate_series(1, 10000000) i;
 
 ANALYZE orders;
 
@@ -58,6 +54,8 @@ FROM orders
 WHERE customer_id = 12345
 ORDER BY order_date DESC
 LIMIT 10;
+
+SELECT count(DISTINCT order_date), count(DISTINCT customer_id) FROM orders;
 
 \echo ''
 \echo 'Expected optimization:'
