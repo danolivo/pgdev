@@ -10482,13 +10482,15 @@ SELECT t1.a, t2.b FROM fprt1 t1 INNER JOIN fprt2 t2 ON (t1.a = t2.b) WHERE t1.a 
    ->  Nested Loop
          Join Filter: (t1.a = t2.b)
          ->  Append
-               ->  Foreign Scan on ftprt1_p1 t1_1
+               ->  Sort
+                     Sort Key: t1_1.a
+                     ->  Foreign Scan on ftprt1_p1 t1_1
                ->  Foreign Scan on ftprt1_p2 t1_2
          ->  Materialize
                ->  Append
                      ->  Foreign Scan on ftprt2_p1 t2_1
                      ->  Foreign Scan on ftprt2_p2 t2_2
-(10 rows)
+(12 rows)
 
 SELECT t1.a, t2.b FROM fprt1 t1 INNER JOIN fprt2 t2 ON (t1.a = t2.b) WHERE t1.a % 25 = 0 ORDER BY 1,2 FOR UPDATE OF t1;
   a  |  b  

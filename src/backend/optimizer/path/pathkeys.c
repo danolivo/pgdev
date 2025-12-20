@@ -19,11 +19,13 @@
 
 #include "access/stratnum.h"
 #include "catalog/pg_opfamily.h"
+#include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "optimizer/planner.h"
 #include "partitioning/partbounds.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/lsyscache.h"
@@ -649,6 +651,98 @@ get_cheapest_path_for_pathkeys(List *paths, List *pathkeys,
 }
 
 /*
+ * get_cheapest_path_for_pathkeys_ext
+ *	  Calls get_cheapest_path_for_pathkeys to obtain cheapest path that
+ *	  satisfies defined criterias and сonsiders one more option: choose
+ *	  overall-optimal path (according the criterion) and explicitly sort its
+ *	  output to satisfy the pathkeys.
+ *
+ *	  Caller is responsible to insert corresponding sort path at the top of
+ *	  returned path if it will be chosen to be used.
+ *
+ *	  Return NULL if no such path.
+ */
+Path *
+get_cheapest_path_for_pathkeys_ext(PlannerInfo *root, RelOptInfo *rel,
+								   List *pathkeys, Relids required_outer,
+								   CostSelector cost_criterion,
+								   bool require_parallel_safe)
+{
+	Path		sort_path;
+	Path	   *base_path = rel->cheapest_total_path;
+	Path	   *path;
+
+	/* In generate_orderedappend_paths() all childrels do have some paths */
+	Assert(base_path);
+
+	path = get_cheapest_path_for_pathkeys(rel->pathlist, pathkeys,
+										  required_outer, cost_criterion,
+										  require_parallel_safe);
+
+	/*
+	 * Stop here if the cheapest total path doesn't satisfy necessary
+	 * conditions
+	 */
+	if ((require_parallel_safe && !base_path->parallel_safe) ||
+		!bms_is_subset(PATH_REQ_OUTER(base_path), required_outer))
+		return path;
+
+	if (path == NULL)
+
+		/*
+		 * Current pathlist doesn't fit the pathkeys. No need to check extra
+		 * sort path ways.
+		 */
+		return base_path;
+
+	/* Consider the cheapest total path with extra sort */
+	if (path != base_path)
+	{
+		int			presorted_keys;
+
+		if (!pathkeys_count_contained_in(pathkeys, base_path->pathkeys,
+										 &presorted_keys))
+		{
+			/*
+			 * We'll need to insert a Sort node, so include costs for that.
+			 * We choose to use incremental sort if it is enabled and there
+			 * are presorted keys; otherwise we use full sort.
+			 *
+			 * We can use the parent's LIMIT if any, since we certainly won't
+			 * pull more than that many tuples from any child.
+			 */
+			if (enable_incremental_sort && presorted_keys > 0)
+			{
+				cost_incremental_sort(&sort_path, root, pathkeys,
+									  presorted_keys,
+									  base_path->disabled_nodes,
+									  base_path->startup_cost,
+									  base_path->total_cost, base_path->rows,
+									  base_path->pathtarget->width, 0.0,
+									  work_mem, -1.0);
+			}
+			else
+			{
+				cost_sort(&sort_path, root, pathkeys, base_path->disabled_nodes,
+						  base_path->total_cost, base_path->rows,
+						  base_path->pathtarget->width, 0.0, work_mem, -1.0);
+			}
+		}
+		else
+		{
+			sort_path.rows = base_path->rows;
+			sort_path.disabled_nodes = base_path->disabled_nodes;
+			sort_path.startup_cost = base_path->startup_cost;
+			sort_path.total_cost = base_path->total_cost;
+		}
+
+		if (compare_path_costs(&sort_path, path, cost_criterion) < 0)
+			return base_path;
+	}
+	return path;
+}
+
+/*
  * get_cheapest_fractional_path_for_pathkeys
  *	  Find the cheapest path (for retrieving a specified fraction of all
  *	  the tuples) that satisfies the given pathkeys and parameterization.
@@ -690,6 +784,95 @@ get_cheapest_fractional_path_for_pathkeys(List *paths,
 	return matched_path;
 }
 
+/*
+ * get_cheapest_fractional_path_for_pathkeys_ext
+ *	  obtain cheapest fractional path that satisfies defined criterias excluding
+ *	  pathkeys and explicitly sort its output to satisfy the pathkeys.
+ *
+ *	  Caller is responsible to insert corresponding sort path at the top of
+ *	  returned path if it will be chosen to be used.
+ *
+ *	  Return NULL if no such path.
+ */
+Path *
+get_cheapest_fractional_path_for_pathkeys_ext(PlannerInfo *root,
+											  RelOptInfo *rel,
+											  List *pathkeys,
+											  Relids required_outer,
+											  double fraction)
+{
+	Path		sort_path;
+	Path	   *base_path = rel->cheapest_total_path;
+	Path	   *path;
+
+	/* In generate_orderedappend_paths() all childrels do have some paths */
+	Assert(base_path);
+
+	path = get_cheapest_fractional_path_for_pathkeys(rel->pathlist, pathkeys,
+													 required_outer, fraction);
+
+	/*
+	 * Stop here if the cheapest total path doesn't satisfy necessary
+	 * conditions
+	 */
+	if (!bms_is_subset(PATH_REQ_OUTER(base_path), required_outer))
+		return path;
+
+	if (path == NULL)
+
+		/*
+		 * Current pathlist doesn't fit the pathkeys. No need to check extra
+		 * sort path ways.
+		 */
+		return base_path;
+
+	/* Consider the cheapest total path with extra sort */
+	if (path != base_path)
+	{
+		int			presorted_keys;
+
+		if (!pathkeys_count_contained_in(pathkeys, base_path->pathkeys,
+										 &presorted_keys))
+		{
+			/*
+			 * We'll need to insert a Sort node, so include costs for that.
+			 * We choose to use incremental sort if it is enabled and there
+			 * are presorted keys; otherwise we use full sort.
+			 *
+			 * We can use the parent's LIMIT if any, since we certainly won't
+			 * pull more than that many tuples from any child.
+			 */
+			if (enable_incremental_sort && presorted_keys > 0)
+			{
+				cost_incremental_sort(&sort_path, root, pathkeys,
+									  presorted_keys,
+									  base_path->disabled_nodes,
+									  base_path->startup_cost,
+									  base_path->total_cost, base_path->rows,
+									  base_path->pathtarget->width, 0.0,
+									  work_mem, -1.0);
+			}
+			else
+			{
+				cost_sort(&sort_path, root, pathkeys, base_path->disabled_nodes,
+						  base_path->total_cost, base_path->rows,
+						  base_path->pathtarget->width, 0.0, work_mem, -1.0);
+			}
+		}
+		else
+		{
+			sort_path.rows = base_path->rows;
+			sort_path.disabled_nodes = base_path->disabled_nodes;
+			sort_path.startup_cost = base_path->startup_cost;
+			sort_path.total_cost = base_path->total_cost;
+		}
+
+		if (compare_fractional_path_costs(&sort_path, path, fraction) <= 0)
+			return base_path;
+	}
+
+	return path;
+}
 
 /*
  * get_cheapest_parallel_safe_total_inner

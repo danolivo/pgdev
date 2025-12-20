@@ -641,12 +641,14 @@ insert into matest2 (name) values ('Test 4');
 insert into matest3 (name) values ('Test 5');
 insert into matest3 (name) values ('Test 6');
 
-set enable_indexscan = off;  -- force use of seqscan/sort, so no merge
+set enable_indexscan = off;  -- force use of seqscan/sort
+set enable_sort = off; -- since merge append may employ sort in children we need to disable sort
 explain (verbose, costs off) select * from matest0 order by 1-id;
 select * from matest0 order by 1-id;
 explain (verbose, costs off) select min(1-id) from matest0;
 select min(1-id) from matest0;
 reset enable_indexscan;
+reset enable_sort;
 
 set enable_seqscan = off;  -- plan with fewest seqscans should be merge
 set enable_parallel_append = off; -- Don't let parallel-append interfere

@@ -1207,12 +1207,14 @@ select event_id
 ----------------------------------------------------------
  Merge Append
    Sort Key: events.event_id
-   ->  Index Scan using events_pkey on events
+   ->  Sort
+         Sort Key: events.event_id
+         ->  Seq Scan on events
    ->  Sort
          Sort Key: events_1.event_id
          ->  Seq Scan on events_child events_1
    ->  Index Scan using other_events_pkey on other_events
-(7 rows)
+(9 rows)
 
 drop table events_child, events, other_events;
 reset enable_indexonlyscan;

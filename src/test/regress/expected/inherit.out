@@ -1668,11 +1668,13 @@ insert into matest2 (name) values ('Test 3');
 insert into matest2 (name) values ('Test 4');
 insert into matest3 (name) values ('Test 5');
 insert into matest3 (name) values ('Test 6');
-set enable_indexscan = off;  -- force use of seqscan/sort, so no merge
+set enable_indexscan = off;  -- force use of seqscan/sort
+set enable_sort = off; -- since merge append may employ sort in children we need to disable sort
 explain (verbose, costs off) select * from matest0 order by 1-id;
                          QUERY PLAN                         
 ------------------------------------------------------------
  Sort
+   Disabled: true
    Output: matest0.id, matest0.name, ((1 - matest0.id))
    Sort Key: ((1 - matest0.id))
    ->  Result
@@ -1686,7 +1688,7 @@ explain (verbose, costs off) select * from matest0 order by 1-id;
                      Output: matest0_3.id, matest0_3.name
                ->  Seq Scan on public.matest3 matest0_4
                      Output: matest0_4.id, matest0_4.name
-(14 rows)
+(15 rows)
 
 select * from matest0 order by 1-id;
  id |  name  
@@ -1722,6 +1724,7 @@ select min(1-id) from matest0;
 (1 row)
 
 reset enable_indexscan;
+reset enable_sort;
 set enable_seqscan = off;  -- plan with fewest seqscans should be merge
 set enable_parallel_append = off; -- Don't let parallel-append interfere
 explain (verbose, costs off) select * from matest0 order by 1-id;
@@ -1848,16 +1851,20 @@ order by t1.b limit 10;
          Merge Cond: (t1.b = t2.b)
          ->  Merge Append
                Sort Key: t1.b
-               ->  Index Scan using matest0i on matest0 t1_1
+               ->  Sort
+                     Sort Key: t1_1.b
+                     ->  Seq Scan on matest0 t1_1
                ->  Index Scan using matest1i on matest1 t1_2
          ->  Materialize
                ->  Merge Append
                      Sort Key: t2.b
-                     ->  Index Scan using matest0i on matest0 t2_1
-                           Filter: (c = d)
+                     ->  Sort
+                           Sort Key: t2_1.b
+                           ->  Seq Scan on matest0 t2_1
+                                 Filter: (c = d)
                      ->  Index Scan using matest1i on matest1 t2_2
                            Filter: (c = d)
-(14 rows)
+(18 rows)
 
 reset enable_nestloop;
 drop table matest0 cascade;

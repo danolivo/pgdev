@@ -4791,9 +4791,10 @@ select min(a) over (partition by a order by a) from part_abc where a >= stable_o
                Window: w1 AS (PARTITION BY part_abc.a ORDER BY part_abc.a)
                ->  Append
                      Subplans Removed: 1
-                     ->  Index Scan using part_abc_2_a_idx on part_abc_2 part_abc_1
-                           Index Cond: (a >= (stable_one() + 1))
-                           Filter: (d <= stable_one())
+                     ->  Sort
+                           Sort Key: part_abc_1.a
+                           ->  Seq Scan on part_abc_2 part_abc_1
+                                 Filter: ((d <= stable_one()) AND (a >= (stable_one() + 1)))
                      ->  Merge Append
                            Sort Key: part_abc_3.a
                            Subplans Removed: 1
@@ -4808,9 +4809,10 @@ select min(a) over (partition by a order by a) from part_abc where a >= stable_o
                Window: w1 AS (PARTITION BY part_abc_5.a ORDER BY part_abc_5.a)
                ->  Append
                      Subplans Removed: 1
-                     ->  Index Scan using part_abc_2_a_idx on part_abc_2 part_abc_6
-                           Index Cond: (a >= (stable_one() + 1))
-                           Filter: (d >= stable_one())
+                     ->  Sort
+                           Sort Key: part_abc_6.a
+                           ->  Seq Scan on part_abc_2 part_abc_6
+                                 Filter: ((d >= stable_one()) AND (a >= (stable_one() + 1)))
                      ->  Merge Append
                            Sort Key: a
                            Subplans Removed: 1
@@ -4820,7 +4822,7 @@ select min(a) over (partition by a order by a) from part_abc where a >= stable_o
                            ->  Index Scan using part_abc_3_3_a_idx on part_abc_3_3 part_abc_9
                                  Index Cond: (a >= (stable_one() + 1))
                                  Filter: (d >= stable_one())
-(35 rows)
+(37 rows)
 
 drop view part_abc_view;
 drop table part_abc;

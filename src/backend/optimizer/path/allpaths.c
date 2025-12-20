@@ -1878,6 +1878,9 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 		List	   *fractional_subpaths = NIL;
 		bool		startup_neq_total = false;
 		bool		fraction_neq_total = false;
+		bool		total_has_ordered = false;
+		bool		startup_has_ordered = false;
+		bool		fractional_has_ordered = false;
 		bool		match_partition_order;
 		bool		match_partition_order_desc;
 		int			end_index;
@@ -1941,29 +1944,24 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 
 			/* Locate the right paths, if they are available. */
 			cheapest_startup =
-				get_cheapest_path_for_pathkeys(childrel->pathlist,
-											   pathkeys,
-											   NULL,
-											   STARTUP_COST,
-											   false);
+				get_cheapest_path_for_pathkeys_ext(root, childrel, pathkeys,
+												   NULL, STARTUP_COST, false);
 			cheapest_total =
-				get_cheapest_path_for_pathkeys(childrel->pathlist,
-											   pathkeys,
-											   NULL,
-											   TOTAL_COST,
-											   false);
+				get_cheapest_path_for_pathkeys_ext(root, childrel, pathkeys,
+												   NULL, TOTAL_COST, false);
+
+			if (pathkeys_contained_in(pathkeys, cheapest_startup->pathkeys))
+				startup_has_ordered = true;
+
+			if (pathkeys_contained_in(pathkeys, cheapest_total->pathkeys))
+				total_has_ordered = true;
 
 			/*
-			 * If we can't find any paths with the right order just use the
-			 * cheapest-total path; we'll have to sort it later.
+			 * In accordance to current planning logic there are no
+			 * parameterised paths under a merge append.
 			 */
-			if (cheapest_startup == NULL || cheapest_total == NULL)
-			{
-				cheapest_startup = cheapest_total =
-					childrel->cheapest_total_path;
-				/* Assert we do have an unparameterized path for this child */
-				Assert(cheapest_total->param_info == NULL);
-			}
+			Assert(cheapest_startup != NULL && cheapest_total != NULL);
+			Assert(cheapest_total->param_info == NULL);
 
 			/*
 			 * When building a fractional path, determine a cheapest
@@ -1994,26 +1992,25 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 					path_fraction /= cheapest_total->rows;
 
 				cheapest_fractional =
-					get_cheapest_fractional_path_for_pathkeys(childrel->pathlist,
-															  pathkeys,
-															  NULL,
-															  path_fraction);
+					get_cheapest_fractional_path_for_pathkeys_ext(root,
+																  childrel,
+																  pathkeys,
+																  NULL,
+																  path_fraction);
+
+				if (pathkeys_contained_in(pathkeys, cheapest_fractional->pathkeys))
+					fractional_has_ordered = true;
 
 				/*
-				 * If we found no path with matching pathkeys, use the
-				 * cheapest total path instead.
-				 *
-				 * XXX We might consider partially sorted paths too (with an
-				 * incremental sort on top). But we'd have to build all the
-				 * incremental paths, do the costing etc.
+				 * In accordance to current planning logic there are no
+				 * parameterised fractional paths under a merge append.
 				 *
 				 * Also, notice whether we actually have different paths for
 				 * the "fractional" and "total" cases.  This helps avoid
 				 * generating two identical ordered append paths.
 				 */
-				if (cheapest_fractional == NULL)
-					cheapest_fractional = cheapest_total;
-				else if (cheapest_fractional != cheapest_total)
+				Assert(cheapest_fractional != NULL);
+				if (cheapest_fractional != cheapest_total)
 					fraction_neq_total = true;
 			}
 
@@ -2105,19 +2102,20 @@ generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 		else
 		{
 			/* We need MergeAppend */
-			add_path(rel, (Path *) create_merge_append_path(root,
-															rel,
-															startup_subpaths,
-															pathkeys,
-															NULL));
-			if (startup_neq_total)
+			if (startup_has_ordered)
+				add_path(rel, (Path *) create_merge_append_path(root,
+																rel,
+																startup_subpaths,
+																pathkeys,
+																NULL));
+			if (startup_neq_total && total_has_ordered)
 				add_path(rel, (Path *) create_merge_append_path(root,
 																rel,
 																total_subpaths,
 																pathkeys,
 																NULL));
 
-			if (fractional_subpaths && fraction_neq_total)
+			if (fractional_subpaths && fraction_neq_total && fractional_has_ordered)
 				add_path(rel, (Path *) create_merge_append_path(root,
 																rel,
 																fractional_subpaths,
