@@ -322,6 +322,34 @@ typedef struct AggStatePerHashData
 } AggStatePerHashData;
 
 
+/*
+ * AggStatePerIndexData - per-index state
+ *
+ * Logic is the same as for AggStatePerHashData - one of these for each
+ * grouping set.
+ */
+typedef struct AggStatePerIndexData
+{
+	TupleIndex	index;			/* current in-memory index data */
+	MemoryContext metacxt;		/* memory context containing TupleIndex */
+	MemoryContext tempctx;		/* short-lived context */
+	TupleTableSlot *indexslot; 	/* slot for loading index */
+	int			numCols;		/* total number of columns in index tuple */
+	int			numKeyCols;		/* number of key columns in index tuple */
+	int			largestGrpColIdx;	/* largest col required for comparison */
+	AttrNumber *idxKeyColIdxInput;	/* key column indices in input slot */
+	AttrNumber *idxKeyColIdxIndex;	/* key column indices in index tuples */
+	TupleIndexIteratorData iter;	/* iterator state for index */
+	Agg		   *aggnode;		/* original Agg node, for numGroups etc. */
+
+	/* state used only for spill mode */
+	AttrNumber	*idxKeyColIdxTL;	/* key column indices in target list */
+	FmgrInfo    *hashfunctions;	/* tuple hashing function */
+	ExprState   *indexhashexpr;	/* ExprState for hashing index datatype(s) */
+	ExprContext *exprcontext;	/* expression context */
+	TupleTableSlot *mergeslot;	/* slot for loading tuple during merge */
+}			AggStatePerIndexData;
+
 extern AggState *ExecInitAgg(Agg *node, EState *estate, int eflags);
 extern void ExecEndAgg(AggState *node);
 extern void ExecReScanAgg(AggState *node);
