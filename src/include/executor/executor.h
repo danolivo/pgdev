@@ -393,8 +393,16 @@ extern ExprState *ExecInitExprWithParams(Expr *node, ParamListInfo ext_params);
 extern ExprState *ExecInitQual(List *qual, PlanState *parent);
 extern ExprState *ExecInitCheck(List *qual, PlanState *parent);
 extern List *ExecInitExprList(List *nodes, PlanState *parent);
+
+/* 
+ * Which strategy to use for aggregation/grouping
+ */
+#define GROUPING_STRATEGY_SORT			1
+#define GROUPING_STRATEGY_HASH			(1 << 1)
+#define GROUPING_STRATEGY_INDEX			(1 << 2)
+
 extern ExprState *ExecBuildAggTrans(AggState *aggstate, struct AggStatePerPhaseData *phase,
-									bool doSort, bool doHash, bool nullcheck);
+									int groupStrategy, bool nullcheck);
 extern ExprState *ExecBuildHash32FromAttrs(TupleDesc desc,
 										   const TupleTableSlotOps *ops,
 										   FmgrInfo *hashfunctions,

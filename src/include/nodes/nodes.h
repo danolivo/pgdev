@@ -365,6 +365,7 @@ typedef enum AggStrategy
 	AGG_SORTED,					/* grouped agg, input must be sorted */
 	AGG_HASHED,					/* grouped agg, use internal hashtable */
 	AGG_MIXED,					/* grouped agg, hash and sort both used */
+	AGG_INDEX,					/* grouped agg, build index for input */
 } AggStrategy;
 
 /*

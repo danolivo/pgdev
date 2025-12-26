@@ -1219,7 +1219,7 @@ typedef struct Agg
 	/* grouping sets to use */
 	List	   *groupingSets;
 
-	/* chained Agg/Sort nodes */
+	/* chained Agg/Sort nodes, for AGG_INDEX contains single Sort node */
 	List	   *chain;
 } Agg;
 

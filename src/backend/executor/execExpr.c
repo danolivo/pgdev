@@ -94,7 +94,7 @@ static void ExecInitCoerceToDomain(ExprEvalStep *scratch, CoerceToDomain *ctest,
 static void ExecBuildAggTransCall(ExprState *state, AggState *aggstate,
 								  ExprEvalStep *scratch,
 								  FunctionCallInfo fcinfo, AggStatePerTrans pertrans,
-								  int transno, int setno, int setoff, bool ishash,
+								  int transno, int setno, int setoff, int strategy,
 								  bool nullcheck);
 static void ExecInitJsonExpr(JsonExpr *jsexpr, ExprState *state,
 							 Datum *resv, bool *resnull,
@@ -3667,7 +3667,7 @@ ExecInitCoerceToDomain(ExprEvalStep *scratch, CoerceToDomain *ctest,
  */
 ExprState *
 ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
-				  bool doSort, bool doHash, bool nullcheck)
+				  int groupStrategy, bool nullcheck)
 {
 	ExprState  *state = makeNode(ExprState);
 	PlanState  *parent = &aggstate->ss.ps;
@@ -3925,7 +3925,7 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 		 * grouping set). Do so for both sort and hash based computations, as
 		 * applicable.
 		 */
-		if (doSort)
+		if (groupStrategy & GROUPING_STRATEGY_SORT)
 		{
 			int			processGroupingSets = Max(phase->numsets, 1);
 			int			setoff = 0;
@@ -3933,13 +3933,13 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 			for (int setno = 0; setno < processGroupingSets; setno++)
 			{
 				ExecBuildAggTransCall(state, aggstate, &scratch, trans_fcinfo,
-									  pertrans, transno, setno, setoff, false,
-									  nullcheck);
+									  pertrans, transno, setno, setoff,
+									  GROUPING_STRATEGY_SORT, nullcheck);
 				setoff++;
 			}
 		}
 
-		if (doHash)
+		if (groupStrategy & GROUPING_STRATEGY_HASH)
 		{
 			int			numHashes = aggstate->num_hashes;
 			int			setoff;
@@ -3953,10 +3953,17 @@ ExecBuildAggTrans(AggState *aggstate, AggStatePerPhase phase,
 			for (int setno = 0; setno < numHashes; setno++)
 			{
 				ExecBuildAggTransCall(state, aggstate, &scratch, trans_fcinfo,
-									  pertrans, transno, setno, setoff, true,
-									  nullcheck);
+									  pertrans, transno, setno, setoff,
+									  GROUPING_STRATEGY_HASH, nullcheck);
 				setoff++;
 			}
+		}
+
+		if (groupStrategy & GROUPING_STRATEGY_INDEX)
+		{
+			ExecBuildAggTransCall(state, aggstate, &scratch, trans_fcinfo,
+								  pertrans, transno, 0, 0,
+								  GROUPING_STRATEGY_INDEX, nullcheck);
 		}
 
 		/* adjust early bail out jump target(s) */
@@ -4011,16 +4018,18 @@ static void
 ExecBuildAggTransCall(ExprState *state, AggState *aggstate,
 					  ExprEvalStep *scratch,
 					  FunctionCallInfo fcinfo, AggStatePerTrans pertrans,
-					  int transno, int setno, int setoff, bool ishash,
+					  int transno, int setno, int setoff, int strategy,
 					  bool nullcheck)
 {
 	ExprContext *aggcontext;
 	int			adjust_jumpnull = -1;
 
-	if (ishash)
+	if (strategy & GROUPING_STRATEGY_HASH)
 		aggcontext = aggstate->hashcontext;
-	else
+	else if (strategy & GROUPING_STRATEGY_SORT)
 		aggcontext = aggstate->aggcontexts[setno];
+	else
+		aggcontext = aggstate->indexcontext;
 
 	/* add check for NULL pointer? */
 	if (nullcheck)

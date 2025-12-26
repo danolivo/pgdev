@@ -2070,3 +2070,108 @@ readtup_datum(Tuplesortstate *state, SortTuple *stup,
 	if (base->sortopt & TUPLESORT_RANDOMACCESS) /* need trailing length word? */
 		LogicalTapeReadExact(tape, &tuplen, sizeof(tuplen));
 }
+
+Tuplesortstate *
+tuplemerge_begin_heap(TupleDesc tupDesc,
+					  int nkeys, AttrNumber *attNums,
+					  Oid *sortOperators, Oid *sortCollations,
+					  bool *nullsFirstFlags,
+					  int workMem, SortCoordinate coordinate)
+{
+	Tuplesortstate *state = tuplemerge_begin_common(workMem, coordinate);
+	TuplesortPublic *base = TuplesortstateGetPublic(state);
+	MemoryContext oldcontext;
+	int			i;
+
+	oldcontext = MemoryContextSwitchTo(base->maincontext);
+
+	Assert(nkeys > 0);
+
+	if (trace_sort)
+		elog(LOG,
+			 "begin tuple merge: nkeys = %d, workMem = %d", nkeys, workMem);
+
+	base->nKeys = nkeys;
+
+	TRACE_POSTGRESQL_SORT_START(HEAP_SORT,
+								false,	/* no unique check */
+								nkeys,
+								workMem,
+								false,
+								PARALLEL_SORT(coordinate));
+
+	base->removeabbrev = removeabbrev_heap;
+	base->comparetup = comparetup_heap;
+	base->comparetup_tiebreak = comparetup_heap_tiebreak;
+	base->writetup = writetup_heap;
+	base->readtup = readtup_heap;
+	base->haveDatum1 = true;
+	base->arg = tupDesc;		/* assume we need not copy tupDesc */
+
+	/* Prepare SortSupport data for each column */
+	base->sortKeys = (SortSupport) palloc0(nkeys * sizeof(SortSupportData));
+
+	for (i = 0; i < nkeys; i++)
+	{
+		SortSupport sortKey = base->sortKeys + i;
+
+		Assert(attNums[i] != 0);
+		Assert(sortOperators[i] != 0);
+
+		sortKey->ssup_cxt = CurrentMemoryContext;
+		sortKey->ssup_collation = sortCollations[i];
+		sortKey->ssup_nulls_first = nullsFirstFlags[i];
+		sortKey->ssup_attno = attNums[i];
+		/* Convey if abbreviation optimization is applicable in principle */
+		sortKey->abbreviate = (i == 0 && base->haveDatum1);
+
+		PrepareSortSupportFromOrderingOp(sortOperators[i], sortKey);
+	}
+
+	/*
+	 * The "onlyKey" optimization cannot be used with abbreviated keys, since
+	 * tie-breaker comparisons may be required.  Typically, the optimization
+	 * is only of value to pass-by-value types anyway, whereas abbreviated
+	 * keys are typically only of value to pass-by-reference types.
+	 */
+	if (nkeys == 1 && !base->sortKeys->abbrev_converter)
+		base->onlyKey = base->sortKeys;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	return state;
+}
+
+void
+tuplemerge_puttupleslot(Tuplesortstate *state, TupleTableSlot *slot)
+{
+	TuplesortPublic *base = TuplesortstateGetPublic(state);
+	MemoryContext oldcontext = MemoryContextSwitchTo(base->tuplecontext);
+	TupleDesc	tupDesc = (TupleDesc) base->arg;
+	SortTuple	stup;
+	MinimalTuple tuple;
+	HeapTupleData htup;
+	Size		tuplen;
+
+	/* copy the tuple into sort storage */
+	tuple = ExecCopySlotMinimalTuple(slot);
+	stup.tuple = tuple;
+	/* set up first-column key value */
+	htup.t_len = tuple->t_len + MINIMAL_TUPLE_OFFSET;
+	htup.t_data = (HeapTupleHeader) ((char *) tuple - MINIMAL_TUPLE_OFFSET);
+	stup.datum1 = heap_getattr(&htup,
+							   base->sortKeys[0].ssup_attno,
+							   tupDesc,
+							   &stup.isnull1);
+
+	/* GetMemoryChunkSpace is not supported for bump contexts */
+	if (TupleSortUseBumpTupleCxt(base->sortopt))
+		tuplen = MAXALIGN(tuple->t_len);
+	else
+		tuplen = GetMemoryChunkSpace(tuple);
+
+	tuplemerge_puttuple_common(state, &stup, tuplen);
+
+	MemoryContextSwitchTo(oldcontext);
+}
+

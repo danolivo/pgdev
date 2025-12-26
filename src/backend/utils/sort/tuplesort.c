@@ -1900,6 +1900,7 @@ static void
 inittapestate(Tuplesortstate *state, int maxTapes)
 {
 	int64		tapeSpace;
+	Size		memtuplesSize;
 
 	/*
 	 * Decrease availMem to reflect the space needed for tape buffers; but
@@ -1912,7 +1913,16 @@ inittapestate(Tuplesortstate *state, int maxTapes)
 	 */
 	tapeSpace = (int64) maxTapes * TAPE_BUFFER_OVERHEAD;
 
-	if (tapeSpace + GetMemoryChunkSpace(state->memtuples) < state->allowedMem)
+	/* 
+	 * In merge state during initial run creation we do not use in-memory
+	 * tuples array and write to tapes directly.
+	 */
+	if (state->memtuples != NULL)
+		memtuplesSize = GetMemoryChunkSpace(state->memtuples);
+	else
+		memtuplesSize = 0;
+
+	if (tapeSpace + memtuplesSize < state->allowedMem)
 		USEMEM(state, tapeSpace);
 
 	/*
@@ -2031,11 +2041,14 @@ mergeruns(Tuplesortstate *state)
 
 	/*
 	 * We no longer need a large memtuples array.  (We will allocate a smaller
-	 * one for the heap later.)
+	 * one for the heap later.)  Note that in merge state this array can be NULL.
 	 */
-	FREEMEM(state, GetMemoryChunkSpace(state->memtuples));
-	pfree(state->memtuples);
-	state->memtuples = NULL;
+	if (state->memtuples)
+	{
+		FREEMEM(state, GetMemoryChunkSpace(state->memtuples));
+		pfree(state->memtuples);
+		state->memtuples = NULL;
+	}
 
 	/*
 	 * Initialize the slab allocator.  We need one slab slot per input tape,
@@ -3156,4 +3169,190 @@ ssup_datum_int32_cmp(Datum x, Datum y, SortSupport ssup)
 		return 1;
 	else
 		return 0;
+}
+
+/* 
+ *    tuplemerge_begin_common
+ * 
+ * Create new Tuplesortstate for performing merge only. This is used when
+ * we know, that input is sorted, but stored in multiple tapes, so only
+ * have to perform merge.
+ * 
+ * Unlike tuplesort_begin_common it does not accept sortopt, because none
+ * of current options are supported by merge (random access and bounded sort).
+ */
+Tuplesortstate *
+tuplemerge_begin_common(int workMem, SortCoordinate coordinate)
+{
+	Tuplesortstate *state;
+	MemoryContext maincontext;
+	MemoryContext sortcontext;
+	MemoryContext oldcontext;
+
+	/*
+	 * Memory context surviving tuplesort_reset.  This memory context holds
+	 * data which is useful to keep while sorting multiple similar batches.
+	 */
+	maincontext = AllocSetContextCreate(CurrentMemoryContext,
+										"TupleMerge main",
+										ALLOCSET_DEFAULT_SIZES);
+
+	/*
+	 * Create a working memory context for one sort operation.  The content of
+	 * this context is deleted by tuplesort_reset.
+	 */
+	sortcontext = AllocSetContextCreate(maincontext,
+										"TupleMerge merge",
+										ALLOCSET_DEFAULT_SIZES);
+
+	/*
+	 * Make the Tuplesortstate within the per-sortstate context.  This way, we
+	 * don't need a separate pfree() operation for it at shutdown.
+	 */
+	oldcontext = MemoryContextSwitchTo(maincontext);
+
+	state = (Tuplesortstate *) palloc0(sizeof(Tuplesortstate));
+
+	if (trace_sort)
+		pg_rusage_init(&state->ru_start);
+
+	state->base.sortopt = TUPLESORT_NONE;
+	state->base.tuples = true;
+	state->abbrevNext = 10;
+
+	/*
+	 * workMem is forced to be at least 64KB, the current minimum valid value
+	 * for the work_mem GUC.  This is a defense against parallel sort callers
+	 * that divide out memory among many workers in a way that leaves each
+	 * with very little memory.
+	 */
+	state->allowedMem = Max(workMem, 64) * (int64) 1024;
+	state->base.sortcontext = sortcontext;
+	state->base.maincontext = maincontext;
+
+	/*
+	 * After all of the other non-parallel-related state, we setup all of the
+	 * state needed for each batch.
+	 */
+
+	/* 
+	 * Merging do not accept RANDOMACCESS, so only possible context is Bump,
+	 * which saves some cycles.
+	 */
+	state->base.tuplecontext = BumpContextCreate(state->base.sortcontext,
+												 "Caller tuples",
+												 ALLOCSET_DEFAULT_SIZES);
+	
+	state->status = TSS_BUILDRUNS;
+	state->bounded = false;
+	state->boundUsed = false;
+	state->availMem = state->allowedMem;
+	
+	/* 
+	 * When performing merge we do not need in-memory array for sorting.
+	 * Even if we do not use memtuples, still allocate it, but make it empty.
+	 * So if someone will invoke inappropriate function in merge mode we will
+	 * not fail.
+	 */
+	state->memtuples = NULL;
+	state->memtupcount = 0;
+	state->memtupsize = INITIAL_MEMTUPSIZE;
+	state->growmemtuples = true;
+	state->slabAllocatorUsed = false;
+
+	/*
+	 * Tape variables (inputTapes, outputTapes, etc.) will be initialized by
+	 * inittapes(), if needed.
+	 */
+	state->result_tape = NULL;	/* flag that result tape has not been formed */
+	state->tapeset = NULL;
+	
+	inittapes(state, true);
+
+	/*
+	 * Initialize parallel-related state based on coordination information
+	 * from caller
+	 */
+	if (!coordinate)
+	{
+		/* Serial sort */
+		state->shared = NULL;
+		state->worker = -1;
+		state->nParticipants = -1;
+	}
+	else if (coordinate->isWorker)
+	{
+		/* Parallel worker produces exactly one final run from all input */
+		state->shared = coordinate->sharedsort;
+		state->worker = worker_get_identifier(state);
+		state->nParticipants = -1;
+	}
+	else
+	{
+		/* Parallel leader state only used for final merge */
+		state->shared = coordinate->sharedsort;
+		state->worker = -1;
+		state->nParticipants = coordinate->nParticipants;
+		Assert(state->nParticipants >= 1);
+	}
+
+	MemoryContextSwitchTo(oldcontext);
+
+	return state;
+}
+
+void
+tuplemerge_start_run(Tuplesortstate *state)
+{
+	if (state->memtupcount == 0)
+		return;
+
+	selectnewtape(state);
+	state->memtupcount = 0;
+}
+
+void
+tuplemerge_performmerge(Tuplesortstate *state)
+{
+	if (state->memtupcount == 0)
+	{
+		/* 
+		 * We have started new run, but no tuples were written. mergeruns
+		 * expects that each run have at least 1 tuple, otherwise it
+		 * will fail to even fill initial merge heap.
+		 */
+		state->nOutputRuns--;
+	}
+	else
+		state->memtupcount = 0;
+
+	mergeruns(state);
+
+	state->current = 0;
+	state->eof_reached = false;
+	state->markpos_block = 0L;
+	state->markpos_offset = 0;
+	state->markpos_eof = false;
+}
+
+void
+tuplemerge_puttuple_common(Tuplesortstate *state, SortTuple *tuple, Size tuplen)
+{
+	MemoryContext oldcxt = MemoryContextSwitchTo(state->base.sortcontext);
+
+	Assert(state->destTape);	
+	WRITETUP(state, state->destTape, tuple);
+
+	MemoryContextSwitchTo(oldcxt);
+	
+	state->memtupcount++;
+}
+
+void
+tuplemerge_end_run(Tuplesortstate *state)
+{
+	if (state->memtupcount != 0)
+	{
+		markrunend(state->destTape);
+	}
 }

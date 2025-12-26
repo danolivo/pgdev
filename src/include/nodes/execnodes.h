@@ -2613,6 +2613,7 @@ typedef struct AggStatePerTransData *AggStatePerTrans;
 typedef struct AggStatePerGroupData *AggStatePerGroup;
 typedef struct AggStatePerPhaseData *AggStatePerPhase;
 typedef struct AggStatePerHashData *AggStatePerHash;
+typedef struct AggStatePerIndexData *AggStatePerIndex;
 
 typedef struct AggState
 {
@@ -2628,17 +2629,18 @@ typedef struct AggState
 	AggStatePerAgg peragg;		/* per-Aggref information */
 	AggStatePerTrans pertrans;	/* per-Trans state information */
 	ExprContext *hashcontext;	/* econtexts for long-lived data (hashtable) */
+	ExprContext *indexcontext;	/* econtexts for long-lived data (index) */
 	ExprContext **aggcontexts;	/* econtexts for long-lived data (per GS) */
 	ExprContext *tmpcontext;	/* econtext for input expressions */
-#define FIELDNO_AGGSTATE_CURAGGCONTEXT 14
+#define FIELDNO_AGGSTATE_CURAGGCONTEXT 15
 	ExprContext *curaggcontext; /* currently active aggcontext */
 	AggStatePerAgg curperagg;	/* currently active aggregate, if any */
-#define FIELDNO_AGGSTATE_CURPERTRANS 16
+#define FIELDNO_AGGSTATE_CURPERTRANS 17
 	AggStatePerTrans curpertrans;	/* currently active trans state, if any */
 	bool		input_done;		/* indicates end of input */
 	bool		agg_done;		/* indicates completion of Agg scan */
 	int			projected_set;	/* The last projected grouping set */
-#define FIELDNO_AGGSTATE_CURRENT_SET 20
+#define FIELDNO_AGGSTATE_CURRENT_SET 21
 	int			current_set;	/* The current grouping set being evaluated */
 	Bitmapset  *grouped_cols;	/* grouped cols in current projection */
 	List	   *all_grouped_cols;	/* list of all grouped cols in DESC order */
@@ -2660,32 +2662,43 @@ typedef struct AggState
 	int			num_hashes;
 	MemoryContext hash_metacxt; /* memory for hash table bucket array */
 	MemoryContext hash_tuplescxt;	/* memory for hash table tuples */
-	struct LogicalTapeSet *hash_tapeset;	/* tape set for hash spill tapes */
-	struct HashAggSpill *hash_spills;	/* HashAggSpill for each grouping set,
-										 * exists only during first pass */
-	TupleTableSlot *hash_spill_rslot;	/* for reading spill files */
-	TupleTableSlot *hash_spill_wslot;	/* for writing spill files */
-	List	   *hash_batches;	/* hash batches remaining to be processed */
-	bool		hash_ever_spilled;	/* ever spilled during this execution? */
-	bool		hash_spill_mode;	/* we hit a limit during the current batch
-									 * and we must not create new groups */
-	Size		hash_mem_limit; /* limit before spilling hash table */
-	uint64		hash_ngroups_limit; /* limit before spilling hash table */
-	int			hash_planned_partitions;	/* number of partitions planned
-											 * for first pass */
-	double		hashentrysize;	/* estimate revised during execution */
-	Size		hash_mem_peak;	/* peak hash table memory usage */
-	uint64		hash_ngroups_current;	/* number of groups currently in
-										 * memory in all hash tables */
-	uint64		hash_disk_used; /* kB of disk space used */
-	int			hash_batches_used;	/* batches used during entire execution */
-
 	AggStatePerHash perhash;	/* array of per-hashtable data */
 	AggStatePerGroup *hash_pergroup;	/* grouping set indexed array of
 										 * per-group pointers */
+	/* Fields used for managing spill mode in hash and index aggs */
+	struct LogicalTapeSet *spill_tapeset;	/* tape set for hash spill tapes */
+	struct HashAggSpill *spills;	/* HashAggSpill for each grouping set,
+									 * exists only during first pass */
+	TupleTableSlot *spill_rslot;	/* for reading spill files */
+	TupleTableSlot *spill_wslot;	/* for writing spill files */
+	List	   *spill_batches;	/* hash batches remaining to be processed */
+
+	bool		spill_ever_happened;	/* ever spilled during this execution? */
+	bool		spill_mode;	/* we hit a limit during the current batch
+							 * and we must not create new groups */
+	Size		spill_mem_limit; /* limit before spilling hash table or index */
+	uint64		spill_ngroups_limit; /* limit before spilling hash table or index */
+	int			spill_planned_partitions;	/* number of partitions planned
+											 * for first pass */
+	double		hashentrysize;	/* estimate revised during execution */
+	Size		spill_mem_peak;	/* peak memory usage of hash table or index */
+	uint64		spill_ngroups_current;	/* number of groups currently in
+										 * memory in all hash tables */
+	uint64		spill_disk_used; /* kB of disk space used */
+	int			spill_batches_used;	/* batches used during entire execution */
+
+	/* these fields are used in AGG_INDEXED mode: */
+	AggStatePerIndex perindex;	/* pointer to per-index state data */
+	bool			index_filled;	/* index filled yet? */
+	MemoryContext	index_metacxt;	/* memory for index structure */
+	MemoryContext	index_nodecxt;	/* memory for index nodes */
+	MemoryContext	index_entrycxt;	/* memory for index entries */
+	Sort		   *index_sort;		/* ordering information for index */
+	Tuplesortstate *mergestate;		/* state for merging projected tuples if
+									 * spill occurred */
 
 	/* support for evaluation of agg input expressions: */
-#define FIELDNO_AGGSTATE_ALL_PERGROUPS 54
+#define FIELDNO_AGGSTATE_ALL_PERGROUPS 62
 	AggStatePerGroup *all_pergroups;	/* array of first ->pergroups, than
 										 * ->hash_pergroup */
 	SharedAggInfo *shared_info; /* one entry per worker */

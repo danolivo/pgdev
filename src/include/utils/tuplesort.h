@@ -475,6 +475,21 @@ extern GinTuple *tuplesort_getgintuple(Tuplesortstate *state, Size *len,
 									   bool forward);
 extern bool tuplesort_getdatum(Tuplesortstate *state, bool forward, bool copy,
 							   Datum *val, bool *isNull, Datum *abbrev);
-
+/* 
+* Special state for merge mode.
+*/
+extern Tuplesortstate *tuplemerge_begin_common(int workMem,
+											   SortCoordinate coordinate);
+extern Tuplesortstate *tuplemerge_begin_heap(TupleDesc tupDesc,
+											int nkeys, AttrNumber *attNums,
+											Oid *sortOperators, Oid *sortCollations,
+											bool *nullsFirstFlags,
+											int workMem, SortCoordinate coordinate);
+extern void tuplemerge_start_run(Tuplesortstate *state);
+extern void tuplemerge_end_run(Tuplesortstate *state);
+extern void tuplemerge_puttuple_common(Tuplesortstate *state, SortTuple *tuple,
+									   Size tuplen);
+extern void tuplemerge_puttupleslot(Tuplesortstate *state, TupleTableSlot *slot);
+extern void tuplemerge_performmerge(Tuplesortstate *state);
 
 #endif							/* TUPLESORT_H */
