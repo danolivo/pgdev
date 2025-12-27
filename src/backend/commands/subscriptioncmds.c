@@ -2649,9 +2649,11 @@ check_publications_origin_sequences(WalReceiverConn *wrconn, List *publications,
 	/*
 	 * Enable sequence synchronization checks only when origin is 'none' , to
 	 * ensure that sequence data from other origins is not inadvertently
-	 * copied.
+	 * copied. This check is necessary if the publisher is running PG19 or
+	 * later, where logical replication sequence synchronization is supported.
 	 */
-	if (!copydata || pg_strcasecmp(origin, LOGICALREP_ORIGIN_NONE) != 0)
+	if (!copydata || pg_strcasecmp(origin, LOGICALREP_ORIGIN_NONE) != 0 ||
+		walrcv_server_version(wrconn) < 190000)
 		return;
 
 	initStringInfo(&cmd);
@@ -2753,7 +2755,7 @@ check_pub_dead_tuple_retention(WalReceiverConn *wrconn)
 	bool		isnull;
 	bool		remote_in_recovery;
 
-	if (walrcv_server_version(wrconn) < 19000)
+	if (walrcv_server_version(wrconn) < 190000)
 		ereport(ERROR,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				errmsg("cannot enable retain_dead_tuples if the publisher is running a version earlier than PostgreSQL 19"));
