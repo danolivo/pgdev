@@ -17,6 +17,7 @@
 
 #include "access/parallel.h"
 #include "executor/instrument.h"
+#include "fmgr.h"
 #include "pgstat.h"
 #include "storage/aio.h"
 #include "storage/buf_internals.h"
@@ -1039,4 +1040,207 @@ AtProcExit_LocalBuffers(void)
 	 * drop the temp rels.
 	 */
 	CheckForLocalBufferLeaks();
+}
+
+/*
+ * pg_flush_local_buffers - flush all dirty local buffers to disk
+ *
+ * This function is primarily useful for parallel query execution involving
+ * temporary tables, where workers need to see the flushed data.
+ * Returns the number of buffers flushed.
+ *
+ * Requires superuser privileges since flushing can affect system performance
+ * and potentially expose information about temporary table usage.
+ */
+PG_FUNCTION_INFO_V1(pg_flush_local_buffers);
+
+Datum
+pg_flush_local_buffers(PG_FUNCTION_ARGS)
+{
+	int			i;
+	int64		counter = 0;
+
+	Assert(!IsParallelWorker());
+	Assert(!(LocalBufHash == NULL && NLocBuffer > 0));
+
+	/* Only superuser can flush local buffers */
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to flush local buffers"),
+				 errhint("Only superusers can flush local buffers.")));
+
+	for (i = 0; i < NLocBuffer; i++)
+	{
+		BufferDesc *bufHdr = GetLocalBufferDescriptor(i);
+		uint32		buf_state;
+
+		/* Allow query cancellation in long loops */
+		CHECK_FOR_INTERRUPTS();
+
+		if (LocalBufHdrGetBlock(bufHdr) == NULL)
+			continue;
+
+		buf_state = pg_atomic_read_u32(&bufHdr->state);
+
+		/* Flush only valid dirty pages */
+		if ((buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
+		{
+			PinLocalBuffer(bufHdr, false);
+
+			/*
+			 * Re-check state after pinning to avoid race conditions.
+			 * The buffer state could have changed between our check and pin.
+			 */
+			buf_state = pg_atomic_read_u32(&bufHdr->state);
+			if (buf_state & BM_DIRTY)
+			{
+				FlushLocalBuffer(bufHdr, NULL);
+				counter++;
+			}
+
+			UnpinLocalBuffer(BufferDescriptorGetBuffer(bufHdr));
+		}
+	}
+
+	/*
+	 * After flushing all buffers, the dirty count should be zero.
+	 * This assertion helps catch accounting bugs.
+	 */
+	Assert(dirtied_localbufs == 0);
+
+	PG_RETURN_INT64(counter);
+}
+
+/*
+ * pg_dirty_local_buffers - return the number of currently dirty local buffers
+ *
+ * This function provides visibility into the current state of local buffer
+ * cache, which is useful for monitoring and diagnostics.
+ *
+ * Note: This returns a point-in-time snapshot. The value can change
+ * immediately after the function returns.
+ */
+PG_FUNCTION_INFO_V1(pg_dirty_local_buffers);
+
+Datum
+pg_dirty_local_buffers(PG_FUNCTION_ARGS)
+{
+	/* Only superuser can view local buffer statistics */
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to view local buffer statistics"),
+				 errhint("Only superusers can view local buffer statistics.")));
+
+	PG_RETURN_INT32(dirtied_localbufs);
+}
+
+PG_FUNCTION_INFO_V1(pg_allocated_local_buffers);
+Datum
+pg_allocated_local_buffers(PG_FUNCTION_ARGS)
+{
+	/* Only superuser can view local buffer statistics */
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to view local buffer statistics"),
+				 errhint("Only superusers can view local buffer statistics.")));
+
+	PG_RETURN_INT32(allocated_localbufs);
+}
+
+#include "access/relation.h"
+
+static void
+shuffle_array(BlockNumber *array, BlockNumber n)
+{
+	for (int i = n - 1; i > 0; i--)
+	{
+		// Generate random index from 0 to i
+		int j = rand() % (i + 1);
+
+		// Swap elements at positions i and j
+		int temp = array[i];
+		array[i] = array[j];
+		array[j] = temp;
+	}
+}
+
+PG_FUNCTION_INFO_V1(pg_read_temp_relation);
+Datum
+pg_read_temp_relation(PG_FUNCTION_ARGS)
+{
+	Oid				relid = PG_GETARG_OID(0);
+	bool			randomize = PG_GETARG_BOOL(1);
+	Relation		rel;
+	BlockNumber 	nblocks;
+	BlockNumber		i;
+	BlockNumber	   *array = NULL;
+
+	rel = relation_open(relid, ExclusiveLock);
+
+	if (!RelationUsesLocalBuffers(rel))
+	{
+		elog(WARNING, "function intended to be used with temporary objects only");
+		relation_close(rel, ExclusiveLock);
+		PG_RETURN_VOID();
+	}
+
+	nblocks = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
+
+	if (randomize)
+	{
+		array = palloc(nblocks * sizeof(BlockNumber));
+
+		for (i = 0; i < nblocks; i++)
+			array[i] = i;
+
+		shuffle_array(array, nblocks);
+	}
+
+	for (i = 0; i < nblocks; i++)
+	{
+		Buffer buf;
+
+		buf = ReadBuffer(rel, (array == NULL) ? i : array[i]);
+		ReleaseBuffer(buf);
+	}
+
+	relation_close(rel, ExclusiveLock);
+	PG_RETURN_VOID();
+}
+
+
+PG_FUNCTION_INFO_V1(pg_temp_buffers_dirty);
+Datum
+pg_temp_buffers_dirty(PG_FUNCTION_ARGS)
+{
+	Oid				relid = PG_GETARG_OID(0);
+	Relation		rel;
+	BlockNumber 	nblocks;
+	BlockNumber		i;
+
+	rel = relation_open(relid, ExclusiveLock);
+
+	if (!RelationUsesLocalBuffers(rel))
+	{
+		elog(WARNING, "function intended to be used with temporary objects only");
+		relation_close(rel, ExclusiveLock);
+		PG_RETURN_VOID();
+	}
+
+	nblocks = smgrnblocks(RelationGetSmgr(rel), MAIN_FORKNUM);
+
+	for (i = 0; i < nblocks; i++)
+	{
+		Buffer buf;
+
+		buf = ReadBuffer(rel, i);
+		MarkLocalBufferDirty(buf);
+		ReleaseBuffer(buf);
+	}
+
+	relation_close(rel, ExclusiveLock);
+	PG_RETURN_VOID();
 }
