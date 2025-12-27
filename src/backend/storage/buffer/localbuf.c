@@ -17,6 +17,7 @@
 
 #include "access/parallel.h"
 #include "executor/instrument.h"
+#include "fmgr.h"
 #include "pgstat.h"
 #include "storage/aio.h"
 #include "storage/buf_internals.h"
@@ -1039,4 +1040,98 @@ AtProcExit_LocalBuffers(void)
 	 * drop the temp rels.
 	 */
 	CheckForLocalBufferLeaks();
+}
+
+/*
+ * pg_flush_local_buffers - flush all dirty local buffers to disk
+ *
+ * This function is primarily useful for parallel query execution involving
+ * temporary tables, where workers need to see the flushed data.
+ * Returns the number of buffers flushed.
+ *
+ * Requires superuser privileges since flushing can affect system performance
+ * and potentially expose information about temporary table usage.
+ */
+PG_FUNCTION_INFO_V1(pg_flush_local_buffers);
+
+Datum
+pg_flush_local_buffers(PG_FUNCTION_ARGS)
+{
+	int			i;
+	int64		counter = 0;
+
+	Assert(!IsParallelWorker());
+	Assert(!(LocalBufHash == NULL && NLocBuffer > 0));
+
+	/* Only superuser can flush local buffers */
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to flush local buffers"),
+				 errhint("Only superusers can flush local buffers.")));
+
+	for (i = 0; i < NLocBuffer; i++)
+	{
+		BufferDesc *bufHdr = GetLocalBufferDescriptor(i);
+		uint32		buf_state;
+
+		/* Allow query cancellation in long loops */
+		CHECK_FOR_INTERRUPTS();
+
+		if (LocalBufHdrGetBlock(bufHdr) == NULL)
+			continue;
+
+		buf_state = pg_atomic_read_u32(&bufHdr->state);
+
+		/* Flush only valid dirty pages */
+		if ((buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
+		{
+			PinLocalBuffer(bufHdr, false);
+
+			/*
+			 * Re-check state after pinning to avoid race conditions.
+			 * The buffer state could have changed between our check and pin.
+			 */
+			buf_state = pg_atomic_read_u32(&bufHdr->state);
+			if (buf_state & BM_DIRTY)
+			{
+				FlushLocalBuffer(bufHdr, NULL);
+				counter++;
+			}
+
+			UnpinLocalBuffer(BufferDescriptorGetBuffer(bufHdr));
+		}
+	}
+
+	/*
+	 * After flushing all buffers, the dirty count should be zero.
+	 * This assertion helps catch accounting bugs.
+	 */
+	Assert(dirtied_localbufs == 0);
+
+	PG_RETURN_INT64(counter);
+}
+
+/*
+ * pg_dirty_local_buffers - return the number of currently dirty local buffers
+ *
+ * This function provides visibility into the current state of local buffer
+ * cache, which is useful for monitoring and diagnostics.
+ *
+ * Note: This returns a point-in-time snapshot. The value can change
+ * immediately after the function returns.
+ */
+PG_FUNCTION_INFO_V1(pg_dirty_local_buffers);
+
+Datum
+pg_dirty_local_buffers(PG_FUNCTION_ARGS)
+{
+	/* Only superuser can view local buffer statistics */
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to view local buffer statistics"),
+				 errhint("Only superusers can view local buffer statistics.")));
+
+	PG_RETURN_INT32(dirtied_localbufs);
 }

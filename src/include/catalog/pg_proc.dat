@@ -12612,4 +12612,12 @@
   proargnames => '{pid,io_id,io_generation,state,operation,off,length,target,handle_data_len,raw_result,result,target_desc,f_sync,f_localmem,f_buffered}',
   prosrc => 'pg_get_aios' },
 
+# Local buffer management functions
+{ oid => '9902', descr => 'flush all dirty local buffers to disk',
+  proname => 'pg_flush_local_buffers', provolatile => 'v', proparallel => 'u',
+  prorettype => 'int8', proargtypes => '', prosrc => 'pg_flush_local_buffers' },
+{ oid => '9903', descr => 'number of currently dirty local buffers',
+  proname => 'pg_dirty_local_buffers', provolatile => 'v', proparallel => 'u',
+  prorettype => 'int4', proargtypes => '', prosrc => 'pg_dirty_local_buffers' },
+
 ]
