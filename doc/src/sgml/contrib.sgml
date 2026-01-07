@@ -170,6 +170,7 @@ CREATE EXTENSION <replaceable>extension_name</replaceable>;
  &seg;
  &sepgsql;
  &contrib-spi;
+ &snowflake;
  &sslinfo;
  &tablefunc;
  &tcn;
