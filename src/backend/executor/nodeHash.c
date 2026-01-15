@@ -2027,6 +2027,9 @@ ExecScanHashBucket(HashJoinState *hjstate,
 				hjstate->hj_CurTuple = hashTuple;
 				return true;
 			}
+
+			/* Tuple matched hash value but failed hash clauses */
+			InstrCountFiltered1(&hjstate->js.ps, 1);
 		}
 
 		hashTuple = hashTuple->next.unshared;
@@ -2084,6 +2087,9 @@ ExecParallelScanHashBucket(HashJoinState *hjstate,
 				hjstate->hj_CurTuple = hashTuple;
 				return true;
 			}
+
+			/* Tuple matched hash value but failed hash clauses */
+			InstrCountFiltered1(&hjstate->js.ps, 1);
 		}
 
 		hashTuple = ExecParallelHashNextTuple(hashtable, hashTuple);

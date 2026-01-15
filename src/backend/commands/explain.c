@@ -2178,7 +2178,8 @@ ExplainNode(PlanState *planstate, List *ancestors,
 							"Merge Cond", planstate, ancestors, es);
 			show_upper_qual(((MergeJoin *) plan)->join.joinqual,
 							"Join Filter", planstate, ancestors, es);
-			if (((MergeJoin *) plan)->join.joinqual)
+			if (((MergeJoin *) plan)->mergeclauses ||
+				((MergeJoin *) plan)->join.joinqual)
 				show_instrumentation_count("Rows Removed by Join Filter", 1,
 										   planstate, es);
 			show_upper_qual(plan->qual, "Filter", planstate, ancestors, es);
@@ -2191,7 +2192,8 @@ ExplainNode(PlanState *planstate, List *ancestors,
 							"Hash Cond", planstate, ancestors, es);
 			show_upper_qual(((HashJoin *) plan)->join.joinqual,
 							"Join Filter", planstate, ancestors, es);
-			if (((HashJoin *) plan)->join.joinqual)
+			if (((HashJoin *) plan)->hashclauses ||
+				((HashJoin *) plan)->join.joinqual)
 				show_instrumentation_count("Rows Removed by Join Filter", 1,
 										   planstate, es);
 			show_upper_qual(plan->qual, "Filter", planstate, ancestors, es);
