@@ -2191,6 +2191,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 							"Hash Cond", planstate, ancestors, es);
 			show_upper_qual(((HashJoin *) plan)->join.joinqual,
 							"Join Filter", planstate, ancestors, es);
+			if (((HashJoin *) plan)->hashclauses)
+				show_instrumentation_count("Rows Removed by Hash Matching", 3,
+										   planstate, es);
 			if (((HashJoin *) plan)->join.joinqual)
 				show_instrumentation_count("Rows Removed by Join Filter", 1,
 										   planstate, es);
@@ -3998,7 +4001,9 @@ show_instrumentation_count(const char *qlabel, int which,
 	if (!es->analyze || !planstate->instrument)
 		return;
 
-	if (which == 2)
+	if (which == 3)
+		nfiltered = planstate->instrument->nfiltered3;
+	else if (which == 2)
 		nfiltered = planstate->instrument->nfiltered2;
 	else
 		nfiltered = planstate->instrument->nfiltered1;

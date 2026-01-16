@@ -1278,6 +1278,11 @@ typedef struct PlanState
 		if (((PlanState *)(node))->instrument) \
 			((PlanState *)(node))->instrument->nfiltered2 += (delta); \
 	} while(0)
+#define InstrCountFiltered3(node, delta) \
+	do { \
+		if (((PlanState *)(node))->instrument) \
+			((PlanState *)(node))->instrument->nfiltered3 += (delta); \
+	} while(0)
 
 /*
  * EPQState is state for executing an EvalPlanQual recheck on a candidate
