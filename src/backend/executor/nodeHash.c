@@ -1995,6 +1995,7 @@ ExecScanHashBucket(HashJoinState *hjstate,
 	HashJoinTable hashtable = hjstate->hj_HashTable;
 	HashJoinTuple hashTuple = hjstate->hj_CurTuple;
 	uint32		hashvalue = hjstate->hj_CurHashValue;
+	TupleTableSlot *inntuple = NULL;
 
 	/*
 	 * hj_CurTuple is the address of the tuple last returned from the current
@@ -2014,8 +2015,6 @@ ExecScanHashBucket(HashJoinState *hjstate,
 	{
 		if (hashTuple->hashvalue == hashvalue)
 		{
-			TupleTableSlot *inntuple;
-
 			/* insert hashtable's tuple into exec slot so ExecQual sees it */
 			inntuple = ExecStoreMinimalTuple(HJTUPLE_MINTUPLE(hashTuple),
 											 hjstate->hj_HashTupleSlot,
@@ -2027,6 +2026,9 @@ ExecScanHashBucket(HashJoinState *hjstate,
 				hjstate->hj_CurTuple = hashTuple;
 				return true;
 			}
+
+			/* Tuple matched hash value but failed hash join clauses */
+			InstrCountFiltered1(&hjstate->js.ps, 1);
 		}
 
 		hashTuple = hashTuple->next.unshared;
@@ -2035,6 +2037,10 @@ ExecScanHashBucket(HashJoinState *hjstate,
 	/*
 	 * no match
 	 */
+
+	if (hjstate->hj_CurTuple == NULL && inntuple == NULL)
+		InstrCountFiltered3(&hjstate->js.ps, 1);
+
 	return false;
 }
 
@@ -2056,6 +2062,7 @@ ExecParallelScanHashBucket(HashJoinState *hjstate,
 	HashJoinTable hashtable = hjstate->hj_HashTable;
 	HashJoinTuple hashTuple = hjstate->hj_CurTuple;
 	uint32		hashvalue = hjstate->hj_CurHashValue;
+	TupleTableSlot *inntuple = NULL;
 
 	/*
 	 * hj_CurTuple is the address of the tuple last returned from the current
@@ -2071,8 +2078,6 @@ ExecParallelScanHashBucket(HashJoinState *hjstate,
 	{
 		if (hashTuple->hashvalue == hashvalue)
 		{
-			TupleTableSlot *inntuple;
-
 			/* insert hashtable's tuple into exec slot so ExecQual sees it */
 			inntuple = ExecStoreMinimalTuple(HJTUPLE_MINTUPLE(hashTuple),
 											 hjstate->hj_HashTupleSlot,
@@ -2084,6 +2089,9 @@ ExecParallelScanHashBucket(HashJoinState *hjstate,
 				hjstate->hj_CurTuple = hashTuple;
 				return true;
 			}
+
+			/* Tuple matched hash value but failed hash clauses */
+			InstrCountFiltered1(&hjstate->js.ps, 1);
 		}
 
 		hashTuple = ExecParallelHashNextTuple(hashtable, hashTuple);
@@ -2092,6 +2100,10 @@ ExecParallelScanHashBucket(HashJoinState *hjstate,
 	/*
 	 * no match
 	 */
+
+	if (hjstate->hj_CurTuple == NULL && inntuple == NULL)
+		InstrCountFiltered3(&hjstate->js.ps, 1);
+
 	return false;
 }
 
