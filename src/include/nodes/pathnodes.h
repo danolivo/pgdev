@@ -1798,6 +1798,12 @@ typedef struct Path
 
 	/* sort ordering of path's output; a List of PathKey nodes; see above */
 	List	   *pathkeys;
+
+	/*
+	 * Almost each path node may have a filter clause. So, it is worth to have
+	 * filter selectivity here.
+	 */
+	Selectivity filter_selectivity;
 } Path;
 
 /* Macro for extracting a path's parameterization relids; beware double eval */

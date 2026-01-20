@@ -550,6 +550,8 @@ typedef struct IndexScan
 	List	   *indexorderbyops;
 	/* forward or backward or don't care */
 	ScanDirection indexorderdir;
+	/* Selectivity of the index clause itself */
+	double		fetched_rows;
 } IndexScan;
 
 /* ----------------

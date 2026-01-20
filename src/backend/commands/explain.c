@@ -1962,6 +1962,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			show_scan_qual(((IndexScan *) plan)->indexorderbyorig,
 						   "Order By", planstate, ancestors, es);
 			show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
+			if (plan->qual != NIL)
+				ExplainPropertyFloat("Estimated Fetched Rows", NULL,
+								((IndexScan *) plan)->fetched_rows, 0, es);
 			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 1,
 										   planstate, es);

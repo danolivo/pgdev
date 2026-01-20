@@ -5520,6 +5520,18 @@ copy_generic_path_info(Plan *dest, Path *src)
 	dest->plan_width = src->pathtarget->width;
 	dest->parallel_aware = src->parallel_aware;
 	dest->parallel_safe = src->parallel_safe;
+
+	if (IsA(dest, IndexScan))
+	{
+		IndexPath *ipath = (IndexPath *) src;
+		double fetched_rows;
+
+		Assert(IsA(src, IndexPath));
+
+		fetched_rows = ipath->indexinfo->rel->tuples * ipath->indexselectivity;
+
+		((IndexScan *) dest)->fetched_rows = clamp_row_est(fetched_rows);
+	}
 }
 
 /*
