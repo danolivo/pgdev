@@ -1112,6 +1112,7 @@ cost_bitmap_heap_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
 	path->disabled_nodes = enable_bitmapscan ? 0 : 1;
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + run_cost;
+	path->fetched_rows = tuples_fetched;
 }
 
 /*

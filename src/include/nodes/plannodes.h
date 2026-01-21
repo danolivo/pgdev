@@ -600,6 +600,8 @@ typedef struct IndexOnlyScan
 	List	   *indextlist;
 	/* forward or backward or don't care */
 	ScanDirection indexorderdir;
+	/* Selectivity of the index clause itself */
+	double		fetched_rows;
 } IndexOnlyScan;
 
 /* ----------------
@@ -646,6 +648,7 @@ typedef struct BitmapHeapScan
 	Scan		scan;
 	/* index quals, in standard expr form */
 	List	   *bitmapqualorig;
+	double		fetched_rows;
 } BitmapHeapScan;
 
 /* ----------------

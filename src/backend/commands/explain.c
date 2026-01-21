@@ -1962,12 +1962,13 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			show_scan_qual(((IndexScan *) plan)->indexorderbyorig,
 						   "Order By", planstate, ancestors, es);
 			show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
-			if (plan->qual != NIL)
+			if (plan->qual)
+			{
 				ExplainPropertyFloat("Estimated Fetched Rows", NULL,
 								((IndexScan *) plan)->fetched_rows, 0, es);
-			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 1,
 										   planstate, es);
+			}
 			show_indexsearches_info(planstate, es);
 			break;
 		case T_IndexOnlyScan:
@@ -1980,8 +1981,12 @@ ExplainNode(PlanState *planstate, List *ancestors,
 						   "Order By", planstate, ancestors, es);
 			show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
 			if (plan->qual)
+			{
+				ExplainPropertyFloat("Estimated Fetched Rows", NULL,
+								((IndexOnlyScan *) plan)->fetched_rows, 0, es);
 				show_instrumentation_count("Rows Removed by Filter", 1,
 										   planstate, es);
+			}
 			if (es->analyze)
 				ExplainPropertyFloat("Heap Fetches", NULL,
 									 planstate->instrument->ntuples2, 0, es);
@@ -2000,8 +2005,12 @@ ExplainNode(PlanState *planstate, List *ancestors,
 										   planstate, es);
 			show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
 			if (plan->qual)
+			{
+				ExplainPropertyFloat("Estimated Fetched Rows", NULL,
+								((BitmapHeapScan *) plan)->fetched_rows, 0, es);
 				show_instrumentation_count("Rows Removed by Filter", 1,
 										   planstate, es);
+			}
 			show_tidbitmap_info((BitmapHeapScanState *) planstate, es);
 			break;
 		case T_SampleScan:

@@ -5532,6 +5532,27 @@ copy_generic_path_info(Plan *dest, Path *src)
 
 		((IndexScan *) dest)->fetched_rows = clamp_row_est(fetched_rows);
 	}
+	else if (IsA(dest, IndexOnlyScan))
+	{
+		IndexPath *ipath = (IndexPath *) src;
+		double fetched_rows;
+
+		Assert(IsA(src, IndexPath));
+
+		fetched_rows = ipath->indexinfo->rel->tuples * ipath->indexselectivity;
+
+		((IndexOnlyScan *) dest)->fetched_rows = clamp_row_est(fetched_rows);
+	}
+	else if (IsA(dest, BitmapHeapScan))
+	{
+		double fetched_rows;
+
+		Assert(IsA(src, BitmapHeapPath));
+
+		fetched_rows = src->fetched_rows;
+
+		((BitmapHeapScan *) dest)->fetched_rows = clamp_row_est(fetched_rows);
+	}
 }
 
 /*

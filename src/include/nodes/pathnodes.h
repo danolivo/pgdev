@@ -1803,7 +1803,7 @@ typedef struct Path
 	 * Almost each path node may have a filter clause. So, it is worth to have
 	 * filter selectivity here.
 	 */
-	Selectivity filter_selectivity;
+	double fetched_rows;
 } Path;
 
 /* Macro for extracting a path's parameterization relids; beware double eval */
