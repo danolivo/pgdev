@@ -16,3 +16,10 @@ AS 'MODULE_PATHNAME', 'heap_force_freeze'
 LANGUAGE C STRICT;
 
 REVOKE EXECUTE ON FUNCTION heap_force_freeze(regclass, tid[]) FROM PUBLIC;
+
+CREATE FUNCTION heap_force_unfreeze(reloid regclass, tids tid[])
+RETURNS VOID
+AS 'MODULE_PATHNAME', 'heap_force_unfreeze'
+LANGUAGE C STRICT;
+
+REVOKE EXECUTE ON FUNCTION heap_force_unfreeze(regclass, tid[]) FROM PUBLIC;

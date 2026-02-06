@@ -9,6 +9,7 @@ EXTENSION = pg_surgery
 DATA = pg_surgery--1.0.sql
 PGFILEDESC = "pg_surgery - perform surgery on a damaged relation"
 
+EXTRA_INSTALL = contrib/pageinspect contrib/pg_visibility
 REGRESS = heap_surgery
 
 ifdef USE_PGXS

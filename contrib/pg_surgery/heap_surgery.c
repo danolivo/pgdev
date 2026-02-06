@@ -14,6 +14,7 @@
 
 #include "access/heapam.h"
 #include "access/visibilitymap.h"
+#include "access/xact.h"
 #include "access/xloginsert.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_proc_d.h"
@@ -28,11 +29,13 @@ PG_MODULE_MAGIC;
 typedef enum HeapTupleForceOption
 {
 	HEAP_FORCE_KILL,
-	HEAP_FORCE_FREEZE
+	HEAP_FORCE_FREEZE,
+	HEAP_FORCE_UNFREEZE
 } HeapTupleForceOption;
 
 PG_FUNCTION_INFO_V1(heap_force_kill);
 PG_FUNCTION_INFO_V1(heap_force_freeze);
+PG_FUNCTION_INFO_V1(heap_force_unfreeze);
 
 static int32 tidcmp(const void *a, const void *b);
 static Datum heap_force_common(FunctionCallInfo fcinfo,
@@ -69,6 +72,23 @@ Datum
 heap_force_freeze(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_DATUM(heap_force_common(fcinfo, HEAP_FORCE_FREEZE));
+}
+
+/*-------------------------------------------------------------------------
+ * heap_force_unfreeze()
+ *
+ * Force unfreeze the tuple(s) pointed to by the item pointer(s) stored in the
+ * given TID array.  Sets xmin to the current transaction ID, creating an
+ * intentional inconsistency with the visibility map ALL_FROZEN flag (which
+ * is left intact).
+ *
+ * Usage: SELECT heap_force_unfreeze(regclass, tid[]);
+ *-------------------------------------------------------------------------
+ */
+Datum
+heap_force_unfreeze(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_DATUM(heap_force_common(fcinfo, HEAP_FORCE_UNFREEZE));
 }
 
 /*-------------------------------------------------------------------------
@@ -268,11 +288,9 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 					did_modify_vm = true;
 				}
 			}
-			else
+			else if (heap_force_opt == HEAP_FORCE_FREEZE)
 			{
 				HeapTupleHeader htup;
-
-				Assert(heap_force_opt == HEAP_FORCE_FREEZE);
 
 				htup = (HeapTupleHeader) PageGetItem(page, itemid);
 
@@ -302,6 +320,27 @@ heap_force_common(FunctionCallInfo fcinfo, HeapTupleForceOption heap_force_opt)
 				htup->t_infomask |= (HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID);
 				htup->t_infomask2 &= ~HEAP_HOT_UPDATED;
 				htup->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+			}
+			else
+			{
+				HeapTupleHeader htup;
+
+				Assert(heap_force_opt == HEAP_FORCE_UNFREEZE);
+
+				htup = (HeapTupleHeader) PageGetItem(page, itemid);
+
+				/*
+				 * Set xmin to the current transaction ID and clear the
+				 * HEAP_XMIN_FROZEN hint bits.  This makes the tuple appear
+				 * as not frozen, creating an inconsistency with the VM
+				 * ALL_FROZEN flag.
+				 *
+				 * We intentionally leave the page-level PD_ALL_VISIBLE and
+				 * the visibility map ALL_FROZEN bit intact so that without
+				 * vacuum_freeze_soft_check the page would be silently skipped.
+				 */
+				HeapTupleHeaderSetXmin(htup, FirstNormalTransactionId);
+				htup->t_infomask &= ~HEAP_XMIN_FROZEN;
 			}
 		}
 
