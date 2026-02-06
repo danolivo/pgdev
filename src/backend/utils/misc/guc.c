@@ -1787,6 +1787,15 @@ static struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"vacuum_freeze_soft_check", PGC_USERSET, CLIENT_CONN_STATEMENT,
+			gettext_noop("Force vacuum to check pages marked as frozen."),
+			NULL
+		},
+		&vacuum_freeze_soft_check,
+		false,
+		NULL, NULL, NULL
+	},
+	{
 		{"array_nulls", PGC_USERSET, COMPAT_OPTIONS_PREVIOUS,
 			gettext_noop("Enable input of NULL elements in arrays."),
 			gettext_noop("When turned on, unquoted NULL in an array input "

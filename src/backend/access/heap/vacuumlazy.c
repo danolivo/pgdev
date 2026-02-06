@@ -1354,6 +1354,11 @@ lazy_scan_skip(LVRelState *vacrel, Buffer *vmbuffer, BlockNumber next_block,
 			 */
 			skipsallvis = true;
 		}
+		else if (vacuum_freeze_soft_check)
+		{
+			/* vacuum_freeze_soft_check forces visiting all-frozen pages */
+			break;
+		}
 
 		vacuum_delay_point();
 		next_unskippable_block++;

@@ -53,6 +53,7 @@
 #include "access/xlogutils.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_database.h"
+#include "commands/vacuum.h"
 #include "catalog/pg_database_d.h"
 #include "catalog/pg_replication_origin.h"
 #include "miscadmin.h"
@@ -7054,11 +7055,28 @@ heap_prepare_freeze_tuple(HeapTupleHeader tuple,
 	else
 	{
 		if (TransactionIdPrecedes(xid, relfrozenxid))
+		{
+			if (vacuum_freeze_soft_check)
+			{
+				/*
+				 * In freeze check mode, warn about the corruption but skip
+				 * this tuple instead of raising an error.
+				 * This change impacts both VACUUM and CLUSTER commands.
+				 */
+				ereport(WARNING,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("found xmin %u from before relfrozenxid %u at ctid (%u,%u)",
+								xid, relfrozenxid,
+								ItemPointerGetBlockNumber(&tuple->t_ctid),
+								ItemPointerGetOffsetNumber(&tuple->t_ctid))));
+				*totally_frozen = false;
+				return false;
+			}
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg_internal("found xmin %u from before relfrozenxid %u",
 									 xid, relfrozenxid)));
-
+		}
 		xmin_frozen = TransactionIdPrecedes(xid, cutoff_xid);
 		if (xmin_frozen)
 		{
