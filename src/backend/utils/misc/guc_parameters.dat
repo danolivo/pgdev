@@ -1454,6 +1454,16 @@
   max => 'INT_MAX',
 },
 
+{ name => 'join_collapse_limit_scale', type => 'real', context => 'PGC_USERSET', group => 'QUERY_TUNING_OTHER',
+  short_desc => 'Hard limit for FROM-list size when we scale it by sublink-to-join transformation.',
+  long_desc => 'The planner multiplies join_collapse_limit by this factor to determine the upper bound for flattening internally-generated joins (e.g., from sublink pullup). A value of 1.0 disables the extra headroom.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'join_collapse_limit_scale',
+  boot_val => '1.5',
+  min => '1.0',
+  max => 'DBL_MAX',
+},
+
 { name => 'krb_caseins_users', type => 'bool', context => 'PGC_SIGHUP', group => 'CONN_AUTH_AUTH',
   short_desc => 'Sets whether Kerberos and GSSAPI user names should be treated as case-insensitive.',
   variable => 'pg_krb_caseins_users',
