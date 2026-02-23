@@ -1457,10 +1457,11 @@ create_lateral_join_info(PlannerInfo *root)
  * levels.
  */
 static int
-EffectiveCollapseLimit(List *list1, List *list2, int current_limit)
+EffectiveCollapseLimit(List *list1, List *list2, bool intJoin)
 {
 	ListCell   *lc;
 	int			counter = 0;
+	int			current_limit = join_collapse_limit;
 	int			max_limit = floor(current_limit * join_collapse_limit_scale);
 
 	/* Not strictly needed, but avoids unnecessary list scans */
@@ -1481,6 +1482,10 @@ EffectiveCollapseLimit(List *list1, List *list2, int current_limit)
 		if (IsPendingJoinList(node))
 			counter++;
 	}
+
+	/* Don't forget the adding element - maybe it is also IGJ-type */
+	if (intJoin)
+		counter++;
 
 	return Min(current_limit + counter, max_limit);
 }
@@ -1921,7 +1926,7 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode,
 			joinlist = list_make1(list_make2(leftjoinlist, rightjoinlist));
 		}
 		else if (list_length(leftjoinlist) + list_length(rightjoinlist) <=
-			EffectiveCollapseLimit(leftjoinlist, rightjoinlist, join_collapse_limit))
+			EffectiveCollapseLimit(leftjoinlist, rightjoinlist, j->rtindex == 0))
 		{
 			if (j->rtindex == 0 && join_collapse_limit_scale > 1.0)
 			{
