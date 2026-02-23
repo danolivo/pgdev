@@ -1463,6 +1463,10 @@ EffectiveCollapseLimit(List *list1, List *list2, int current_limit)
 	int			counter = 0;
 	int			max_limit = floor(current_limit * join_collapse_limit_scale);
 
+	/* Not strictly needed, but avoids unnecessary list scans */
+	if (join_collapse_limit_scale <= 1.0)
+		return current_limit;
+
 	foreach(lc, list1)
 	{
 		Node *node = lfirst(lc);
@@ -1496,6 +1500,13 @@ ResolvePendingJoins(List *list, int current_limit)
 {
 	List	   *tail = NIL;
 	ListCell   *lc;
+
+	/*
+	 * When the scale factor is 1.0, no PendingJoinList nodes can exist in the
+	 * tree, so there is nothing to resolve.
+	 */
+	if (join_collapse_limit_scale <= 1.0)
+		return list;
 
 	foreach(lc, list)
 	{
@@ -1561,6 +1572,11 @@ ResolvePendingJoins(List *list, int current_limit)
  * A sub-joinlist represents a subproblem to be planned separately. Currently
  * sub-joinlists arise only from FULL OUTER JOIN or when collapsing of
  * subproblems is stopped by join_collapse_limit or from_collapse_limit.
+ *
+ * Internally-generated joins (IGJs) produced by sublink-to-join pullup
+ * (rtindex == 0) receive special treatment: the effective collapse limit is
+ * stretched so that such joins can participate in the same optimization
+ * problem as user-written joins, controlled by join_collapse_limit_scale.
  */
 List *
 deconstruct_jointree(PlannerInfo *root)
@@ -1594,6 +1610,10 @@ deconstruct_jointree(PlannerInfo *root)
 								 top_jdomain, NULL,
 								 &item_list);
 
+	/*
+	 * Remove PendingJoinList wrappers and try to pull each IGJ's right-hand
+	 * side into the main join problem whenever the limit permits.
+	 */
 	result = ResolvePendingJoins(result, join_collapse_limit);
 
 	/* Now we can form the value of all_query_rels, too */
@@ -1903,7 +1923,7 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode,
 		else if (list_length(leftjoinlist) + list_length(rightjoinlist) <=
 			EffectiveCollapseLimit(leftjoinlist, rightjoinlist, join_collapse_limit))
 		{
-			if (j->rtindex == 0)
+			if (j->rtindex == 0 && join_collapse_limit_scale > 1.0)
 			{
 				PendingJoinList *jlist = (PendingJoinList *) palloc0(sizeof(PendingJoinList));
 
@@ -1925,7 +1945,7 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode,
 			else
 				leftpart = (Node *) leftjoinlist;
 
-			if (j->rtindex == 0)
+			if (j->rtindex == 0 && join_collapse_limit_scale > 1.0)
 			{
 				PendingJoinList *jlist =
 						(PendingJoinList *) palloc0(sizeof(PendingJoinList));
