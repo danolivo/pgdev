@@ -4002,6 +4002,19 @@ struct config_real ConfigureNamesReal[] =
 	},
 
 	{
+		{"join_collapse_limit_scale", PGC_USERSET, QUERY_TUNING_OTHER,
+			gettext_noop("Hard limit for FROM-list size when we scale it by sublink-to-join transformation."),
+			gettext_noop("The planner multiplies join_collapse_limit by this factor to determine "
+						 "the upper bound for flattening internally-generated joins (e.g., from "
+						 "sublink pullup). A value of 1.0 disables the extra headroom."),
+			GUC_EXPLAIN
+		},
+		&join_collapse_limit_scale,
+		1.5, 1.0, DBL_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"recursive_worktable_factor", PGC_USERSET, QUERY_TUNING_OTHER,
 			gettext_noop("Sets the planner's estimate of the average size "
 						 "of a recursive query's working table."),

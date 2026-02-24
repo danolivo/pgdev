@@ -38,7 +38,26 @@
 /* These parameters are set by GUC */
 int			from_collapse_limit;
 int			join_collapse_limit;
+double		join_collapse_limit_scale;
 
+/*
+ * PendingJoinList is a local-only node used during join tree deconstruction to
+ * tag the right side of internally-generated joins (from sublink pullup,
+ * rtindex == 0).  It allows the effective collapse limit to be raised so that
+ * internally-generated joins can participate in the same join search problem.
+ * Uses T_Invalid as its node tag since it is never exposed outside this file.
+ *
+ * There shouldn't be a lot of harm with using T_Invalid node type: we use it
+ * locally, in the same context, and it must vanish right after we finalize
+ * the query tree decomposition.
+ */
+typedef struct PendingJoinList
+{
+	NodeTag		type;
+	List	   *joinlist;
+} PendingJoinList;
+
+#define IsPendingJoinList(node)	(node && nodeTag(node) == T_Invalid)
 
 /*
  * deconstruct_jointree requires multiple passes over the join tree, because we
@@ -1064,6 +1083,118 @@ create_lateral_join_info(PlannerInfo *root)
  *****************************************************************************/
 
 /*
+ * Calculate hard limit for the current joinlist.
+ *
+ * Consider only PendingJoinList nodes that have bubbled up to the current
+ * joinlist level; those nested deeper are accounted for at their own join
+ * levels.
+ */
+static int
+EffectiveCollapseLimit(List *list1, List *list2, bool intJoin)
+{
+	ListCell   *lc;
+	int			counter = 0;
+	int			current_limit = join_collapse_limit;
+	int			max_limit = floor(current_limit * join_collapse_limit_scale);
+
+	/* Not strictly needed, but avoids unnecessary list scans */
+	if (join_collapse_limit_scale <= 1.0)
+		return current_limit;
+
+	foreach(lc, list1)
+	{
+		Node *node = lfirst(lc);
+
+		if (IsPendingJoinList(node))
+			counter++;
+	}
+	foreach(lc, list2)
+	{
+		Node *node = lfirst(lc);
+
+		if (IsPendingJoinList(node))
+			counter++;
+	}
+
+	/* Don't forget the adding element - maybe it is also IGJ-type */
+	if (intJoin)
+		counter++;
+
+	return Min(current_limit + counter, max_limit);
+}
+
+/*
+ * Pass through the jointree and replace each PendingJoinList node with the
+ * joinlist, pointed to by this node. Attempt to pull this joinlist into the
+ * main problem.
+ *
+ * The current_limit should be the fixed value join_collapse_limit -- we don't
+ * want to allow the joinlist to grow too much: if the sublink join tree
+ * doesn't fit the standard limit, just let it be resolved independently, as
+ * it would be if no transformation had happened at all.
+ */
+static List *
+ResolvePendingJoins(List *list, int current_limit)
+{
+	List	   *tail = NIL;
+	ListCell   *lc;
+
+	/*
+	 * When the scale factor is 1.0, no PendingJoinList nodes can exist in the
+	 * tree, so there is nothing to resolve.
+	 */
+	if (join_collapse_limit_scale <= 1.0)
+		return list;
+
+	foreach(lc, list)
+	{
+		Node *node = (Node *) lfirst(lc);
+
+		if IsA(node, RangeTblRef)
+		{
+			continue;
+		}
+		else if IsA(node, List)
+		{
+			list = foreach_delete_current(list, lc);
+			tail = lappend(tail, ResolvePendingJoins((List *) node, current_limit));
+		}
+		else if IsPendingJoinList(node)
+		{
+			PendingJoinList *jlist = (PendingJoinList *) node;
+
+			list = foreach_delete_current(list, lc);
+			if (list_length(jlist->joinlist) == 1)
+			{
+				/*
+				 * Single RangeTblRef or FULL JOIN in the list. We need it to
+				 * extend our collapse limit
+				 */
+				if (IsA(linitial(jlist->joinlist), RangeTblRef))
+					tail = lappend(tail, linitial(jlist->joinlist));
+				else
+					tail = lappend(tail, ResolvePendingJoins(jlist->joinlist, current_limit));
+			}
+			else
+			{
+				jlist->joinlist = ResolvePendingJoins(jlist->joinlist, current_limit);
+				if (list_length(list) + list_length(jlist->joinlist) +
+					list_length(tail) <= current_limit)
+				{
+					tail = list_concat(tail, jlist->joinlist);
+				}
+				else
+					tail = lappend(tail, jlist->joinlist);
+			}
+		}
+		else
+			elog(ERROR, "unexpected node type %d", node->type);
+	}
+
+	return list_concat(list, tail);
+}
+
+/*
  * deconstruct_jointree
  *	  Recursively scan the query's join tree for WHERE and JOIN/ON qual
  *	  clauses, and add these to the appropriate restrictinfo and joininfo
@@ -1079,6 +1210,11 @@ create_lateral_join_info(PlannerInfo *root)
  * A sub-joinlist represents a subproblem to be planned separately. Currently
  * sub-joinlists arise only from FULL OUTER JOIN or when collapsing of
  * subproblems is stopped by join_collapse_limit or from_collapse_limit.
+ *
+ * Internally-generated joins (IGJs) produced by sublink-to-join pullup
+ * (rtindex == 0) receive special treatment: the effective collapse limit is
+ * stretched so that such joins can participate in the same optimization
+ * problem as user-written joins, controlled by join_collapse_limit_scale.
  */
 List *
 deconstruct_jointree(PlannerInfo *root)
@@ -1111,6 +1247,12 @@ deconstruct_jointree(PlannerInfo *root)
 	result = deconstruct_recurse(root, (Node *) root->parse->jointree,
 								 top_jdomain, NULL,
 								 &item_list);
+
+	/*
+	 * Remove PendingJoinList wrappers and try to pull each IGJ's right-hand
+	 * side into the main join problem whenever the limit permits.
+	 */
+	result = ResolvePendingJoins(result, join_collapse_limit);
 
 	/* Now we can form the value of all_query_rels, too */
 	root->all_query_rels = bms_union(root->all_baserels, root->outer_join_rels);
@@ -1417,27 +1559,49 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode,
 			joinlist = list_make1(list_make2(leftjoinlist, rightjoinlist));
 		}
 		else if (list_length(leftjoinlist) + list_length(rightjoinlist) <=
-				 join_collapse_limit)
+			EffectiveCollapseLimit(leftjoinlist, rightjoinlist, j->rtindex == 0))
 		{
-			/* OK to combine subproblems */
-			joinlist = list_concat(leftjoinlist, rightjoinlist);
+			if (j->rtindex == 0 && join_collapse_limit_scale > 1.0)
+			{
+				PendingJoinList *jlist = (PendingJoinList *) palloc0(sizeof(PendingJoinList));
+
+				jlist->joinlist = rightjoinlist;
+				joinlist = lappend(leftjoinlist, jlist);
+			}
+			else
+				/* OK to combine subproblems */
+				joinlist = list_concat(leftjoinlist, rightjoinlist);
 		}
 		else
 		{
 			/* can't combine, but needn't force join order above here */
-			Node	   *leftpart,
-					   *rightpart;
+			Node	   *leftpart;
 
 			/* avoid creating useless 1-element sublists */
 			if (list_length(leftjoinlist) == 1)
 				leftpart = (Node *) linitial(leftjoinlist);
 			else
 				leftpart = (Node *) leftjoinlist;
-			if (list_length(rightjoinlist) == 1)
-				rightpart = (Node *) linitial(rightjoinlist);
+
+			if (j->rtindex == 0 && join_collapse_limit_scale > 1.0)
+			{
+				PendingJoinList *jlist =
+						(PendingJoinList *) palloc0(sizeof(PendingJoinList));
+
+				jlist->joinlist = rightjoinlist;
+				joinlist = list_make2(leftpart, jlist);
+			}
 			else
-				rightpart = (Node *) rightjoinlist;
-			joinlist = list_make2(leftpart, rightpart);
+			{
+				Node *rightpart;
+
+				if (list_length(rightjoinlist) == 1)
+					rightpart = (Node *) linitial(rightjoinlist);
+				else
+					rightpart = (Node *) rightjoinlist;
+
+				joinlist = list_make2(leftpart, rightpart);
+			}
 		}
 	}
 	else
