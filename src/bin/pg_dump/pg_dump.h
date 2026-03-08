@@ -407,6 +407,7 @@ typedef struct _indxInfo
 	int			indnattrs;		/* total number of index attributes */
 	Oid		   *indkeys;		/* In spite of the name 'indkeys' this field
 								 * contains both key and nonkey attributes */
+	Oid			indtype;		/* OID of index's composite type, if any */
 	bool		indisclustered;
 	bool		indisreplident;
 	bool		indnullsnotdistinct;
@@ -724,6 +725,7 @@ extern OprInfo *findOprByOid(Oid oid);
 extern CollInfo *findCollationByOid(Oid oid);
 extern NamespaceInfo *findNamespaceByOid(Oid oid);
 extern ExtensionInfo *findExtensionByOid(Oid oid);
+extern IndxInfo *findIndexByOid(Oid oid);
 extern PublicationInfo *findPublicationByOid(Oid oid);
 extern SubscriptionInfo *findSubscriptionByOid(Oid oid);
 

@@ -820,6 +820,9 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 				EEO_JUMP(op->d.boolexpr.jumpdone);
 			}
 
+			/* reset */
+			*op->d.boolexpr.guaranteed_empty = false;
+
 			EEO_NEXT();
 		}
 
@@ -828,6 +831,8 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			if (*op->resnull)
 			{
 				/* result is already set to NULL, need not change it */
+				/* reset */
+				*op->d.boolexpr.guaranteed_empty = false;
 			}
 			else if (!DatumGetBool(*op->resvalue))
 			{
@@ -843,10 +848,15 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			{
 				*op->resvalue = (Datum) 0;
 				*op->resnull = true;
+				/* reset */
+				*op->d.boolexpr.guaranteed_empty = false;
 			}
 			else
 			{
 				/* result is already set to TRUE, need not change it */
+				/* reset */
+				*op->d.boolexpr.guaranteed_empty = false;
+
 			}
 
 			EEO_NEXT();
@@ -865,6 +875,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		EEO_CASE(EEOP_BOOL_OR_STEP_FIRST)
 		{
 			*op->d.boolexpr.anynull = false;
+			*op->d.boolexpr.count_guaranteed_empty = 0;
 
 			/*
 			 * EEOP_BOOL_OR_STEP_FIRST resets anynull, otherwise it's the same
@@ -876,6 +887,10 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 
 		EEO_CASE(EEOP_BOOL_OR_STEP)
 		{
+			*op->d.boolexpr.count_guaranteed_empty +=
+				(int) (*op->d.boolexpr.guaranteed_empty);
+			*op->d.boolexpr.guaranteed_empty = false;
+
 			if (*op->resnull)
 			{
 				*op->d.boolexpr.anynull = true;
@@ -892,6 +907,10 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 
 		EEO_CASE(EEOP_BOOL_OR_STEP_LAST)
 		{
+			*op->d.boolexpr.count_guaranteed_empty +=
+				(int) (*op->d.boolexpr.guaranteed_empty);
+			*op->d.boolexpr.guaranteed_empty = false;
+
 			if (*op->resnull)
 			{
 				/* result is already set to NULL, need not change it */
@@ -913,6 +932,10 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			}
 			else
 			{
+				if (*op->d.boolexpr.count_guaranteed_empty == op->d.boolexpr.nargs)
+					*op->d.boolexpr.guaranteed_empty = true;
+				else
+					*op->d.boolexpr.guaranteed_empty = false;
 				/* result is already set to FALSE, need not change it */
 			}
 
@@ -943,6 +966,9 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 				/* ... bail out early, returning FALSE */
 				*op->resnull = false;
 				*op->resvalue = BoolGetDatum(false);
+				if (op->d.qualexpr.guaranteed_empty &&
+					op - state->steps == state->steps_len - 2 /* + EEOP_DONE */)
+					state->guaranteed_empty = *op->d.qualexpr.guaranteed_empty;
 				EEO_JUMP(op->d.qualexpr.jumpdone);
 			}
 
@@ -4758,7 +4784,16 @@ ExecEvalSubPlan(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 	/* could potentially be nested, so make sure there's enough stack */
 	check_stack_depth();
 
-	*op->resvalue = ExecSubPlan(sstate, econtext, op->resnull);
+	if (sstate->guaranteed_empty == false)
+		*op->resvalue = ExecSubPlan(sstate, econtext, op->resnull);
+	else
+	{
+		*op->resvalue = false;
+		*op->resnull = false;
+	}
+
+	if (op->opcode == EEOP_SUBPLAN && op->d.subplan.guaranteed_empty && sstate->guaranteed_empty)
+		*op->d.subplan.guaranteed_empty = sstate->guaranteed_empty;
 }
 
 /*

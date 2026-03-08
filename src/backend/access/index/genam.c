@@ -23,6 +23,7 @@
 #include "access/heapam.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
+#include "access/tempcat.h"
 #include "access/transam.h"
 #include "catalog/index.h"
 #include "lib/stringinfo.h"
@@ -404,6 +405,7 @@ systable_beginscan(Relation heapRelation,
 	sysscan->heap_rel = heapRelation;
 	sysscan->irel = irel;
 	sysscan->slot = table_slot_create(heapRelation, NULL);
+	sysscan->tempscan = NULL;
 
 	if (snapshot == NULL)
 	{
@@ -417,6 +419,9 @@ systable_beginscan(Relation heapRelation,
 		/* Caller is responsible for any snapshot. */
 		sysscan->snapshot = NULL;
 	}
+
+	if (enable_temp_memory_catalog)
+		sysscan->tempscan = temp_catalog_beginscan(heapRelation, nkeys, key);
 
 	if (irel)
 	{
@@ -467,6 +472,7 @@ systable_beginscan(Relation heapRelation,
 	if (TransactionIdIsValid(CheckXidAlive))
 		bsysscan = true;
 
+
 	return sysscan;
 }
 
@@ -505,6 +511,16 @@ HeapTuple
 systable_getnext(SysScanDesc sysscan)
 {
 	HeapTuple	htup = NULL;
+
+	if (sysscan->tempscan)
+	{
+		htup = temp_catalog_getnext(sysscan->tempscan, (BufferHeapTupleTableSlot *) sysscan->slot);
+		if(htup)
+		{
+			HandleConcurrentAbort();
+			return htup;
+		}
+	}
 
 	if (sysscan->irel)
 	{
@@ -566,6 +582,9 @@ systable_recheck_tuple(SysScanDesc sysscan, HeapTuple tup)
 	Snapshot	freshsnap;
 	bool		result;
 
+	if (sysscan->tempscan && temp_catalog_is_fetched(sysscan->tempscan))
+		return true;
+
 	Assert(tup == ExecFetchSlotHeapTuple(sysscan->slot, false, NULL));
 
 	/*
@@ -597,6 +616,9 @@ systable_recheck_tuple(SysScanDesc sysscan, HeapTuple tup)
 void
 systable_endscan(SysScanDesc sysscan)
 {
+	if (sysscan->tempscan)
+		temp_catalog_endscan(sysscan->tempscan);
+
 	if (sysscan->slot)
 	{
 		ExecDropSingleTupleTableSlot(sysscan->slot);
@@ -855,6 +877,10 @@ systable_inplace_update_begin(Relation relation,
 		slot = scan->slot;
 		Assert(TTS_IS_BUFFERTUPLE(slot));
 		bslot = (BufferHeapTupleTableSlot *) slot;
+
+		/* When using in-memory temp catalog the pointer is zero */
+		if (!bslot->buffer)
+			break;
 	} while (!heap_inplace_lock(scan->heap_rel,
 								bslot->base.tuple, bslot->buffer,
 								(void (*) (void *)) systable_endscan, scan));
@@ -898,6 +924,8 @@ systable_inplace_update_cancel(void *state)
 	HeapTuple	oldtup = bslot->base.tuple;
 	Buffer		buffer = bslot->buffer;
 
-	heap_inplace_unlock(relation, oldtup, buffer);
+	if (buffer)
+		heap_inplace_unlock(relation, oldtup, buffer);
+
 	systable_endscan(scan);
 }

@@ -54,20 +54,9 @@
 #include "utils/selfuncs.h"
 #include "utils/varlena.h"
 
-
-typedef enum
-{
-	Pattern_Type_Like,
-	Pattern_Type_Like_IC,
-	Pattern_Type_Regex,
-	Pattern_Type_Regex_IC,
-	Pattern_Type_Prefix,
-} Pattern_Type;
-
-typedef enum
-{
-	Pattern_Prefix_None, Pattern_Prefix_Partial, Pattern_Prefix_Exact,
-} Pattern_Prefix_Status;
+#include "catalog/pg_proc.h"
+#include "utils/catcache.h"
+#include "utils/syscache.h"
 
 static Node *like_regex_support(Node *rawreq, Pattern_Type ptype);
 static List *match_pattern_prefix(Node *leftop,
@@ -107,6 +96,119 @@ static Datum string_to_datum(const char *str, Oid datatype);
 static Const *string_to_const(const char *str, Oid datatype);
 static Const *string_to_bytea_const(const char *str, size_t str_len);
 
+/****************************************************************************
+ *		  ----  ROUTINES FOR "SPECIAL" INDEXABLE OPERATORS  FOR
+ *						  SPECIAL USER_DEFINED TYPES ----
+ *								  -- teodor
+ ****************************************************************************/
+
+static Oid mmPFPOid = InvalidOid;
+static Oid mmGTOid = InvalidOid;
+static Oid mcharOid = InvalidOid;
+static Oid mvarcharOid = InvalidOid;
+
+#define	HeapTupleGetOid(type, tuple) (((type)GETSTRUCT(tuple))->oid)
+
+static Oid
+findTypeOid(char *typname)
+{
+	CatCList	*catlist;
+	HeapTuple   tup;
+	int		 n_members;
+	Oid		 typoid;
+
+	catlist = SearchSysCacheList(TYPENAMENSP, 1,
+								 CStringGetDatum(typname), 0, 0);
+
+	n_members = catlist->n_members;
+
+	if (n_members != 1)
+	{
+		ReleaseSysCacheList(catlist);
+		if (n_members > 1)
+			elog(ERROR,"There are %d candidates for '%s' type",
+				 n_members, typname);
+		return InvalidOid;
+	}
+
+	tup = &catlist->members[0]->tuple;
+
+	typoid = HeapTupleGetOid(Form_pg_type, tup);
+
+	ReleaseSysCacheList(catlist);
+
+	return typoid;
+}
+
+static bool
+fillMCharOIDS() {
+	CatCList	*catlist;
+	HeapTuple   tup;
+	char		*funcname = "mchar_pattern_fixed_prefix";
+	int		 n_members;
+
+	catlist = SearchSysCacheList(PROCNAMEARGSNSP, 1,
+								 CStringGetDatum(funcname), 0, 0);
+	n_members = catlist->n_members;
+
+	if (n_members != 1) {
+		ReleaseSysCacheList(catlist);
+		if (n_members > 1)
+			elog(ERROR,"There are %d candidates for '%s' function'", n_members, funcname);
+		return false;
+	}
+
+	tup = &catlist->members[0]->tuple;
+
+	if ( HeapTupleGetOid(Form_pg_proc, tup) != mmPFPOid ) {
+		char	   *quals_funcname = "mchar_greaterstring";
+		Oid		 tmp_mmPFPOid = HeapTupleGetOid(Form_pg_proc, tup);
+
+		ReleaseSysCacheList(catlist);
+
+		mcharOid = findTypeOid("mchar");
+		mvarcharOid = findTypeOid("mvarchar");
+
+		if ( mcharOid == InvalidOid || mvarcharOid == InvalidOid ) {
+			elog(LOG,"Can't find mchar/mvarvarchar types: mchar=%d mvarchar=%d", 
+					mcharOid, mvarcharOid);
+			return false;
+		}
+
+		catlist = SearchSysCacheList(PROCNAMEARGSNSP, 1,
+									 CStringGetDatum(quals_funcname), 0, 0);
+		n_members = catlist->n_members;
+
+		if ( n_members != 1 ) {
+			ReleaseSysCacheList(catlist);
+			if ( n_members > 1 )
+				elog(ERROR,"There are %d candidates for '%s' function'", n_members, quals_funcname);
+			return false;
+		}
+
+		tup = &catlist->members[0]->tuple;
+		mmGTOid  = HeapTupleGetOid(Form_pg_proc, tup);
+		mmPFPOid = tmp_mmPFPOid;
+	}
+
+	ReleaseSysCacheList(catlist);
+
+	return true;
+}
+
+static Pattern_Prefix_Status
+mchar_pattern_fixed_prefix(Const *patt, Pattern_Type ptype, Const **prefix)
+{
+	if (!fillMCharOIDS())
+		return Pattern_Prefix_None;
+
+	return (Pattern_Prefix_Status)DatumGetInt32( OidFunctionCall3(
+		mmPFPOid,
+		PointerGetDatum(patt),
+		Int32GetDatum(ptype),
+		PointerGetDatum(prefix)
+	) );
+}
 
 /*
  * Planner support functions for LIKE, regex, and related operators
@@ -259,6 +361,7 @@ match_pattern_prefix(Node *leftop,
 	Expr	   *expr;
 	FmgrInfo	ltproc;
 	Const	   *greaterstr;
+	bool		isMchar = false;
 
 	/*
 	 * Can't do anything with a non-constant or NULL pattern argument.
@@ -291,8 +394,16 @@ match_pattern_prefix(Node *leftop,
 	/*
 	 * Try to extract a fixed prefix from the pattern.
 	 */
-	pstatus = pattern_fixed_prefix(patt, ptype, expr_coll,
-								   &prefix, NULL);
+	ldatatype = exprType(leftop);
+	if (fillMCharOIDS() && (ldatatype == mcharOid ||
+							ldatatype == mvarcharOid))
+	{
+		pstatus = mchar_pattern_fixed_prefix(patt, ptype, &prefix);
+		isMchar = true;
+	}
+	else
+		pstatus = pattern_fixed_prefix(patt, ptype, expr_coll,
+									   &prefix, NULL);
 
 	/* fail if no fixed prefix */
 	if (pstatus == Pattern_Prefix_None)
@@ -307,7 +418,6 @@ match_pattern_prefix(Node *leftop,
 	 * selected operators also determine the needed type of the prefix
 	 * constant.
 	 */
-	ldatatype = exprType(leftop);
 	switch (ldatatype)
 	{
 		case TEXTOID:
@@ -374,7 +484,16 @@ match_pattern_prefix(Node *leftop,
 			break;
 		default:
 			/* Can't get here unless we're attached to the wrong operator */
-			return NIL;
+			if (!isMchar)
+				return NIL;
+			collation_aware = false;
+			rdatatype = mvarcharOid;
+			ltopr = get_opfamily_member(opfamily, ldatatype, rdatatype,
+										BTLessStrategyNumber);
+			eqopr = get_opfamily_member(opfamily, ldatatype, rdatatype,
+										BTEqualStrategyNumber);
+			geopr = get_opfamily_member(opfamily, ldatatype, rdatatype,
+										BTGreaterEqualStrategyNumber);
 	}
 
 	/*
@@ -386,9 +505,10 @@ match_pattern_prefix(Node *leftop,
 	 */
 	if (prefix->consttype != rdatatype)
 	{
-		Assert(prefix->consttype == TEXTOID &&
-			   rdatatype == BPCHAROID);
-		prefix->consttype = rdatatype;
+		Assert(isMchar || (prefix->consttype == TEXTOID &&
+			   rdatatype == BPCHAROID));
+		if (!isMchar)
+			prefix->consttype = rdatatype;
 	}
 
 	/*
@@ -457,7 +577,12 @@ match_pattern_prefix(Node *leftop,
 	if (!op_in_opfamily(ltopr, opfamily))
 		return result;
 	fmgr_info(get_opcode(ltopr), &ltproc);
-	greaterstr = make_greater_string(prefix, &ltproc, indexcollation);
+	if (isMchar)
+		greaterstr = (Const*)DatumGetPointer(OidFunctionCall1(
+												mmGTOid,
+												PointerGetDatum(prefix)));
+	else
+		greaterstr = make_greater_string(prefix, &ltproc, indexcollation);
 	if (greaterstr)
 	{
 		expr = make_opclause(ltopr, BOOLOID, false,

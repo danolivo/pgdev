@@ -87,7 +87,6 @@ static void flagInhTables(Archive *fout, TableInfo *tblinfo, int numTables,
 static void flagInhIndexes(Archive *fout, TableInfo *tblinfo, int numTables);
 static void flagInhAttrs(Archive *fout, TableInfo *tblinfo, int numTables);
 static int	strInArray(const char *pattern, char **arr, int arr_size);
-static IndxInfo *findIndexByOid(Oid oid);
 
 
 /*
@@ -865,7 +864,7 @@ findTableByOid(Oid oid)
  *	  finds the DumpableObject for the index with the given oid
  *	  returns NULL if not found
  */
-static IndxInfo *
+IndxInfo *
 findIndexByOid(Oid oid)
 {
 	CatalogId	catId;

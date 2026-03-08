@@ -14855,7 +14855,7 @@ a_expr:		c_expr									{ $$ = $1; }
 				}
 			| a_expr LIKE a_expr ESCAPE a_expr					%prec LIKE
 				{
-					FuncCall   *n = makeFuncCall(SystemFuncName("like_escape"),
+					FuncCall *n = makeFuncCall(list_make1(makeString("like_escape")),
 												 list_make2($3, $5),
 												 COERCE_EXPLICIT_CALL,
 												 @2);
@@ -14869,7 +14869,7 @@ a_expr:		c_expr									{ $$ = $1; }
 				}
 			| a_expr NOT_LA LIKE a_expr ESCAPE a_expr			%prec NOT_LA
 				{
-					FuncCall   *n = makeFuncCall(SystemFuncName("like_escape"),
+					FuncCall *n = makeFuncCall(list_make1(makeString("like_escape")),
 												 list_make2($4, $6),
 												 COERCE_EXPLICIT_CALL,
 												 @2);
@@ -14883,7 +14883,7 @@ a_expr:		c_expr									{ $$ = $1; }
 				}
 			| a_expr ILIKE a_expr ESCAPE a_expr					%prec ILIKE
 				{
-					FuncCall   *n = makeFuncCall(SystemFuncName("like_escape"),
+					FuncCall *n = makeFuncCall(list_make1(makeString("like_escape")),
 												 list_make2($3, $5),
 												 COERCE_EXPLICIT_CALL,
 												 @2);
@@ -14897,7 +14897,7 @@ a_expr:		c_expr									{ $$ = $1; }
 				}
 			| a_expr NOT_LA ILIKE a_expr ESCAPE a_expr			%prec NOT_LA
 				{
-					FuncCall   *n = makeFuncCall(SystemFuncName("like_escape"),
+					FuncCall *n = makeFuncCall(list_make1(makeString("like_escape")),
 												 list_make2($4, $6),
 												 COERCE_EXPLICIT_CALL,
 												 @2);
@@ -14907,7 +14907,7 @@ a_expr:		c_expr									{ $$ = $1; }
 
 			| a_expr SIMILAR TO a_expr							%prec SIMILAR
 				{
-					FuncCall   *n = makeFuncCall(SystemFuncName("similar_to_escape"),
+					FuncCall *n = makeFuncCall(list_make1(makeString("similar_to_escape")),
 												 list_make1($4),
 												 COERCE_EXPLICIT_CALL,
 												 @2);
@@ -14916,7 +14916,7 @@ a_expr:		c_expr									{ $$ = $1; }
 				}
 			| a_expr SIMILAR TO a_expr ESCAPE a_expr			%prec SIMILAR
 				{
-					FuncCall   *n = makeFuncCall(SystemFuncName("similar_to_escape"),
+					FuncCall *n = makeFuncCall(list_make1(makeString("similar_to_escape")),
 												 list_make2($4, $6),
 												 COERCE_EXPLICIT_CALL,
 												 @2);
@@ -14925,7 +14925,7 @@ a_expr:		c_expr									{ $$ = $1; }
 				}
 			| a_expr NOT_LA SIMILAR TO a_expr					%prec NOT_LA
 				{
-					FuncCall   *n = makeFuncCall(SystemFuncName("similar_to_escape"),
+					FuncCall *n = makeFuncCall(list_make1(makeString("similar_to_escape")),
 												 list_make1($5),
 												 COERCE_EXPLICIT_CALL,
 												 @2);
@@ -14934,7 +14934,7 @@ a_expr:		c_expr									{ $$ = $1; }
 				}
 			| a_expr NOT_LA SIMILAR TO a_expr ESCAPE a_expr		%prec NOT_LA
 				{
-					FuncCall   *n = makeFuncCall(SystemFuncName("similar_to_escape"),
+					FuncCall *n = makeFuncCall(list_make1(makeString("similar_to_escape")),
 												 list_make2($5, $7),
 												 COERCE_EXPLICIT_CALL,
 												 @2);

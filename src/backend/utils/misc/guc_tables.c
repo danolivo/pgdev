@@ -88,6 +88,7 @@
 #include "utils/plancache.h"
 #include "utils/ps_status.h"
 #include "utils/xml.h"
+#include "access/tempcat.h"
 
 /* This value is normally passed in from the Makefile */
 #ifndef PG_KRB_SRVTAB
@@ -995,6 +996,26 @@ struct config_bool ConfigureNamesBool[] =
 		},
 		&enable_group_by_reordering,
 		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_self_join_removal", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enable removal of unique self-joins."),
+			NULL,
+			GUC_EXPLAIN | GUC_NOT_IN_SAMPLE
+		},
+		&enable_self_join_removal,
+		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_temp_memory_catalog", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enable in-memory system catalog for temporary tables."),
+			NULL,
+			GUC_EXPLAIN | GUC_NOT_IN_SAMPLE
+		},
+		&enable_temp_memory_catalog,
+		false,
 		NULL, NULL, NULL
 	},
 	{

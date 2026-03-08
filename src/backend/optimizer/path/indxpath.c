@@ -109,8 +109,6 @@ static List *build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 							   bool *skip_nonnative_saop);
 static List *build_paths_for_OR(PlannerInfo *root, RelOptInfo *rel,
 								List *clauses, List *other_clauses);
-static List *generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
-									  List *clauses, List *other_clauses);
 static Path *choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel,
 							   List *paths);
 static int	path_usage_comparator(const void *a, const void *b);
@@ -1176,7 +1174,7 @@ build_paths_for_OR(PlannerInfo *root, RelOptInfo *rel,
  * for the purpose of generating indexquals, but are not to be searched for
  * ORs.  (See build_paths_for_OR() for motivation.)
  */
-static List *
+List *
 generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
 						 List *clauses, List *other_clauses)
 {
@@ -3214,7 +3212,6 @@ match_clause_to_ordering_op(IndexOptInfo *index,
 	return clause;
 }
 
-
 /****************************************************************************
  *				----  ROUTINES TO DO PARTIAL INDEX PREDICATE TESTS	----
  ****************************************************************************/
@@ -3441,6 +3438,22 @@ relation_has_unique_index_for(PlannerInfo *root, RelOptInfo *rel,
 							  List *restrictlist,
 							  List *exprlist, List *oprlist)
 {
+	return relation_has_unique_index_ext(root, rel, restrictlist,
+										 exprlist, oprlist, NULL);
+}
+
+/*
+ * relation_has_unique_index_ext
+ *	  Same as relation_has_unique_index_for(), but supports extra_clauses
+ *	  parameter.  If extra_clauses isn't NULL, return baserestrictinfo clauses
+ *	  which were used to derive uniqueness.
+ */
+bool
+relation_has_unique_index_ext(PlannerInfo *root, RelOptInfo *rel,
+							  List *restrictlist,
+							  List *exprlist, List *oprlist,
+							  List **extra_clauses)
+{
 	ListCell   *ic;
 
 	Assert(list_length(exprlist) == list_length(oprlist));
@@ -3495,6 +3508,7 @@ relation_has_unique_index_for(PlannerInfo *root, RelOptInfo *rel,
 	{
 		IndexOptInfo *ind = (IndexOptInfo *) lfirst(ic);
 		int			c;
+		List	   *exprs = NIL;
 
 		/*
 		 * If the index is not unique, or not immediately enforced, or if it's
@@ -3546,6 +3560,24 @@ relation_has_unique_index_for(PlannerInfo *root, RelOptInfo *rel,
 				if (match_index_to_operand(rexpr, c, ind))
 				{
 					matched = true; /* column is unique */
+
+					if (bms_membership(rinfo->clause_relids) == BMS_SINGLETON)
+					{
+						MemoryContext oldMemCtx =
+							MemoryContextSwitchTo(root->planner_cxt);
+
+						/*
+						 * Add filter clause into a list allowing caller to
+						 * know if uniqueness have made not only by join
+						 * clauses.
+						 */
+						Assert(bms_is_empty(rinfo->left_relids) ||
+							   bms_is_empty(rinfo->right_relids));
+						if (extra_clauses)
+							exprs = lappend(exprs, rinfo);
+						MemoryContextSwitchTo(oldMemCtx);
+					}
+
 					break;
 				}
 			}
@@ -3588,7 +3620,11 @@ relation_has_unique_index_for(PlannerInfo *root, RelOptInfo *rel,
 
 		/* Matched all key columns of this index? */
 		if (c == ind->nkeycolumns)
+		{
+			if (extra_clauses)
+				*extra_clauses = exprs;
 			return true;
+		}
 	}
 
 	return false;

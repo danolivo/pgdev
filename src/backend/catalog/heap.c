@@ -1285,6 +1285,11 @@ heap_create_with_catalog(const char *relname,
 		relacl = NULL;
 
 	/*
+	 * This prevents sending cache invalidation messages for temporary tables.
+	 */
+	BEGIN_TEMP_TABLE_SCOPE_LOCAL(relpersistence == RELPERSISTENCE_TEMP);
+
+	/*
 	 * Create the relcache entry (mostly dummy at this point) and the physical
 	 * disk file.  (If we fail further down, it's the smgr's responsibility to
 	 * remove the disk file again.)
@@ -1509,6 +1514,8 @@ heap_create_with_catalog(const char *relname,
 	 */
 	table_close(new_rel_desc, NoLock);	/* do not unlock till end of xact */
 	table_close(pg_class_desc, RowExclusiveLock);
+
+	END_TEMP_TABLE_SCOPE();
 
 	return relid;
 }
@@ -3118,6 +3125,8 @@ heap_truncate_one_rel(Relation rel)
 	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 		return;
 
+	BEGIN_TEMP_TABLE_SCOPE_SHARED(rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP);
+
 	/* Truncate the underlying relation */
 	table_relation_nontransactional_truncate(rel);
 
@@ -3135,6 +3144,8 @@ heap_truncate_one_rel(Relation rel)
 		/* keep the lock... */
 		table_close(toastrel, NoLock);
 	}
+
+	END_TEMP_TABLE_SCOPE();
 }
 
 /*

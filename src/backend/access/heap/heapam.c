@@ -43,6 +43,7 @@
 #include "access/syncscan.h"
 #include "access/sysattr.h"
 #include "access/tableam.h"
+#include "access/tempcat.h"
 #include "access/transam.h"
 #include "access/valid.h"
 #include "access/visibilitymap.h"
@@ -72,6 +73,10 @@
 #include "utils/spccache.h"
 #include "utils/syscache.h"
 
+#include "nodes/execnodes.h"
+#include "catalog/index.h"
+#include "utils/memutils.h"
+#include "access/tempcat.h"
 
 static HeapTuple heap_prepare_insert(Relation relation, HeapTuple tup,
 									 TransactionId xid, CommandId cid, int options);
@@ -6397,6 +6402,13 @@ heap_inplace_update_and_unlock(Relation relation,
 	uint32		newlen;
 
 	Assert(ItemPointerEquals(&oldtup->t_self, &tuple->t_self));
+
+	if (enable_temp_memory_catalog && IsTempTableScope())
+	{
+		temp_catalog_update_inplace(relation, tuple);
+		return;
+	}
+
 	oldlen = oldtup->t_len - htup->t_hoff;
 	newlen = tuple->t_len - tuple->t_data->t_hoff;
 	if (oldlen != newlen || htup->t_hoff != tuple->t_data->t_hoff)
@@ -6488,6 +6500,12 @@ heap_inplace_update(Relation relation, HeapTuple tuple)
 	HeapTupleHeader htup;
 	uint32		oldlen;
 	uint32		newlen;
+
+	if (enable_temp_memory_catalog && IsTempTableScope())
+	{
+		temp_catalog_update_inplace(relation, tuple);
+		return;
+	}
 
 	/*
 	 * For now, we don't allow parallel updates.  Unlike a regular update,

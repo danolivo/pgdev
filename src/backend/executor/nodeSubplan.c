@@ -84,7 +84,11 @@ ExecSubPlan(SubPlanState *node,
 
 	/* Select appropriate evaluation strategy */
 	if (subplan->useHashTable)
+	{
 		retval = ExecHashSubPlan(node, econtext, isNull);
+		if (node->planstate->guaranteed_empty)
+			node->guaranteed_empty = true;
+	}
 	else
 		retval = ExecScanSubPlan(node, econtext, isNull);
 
@@ -105,6 +109,9 @@ ExecHashSubPlan(SubPlanState *node,
 	SubPlan    *subplan = node->subplan;
 	PlanState  *planstate = node->planstate;
 	TupleTableSlot *slot;
+	bool	hasParam = (planstate->plan->extParam != NULL ||
+						subplan->setParam != NIL ||
+						planstate->chgParam != NULL);
 
 	/* Shouldn't have any direct correlation Vars */
 	if (subplan->parParam != NIL || node->args != NIL)
@@ -122,8 +129,11 @@ ExecHashSubPlan(SubPlanState *node,
 	 * lefthand side.
 	 */
 	*isNull = false;
-	if (!node->havehashrows && !node->havenullrows)
+	if (!node->havehashrows && !node->havenullrows) {
+		if (hasParam == false)
+			node->planstate->guaranteed_empty = true;
 		return BoolGetDatum(false);
+	}
 
 	/*
 	 * Evaluate lefthand expressions and form a projection tuple. First we

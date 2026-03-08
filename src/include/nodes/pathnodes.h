@@ -17,10 +17,12 @@
 #define PATHNODES_H
 
 #include "access/sdir.h"
+#include "catalog/pg_statistic.h"
 #include "lib/stringinfo.h"
 #include "nodes/params.h"
 #include "nodes/parsenodes.h"
 #include "storage/block.h"
+#include "utils/lsyscache.h"
 
 
 /*
@@ -728,7 +730,7 @@ typedef struct PartitionSchemeData *PartitionScheme;
  * populate these fields, for base rels; but someday they might be used for
  * join rels too:
  *
- *		unique_for_rels - list of Relid sets, each one being a set of other
+ *		unique_for_rels - list of UniqueRelInfo, each one being a set of other
  *					rels for which this one has been proven unique
  *		non_unique_for_rels - list of Relid sets, each one being a set of
  *					other rels for which we have tried and failed to prove
@@ -869,6 +871,7 @@ typedef struct RelOptInfo
 	 */
 	/* estimated number of result tuples */
 	Cardinality rows;
+	Cardinality rowsUnclamped;
 
 	/*
 	 * per-relation planner control flags
@@ -967,7 +970,7 @@ typedef struct RelOptInfo
 	/*
 	 * cache space for remembering if we have proven this relation unique
 	 */
-	/* known unique for these other relid set(s) */
+	/* known unique for these other relid set(s) given in UniqueRelInfo(s) */
 	List	   *unique_for_rels;
 	/* known not unique for these set(s) */
 	List	   *non_unique_for_rels;
@@ -1203,6 +1206,10 @@ struct IndexOptInfo
 	/* AM's cost estimator */
 	/* Rather than include amapi.h here, we declare amcostestimate like this */
 	void		(*amcostestimate) (struct PlannerInfo *, struct IndexPath *, double, Cost *, Cost *, Selectivity *, double *, double *) pg_node_attr(read_write_ignore);
+
+	/* cache for per-tuple index statistic. That stats could be large and it
+	 * will be expensive to uncompress it every time */
+	AttStatsSlot	*sslots pg_node_attr(equal_ignore, query_jumble_ignore, read_write_ignore, read_as(0));
 };
 
 /*
@@ -1472,6 +1479,16 @@ typedef struct PathKey
 	int			pk_strategy;	/* sort direction (ASC or DESC) */
 	bool		pk_nulls_first; /* do NULLs come before normal values? */
 } PathKey;
+
+/*
+ * Combines information about pathkeys and the associated clauses.
+ */
+typedef struct PathKeyInfo
+{
+	NodeTag		type;
+	List	   *pathkeys;
+	List	   *clauses;
+} PathKeyInfo;
 
 /*
  * Contains an order of group-by clauses and the corresponding list of
@@ -1935,6 +1952,11 @@ typedef struct AppendPath
 	/* Index of first partial path in subpaths; list_length(subpaths) if none */
 	int			first_partial_path;
 	Cardinality limit_tuples;	/* hard limit on output tuples, or -1 */
+	bool		pull_tlist;	/* if = true, create_append_plan()
+							 * should get targetlist from any
+							 * subpath - they are the same,
+							 * because the only place - append
+							 * index scan for range OR */
 } AppendPath;
 
 #define IS_DUMMY_APPEND(p) \
@@ -3433,5 +3455,30 @@ typedef struct AggTransInfo
 	Datum		initValue pg_node_attr(read_write_ignore);
 	bool		initValueIsNull;
 } AggTransInfo;
+
+/*
+ * UniqueRelInfo caches a fact that a relation is unique when being joined
+ * to other relation(s).
+ */
+typedef struct UniqueRelInfo
+{
+	pg_node_attr(no_copy_equal, no_read, no_query_jumble)
+
+	NodeTag		type;
+
+	/*
+	 * The relation in consideration is unique when being joined with this set
+	 * of other relation(s).
+	 */
+	Relids		outerrelids;
+
+	/*
+	 * Additional clauses from a baserestrictinfo list that were used to prove
+	 * the uniqueness.   We cache it for the self-join checking procedure: a
+	 * self-join can be removed if the outer relation contains strictly the
+	 * same set of clauses.
+	 */
+	List	   *extra_clauses;
+} UniqueRelInfo;
 
 #endif							/* PATHNODES_H */

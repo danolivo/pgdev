@@ -46,6 +46,7 @@
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
@@ -3336,6 +3337,52 @@ get_attstatsslot(AttStatsSlot *sslot, HeapTuple statstuple,
 	return true;
 }
 
+AttStatsSlot*
+fill_attstatsslot(AttStatsSlot *sslots, HeapTuple statstuple,
+				  int reqkind, Oid reqop, int flags)
+{
+	int	add_flags = 0, has_flags = 0;
+	AttStatsSlot	*sslot;
+	MemoryContext	oldctx;
+
+	if (reqkind >= STATISTIC_NUM_SLOTS)
+		return NULL;			/* not there */
+
+	sslot = sslots + reqkind;
+
+	if (sslot->values != NULL)
+		has_flags |= ATTSTATSSLOT_VALUES;
+	if (sslot->numbers != NULL)
+		has_flags |= ATTSTATSSLOT_NUMBERS;
+
+	if ((flags & ATTSTATSSLOT_VALUES) && !(has_flags & ATTSTATSSLOT_VALUES))
+		add_flags |= ATTSTATSSLOT_VALUES;
+
+	if ((flags & ATTSTATSSLOT_NUMBERS) && !(has_flags & ATTSTATSSLOT_NUMBERS))
+		add_flags |= ATTSTATSSLOT_NUMBERS;
+
+	if (add_flags == 0 && (reqop == InvalidOid || sslot->staop == reqop))
+		return sslot;
+
+	sslot->incache = false;
+	free_attstatsslot(sslot);
+
+	oldctx = MemoryContextSwitchTo(GetMemoryChunkContext(sslots));
+
+	if (get_attstatsslot(sslot, statstuple, reqkind, reqop,
+						 add_flags | has_flags))
+	{
+		sslot->incache = true;
+		MemoryContextSwitchTo(oldctx);
+		return sslot;
+	}
+	else
+	{
+		MemoryContextSwitchTo(oldctx);
+		return NULL;
+	}
+}
+
 /*
  * free_attstatsslot
  *		Free data allocated by get_attstatsslot
@@ -3343,6 +3390,10 @@ get_attstatsslot(AttStatsSlot *sslot, HeapTuple statstuple,
 void
 free_attstatsslot(AttStatsSlot *sslot)
 {
+	/* do not free cached slot */
+	if (sslot->incache)
+		return;
+
 	/* The values[] array was separately palloc'd by deconstruct_array */
 	if (sslot->values)
 		pfree(sslot->values);

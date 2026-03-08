@@ -336,11 +336,14 @@ StreamLogicalLog(void)
 		{
 			struct stat statbuf;
 
+			mode_t mode = (useumask == 1) ?
+				(S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) : (S_IRUSR | S_IWUSR);
+
 			if (strcmp(outfile, "-") == 0)
 				outfd = fileno(stdout);
 			else
 				outfd = open(outfile, O_CREAT | O_APPEND | O_WRONLY | PG_BINARY,
-							 S_IRUSR | S_IWUSR);
+							 mode);
 			if (outfd == -1)
 			{
 				pg_log_error("could not open log file \"%s\": %m", outfile);

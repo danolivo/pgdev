@@ -1348,6 +1348,54 @@ build_joinrel_joinlist(RelOptInfo *joinrel,
 	joinrel->joininfo = result;
 }
 
+typedef struct UniquePtrList {
+	List	*unique_list;
+	HTAB	*h;
+} UniquePtrList;
+
+static void
+addUniquePtrList(UniquePtrList *upl, void *v)
+{
+	if (upl->h != NULL || list_length(upl->unique_list) > 32)
+	{
+		bool		found;
+
+		if (upl->h == NULL)
+		{
+			HASHCTL hash_ctl;
+			ListCell	*l;
+
+			MemSet(&hash_ctl, 0, sizeof(hash_ctl));
+
+			hash_ctl.keysize = sizeof(void*);
+			hash_ctl.entrysize = sizeof(void*);
+
+			upl->h = hash_create("UniquePtrList storage", 64,
+															 &hash_ctl,
+															 HASH_BLOBS |
+															 HASH_ELEM);
+
+			foreach(l, upl->unique_list)
+			{
+				void	*k =  lfirst(l);
+
+				hash_search(upl->h, &k,
+																HASH_ENTER,
+																&found);
+				Assert(found == false);
+			}
+		}
+
+		hash_search(upl->h, &v, HASH_ENTER, &found);
+		if (found == false)
+			upl->unique_list = lappend(upl->unique_list, v);
+	}
+	else
+	{
+		upl->unique_list = list_append_unique_ptr(upl->unique_list, v);
+	}
+}
+
 static List *
 subbuild_joinrel_restrictlist(PlannerInfo *root,
 							  RelOptInfo *joinrel,
@@ -1356,6 +1404,10 @@ subbuild_joinrel_restrictlist(PlannerInfo *root,
 							  List *new_restrictlist)
 {
 	ListCell   *l;
+	UniquePtrList   upl;
+
+	memset(&upl, 0, sizeof(upl));
+	upl.unique_list = new_restrictlist;
 
 	foreach(l, input_rel->joininfo)
 	{
@@ -1400,7 +1452,7 @@ subbuild_joinrel_restrictlist(PlannerInfo *root,
 			 * will have been multiply-linked rather than copied, pointer
 			 * equality should be a sufficient test.)
 			 */
-			new_restrictlist = list_append_unique_ptr(new_restrictlist, rinfo);
+			addUniquePtrList(&upl, rinfo);
 		}
 		else
 		{
@@ -1411,7 +1463,8 @@ subbuild_joinrel_restrictlist(PlannerInfo *root,
 		}
 	}
 
-	return new_restrictlist;
+	hash_destroy(upl.h);
+	return upl.unique_list;
 }
 
 static List *
@@ -1420,6 +1473,10 @@ subbuild_joinrel_joinlist(RelOptInfo *joinrel,
 						  List *new_joininfo)
 {
 	ListCell   *l;
+	UniquePtrList	upl;
+
+	memset(&upl, 0, sizeof(upl));
+	upl.unique_list = new_joininfo;
 
 	/* Expected to be called only for join between parent relations. */
 	Assert(joinrel->reloptkind == RELOPT_JOINREL);
@@ -1445,11 +1502,12 @@ subbuild_joinrel_joinlist(RelOptInfo *joinrel,
 			 * multiply-linked rather than copied, pointer equality should be
 			 * a sufficient test.)
 			 */
-			new_joininfo = list_append_unique_ptr(new_joininfo, rinfo);
+			addUniquePtrList(&upl, rinfo);
 		}
 	}
 
-	return new_joininfo;
+	hash_destroy(upl.h);
+	return upl.unique_list;
 }
 
 

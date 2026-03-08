@@ -185,6 +185,7 @@ ExecScan(ScanState *node,
 	 * storage allocated in the previous tuple cycle.
 	 */
 	ResetExprContext(econtext);
+	node->ps.guaranteed_empty = false;
 
 	/*
 	 * get a tuple from the access method.  Loop until we obtain a tuple that
@@ -243,7 +244,14 @@ ExecScan(ScanState *node,
 				return slot;
 			}
 		}
-		else
+		else if (qual && qual->guaranteed_empty)
+		{
+			/* Qual guarantees the absence of results */
+			node->ps.guaranteed_empty = true;
+			ExecClearTuple(slot);
+
+			return slot;
+		} else
 			InstrCountFiltered1(node, 1);
 
 		/*

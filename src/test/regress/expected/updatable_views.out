@@ -489,8 +489,8 @@ MERGE INTO rw_view1 t
  merge_action | a |   b   | a |      b      
 --------------+---+-------+---+-------------
  UPDATE       | 1 | ROW 1 | 1 | ROW 1
- DELETE       | 3 | ROW 3 | 3 | Row 3
  INSERT       | 2 | ROW 2 | 2 | Unspecified
+ DELETE       | 3 | ROW 3 | 3 | Row 3
 (3 rows)
 
 SELECT * FROM base_tbl ORDER BY a;
@@ -560,18 +560,14 @@ EXPLAIN (costs off)
 MERGE INTO rw_view1 t
   USING (SELECT * FROM generate_series(1,5)) AS s(a) ON t.a = s.a
   WHEN MATCHED THEN UPDATE SET b = 'Updated';
-                            QUERY PLAN                             
--------------------------------------------------------------------
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
  Merge on base_tbl
-   ->  Hash Join
-         Hash Cond: (base_tbl.a = generate_series.generate_series)
-         ->  Bitmap Heap Scan on base_tbl
-               Recheck Cond: (a > 0)
-               ->  Bitmap Index Scan on base_tbl_pkey
-                     Index Cond: (a > 0)
-         ->  Hash
-               ->  Function Scan on generate_series
-(9 rows)
+   ->  Nested Loop
+         ->  Function Scan on generate_series
+         ->  Index Scan using base_tbl_pkey on base_tbl
+               Index Cond: ((a = generate_series.generate_series) AND (a > 0))
+(5 rows)
 
 EXPLAIN (costs off)
 MERGE INTO rw_view1 t
@@ -594,18 +590,14 @@ EXPLAIN (costs off)
 MERGE INTO rw_view1 t
   USING (SELECT * FROM generate_series(1,5)) AS s(a) ON t.a = s.a
   WHEN NOT MATCHED THEN INSERT (a) VALUES (s.a);
-                            QUERY PLAN                             
--------------------------------------------------------------------
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
  Merge on base_tbl
-   ->  Hash Right Join
-         Hash Cond: (base_tbl.a = generate_series.generate_series)
-         ->  Bitmap Heap Scan on base_tbl
-               Recheck Cond: (a > 0)
-               ->  Bitmap Index Scan on base_tbl_pkey
-                     Index Cond: (a > 0)
-         ->  Hash
-               ->  Function Scan on generate_series
-(9 rows)
+   ->  Nested Loop Left Join
+         ->  Function Scan on generate_series
+         ->  Index Scan using base_tbl_pkey on base_tbl
+               Index Cond: ((a = generate_series.generate_series) AND (a > 0))
+(5 rows)
 
 -- it's still updatable if we add a DO ALSO rule
 CREATE TABLE base_tbl_hist(ts timestamptz default now(), a int, b text);
@@ -3119,16 +3111,13 @@ SELECT * FROM rw_view1;
 (1 row)
 
 EXPLAIN (costs off) DELETE FROM rw_view1 WHERE id = 1 AND snoop(data);
-                            QUERY PLAN                             
--------------------------------------------------------------------
- Update on base_tbl base_tbl_1
-   ->  Nested Loop
-         ->  Index Scan using base_tbl_pkey on base_tbl base_tbl_1
-               Index Cond: (id = 1)
-         ->  Index Scan using base_tbl_pkey on base_tbl
-               Index Cond: (id = 1)
-               Filter: ((NOT deleted) AND snoop(data))
-(7 rows)
+                    QUERY PLAN                    
+--------------------------------------------------
+ Update on base_tbl
+   ->  Index Scan using base_tbl_pkey on base_tbl
+         Index Cond: (id = 1)
+         Filter: ((NOT deleted) AND snoop(data))
+(4 rows)
 
 DELETE FROM rw_view1 WHERE id = 1 AND snoop(data);
 NOTICE:  snooped value: Row 1

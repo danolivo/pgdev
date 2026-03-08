@@ -28,6 +28,7 @@
 #include "access/multixact.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
+#include "access/tempcat.h"
 #include "access/toast_compression.h"
 #include "access/transam.h"
 #include "access/visibilitymap.h"
@@ -56,6 +57,7 @@
 #include "commands/progress.h"
 #include "commands/tablecmds.h"
 #include "commands/trigger.h"
+#include "commands/typecmds.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -131,7 +133,7 @@ static void SetReindexProcessing(Oid heapOid, Oid indexOid);
 static void ResetReindexProcessing(void);
 static void SetReindexPending(List *indexes);
 static void RemoveReindexPending(Oid indexOid);
-
+static void IndexTypeCreate(Relation indexRelation);
 
 /*
  * relationHasPrimaryKey
@@ -672,6 +674,112 @@ UpdateIndexRelation(Oid indexoid,
 	heap_freetuple(tuple);
 }
 
+/*
+ * We only need to create reltype for multicolumn user-defined
+ * B-tree indexes that don't have a reltype yet.
+ */
+#define INDEX_NEEDS_RELTYPE(indexRelation, indexInfo, accessMethodOid) ( \
+	!IsSystemRelation(indexRelation)				\
+	&& indexInfo->ii_NumIndexKeyAttrs > 1			\
+	&& accessMethodOid == BTREE_AM_OID				\
+	&& indexRelation->rd_rel->reltype == InvalidOid	\
+	&& (!IsBinaryUpgrade || binary_upgrade_next_pg_type_oid != InvalidOid))
+
+/*
+ * IndexTypeCreate
+ *
+ * Create type for specified index.
+ */
+void
+IndexTypeCreate(Relation indexRelation)
+{
+	Oid ownerId = GetUserId();
+	Oid namespaceId = RelationGetNamespace(indexRelation);
+	Oid new_array_oid = AssignTypeArrayOid();
+	ObjectAddress new_type_addr;
+	char* relarrayname;
+
+	/* Index must not have a reltype yet */
+	Assert(indexRelation->rd_rel->reltype == InvalidOid);
+
+	/*
+	* Build compound type for compound index to be able to use it in statistic.
+	* We need to collect statistic for compound indexes to be able to better
+	* predict selectivity of multicolumn joins.
+	*/
+	new_type_addr = TypeCreate(InvalidOid,
+			RelationGetRelationName(indexRelation),
+			namespaceId,
+			RelationGetRelid(indexRelation),
+			RELKIND_INDEX,
+			ownerId, 			/* owner's ID */
+			-1,					/* internal size (varlena) */
+			TYPTYPE_COMPOSITE,	/* type-type (composite) */
+			TYPCATEGORY_COMPOSITE,	/* type-category (ditto) */
+			false,				/* composite types are never preferred */
+			DEFAULT_TYPDELIM,	/* default array delimiter */
+			F_RECORD_IN,		/* input procedure */
+			F_RECORD_OUT,		/* output procedure */
+			F_RECORD_RECV,		/* receive procedure */
+			F_RECORD_SEND,		/* send procedure */
+			InvalidOid,			/* typmodin procedure - none */
+			InvalidOid,			/* typmodout procedure - none */
+			InvalidOid,			/* analyze procedure - default */
+			InvalidOid,			/* subscript procedure - default */
+			InvalidOid,			/* array element type - irrelevant */
+			false,				/* this is not an array type */
+			new_array_oid,		/* array type if any */
+			InvalidOid,			/* domain base type - irrelevant */
+			NULL,				/* default value - none */
+			NULL,				/* default binary representation */
+			false,				/* passed by reference */
+			'd',				/* alignment - must be the largest! */
+			'x',				/* fully TOASTable */
+			-1,					/* typmod */
+			0,					/* array dimensions for typBaseType */
+			false,				/* Type NOT NULL */
+			InvalidOid); 		/* rowtypes never have a collation */
+
+	indexRelation->rd_rel->reltype = new_type_addr.objectId;
+
+	relarrayname = makeArrayTypeName(RelationGetRelationName(indexRelation),
+										namespaceId);
+
+	TypeCreate(new_array_oid,	/* force the type's OID to this */
+				relarrayname,	/* Array type name */
+				namespaceId,	/* Same namespace as parent */
+				InvalidOid,		/* Not composite, no relationOid */
+				0,				/* relkind, also N/A here */
+				ownerId,		/* owner's ID */
+				-1,				/* Internal size (varlena) */
+				TYPTYPE_BASE,	/* Not composite - typelem is */
+				TYPCATEGORY_ARRAY,	/* type-category (array) */
+				false,			/* array types are never preferred */
+				DEFAULT_TYPDELIM,	/* default array delimiter */
+				F_ARRAY_IN,		/* array input proc */
+				F_ARRAY_OUT,	/* array output proc */
+				F_ARRAY_RECV,	/* array recv (bin) proc */
+				F_ARRAY_SEND,	/* array send (bin) proc */
+				InvalidOid,		/* typmodin procedure - none */
+				InvalidOid,		/* typmodout procedure - none */
+				F_ARRAY_TYPANALYZE,	/* array analyze procedure */
+				F_ARRAY_SUBSCRIPT_HANDLER,	/* subscript procedure - default */
+				indexRelation->rd_rel->reltype,	/* array element type - the rowtype */
+				true,			/* yes, this is an array type */
+				InvalidOid,		/* this has no array type */
+				InvalidOid,		/* domain base type - irrelevant */
+				NULL,			/* default value - none */
+				NULL,			/* default binary representation */
+				false,			/* passed by reference */
+				'd',			/* alignment - must be the largest! */
+				'x',			/* fully TOASTable */
+				-1,				/* typmod */
+				0,				/* array dimensions for typBaseType */
+				false,			/* Type NOT NULL */
+				InvalidOid);	/* rowtypes never have a collation */
+
+	pfree(relarrayname);
+}
 
 /*
  * index_create
@@ -757,6 +865,7 @@ index_create(Relation heapRelation,
 	bool		invalid = (flags & INDEX_CREATE_INVALID) != 0;
 	bool		concurrent = (flags & INDEX_CREATE_CONCURRENT) != 0;
 	bool		partitioned = (flags & INDEX_CREATE_PARTITIONED) != 0;
+	bool		withoutType = (flags & INDEX_CREATE_WITHOUT_TYPE) != 0;
 	char		relkind;
 	TransactionId relfrozenxid;
 	MultiXactId relminmxid;
@@ -914,6 +1023,11 @@ index_create(Relation heapRelation,
 						indexRelationName, RelationGetRelationName(heapRelation))));
 	}
 
+	/* 
+	 * Don't send cache invalidation messages for indexes on temp tables
+	 */
+	BEGIN_TEMP_TABLE_SCOPE_LOCAL(heapRelation->rd_rel->relpersistence == RELPERSISTENCE_TEMP);
+
 	/*
 	 * construct tuple descriptor for index tuples
 	 */
@@ -990,6 +1104,11 @@ index_create(Relation heapRelation,
 	Assert(relfrozenxid == InvalidTransactionId);
 	Assert(relminmxid == InvalidMultiXactId);
 	Assert(indexRelationId == RelationGetRelid(indexRelation));
+
+	/* Create a reltype for index if it is needed */
+	if (withoutType == false && INDEX_NEEDS_RELTYPE(indexRelation, indexInfo, accessMethodId)
+		&& !is_internal)
+		IndexTypeCreate(indexRelation);
 
 	/*
 	 * Obtain exclusive lock on it.  Although no other transactions can see it
@@ -1282,6 +1401,8 @@ index_create(Relation heapRelation,
 	 */
 	index_close(indexRelation, NoLock);
 
+	END_TEMP_TABLE_SCOPE();
+
 	return indexRelationId;
 }
 
@@ -1455,7 +1576,7 @@ index_concurrently_create_copy(Relation heapRelation, Oid oldIndexId,
 							  indcoloptions->values,
 							  stattargets,
 							  reloptionsDatum,
-							  INDEX_CREATE_SKIP_BUILD | INDEX_CREATE_CONCURRENT,
+							  INDEX_CREATE_SKIP_BUILD | INDEX_CREATE_CONCURRENT | INDEX_CREATE_WITHOUT_TYPE,
 							  0,
 							  true, /* allow table to be a system catalog? */
 							  false,	/* is_internal? */
@@ -1596,6 +1717,32 @@ index_concurrently_swap(Oid newIndexId, Oid oldIndexId, const char *oldName)
 	isPartition = newClassForm->relispartition;
 	newClassForm->relispartition = oldClassForm->relispartition;
 	oldClassForm->relispartition = isPartition;
+
+	/* copy  index type to new index */
+	newClassForm->reltype = oldClassForm->reltype;
+
+	if (OidIsValid(oldClassForm->reltype))
+	{
+		Relation	pg_type;
+		HeapTuple	typeTuple;
+		Form_pg_type	typeForm;
+
+		pg_type = table_open(TypeRelationId, RowExclusiveLock);
+
+		typeTuple = SearchSysCacheCopy1(TYPEOID,
+										ObjectIdGetDatum(oldClassForm->reltype));
+		if (!HeapTupleIsValid(typeTuple))
+			elog(ERROR, "could not find tuple for type %u", oldClassForm->reltype);
+
+		typeForm = (Form_pg_type) GETSTRUCT(typeTuple);
+
+		typeForm->typrelid = newIndexId;
+
+		CatalogTupleUpdate(pg_type, &typeTuple->t_self, typeTuple);
+
+		heap_freetuple(typeTuple);
+		table_close(pg_type, RowExclusiveLock);
+	}
 
 	CatalogTupleUpdate(pg_class, &oldClassTuple->t_self, oldClassTuple);
 	CatalogTupleUpdate(pg_class, &newClassTuple->t_self, newClassTuple);
@@ -1785,8 +1932,9 @@ index_concurrently_swap(Oid newIndexId, Oid oldIndexId, const char *oldName)
 	 * vice-versa.  Note that a call to CommandCounterIncrement() would cause
 	 * duplicate entries in pg_depend, so this should not be done.
 	 */
-	changeDependenciesOf(RelationRelationId, newIndexId, oldIndexId);
-	changeDependenciesOn(RelationRelationId, newIndexId, oldIndexId);
+	//changeDependenciesOf(RelationRelationId, newIndexId, oldIndexId);
+	//changeDependenciesOn(RelationRelationId, newIndexId, oldIndexId);
+	deleteDependencyRecordsFor(RelationRelationId, newIndexId, false);
 
 	changeDependenciesOf(RelationRelationId, oldIndexId, newIndexId);
 	changeDependenciesOn(RelationRelationId, oldIndexId, newIndexId);
@@ -2119,6 +2267,7 @@ index_drop(Oid indexId, bool concurrent, bool concurrent_lock_mode)
 	Relation	indexRelation;
 	HeapTuple	tuple;
 	bool		hasexprs;
+	bool		remove_statistics;
 	LockRelId	heaprelid,
 				indexrelid;
 	LOCKTAG		heaplocktag;
@@ -2195,24 +2344,6 @@ index_drop(Oid indexId, bool concurrent, bool concurrent_lock_mode)
 	 */
 	if (concurrent)
 	{
-		/*
-		 * We must commit our transaction in order to make the first pg_index
-		 * state update visible to other sessions.  If the DROP machinery has
-		 * already performed any other actions (removal of other objects,
-		 * pg_depend entries, etc), the commit would make those actions
-		 * permanent, which would leave us with inconsistent catalog state if
-		 * we fail partway through the following sequence.  Since DROP INDEX
-		 * CONCURRENTLY is restricted to dropping just one index that has no
-		 * dependencies, we should get here before anything's been done ---
-		 * but let's check that to be sure.  We can verify that the current
-		 * transaction has not executed any transactional updates by checking
-		 * that no XID has been assigned.
-		 */
-		if (GetTopTransactionIdIfAny() != InvalidTransactionId)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("DROP INDEX CONCURRENTLY must be first action in transaction")));
-
 		/*
 		 * Mark index invalid by updating its pg_index entry
 		 */
@@ -2313,6 +2444,16 @@ index_drop(Oid indexId, bool concurrent, bool concurrent_lock_mode)
 	pgstat_drop_relation(userIndexRelation);
 
 	/*
+	 * We might have stored multicolumn statistics for btree indexes. They are
+	 * created only for non-system and non-TOAST indexes, so check only for such
+	 * such indexes.
+	 */
+	remove_statistics =
+		IndexRelationGetNumberOfKeyAttributes(userIndexRelation) > 1 &&
+		userIndexRelation->rd_rel->relam == BTREE_AM_OID &&
+		!IsSystemRelation(userIndexRelation);
+
+	/*
 	 * Close and flush the index's relcache entry, to ensure relcache doesn't
 	 * try to rebuild it while we're deleting catalog entries. We keep the
 	 * lock though.
@@ -2339,10 +2480,10 @@ index_drop(Oid indexId, bool concurrent, bool concurrent_lock_mode)
 	table_close(indexRelation, RowExclusiveLock);
 
 	/*
-	 * if it has any expression columns, we might have stored statistics about
-	 * them.
+	 * if it has any expression columns or whole index stat, we might have
+	 * stored statistics about them.
 	 */
-	if (hasexprs)
+	if (hasexprs || remove_statistics)
 		RemoveStatistics(indexId, 0);
 
 	/*
@@ -2877,6 +3018,14 @@ index_update_stats(Relation rel,
 	if (rd_rel->relhasindex != hasindex)
 	{
 		rd_rel->relhasindex = hasindex;
+		dirty = true;
+	}
+
+	/* If index's reltype has been created, update it in pg_class. */
+	if (rel->rd_rel->relkind == RELKIND_INDEX &&
+		rd_rel->reltype != rel->rd_rel->reltype)
+	{
+		rd_rel->reltype = rel->rd_rel->reltype;
 		dirty = true;
 	}
 
@@ -3706,6 +3855,8 @@ reindex_index(const ReindexStmt *stmt, Oid indexId,
 	 */
 	CheckTableNotInUse(iRel, "REINDEX INDEX");
 
+	BEGIN_TEMP_TABLE_SCOPE_LOCAL(iRel->rd_islocaltemp);
+
 	/* Set new tablespace, if requested */
 	if (set_tablespace)
 	{
@@ -3747,6 +3898,10 @@ reindex_index(const ReindexStmt *stmt, Oid indexId,
 
 	/* Create a new physical relation for the index */
 	RelationSetNewRelfilenumber(iRel, persistence);
+
+	/* Create a reltype for index if it is needed */
+	if (INDEX_NEEDS_RELTYPE(iRel, indexInfo, iRel->rd_rel->relam))
+		IndexTypeCreate(iRel);
 
 	/* Initialize the index and rebuild */
 	/* Note: we do not need to re-establish pkey setting */
@@ -3839,6 +3994,8 @@ reindex_index(const ReindexStmt *stmt, Oid indexId,
 
 	/* Restore userid and security context */
 	SetUserIdAndSecContext(save_userid, save_sec_context);
+
+	END_TEMP_TABLE_SCOPE();
 
 	/* Close rels, but keep locks */
 	index_close(iRel, NoLock);

@@ -181,7 +181,7 @@ static SerializeMetrics GetSerializationMetrics(DestReceiver *dest);
  */
 void
 ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
-			 ParamListInfo params, DestReceiver *dest)
+			 ParamListInfo params, DestReceiver *dest, uint64 *processed)
 {
 	ExplainState *es = NewExplainState();
 	TupOutputState *tstate;
@@ -191,6 +191,9 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 	ListCell   *lc;
 	bool		timing_set = false;
 	bool		summary_set = false;
+
+	if (processed)
+		*processed = 0;
 
 	/* Parse options list. */
 	foreach(lc, stmt->options)
@@ -363,6 +366,9 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 	end_tup_output(tstate);
 
 	pfree(es->str->data);
+
+	if (processed)
+		*processed = es->es_processed;
 }
 
 /*
@@ -773,6 +779,8 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 	 * total execution time (although it should be pretty minimal).
 	 */
 	INSTR_TIME_SET_CURRENT(starttime);
+
+	es->es_processed += queryDesc->estate->es_processed;
 
 	ExecutorEnd(queryDesc);
 

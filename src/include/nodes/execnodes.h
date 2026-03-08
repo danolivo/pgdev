@@ -138,6 +138,8 @@ typedef struct ExprState
 	 * ExecInitExprRec().
 	 */
 	ErrorSaveContext *escontext;
+	
+	bool		guaranteed_empty;
 } ExprState;
 
 
@@ -991,6 +993,7 @@ typedef struct SubPlanState
 	FmgrInfo   *lhs_hash_funcs; /* hash functions for lefthand datatype(s) */
 	FmgrInfo   *cur_eq_funcs;	/* equality functions for LHS vs. table */
 	ExprState  *cur_eq_comp;	/* equality comparator for LHS vs. table */
+	bool		guaranteed_empty;
 } SubPlanState;
 
 /*
@@ -1168,6 +1171,8 @@ typedef struct PlanState
 	 * descriptor, without encoding knowledge about all executor nodes.
 	 */
 	TupleDesc	scandesc;
+
+	bool guaranteed_empty;
 
 	/*
 	 * Define the slot types for inner, outer and scanslots for expression

@@ -509,6 +509,9 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 
 			index_close(indexRelation, NoLock);
 
+			info->sslots = palloc0(
+					(STATISTIC_NUM_SLOTS + 1) * sizeof(AttStatsSlot));
+
 			/*
 			 * We've historically used lcons() here.  It'd make more sense to
 			 * use lappend(), but that causes the planner to change behavior

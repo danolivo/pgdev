@@ -172,7 +172,6 @@ static List *fix_indexorderby_references(PlannerInfo *root, IndexPath *index_pat
 static Node *fix_indexqual_clause(PlannerInfo *root,
 								  IndexOptInfo *index, int indexcol,
 								  Node *clause, List *indexcolnos);
-static Node *fix_indexqual_operand(Node *node, IndexOptInfo *index, int indexcol);
 static List *get_switched_clauses(List *clauses, Relids outerrelids);
 static List *order_qual_clauses(PlannerInfo *root, List *clauses);
 static void copy_generic_path_info(Plan *dest, Path *src);
@@ -1247,6 +1246,7 @@ create_append_plan(PlannerInfo *root, AppendPath *best_path, int flags)
 		/* Generate a Result plan with constant-FALSE gating qual */
 		Plan	   *plan;
 
+		tlist = build_path_tlist(root, &best_path->path);
 		plan = (Plan *) make_result(tlist,
 									(Node *) list_make1(makeBoolConst(false,
 																	  false)),
@@ -1275,7 +1275,7 @@ create_append_plan(PlannerInfo *root, AppendPath *best_path, int flags)
 	plan->plan.righttree = NULL;
 	plan->apprelids = rel->relids;
 
-	if (pathkeys != NIL)
+	if (pathkeys != NIL && best_path->pull_tlist == false)
 	{
 		/*
 		 * Compute sort column info, and adjust the Append's tlist as needed.
@@ -1309,11 +1309,17 @@ create_append_plan(PlannerInfo *root, AppendPath *best_path, int flags)
 		/* Must insist that all children return the same tlist */
 		subplan = create_plan_recurse(root, subpath, CP_EXACT_TLIST);
 
+		if (tlist == NIL && best_path->pull_tlist)
+			plan->plan.targetlist = tlist = copyObject(subplan->targetlist);
+
 		/*
 		 * For ordered Appends, we must insert a Sort node if subplan isn't
 		 * sufficiently ordered.
+		 * if best_path->pull_tlist = then plan came from
+		 * keybased_rewrite_index_paths() which guarantee correct sorting in
+		 * subplan
 		 */
-		if (pathkeys != NIL)
+		if (pathkeys != NIL && best_path->pull_tlist == false)
 		{
 			int			numsortkeys;
 			AttrNumber *sortColIdx;
@@ -5160,7 +5166,7 @@ fix_indexqual_clause(PlannerInfo *root, IndexOptInfo *index, int indexcol,
  * Most of the code here is just for sanity cross-checking that the given
  * expression actually matches the index column it's claimed to.
  */
-static Node *
+Node *
 fix_indexqual_operand(Node *node, IndexOptInfo *index, int indexcol)
 {
 	Var		   *result;

@@ -17,15 +17,20 @@
  */
 #include "postgres.h"
 
+#include <float.h>
+
+#include "miscadmin.h"
 #include "access/stratnum.h"
 #include "catalog/pg_opfamily.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/cost.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "partitioning/partbounds.h"
 #include "utils/lsyscache.h"
+#include "utils/selfuncs.h"
 
 /* Consider reordering of GROUP BY keys? */
 bool		enable_group_by_reordering = true;
@@ -364,7 +369,7 @@ pathkeys_contained_in(List *keys1, List *keys2)
  *
  * Returns the number of GROUP BY keys with a matching pathkey.
  */
-static int
+int
 group_keys_reorder_by_pathkeys(List *pathkeys, List **group_pathkeys,
 							   List **group_clauses,
 							   int num_groupby_pathkeys)
@@ -2133,7 +2138,7 @@ right_merge_direction(PlannerInfo *root, PathKey *pathkey)
  * ordering. Thus we return 0, if no valuable keys are found, or the number
  * of leading keys shared by the list and the requested ordering..
  */
-static int
+int
 pathkeys_useful_for_ordering(PlannerInfo *root, List *pathkeys)
 {
 	int			n_common_pathkeys;

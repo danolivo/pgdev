@@ -110,15 +110,20 @@ typedef struct
 	Oid			relId;			/* relation ID */
 } SharedInvalSnapshotMsg;
 
-typedef union
+typedef struct
 {
-	int8		id;				/* type field --- must be first */
-	SharedInvalCatcacheMsg cc;
-	SharedInvalCatalogMsg cat;
-	SharedInvalRelcacheMsg rc;
-	SharedInvalSmgrMsg sm;
-	SharedInvalRelmapMsg rm;
-	SharedInvalSnapshotMsg sn;
+	union
+	{
+		int8		id;				/* type field --- must be first */
+		SharedInvalCatcacheMsg cc;
+		SharedInvalCatalogMsg cat;
+		SharedInvalRelcacheMsg rc;
+		SharedInvalSmgrMsg sm;
+		SharedInvalRelmapMsg rm;
+		SharedInvalSnapshotMsg sn;
+	};
+
+	bool isLocal;
 } SharedInvalidationMessage;
 
 

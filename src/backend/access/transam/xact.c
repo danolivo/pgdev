@@ -2815,6 +2815,9 @@ AbortTransaction(void)
 			 TransStateAsString(s->state));
 	Assert(s->parent == NULL);
 
+	CallXactCallbacks(is_parallel_worker ? XACT_EVENT_PARALLEL_PRE_ABORT
+					  : XACT_EVENT_PRE_ABORT);
+	
 	/*
 	 * set the current transaction state information appropriately during the
 	 * abort processing
@@ -5247,6 +5250,9 @@ AbortSubTransaction(void)
 	 */
 	AtEOSubXact_Parallel(false, s->subTransactionId);
 	s->parallelModeLevel = 0;
+
+	CallSubXactCallbacks(SUBXACT_EVENT_PRE_ABORT_SUB, s->subTransactionId,
+							s->parent->subTransactionId);
 
 	/*
 	 * We can skip all this stuff if the subxact failed before creating a

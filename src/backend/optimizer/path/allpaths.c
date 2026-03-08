@@ -782,6 +782,9 @@ set_plain_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	/* Consider index scans */
 	create_index_paths(root, rel);
 
+	/* Consider index scans with rewrited quals */
+	keybased_rewrite_index_paths(root, rel);
+
 	/* Consider TID scans */
 	create_tidscan_paths(root, rel);
 }

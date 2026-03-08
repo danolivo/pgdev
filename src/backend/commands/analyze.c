@@ -36,8 +36,11 @@
 #include "common/pg_prng.h"
 #include "executor/executor.h"
 #include "foreign/fdwapi.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/makefuncs.h"
+#include "nodes/pg_list.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_relation.h"
 #include "pgstat.h"
@@ -49,6 +52,7 @@
 #include "utils/attoptcache.h"
 #include "utils/datum.h"
 #include "utils/guc.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
@@ -57,6 +61,7 @@
 #include "utils/spccache.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
+#include "utils/typcache.h"
 
 
 /* Per-index data for ANALYZE */
@@ -66,6 +71,7 @@ typedef struct AnlIndexData
 	double		tupleFract;		/* fraction of rows for partial index */
 	VacAttrStats **vacattrstats;	/* index attrs to analyze */
 	int			attr_cnt;
+	bool        multicolumn;    /* Collect compound row statistic for multicolumn index */
 } AnlIndexData;
 
 
@@ -243,6 +249,8 @@ analyze_rel(Oid relid, RangeVar *relation,
 	pgstat_progress_start_command(PROGRESS_COMMAND_ANALYZE,
 								  RelationGetRelid(onerel));
 
+	BEGIN_TEMP_TABLE_SCOPE_SHARED(onerel->rd_rel->relpersistence == RELPERSISTENCE_TEMP);
+
 	/*
 	 * Do the normal non-recursive ANALYZE.  We can skip this for partitioned
 	 * tables, which don't contain any rows.
@@ -265,6 +273,8 @@ analyze_rel(Oid relid, RangeVar *relation,
 	 * expose us to concurrent-update failures in update_attstats.)
 	 */
 	relation_close(onerel, NoLock);
+
+	END_TEMP_TABLE_SCOPE();
 
 	pgstat_progress_end_command();
 }
@@ -308,6 +318,9 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 	int64		AnalyzePageDirty = VacuumPageDirty;
 	PgStat_Counter startreadtime = 0;
 	PgStat_Counter startwritetime = 0;
+	int    rowsAttrPitch;
+	Datum *rowsAttrValues;
+	bool  *rowsAttrNulls;
 
 	if (inh)
 		ereport(elevel,
@@ -319,6 +332,8 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 				(errmsg("analyzing \"%s.%s\"",
 						get_namespace_name(RelationGetNamespace(onerel)),
 						RelationGetRelationName(onerel))));
+
+	BEGIN_TEMP_TABLE_SCOPE_LOCAL(RelationUsesLocalBuffers(onerel))
 
 	/*
 	 * Set up a working context so that we can easily free whatever junk gets
@@ -476,6 +491,21 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 				}
 				thisdata->attr_cnt = tcnt;
 			}
+			else if (indexInfo->ii_NumIndexAttrs > 1 && va_cols == NIL &&
+					 Irel[ind]->rd_rel->reltype != InvalidOid)
+			{
+				/* Collect statistic for multicolumn index for better predicting selectivity of multicolumn joins */
+				RowExpr* row = makeNode(RowExpr);
+				row->row_typeid = Irel[ind]->rd_rel->reltype;
+				row->row_format = COERCE_EXPLICIT_CAST;
+				row->location = -1;
+				row->colnames = NULL;
+				thisdata->vacattrstats = (VacAttrStats **)palloc(sizeof(VacAttrStats *));
+				thisdata->vacattrstats[0] = examine_attribute(Irel[ind], 1, (Node*)row);
+				thisdata->vacattrstats[0]->tupDesc = lookup_type_cache(row->row_typeid, TYPECACHE_TUPDESC)->tupDesc;
+				thisdata->attr_cnt = 1;
+				thisdata->multicolumn = true;
+			}
 		}
 	}
 
@@ -528,6 +558,25 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 								  rows, targrows,
 								  &totalrows, &totaldeadrows);
 
+
+	if (va_cols == NIL && AllocSizeIsValid(numrows * onerel->rd_att->natts * sizeof(Datum)))
+	{
+		rowsAttrPitch  = onerel->rd_att->natts;
+		rowsAttrValues = (Datum *) palloc(numrows * rowsAttrPitch * sizeof(Datum));
+		rowsAttrNulls  = (bool *)  palloc(numrows * rowsAttrPitch * sizeof(bool));
+		for(i = 0; i < numrows; i++)
+		{
+			size_t index = i * rowsAttrPitch;
+			heap_deform_tuple(rows[i], onerel->rd_att, rowsAttrValues + index, rowsAttrNulls + index);
+		}
+	}
+	else
+	{
+		rowsAttrPitch  = 0;
+		rowsAttrValues = NULL;
+		rowsAttrNulls  = NULL;
+	}
+
 	/*
 	 * Compute the statistics.  Temporary results during the calculations for
 	 * each column are stored in a child context.  The calc routines are
@@ -553,6 +602,10 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 			AttributeOpts *aopt;
 
 			stats->rows = rows;
+			stats->rowsAttrPitch  = rowsAttrPitch;
+			stats->rowsAttrValues = rowsAttrValues + (stats->tupattnum - 1);
+			stats->rowsAttrNulls  = rowsAttrNulls  + (stats->tupattnum - 1);
+
 			stats->tupDesc = onerel->rd_att;
 			stats->compute_stats(stats,
 								 std_fetch_func,
@@ -819,6 +872,8 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 	MemoryContextSwitchTo(caller_context);
 	MemoryContextDelete(anl_context);
 	anl_context = NULL;
+
+	END_TEMP_TABLE_SCOPE();
 }
 
 /*
@@ -919,28 +974,41 @@ compute_index_stats(Relation onerel, double totalrows,
 							   values,
 							   isnull);
 
-				/*
-				 * Save just the columns we care about.  We copy the values
-				 * into ind_context from the estate's per-tuple context.
-				 */
-				for (i = 0; i < attr_cnt; i++)
+				if (thisdata->multicolumn)
 				{
-					VacAttrStats *stats = thisdata->vacattrstats[i];
-					int			attnum = stats->tupattnum;
-
-					if (isnull[attnum - 1])
-					{
-						exprvals[tcnt] = (Datum) 0;
-						exprnulls[tcnt] = true;
-					}
-					else
-					{
-						exprvals[tcnt] = datumCopy(values[attnum - 1],
-												   stats->attrtype->typbyval,
-												   stats->attrtype->typlen);
-						exprnulls[tcnt] = false;
-					}
+					/* For multicolumn index construct compound value */
+					VacAttrStats *stats = thisdata->vacattrstats[0];
+					exprvals[tcnt] = HeapTupleGetDatum(heap_form_tuple(stats->tupDesc,
+																	   values,
+																	   isnull));
+					exprnulls[tcnt] = false;
 					tcnt++;
+				}
+				else
+				{
+					/*
+					 * Save just the columns we care about.  We copy the values
+					 * into ind_context from the estate's per-tuple context.
+					 */
+					for (i = 0; i < attr_cnt; i++)
+					{
+						VacAttrStats *stats = thisdata->vacattrstats[i];
+						int			attnum = stats->tupattnum;
+
+						if (isnull[attnum - 1])
+						{
+							exprvals[tcnt] = (Datum) 0;
+							exprnulls[tcnt] = true;
+						}
+						else
+						{
+							exprvals[tcnt] = datumCopy(values[attnum - 1],
+													   stats->attrtype->typbyval,
+													   stats->attrtype->typlen);
+							exprnulls[tcnt] = false;
+						}
+						tcnt++;
+					}
 				}
 			}
 		}
@@ -1751,11 +1819,22 @@ update_attstats(Oid relid, bool inh, int natts, VacAttrStats **vacattrstats)
 static Datum
 std_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull)
 {
-	int			attnum = stats->tupattnum;
-	HeapTuple	tuple = stats->rows[rownum];
-	TupleDesc	tupDesc = stats->tupDesc;
+	if (stats->rowsAttrPitch)
+	{
+		size_t index = rownum * stats->rowsAttrPitch;
+		*isNull = stats->rowsAttrNulls[index];
 
-	return heap_getattr(tuple, attnum, tupDesc, isNull);
+		return stats->rowsAttrValues[index];
+	}
+	else
+	{
+		int			attnum = stats->tupattnum;
+		HeapTuple	tuple = stats->rows[rownum];
+		TupleDesc	tupDesc = stats->tupDesc;
+
+		return heap_getattr(tuple, attnum, tupDesc, isNull);
+	}
+
 }
 
 /*
@@ -2696,6 +2775,7 @@ compute_scalar_stats(VacAttrStatsP stats,
 		 * histogram won't collapse to empty or a singleton.)
 		 */
 		num_hist = ndistinct - num_mcv;
+
 		if (num_hist > num_bins)
 			num_hist = num_bins + 1;
 		if (num_hist >= 2)

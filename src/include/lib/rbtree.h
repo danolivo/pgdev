@@ -58,12 +58,14 @@ typedef int (*rbt_comparator) (const RBTNode *a, const RBTNode *b, void *arg);
 typedef void (*rbt_combiner) (RBTNode *existing, const RBTNode *newdata, void *arg);
 typedef RBTNode *(*rbt_allocfunc) (void *arg);
 typedef void (*rbt_freefunc) (RBTNode *x, void *arg);
+typedef void (*rbt_fixfunc) (RBTNode *x, void *arg);
 
 extern RBTree *rbt_create(Size node_size,
 						  rbt_comparator comparator,
 						  rbt_combiner combiner,
 						  rbt_allocfunc allocfunc,
 						  rbt_freefunc freefunc,
+						  rbt_fixfunc fixfunc,
 						  void *arg);
 
 extern RBTNode *rbt_find(RBTree *rbt, const RBTNode *data);

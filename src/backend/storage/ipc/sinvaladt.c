@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "access/transam.h"
+#include "access/xlog.h"
 #include "miscadmin.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
@@ -127,8 +128,8 @@
  * per iteration.
  */
 
-#define MAXNUMMESSAGES 4096
-#define MSGNUMWRAPAROUND (MAXNUMMESSAGES * 262144)
+#define MAXNUMMESSAGES 16384
+#define MSGNUMWRAPAROUND (MAXNUMMESSAGES * 65536)
 #define CLEANUP_MIN (MAXNUMMESSAGES / 2)
 #define CLEANUP_QUANTUM (MAXNUMMESSAGES / 16)
 #define SIG_THRESHOLD (MAXNUMMESSAGES / 2)
@@ -171,8 +172,6 @@ typedef struct SISeg
 	int			minMsgNum;		/* oldest message still needed */
 	int			maxMsgNum;		/* next message number to be assigned */
 	int			nextThreshold;	/* # of messages to call SICleanupQueue */
-
-	slock_t		msgnumLock;		/* spinlock protecting maxMsgNum */
 
 	/*
 	 * Circular buffer holding shared-inval messages
@@ -246,7 +245,6 @@ CreateSharedInvalidationState(void)
 	shmInvalBuffer->minMsgNum = 0;
 	shmInvalBuffer->maxMsgNum = 0;
 	shmInvalBuffer->nextThreshold = CLEANUP_MIN;
-	SpinLockInit(&shmInvalBuffer->msgnumLock);
 
 	/* The buffer[] array is initially all unused, so we need not fill it */
 
@@ -412,16 +410,21 @@ SIInsertDataEntries(const SharedInvalidationMessage *data, int n)
 		 * Insert new message(s) into proper slot of circular buffer
 		 */
 		max = segP->maxMsgNum;
-		while (nthistime-- > 0)
+		while (nthistime)
 		{
-			segP->buffer[max % MAXNUMMESSAGES] = *data++;
-			max++;
+			if ((MyDatabaseId == InvalidOid) || !data->isLocal)
+			{
+				segP->buffer[max % MAXNUMMESSAGES] = *data;
+				max++;
+				nthistime--;
+			}
+
+			data++;
 		}
 
 		/* Update current value of maxMsgNum using spinlock */
-		SpinLockAcquire(&segP->msgnumLock);
+		pg_memory_barrier();
 		segP->maxMsgNum = max;
-		SpinLockRelease(&segP->msgnumLock);
 
 		/*
 		 * Now that the maxMsgNum change is globally visible, we give everyone
@@ -507,11 +510,6 @@ SIGetDataEntries(SharedInvalidationMessage *data, int datasize)
 	 */
 	stateP->hasMessages = false;
 
-	/* Fetch current value of maxMsgNum using spinlock */
-	SpinLockAcquire(&segP->msgnumLock);
-	max = segP->maxMsgNum;
-	SpinLockRelease(&segP->msgnumLock);
-
 	if (stateP->resetState)
 	{
 		/*
@@ -519,12 +517,16 @@ SIGetDataEntries(SharedInvalidationMessage *data, int datasize)
 		 * since the reset, as well; and that means we should clear the
 		 * signaled flag, too.
 		 */
-		stateP->nextMsgNum = max;
+		stateP->nextMsgNum = segP->maxMsgNum;
 		stateP->resetState = false;
 		stateP->signaled = false;
 		LWLockRelease(SInvalReadLock);
 		return -1;
 	}
+
+	/* Fetch current value of maxMsgNum using spinlock */
+	max = segP->maxMsgNum;
+	pg_memory_barrier();
 
 	/*
 	 * Retrieve messages and advance backend's counter, until data array is

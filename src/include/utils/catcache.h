@@ -223,7 +223,7 @@ extern void ResetCatalogCaches(void);
 extern void ResetCatalogCachesExt(bool debug_discard);
 extern void CatalogCacheFlushCatalog(Oid catId);
 extern void CatCacheInvalidate(CatCache *cache, uint32 hashValue);
-extern void PrepareToInvalidateCacheTuple(Relation relation,
+extern void PrepareToInvalidateCacheTuple(Oid relid,
 										  HeapTuple tuple,
 										  HeapTuple newtuple,
 										  void (*function) (int, uint32, Oid));

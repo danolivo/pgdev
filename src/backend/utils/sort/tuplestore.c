@@ -545,7 +545,7 @@ tuplestore_select_read_pointer(Tuplestorestate *state, int ptr)
 int64
 tuplestore_tuple_count(Tuplestorestate *state)
 {
-	return state->tuples;
+	return (state) ? state->tuples : 0;
 }
 
 /*

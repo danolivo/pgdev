@@ -114,6 +114,7 @@
 #include "access/xact.h"
 #include "access/xloginsert.h"
 #include "catalog/catalog.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_constraint.h"
 #include "miscadmin.h"
 #include "storage/sinval.h"
@@ -273,6 +274,11 @@ static struct RELCACHECALLBACK
 
 static int	relcache_callback_count = 0;
 
+
+
+char temp_table_scope = TEMP_TABLE_SCOPE_NOTEMP;
+
+
 /* ----------------------------------------------------------------
  *				Invalidation subgroup support functions
  * ----------------------------------------------------------------
@@ -320,6 +326,14 @@ AddInvalidationMessage(InvalidationMsgsGroup *group, int subgroup,
 	}
 	/* Okay, add message to current group */
 	ima->msgs[nextindex] = *msg;
+
+	/* Mark message as local-only when it's related to temporary tables.
+	   Don't mark snapshot invalidation or any messages when higher that
+	   read commited isolation level, because it causes troubles. */
+	ima->msgs[nextindex].isLocal = IsLocalTempTableScope() &&
+	                               msg->id != SHAREDINVALSNAPSHOT_ID &&
+	                               XactIsoLevel == XACT_READ_COMMITTED;
+
 	group->nextmsg[subgroup]++;
 }
 
@@ -1211,6 +1225,8 @@ CacheInvalidateHeapTuple(Relation relation,
 	Oid			tupleRelId;
 	Oid			databaseId;
 	Oid			relationId;
+	bool		tempRel = false;
+	bool		checkTemp = false;
 
 	/* Do nothing during bootstrap */
 	if (IsBootstrapProcessingMode())
@@ -1247,7 +1263,7 @@ CacheInvalidateHeapTuple(Relation relation,
 		RegisterSnapshotInvalidation(databaseId, tupleRelId);
 	}
 	else
-		PrepareToInvalidateCacheTuple(relation, tuple, newtuple,
+		PrepareToInvalidateCacheTuple(tupleRelId, tuple, newtuple,
 									  RegisterCatcacheInvalidation);
 
 	/*
@@ -1266,6 +1282,9 @@ CacheInvalidateHeapTuple(Relation relation,
 			databaseId = InvalidOid;
 		else
 			databaseId = MyDatabaseId;
+
+		tempRel = (classtup->relpersistence == RELPERSISTENCE_TEMP) ?
+						true : false;
 	}
 	else if (tupleRelId == AttributeRelationId)
 	{
@@ -1284,6 +1303,7 @@ CacheInvalidateHeapTuple(Relation relation,
 		 * never come here for a shared rel anyway.)
 		 */
 		databaseId = MyDatabaseId;
+		checkTemp = true;
 	}
 	else if (tupleRelId == IndexRelationId)
 	{
@@ -1297,6 +1317,7 @@ CacheInvalidateHeapTuple(Relation relation,
 		 */
 		relationId = indextup->indexrelid;
 		databaseId = MyDatabaseId;
+		checkTemp = true;
 	}
 	else if (tupleRelId == ConstraintRelationId)
 	{
@@ -1318,10 +1339,29 @@ CacheInvalidateHeapTuple(Relation relation,
 	else
 		return;
 
+	if (checkTemp)
+	{
+		HeapTuple		htup = SearchSysCache1(RELOID, ObjectIdGetDatum(relationId));
+
+		if (HeapTupleIsValid(htup))
+		{
+			Form_pg_class c = (Form_pg_class)GETSTRUCT(htup);
+
+			tempRel = (c->relisshared == false &&
+					   c->relpersistence == RELPERSISTENCE_TEMP &&
+					   isTempOrTempToastNamespace(c->relnamespace)) ?
+					true : false;
+
+			ReleaseSysCache(htup);
+		}
+	}
+
 	/*
 	 * Yes.  We need to register a relcache invalidation event.
 	 */
+	BEGIN_TEMP_TABLE_SCOPE_LOCAL(tempRel);
 	RegisterRelcacheInvalidation(databaseId, relationId);
+	END_TEMP_TABLE_SCOPE();
 }
 
 /*
@@ -1373,7 +1413,11 @@ CacheInvalidateRelcache(Relation relation)
 	else
 		databaseId = MyDatabaseId;
 
+	BEGIN_TEMP_TABLE_SCOPE_LOCAL(relation->rd_rel->relisshared == false &&
+	                       RELATION_IS_LOCAL(relation) &&
+	                       !RELATION_IS_OTHER_TEMP(relation));
 	RegisterRelcacheInvalidation(databaseId, relationId);
+	END_TEMP_TABLE_SCOPE();
 }
 
 /*
@@ -1409,7 +1453,12 @@ CacheInvalidateRelcacheByTuple(HeapTuple classTuple)
 		databaseId = InvalidOid;
 	else
 		databaseId = MyDatabaseId;
+	
+	BEGIN_TEMP_TABLE_SCOPE_LOCAL(classtup->relisshared == false &&
+	                       classtup->relpersistence == RELPERSISTENCE_TEMP &&
+	                       isTempOrTempToastNamespace(classtup->relnamespace));
 	RegisterRelcacheInvalidation(databaseId, relationId);
+	END_TEMP_TABLE_SCOPE();
 }
 
 /*
@@ -1467,6 +1516,8 @@ CacheInvalidateSmgr(RelFileLocatorBackend rlocator)
 	msg.sm.backend_hi = rlocator.backend >> 16;
 	msg.sm.backend_lo = rlocator.backend & 0xffff;
 	msg.sm.rlocator = rlocator.locator;
+	msg.isLocal = false;
+
 	/* check AddCatcacheInvalidationMessage() for an explanation */
 	VALGRIND_MAKE_MEM_DEFINED(&msg, sizeof(msg));
 
@@ -1495,6 +1546,8 @@ CacheInvalidateRelmap(Oid databaseId)
 
 	msg.rm.id = SHAREDINVALRELMAP_ID;
 	msg.rm.dbId = databaseId;
+	msg.isLocal = false;
+
 	/* check AddCatcacheInvalidationMessage() for an explanation */
 	VALGRIND_MAKE_MEM_DEFINED(&msg, sizeof(msg));
 

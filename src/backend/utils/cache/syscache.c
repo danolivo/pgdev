@@ -21,6 +21,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/tempcat.h"
 #include "catalog/pg_db_role_setting_d.h"
 #include "catalog/pg_depend_d.h"
 #include "catalog/pg_description_d.h"
@@ -162,6 +163,8 @@ InitCatalogCache(void)
 				sizeof(Oid), oid_compare);
 
 	CacheInitialized = true;
+
+	temp_catalog_init();
 }
 
 /*
@@ -799,4 +802,21 @@ oid_compare(const void *a, const void *b)
 	Oid			ob = *((const Oid *) b);
 
 	return pg_cmp_u32(oa, ob);
+}
+
+HeapTuple TryGetSysCacheRelationClassTuple(Oid relid)
+{
+	HeapTuple tuple;
+
+	/* Fail if cache is unitialized */
+	if (!SysCache[RELOID])
+		return NULL;
+
+	/* Fail if cache didn't yet populated tuple description.
+	 * We better fail that miss the cache. */
+	if (!SysCache[RELOID]->cc_tupdesc)
+		return NULL;
+
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	return tuple;
 }

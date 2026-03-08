@@ -363,12 +363,17 @@ typedef struct ExprEvalStep
 		struct
 		{
 			bool	   *anynull;	/* track if any input was NULL */
+			bool		*guaranteed_empty;
+			bool		is_last;
+			int			*count_guaranteed_empty;
+			int			nargs;
 			int			jumpdone;	/* jump here if result determined */
 		}			boolexpr;
 
 		/* for EEOP_QUAL */
 		struct
 		{
+			bool		*guaranteed_empty;
 			int			jumpdone;	/* jump here on false or null */
 		}			qualexpr;
 
@@ -636,6 +641,7 @@ typedef struct ExprEvalStep
 		{
 			/* out-of-line state, created by nodeSubplan.c */
 			SubPlanState *sstate;
+			bool		*guaranteed_empty;
 		}			subplan;
 
 		/* for EEOP_AGG_*DESERIALIZE */

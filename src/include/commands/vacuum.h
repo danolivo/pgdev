@@ -170,6 +170,9 @@ typedef struct VacAttrStats
 	 */
 	int			tupattnum;		/* attribute number within tuples */
 	HeapTuple  *rows;			/* access info for std fetch function */
+	int         rowsAttrPitch;		/* access info for rows data */
+	Datum*      rowsAttrValues;
+	bool*       rowsAttrNulls;
 	TupleDesc	tupDesc;
 	Datum	   *exprvals;		/* access info for index fetch function */
 	bool	   *exprnulls;

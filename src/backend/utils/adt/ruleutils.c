@@ -39,6 +39,7 @@
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/tablespace.h"
+#include "common/hashfn.h"
 #include "common/keywords.h"
 #include "executor/spi.h"
 #include "funcapi.h"
@@ -291,6 +292,8 @@ typedef struct
 	int		   *leftattnos;		/* left-child varattnos of join cols, or 0 */
 	int		   *rightattnos;	/* right-child varattnos of join cols, or 0 */
 	List	   *usingNames;		/* names assigned to merged columns */
+
+	HTAB		*all_names;		/* hash to store all names colname_is_unique() */
 } deparse_columns;
 
 /* This macro is analogous to rt_fetch(), but for deparse_columns structs */
@@ -371,6 +374,7 @@ static void set_relation_column_names(deparse_namespace *dpns,
 									  deparse_columns *colinfo);
 static void set_join_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 								  deparse_columns *colinfo);
+static void add_colname(deparse_columns *colinfo, char *colname);
 static bool colname_is_unique(const char *colname, deparse_namespace *dpns,
 							  deparse_columns *colinfo);
 static char *make_colname_unique(char *colname, deparse_namespace *dpns,
@@ -4683,7 +4687,10 @@ set_join_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 					changed_any = true;
 			}
 			else
+			{
 				colinfo->new_colnames[j] = child_colname;
+				add_colname(colinfo, child_colname);
+			}
 		}
 
 		colinfo->is_new_col[j] = leftcolinfo->is_new_col[jc];
@@ -4732,7 +4739,10 @@ set_join_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 					changed_any = true;
 			}
 			else
+			{
 				colinfo->new_colnames[j] = child_colname;
+				add_colname(colinfo, child_colname);
+			}
 		}
 
 		colinfo->is_new_col[j] = rightcolinfo->is_new_col[jc];
@@ -4757,6 +4767,29 @@ set_join_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 		colinfo->printaliases = false;
 }
 
+static uint32
+pstring_hash(const void *key, Size keysize)
+{
+	return string_hash(*(const void **)key, NAMEDATALEN);
+}
+
+static int
+pstring_compare(const void *key1, const void *key2, Size keysize)
+{
+	return strncmp(*(const void **)key1, *(const void **)key2, keysize - 1);
+}
+
+static void
+add_colname(deparse_columns *colinfo, char *colname)
+{
+	if (colinfo->all_names)
+	{
+		bool found;
+
+		hash_search(colinfo->all_names, &colname, HASH_ENTER, &found);
+	}
+}
+
 /*
  * colname_is_unique: is colname distinct from already-chosen column names?
  *
@@ -4768,6 +4801,75 @@ colname_is_unique(const char *colname, deparse_namespace *dpns,
 {
 	int			i;
 	ListCell   *lc;
+
+	if (colinfo->all_names != NULL ||
+		(colinfo->num_cols + colinfo->num_new_cols +
+		 list_length(dpns->using_names) +
+		 list_length(colinfo->parentUsing)) > 64)
+	{
+		bool	found;
+
+		if (colinfo->all_names == NULL)
+		{
+			HASHCTL	hash_ctl;
+
+			MemSet(&hash_ctl, 0, sizeof(hash_ctl));
+
+			hash_ctl.keysize = sizeof(char*);
+			hash_ctl.entrysize = sizeof(char*);
+			hash_ctl.hash = pstring_hash;
+			hash_ctl.match = pstring_compare;
+
+			colinfo->all_names = hash_create("colname_is_unique storage",
+											 512, &hash_ctl,
+											 HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
+
+
+			for (i = 0; i < colinfo->num_cols; i++)
+			{
+				if (colinfo->colnames[i] == NULL)
+					continue;
+
+				hash_search(colinfo->all_names, &colinfo->colnames[i],
+							HASH_ENTER, &found);
+			}
+
+			for (i = 0; i < colinfo->num_new_cols; i++)
+			{
+				if (colinfo->new_colnames[i] == NULL)
+					continue;
+
+				hash_search(colinfo->all_names, &colinfo->new_colnames[i],
+							HASH_ENTER, &found);
+			}
+
+			foreach(lc, dpns->using_names)
+			{
+				char	 *oldname = (char *) lfirst(lc);
+
+				hash_search(colinfo->all_names, &oldname,
+							HASH_ENTER, &found);
+			}
+
+			foreach(lc, colinfo->parentUsing)
+			{
+				char	 *oldname = (char *) lfirst(lc);
+
+				hash_search(colinfo->all_names, &oldname,
+							HASH_ENTER, &found);
+			}
+		}
+
+		hash_search(colinfo->all_names, &colname, HASH_FIND, &found);
+
+		if (found)
+			return false;
+
+		hash_search(colinfo->all_names, &colname, HASH_ENTER, &found);
+		Assert(found == false);
+
+		return true;
+	}
 
 	/* Check against already-assigned column aliases within RTE */
 	for (i = 0; i < colinfo->num_cols; i++)
@@ -4820,6 +4922,8 @@ static char *
 make_colname_unique(char *colname, deparse_namespace *dpns,
 					deparse_columns *colinfo)
 {
+	CHECK_FOR_INTERRUPTS();
+
 	/*
 	 * If the selected name isn't unique, append digits to make it so.  For a
 	 * very long input name, we might have to truncate to stay within

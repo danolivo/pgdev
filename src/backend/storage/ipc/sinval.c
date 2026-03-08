@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "miscadmin.h"
 #include "nodes/memnodes.h"
 #include "storage/latch.h"
@@ -47,7 +48,26 @@ volatile sig_atomic_t catchupInterruptPending = false;
 void
 SendSharedInvalidMessages(const SharedInvalidationMessage *msgs, int n)
 {
-	SIInsertDataEntries(msgs, n);
+	int i;
+	int count = n;
+
+	/*
+	 * Execute local invalidation messages right away without inserting
+	 * into shared buffer.
+	 * Note: conditions must be in sync with SIInsertDataEntries function.
+	 */
+	if (MyDatabaseId != InvalidOid)
+	{
+		for (i=0; i<count; i++)
+			if (msgs[i].isLocal)
+			{
+				LocalExecuteInvalidationMessage((SharedInvalidationMessage*)&msgs[i]);
+				n--;
+			}
+	}
+
+	if (n)
+		SIInsertDataEntries(msgs, n);
 }
 
 /*
@@ -101,7 +121,6 @@ ReceiveSharedInvalidMessages(void (*invalFunction) (SharedInvalidationMessage *m
 		if (getResult < 0)
 		{
 			/* got a reset message */
-			elog(DEBUG4, "cache state reset");
 			SharedInvalidMessageCounter++;
 			resetFunction();
 			break;				/* nothing more to do */

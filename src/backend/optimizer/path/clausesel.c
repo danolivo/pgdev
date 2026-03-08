@@ -12,8 +12,16 @@
  *
  *-------------------------------------------------------------------------
  */
+#include <math.h>
 #include "postgres.h"
 
+#include "access/genam.h"
+#include "access/htup_details.h"
+#include "catalog/pg_collation.h"
+#include "common/pg_prng.h"
+#include "commands/vacuum.h"
+#include "funcapi.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
@@ -23,6 +31,17 @@
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
+
+#include "parser/parsetree.h"
+#include "utils/array.h"
+#include "utils/builtins.h"
+#include "utils/rel.h"
+#include "utils/syscache.h"
+#include "utils/typcache.h"
+
+#define EXHAUSTIVE_IN_SELECTIVITY_THRESHOLD (default_statistics_target/4)
+#define RANGE_IN_SELECTIVITY_THRESHOLD (default_statistics_target/20)
+#define MULTICOLUMN_STATISTIC_FALLBACK_DISTINCT_THRESHOLD (default_statistics_target)
 
 /*
  * Data structure for accumulating info about possible range-query
@@ -48,6 +67,1095 @@ static Selectivity clauselist_selectivity_or(PlannerInfo *root,
 											 JoinType jointype,
 											 SpecialJoinInfo *sjinfo,
 											 bool use_extended_stats);
+
+static bool treat_as_join_clause(PlannerInfo *root, Node *clause, RestrictInfo *rinfo,
+					 int varRelid, SpecialJoinInfo *sjinfo);
+
+typedef enum CorrelationKind {
+	CKRestrict = 0,
+	CKIndepend,		/* unknown correlation */
+	CKLikelySelf,	/* Seems, should be close to be correlated, like agg with
+					   self join */
+	CKSelf,			/* 100% correlation because of self join */
+	CKMul			/* product of all CKLikelySelf * CKSelf */
+} CorrelationKind;
+static CorrelationKind get_correlation_kind(PlannerInfo *root, int varRelid,
+											OpExpr* expr);
+
+/*
+ *  Get variabe node. Returns null if node is not a Var node.
+ */
+static inline Var*
+get_var(Node* node)
+{
+	if (IsA(node, RelabelType))
+		node = (Node *) ((RelabelType *) node)->arg;
+
+	return IsA(node, Var) ? (Var*)node : NULL;
+}
+
+/*
+ * Locate compound index which can be used for multicolumn clauses/join.
+ */
+static IndexOptInfo*
+locate_inner_multicolumn_index(PlannerInfo *root, Index varno, List* vars,
+						 int n_clauses,
+						 int **permutation, List **missed_vars, int* n_keys)
+{
+	ListCell		*ilist;
+	RelOptInfo		*rel = find_base_rel(root, varno);
+	IndexOptInfo	*index_opt = NULL;
+	List			*missed_vars_opt = NIL;
+	int				*permutation_opt = NULL;
+	int				n_index_cols_opt = 0;
+	bool			used[INDEX_MAX_KEYS];
+	int				posvars[INDEX_MAX_KEYS];
+
+	*n_keys = 0;
+	*missed_vars = NIL;
+
+	Assert(list_length(vars) >= 1);
+	Assert(list_length(vars) <= n_clauses);
+
+	foreach(ilist, rel->indexlist)
+	{
+		IndexOptInfo	*index = (IndexOptInfo *) lfirst(ilist);
+		ListCell		*vlist;
+		int				i, n_index_cols = 0;
+		List			*missed = NIL;
+		int				*perm = NULL;
+		int				last_idx = 0;
+
+		memset(used, 0, sizeof(used));
+		perm = palloc(n_clauses * sizeof(*perm));
+		for(i=0; i<n_clauses; i++)
+			perm[i] = -1;
+
+		i = 0;
+		foreach (vlist, vars)
+		{
+			Var* var = lfirst(vlist);
+			int pos;
+
+			for (pos = 0; pos < index->nkeycolumns; pos++)
+			{
+				if (index->indexkeys[pos] == var->varattno)
+				{
+					if (used[pos])
+						missed = lappend(missed, var);
+					else
+					{
+						used[pos] = true;
+						posvars[pos] = i;
+						perm[i] = pos;
+						n_index_cols++;
+						last_idx = Max(last_idx, pos);
+						break;
+					}
+				}
+			}
+
+			/* var isn't found in index columns */
+			if (pos == index->nkeycolumns && !list_member_ptr(missed, var))
+				missed = lappend(missed, var);
+
+			i += 1;
+		}
+
+		if (n_index_cols == 0)
+			continue;
+
+		/* check that found columns are first columns in index */
+		if (index->nkeycolumns != n_index_cols)
+		{
+			int old_n_index_cols = n_index_cols;
+
+			for (i = 0; i <= last_idx; i++)
+			{
+				if (n_index_cols != old_n_index_cols)
+				{
+					/*
+					 * We will use only first n_index_cols columns instead of
+					 * found old_n_index_cols, so, all other columns should be
+					 * added to missed list
+					 */
+					if (used[i])
+					{
+						Var *var = list_nth(vars, posvars[i]);
+
+						missed = lappend(missed, var);
+					}
+				}
+				else if (!used[i])
+				{
+					if (i==0)
+						/* there isn't useful prefix */
+						goto TryNextIndex;
+
+					/* we will use only first i columns, save as new n_index_cols */
+					n_index_cols = i;
+				}
+			}
+		}
+
+		/* found exact match vars - index, immediately return */
+		if (vlist == NULL && list_length(missed) == 0 && n_index_cols == index->nkeycolumns)
+		{
+			*permutation = perm;
+			*n_keys = n_index_cols;
+			return index;
+		}
+
+		/* save partially matched index */
+		if (index_opt == NULL ||
+			n_index_cols > n_index_cols_opt ||
+			(n_index_cols == n_index_cols_opt && index->nkeycolumns < index_opt->nkeycolumns))
+		{
+			index_opt = index;
+			missed_vars_opt = missed;
+			if (permutation_opt)
+				pfree(permutation_opt);
+			permutation_opt = perm;
+			perm = NULL;
+			n_index_cols_opt = n_index_cols;
+		}
+TryNextIndex:
+		if (perm)
+			pfree(perm);
+	}
+
+	if (index_opt)
+	{
+		*missed_vars = list_concat_unique(*missed_vars, missed_vars_opt);
+		*permutation = permutation_opt;
+		*n_keys = n_index_cols_opt;
+	}
+
+	return index_opt;
+}
+
+/*
+ * verify that used vars are leading columns
+ */
+static bool
+check_leading_vars_index(IndexOptInfo *index, int n_vars,
+						 bool used[INDEX_MAX_KEYS])
+{
+	int	i;
+
+	if (index->nkeycolumns == n_vars)
+		return true;
+
+	for(i=0; i<n_vars; i++)
+		if (used[i] == false)
+			return false;
+
+	return true;
+}
+
+
+/*
+ * Locate index which exactly match joins vars
+ */
+static IndexOptInfo*
+locate_outer_multicolumn_index(PlannerInfo *root, Index varno, List* vars,
+							   int *permutation)
+{
+	ListCell   *ilist;
+	RelOptInfo* rel = find_base_rel(root, varno);
+	int n_vars = list_length(vars);
+	bool	used[INDEX_MAX_KEYS];
+	IndexOptInfo *index_opt = NULL;
+
+	Assert(n_vars >= 1);
+
+	foreach(ilist, rel->indexlist)
+	{
+		IndexOptInfo	*index = (IndexOptInfo *) lfirst(ilist);
+		ListCell		*vlist;
+		int				i;
+
+		if (index->nkeycolumns < n_vars)
+			continue;
+
+		memset(used, 0, sizeof(used));
+
+		i = 0;
+		foreach (vlist, vars)
+		{
+			Var* var = lfirst(vlist);
+
+			if (permutation[i] < 0 ||
+				index->nkeycolumns <= permutation[i] ||
+				index->indexkeys[permutation[i]] != var->varattno)
+				break;
+
+			used[i] = true;
+			i += 1;
+		}
+
+		if (vlist == NULL && check_leading_vars_index(index, n_vars, used))
+		{
+			if (index->nkeycolumns == n_vars)
+				/* found exact match vars - index, immediately return */
+				return index;
+			else if (index_opt == NULL ||
+					 index_opt->nkeycolumns > index->nkeycolumns)
+				/* found better candidate - store it */
+				index_opt = index;
+		}
+	}
+
+	return index_opt;
+}
+
+typedef struct InArrayClause
+{
+	ArrayType*	array;
+	Datum*		elems;
+	bool*		nulls;
+	int			index;
+	int			n_elems;
+	int			curr_elem;
+} InArrayClause;
+
+typedef struct TupleIterator
+{
+	Datum	values	[INDEX_MAX_KEYS];
+	bool	isnull[INDEX_MAX_KEYS];
+	int		n_variants;
+	int		i_variant;
+	int		*permutation;
+	List	*in_clauses;
+	bool	isExhaustive;
+} TupleIterator;
+
+static void
+initTupleIterator(TupleIterator *it, List *consts, int *permutation,
+				  List *in_clauses)
+{
+	ListCell	*l;
+	int			i;
+	double		n_variants = 1;
+
+	it->n_variants = 1;
+	it->permutation = permutation;
+	it->in_clauses = in_clauses;
+	it->isExhaustive = false;
+	for(i = 0; i < INDEX_MAX_KEYS; i++)
+		it->isnull[i] = true;
+
+	i = 0;
+	foreach (l, consts)
+	{
+		Const* c = (Const*) lfirst(l);
+		int j = permutation[i++];
+
+		if (j<0)
+			continue;
+		it->values[j] = c->constvalue;
+		it->isnull[j] = c->constisnull;
+	}
+
+	foreach (l, in_clauses)
+	{
+		InArrayClause*	iac = (InArrayClause*) lfirst(l);
+		int16			elmlen;
+		bool			elmbyval;
+		char			elmalign;
+
+		get_typlenbyvalalign(iac->array->elemtype,
+							 &elmlen, &elmbyval, &elmalign);
+		deconstruct_array(iac->array, iac->array->elemtype,
+						  elmlen, elmbyval, elmalign,
+						  &iac->elems, &iac->nulls, &iac->n_elems);
+		iac->curr_elem = 0;
+		n_variants *= (double)iac->n_elems;
+	}
+
+	if (n_variants > EXHAUSTIVE_IN_SELECTIVITY_THRESHOLD)
+	{
+		it->isExhaustive = true;
+		it->n_variants = EXHAUSTIVE_IN_SELECTIVITY_THRESHOLD;
+	}
+	else
+		it->n_variants = n_variants;
+
+	it->i_variant = it->n_variants;
+}
+
+static void
+resetTupleIterator(TupleIterator *it)
+{
+	ListCell	*l;
+
+	it->i_variant = it->n_variants;
+
+	foreach (l, it->in_clauses)
+	{
+		InArrayClause*  iac = (InArrayClause*) lfirst(l);
+
+		iac->curr_elem = 0;
+	}
+}
+
+static bool
+getTupleIterator(TupleIterator *it)
+{
+	ListCell	*l;
+	int			carry = 1;
+
+	if (it->i_variant == 0)
+		return false;
+
+	it->i_variant--;
+
+	foreach (l, it->in_clauses)
+	{
+		InArrayClause* iac = (InArrayClause*) lfirst(l);
+		int j = it->permutation[iac->index];
+
+		if (j<0)
+			continue;
+
+		if (it->isExhaustive)
+		{
+			/* use random subset of IN list(s) */
+			iac->curr_elem = pg_prng_uint64(&pg_global_prng_state) % iac->n_elems;
+		}
+		else if ((iac->curr_elem += carry) >= iac->n_elems)
+		{
+			iac->curr_elem = 0;
+			carry = 1;
+		}
+		else
+			carry = 0;
+
+		it->values[j] = iac->elems[iac->curr_elem];
+		it->isnull[j] = iac->nulls[iac->curr_elem];
+	}
+
+	return true;
+}
+
+static double
+get_numdistinct(PlannerInfo *root, IndexOptInfo* index, int n_keys)
+{
+	double numdistinct = 1.0;
+	ListCell	*lc;
+	int			i = 0;
+
+	foreach(lc, index->indextlist)
+	{
+		TargetEntry *tle = lfirst(lc);
+		VariableStatData	vardata;
+		bool				isdefault;
+
+		examine_variable(root, (Node*)tle->expr, 0, &vardata);
+
+		numdistinct *= get_variable_numdistinct(&vardata, &isdefault);
+
+		ReleaseVariableStats(vardata);
+
+		if (++i >= n_keys)
+			break;
+	}
+
+	if (numdistinct > index->tuples)
+		numdistinct = index->tuples;
+
+	return numdistinct;
+}
+
+static Selectivity
+estimate_selectivity_by_index(PlannerInfo *root, IndexOptInfo* index,
+							  VariableStatData *vardata,
+							  List *consts, List** missed_vars, int *permutation,
+							  List *in_clauses, int n_keys,
+							  bool *usedEqSel,
+							  bool *isWeakSelectivity)
+{
+	TupleIterator	it;
+	Selectivity		sum = 0.0;
+	TypeCacheEntry	*typentry;
+	Datum			constant;
+	int				nBins;
+	double			nDistinct = 0.0;
+
+	*isWeakSelectivity = false;
+
+	if (n_keys < index->nkeycolumns )
+	{
+		double	nd;
+		bool				isdefault;
+
+		nDistinct = get_numdistinct(root, index, n_keys);
+		nd = get_variable_numdistinct(vardata, &isdefault);
+
+		if (isdefault == false && nDistinct > nd)
+			nDistinct = sqrt(nDistinct * nd);
+	}
+
+	/*
+	 * Assume that two compound types are coherent, so we can use equality
+	 * function from one type to compare it with other type. Use >= and <= range
+	 * definition.
+	 */
+	typentry = lookup_type_cache(vardata->atttype,
+								 TYPECACHE_EQ_OPR | TYPECACHE_TUPDESC);
+	initTupleIterator(&it, consts, permutation, in_clauses);
+
+	/*
+	 * Try to  simplify calculations: if all variants matches to small amount of
+	 * bins histogram the we don't need to check tuples separately, it's enough
+	 * to checck min and max tuples and compute selecivity by range of bins
+	 */
+
+	if (n_keys != index->nkeycolumns &&
+		it.n_variants > RANGE_IN_SELECTIVITY_THRESHOLD)
+	{
+		Datum	constantMax = 0,
+				constantMin = 0;
+		FmgrInfo		opprocLT, opprocGT;
+
+		fmgr_info(F_RECORD_GT, &opprocGT);
+		fmgr_info(F_RECORD_LT, &opprocLT);
+
+		/*
+		 * Find min and max tuples
+		 */
+		while(getTupleIterator(&it))
+		{
+			/* we check cache invalidation message */
+			if (typentry->tupDesc == NULL)
+				typentry = lookup_type_cache(vardata->atttype,
+											 TYPECACHE_EQ_OPR | TYPECACHE_TUPDESC);
+			constant = HeapTupleGetDatum(heap_form_tuple(typentry->tupDesc,
+														 it.values, it.isnull));
+
+			if (constantMax == 0 ||
+				DatumGetBool(FunctionCall2Coll(&opprocGT,
+											   DEFAULT_COLLATION_OID,
+											   constant, constantMax)))
+			{
+				constantMax = constant;
+				if (constantMin != 0)
+					continue;
+			}
+			if (constantMin == 0 ||
+				DatumGetBool(FunctionCall2Coll(&opprocLT,
+											   DEFAULT_COLLATION_OID,
+											   constant, constantMin)))
+			{
+				constantMin = constant;
+			}
+		}
+
+		sum = prefix_record_histogram_selectivity(vardata,
+												  constantMin, constantMax,
+												  n_keys, nDistinct,
+												  &nBins);
+
+		if (sum > 0 && (nBins == it.n_variants || nBins <=2))
+			/*
+			 * conclude that all  tuples are in the same, rather small, range of
+			 * bins
+			 */
+			goto finish;
+
+		/*
+		 * let try tuples one by one
+		 */
+		sum = 0.0;
+		resetTupleIterator(&it);
+	}
+
+	while(getTupleIterator(&it))
+	{
+		Selectivity	s;
+
+		/* we check cache invalidation message */
+		if (typentry->tupDesc == NULL)
+			typentry = lookup_type_cache(vardata->atttype,
+										 TYPECACHE_EQ_OPR | TYPECACHE_TUPDESC);
+		constant = HeapTupleGetDatum(heap_form_tuple(typentry->tupDesc,
+													 it.values, it.isnull));
+
+		if (n_keys != index->nkeycolumns)
+		{
+			s = prefix_record_histogram_selectivity(vardata,
+													constant, constant,
+													n_keys,
+													nDistinct,
+													&nBins);
+
+			if (nBins == 0 && n_keys < index->nkeycolumns && nDistinct > MULTICOLUMN_STATISTIC_FALLBACK_DISTINCT_THRESHOLD)
+				*isWeakSelectivity = true;
+
+			if (s < 0)
+			{
+				/*
+				 * There is no histogram, fallback to single available option
+				 */
+				s = eqconst_selectivity(typentry->eq_opr, DEFAULT_COLLATION_OID, vardata,
+											 constant, false, true, false,
+											 n_keys);
+
+				if (usedEqSel)
+					*usedEqSel = true;
+			}
+		}
+		else
+		{
+			s = eqconst_selectivity(typentry->eq_opr, DEFAULT_COLLATION_OID, vardata,
+									constant, false, true, false,
+									-1);
+		}
+
+		sum += s - s*sum;
+	}
+
+finish:
+	if (it.isExhaustive)
+		sum *= ((double)(it.n_variants))/EXHAUSTIVE_IN_SELECTIVITY_THRESHOLD;
+
+	return sum;
+}
+
+typedef struct ClauseVarPair
+{
+	Var		*var;
+	int		idx;
+} ClauseVarPair;
+
+static void
+appendCVP(List **cvp, Var *var, int idx)
+{
+	ClauseVarPair	*e;
+
+	e = palloc(sizeof(*e));
+	e->var = var;
+	e->idx = idx;
+
+	*cvp = lappend(*cvp, e);
+}
+
+static int
+findCVP(List* cvp, Var* var)
+{
+	ListCell* lc;
+	foreach(lc, cvp)
+	{
+		ClauseVarPair* c = (ClauseVarPair*)lfirst(lc);
+		if (c->var == var)
+			return c->idx;
+	}
+	return -1;
+}
+
+static bool
+initVarData(IndexOptInfo *index, VariableStatData *vardata)
+{
+	Relation	indexRel = index_open(index->indexoid, AccessShareLock);
+
+	if (!indexRel->rd_rel->reltype)
+	{
+		index_close(indexRel, AccessShareLock);
+
+		return false;
+	}
+
+	memset(vardata, 0, sizeof(*vardata));
+	vardata->isunique = index->unique;
+	vardata->atttype = indexRel->rd_rel->reltype;
+	vardata->rel = index->rel;
+	vardata->acl_ok = true;
+	vardata->statsTuple = SearchSysCache3(STATRELATTINH,
+										  ObjectIdGetDatum(index->indexoid),
+										  Int16GetDatum(1),
+										  BoolGetDatum(false));
+	vardata->freefunc = ReleaseSysCache;
+
+	index_close(indexRel, AccessShareLock);
+
+	if (!HeapTupleIsValid(vardata->statsTuple))
+	{
+		ReleaseVariableStats(*vardata);
+		return false;
+	}
+
+	vardata->sslots = index->sslots;
+
+	return true;
+}
+
+static int
+markEstimatedColumns(Bitmapset **estimatedclauses, List	*pairs,
+					 List	*vars, List	*missed_vars)
+{
+	ListCell	*l;
+	int			n_estimated = 0;
+
+	foreach(l, vars)
+	{
+		Var* var = (Var *) lfirst(l);
+		ListCell	*ll;
+
+		if (list_member_ptr(missed_vars, var))
+			continue;
+
+		foreach(ll, pairs)
+		{
+			ClauseVarPair *cvp=(ClauseVarPair*)lfirst(ll);
+
+			if (cvp->var == var)
+			{
+				*estimatedclauses = bms_add_member(*estimatedclauses, cvp->idx);
+				n_estimated += 1;
+				break;
+			}
+		}
+
+		Assert(ll != NULL);
+	}
+
+	return n_estimated;
+}
+
+#define SET_VARNOS(vn) do {										\
+	if ((vn) != 0)												\
+	{															\
+		if (data[0].varno == 0)									\
+			data[0].varno = (vn);								\
+		else if (data[1].varno == 0 && data[0].varno != (vn))	\
+			data[1].varno = (vn);								\
+	}															\
+} while(0)
+
+#define GET_RELBY_NO(vn)	\
+((data[0].varno == (vn) && (vn) != 0) ? &data[0] : ((data[1].varno == (vn) && (vn) != 0) ? &data[1] : NULL))
+
+#define SET_CURDATA(vn)	((cur = GET_RELBY_NO(vn)) != NULL)
+
+static bool
+hasSAOPRestriction(List *clauses, Bitmapset *estimatedclauses)
+{
+	ListCell	*l;
+	int		i = -1;
+
+	foreach(l, clauses)
+	{
+		Node* clause = (Node *) lfirst(l);
+		RestrictInfo	*rinfo = NULL;
+
+		i++;
+		if (bms_is_member(i, estimatedclauses))
+			continue;
+
+		if (IsA(clause, RestrictInfo))
+		{
+			rinfo = (RestrictInfo *) clause;
+			if (!rinfo->orclause)
+				clause = (Node*)rinfo->clause;
+		}
+
+		if (IsA(clause, ScalarArrayOpExpr))
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Check if clauses represent multicolumn join with compound indexes available
+ * for both side of comparison of indexed columns of one relation with constant
+ * values. If so, calculates selectivity of compound type comparison and returns
+ * true.
+ */
+static bool
+use_multicolumn_statistic(PlannerInfo *root, List *clauses, int varRelid,
+						  JoinType jointype, SpecialJoinInfo *sjinfo,
+						  Selectivity* restrict_selectivity, Selectivity *join_selectivity,
+						  Bitmapset	**estimatedclauses, CorrelationKind
+						  *correlationKind)
+{
+	ListCell			*l;
+	List*				var_clause_map = NIL;
+	List*				missed_vars = NIL;
+	int					i;
+	int					*permutation = NULL;
+	int					n_estimated = 0;
+	int					n_keys;
+	TypeCacheEntry		*typentry;
+
+	struct	{
+		Index				varno;
+
+		List				*restrictionColumns;
+		List				*restrictionConsts;
+		List				*in_clauses;
+		List				*ineqRestrictionClauses;
+
+		List				*joinColumns;
+
+		IndexOptInfo		*index;
+		VariableStatData	vardata;
+	} data[2], *cur;
+
+	if (list_length(clauses) < 1)
+		return false;
+
+	/*
+	 * For simple queries default estimator is good enough, but multicolumn
+	 * statistic could be too expensive because of search and decompress a lot
+	 * of stat data (histogramm of multicolumn indexes).
+	 */
+	if (root->join_rel_list == NIL &&
+		root->simple_rel_array_size <= 2 /* 0th is always empty */ &&
+		/* list_length(clauses) < 4 && */
+		hasSAOPRestriction(clauses, *estimatedclauses) == false)
+		return false;
+
+	*correlationKind = CKIndepend;
+	memset(data, 0, sizeof(data));
+
+	i=-1;
+	foreach(l, clauses)
+	{
+		Node* clause = (Node *) lfirst(l);
+		RestrictInfo* rinfo = NULL;
+		OpExpr	   *opclause = NULL;
+
+		i++;
+
+		/* do not use already estimated clauses */
+		if (bms_is_member(i, *estimatedclauses))
+			continue;
+
+		if (IsA(clause, RestrictInfo))
+		{
+			rinfo = (RestrictInfo *) clause;
+			if (!rinfo->orclause)
+				clause = (Node*)rinfo->clause;
+		}
+		if (IsA(clause, OpExpr))
+			opclause = (OpExpr*)clause;
+
+		if (IsA(clause, Var)) /* boolean variable */
+		{
+			Var* var1 = (Var*)clause;
+
+			SET_VARNOS(var1->varno);
+			if (SET_CURDATA(var1->varno))
+			{
+				cur->restrictionColumns = lappend(cur->restrictionColumns, var1);
+				appendCVP(&var_clause_map, var1, i);
+				cur->restrictionConsts = lappend(cur->restrictionConsts,
+												 makeBoolConst(true, false));
+			}
+		}
+		else if (IsA(clause, BoolExpr) && ((BoolExpr*)clause)->boolop == NOT_EXPR) /* (NOT bool_expr) */
+		{
+			Node* arg1 = (Node*) linitial( ((BoolExpr*)clause)->args);
+			Var* var1 = get_var(arg1);
+
+			if (var1 == NULL)
+				continue;
+
+			SET_VARNOS(var1->varno);
+			if (SET_CURDATA(var1->varno))
+			{
+				cur->restrictionColumns = lappend(cur->restrictionColumns, var1);
+				appendCVP(&var_clause_map, var1, i);
+				cur->restrictionConsts = lappend(cur->restrictionConsts,
+												 makeBoolConst(false, false));
+			}
+		}
+		else if (IsA(clause, ScalarArrayOpExpr))
+		{
+			ScalarArrayOpExpr* in = (ScalarArrayOpExpr*)clause;
+			Var* var1;
+			Node* arg2;
+			InArrayClause* iac;
+
+			var1 = get_var((Node*)linitial(in->args));
+			arg2 = (Node*) lsecond(in->args);
+
+			if (!in->useOr
+				|| list_length(in->args) != 2
+				|| get_oprrest(in->opno) != F_EQSEL
+				|| var1 == NULL
+				|| !IsA(arg2, Const))
+			{
+				continue;
+			}
+
+			SET_VARNOS(var1->varno);
+			if (SET_CURDATA(var1->varno))
+			{
+				cur->restrictionColumns = lappend(cur->restrictionColumns, var1);
+				appendCVP(&var_clause_map, var1, i);
+				cur->restrictionConsts = lappend(cur->restrictionConsts, arg2);
+
+				iac = (InArrayClause*)palloc(sizeof(InArrayClause));
+				iac->array = (ArrayType*)DatumGetPointer(((Const*)arg2)->constvalue);
+				iac->index = list_length(cur->restrictionConsts) - 1;
+
+				cur->in_clauses = lappend(cur->in_clauses, iac);
+			}
+		}
+		else if (opclause
+				 && list_length(opclause->args) == 2)
+		{
+			int oprrest = get_oprrest(opclause->opno);
+			Node* arg1 = (Node*) linitial(opclause->args);
+			Node* arg2 = (Node*) lsecond(opclause->args);
+			Var* var1 = get_var(arg1);
+			Var* var2 = get_var(arg2);
+
+			if (oprrest == F_EQSEL && treat_as_join_clause(root, (Node*)opclause, NULL, varRelid, sjinfo))
+			{
+				if (var1 == NULL || var2 == NULL || var1->vartype != var2->vartype)
+					continue;
+
+				SET_VARNOS(var1->varno);
+				SET_VARNOS(var2->varno);
+
+				if (var1->varno == data[0].varno && var2->varno == data[1].varno)
+				{
+					data[0].joinColumns = lappend(data[0].joinColumns, var1);
+					appendCVP(&var_clause_map, var1, i);
+					data[1].joinColumns = lappend(data[1].joinColumns, var2);
+					appendCVP(&var_clause_map, var2, i);
+				}
+				else if (var1->varno == data[1].varno && var2->varno == data[0].varno)
+				{
+					data[0].joinColumns = lappend(data[0].joinColumns, var2);
+					appendCVP(&var_clause_map, var2, i);
+					data[1].joinColumns = lappend(data[1].joinColumns, var1);
+					appendCVP(&var_clause_map, var1, i);
+				}
+			}
+			else /* Estimate selectivity for a restriction clause. */
+			{
+				/*
+				 * Give up if it is not equality comparison of variable with
+				 * constant or some other clause is treated as join condition
+				 */
+				if (((var1 == NULL) == (var2 == NULL)))
+					continue;
+
+				if (var1 == NULL)
+				{
+					/* swap var1 and var2 */
+					var1 = var2;
+					arg2 = arg1;
+				}
+
+				SET_VARNOS(var1->varno);
+
+				if (SET_CURDATA(var1->varno))
+				{
+					if ((rinfo && is_pseudo_constant_clause_relids(arg2, rinfo->right_relids))
+						|| (!rinfo && NumRelids(root, clause) == 1 && is_pseudo_constant_clause(arg2)))
+					{
+						/* Restriction clause with a pseudoconstant . */
+						Node* const_val = estimate_expression_value(root, arg2);
+
+						if (IsA(const_val, Const))
+						{
+							switch (oprrest)
+							{
+								case F_EQSEL:
+									cur->restrictionColumns =
+										lappend(cur->restrictionColumns, var1);
+									cur->restrictionConsts =
+										lappend(cur->restrictionConsts, const_val);
+									appendCVP(&var_clause_map, var1, i);
+									break;
+								case F_SCALARGTSEL:
+								case F_SCALARGESEL:
+								case F_SCALARLTSEL:
+								case F_SCALARLESEL:
+									/*
+									 * We do not consider range predicates now,
+									 * but we can mark them as estimated
+									 * if their variables are covered by index.
+									 */
+									appendCVP(&var_clause_map, var1, i);
+									cur->ineqRestrictionClauses =
+										lappend(cur->ineqRestrictionClauses, var1);
+									break;
+								default:
+									break;
+							}
+						}
+					}
+
+				}
+			}
+		}
+		/* else just skip clause to work with it later in caller */
+	}
+
+	*restrict_selectivity = 1.0;
+	*join_selectivity = 1.0;
+
+	/*
+	 * First, try to estimate selectivity by restrictions
+	 */
+	for(i=0; i<lengthof(data); i++)
+	{
+		cur = &data[i];
+
+		/* compute restriction clauses if applicable */
+		if (cur->varno == 0 || list_length(cur->restrictionColumns) < 1)
+			continue;
+
+		cur->index = locate_inner_multicolumn_index(
+					root, cur->varno, cur->restrictionColumns,
+					list_length(clauses), &permutation, &missed_vars, &n_keys);
+
+		if (cur->index && n_keys > 1 &&
+			initVarData(cur->index, &cur->vardata))
+		{
+			bool	usedEqSel= false;
+			double s;
+			bool usedWeakSelectivity;
+
+			s = estimate_selectivity_by_index(
+									root, cur->index, &cur->vardata,
+									cur->restrictionConsts, &missed_vars, permutation,
+									cur->in_clauses, n_keys, &usedEqSel, &usedWeakSelectivity);
+
+			if (usedWeakSelectivity)
+			{
+				double simpleSelectivity = 1.0;
+				foreach(l, cur->restrictionColumns)
+				{
+					Node* clause;
+					int   clauseIndex;
+					double clauseSelectivity;
+					
+					clauseIndex = findCVP(var_clause_map, (Var*)lfirst(l));
+					if (clauseIndex < 0)
+					{
+						simpleSelectivity = -1;
+						break;
+					}
+
+					clause = (Node*)list_nth(clauses, clauseIndex);
+
+					clauseSelectivity = clause_selectivity_ext(root, clause, varRelid, jointype, sjinfo, false);
+					
+					simpleSelectivity *= clauseSelectivity;
+				}
+
+				if (simpleSelectivity > 0 && simpleSelectivity < s)
+				{
+					s = simpleSelectivity;
+				}
+			}
+
+			*restrict_selectivity *= s;
+
+			ReleaseVariableStats(cur->vardata);
+
+			/*
+			 * mark inequality clauses as used, see estimate_selectivity_by_index()
+			 */
+			if (usedEqSel)
+			{
+				foreach(l, cur->ineqRestrictionClauses)
+				{
+					Var* var = (Var *) lfirst(l);
+
+					/*
+					 * Note, restrictionColumns will contains extra columns !
+					 */
+					for(i=0; i<cur->index->nkeycolumns; i++)
+						if (cur->index->indexkeys[i] == var->varattno)
+							cur->restrictionColumns =
+								lappend(cur->restrictionColumns, var);
+				}
+			}
+
+			n_estimated +=
+				markEstimatedColumns(estimatedclauses, var_clause_map,
+									 cur->restrictionColumns, missed_vars);
+		}
+
+		if (permutation)
+		{
+			pfree(permutation);
+			permutation = NULL;
+		}
+	}
+
+	/* Deal with join clauses, if possible */
+	if (list_length(data[0].joinColumns) < 1)
+		goto cleanup;
+
+	data[0].index = locate_inner_multicolumn_index(
+						root,
+						data[0].varno, data[0].joinColumns,
+						list_length(clauses), &permutation, &missed_vars, &n_keys);
+
+	if (!data[0].index || n_keys < 1)
+		goto cleanup;
+
+	Assert(permutation != NULL);
+	Assert(data[1].varno != 0);
+	Assert(list_length(data[0].joinColumns) == list_length(data[1].joinColumns));
+
+	data[1].index = locate_outer_multicolumn_index(
+										root,
+										data[1].varno, data[1].joinColumns,
+										permutation);
+
+	if (!data[1].index)
+		goto cleanup;
+
+	if (!initVarData(data[0].index, &data[0].vardata))
+		goto cleanup;
+
+	if (!initVarData(data[1].index, &data[1].vardata))
+	{
+		ReleaseVariableStats(data[0].vardata);
+		goto cleanup;
+	}
+
+	typentry = lookup_type_cache(data[0].vardata.atttype, TYPECACHE_EQ_OPR);
+	*join_selectivity *= eqjoin_selectivity(root, typentry->eq_opr,
+											DEFAULT_COLLATION_OID,
+											&data[0].vardata, &data[1].vardata,
+											sjinfo, n_keys);
+
+	/* for self join */
+	if (data[0].index->indexoid == data[1].index->indexoid)
+		*correlationKind = CKSelf;
+	else
+	{
+		RangeTblEntry *lrte = planner_rt_fetch(data[0].index->rel->relid, root),
+					  *rrte = planner_rt_fetch(data[1].index->rel->relid, root);
+
+		if (lrte->relid == rrte->relid)
+			*correlationKind = CKSelf;
+	}
+
+	for (i = 0; i < lengthof(data); i++)
+		ReleaseVariableStats(data[i].vardata);
+
+	n_estimated +=
+				markEstimatedColumns(estimatedclauses, var_clause_map,
+									 data[0].joinColumns, missed_vars);
+
+cleanup:
+	if (permutation)
+		pfree(permutation);
+
+	return n_estimated != 0;
+}
 
 /****************************************************************************
  *		ROUTINES TO COMPUTE SELECTIVITIES
@@ -96,6 +1204,54 @@ static Selectivity clauselist_selectivity_or(PlannerInfo *root,
  * Of course this is all very dependent on the behavior of the inequality
  * selectivity functions; perhaps some day we can generalize the approach.
  */
+
+static void
+appendSelectivityRes(Selectivity s[5], Selectivity sel, CorrelationKind ck)
+{
+	switch(ck)
+	{
+		case CKRestrict:
+			s[ck] *= sel;
+			break;
+		case CKSelf:
+		case CKLikelySelf:
+			s[CKMul] *= sel;
+			if (s[ck] > sel)
+				s[ck] = sel;
+			/* FALLTHROUGH */
+		case CKIndepend:
+			s[CKIndepend] *= sel;
+			break;
+		default:
+			elog(ERROR, "unknown selectivity kind: %d", ck);
+	}
+}
+
+static Selectivity
+finalizeSelectivityRes(Selectivity s[5])
+{
+	Selectivity	sel;
+
+	sel = s[CKRestrict] * s[CKIndepend];
+
+	if (s[CKIndepend] != s[CKMul])
+	{
+		/* we have both independ and correlated - fallback */
+		sel *= s[CKMul];
+	}
+	else
+	{
+		/* we have only correlated join clauses */
+		if (s[CKLikelySelf] != 1.0 && sel < s[CKLikelySelf])
+			sel = sel + (s[CKLikelySelf] - sel) * 0.25;
+
+		if (s[CKSelf] != 1.0 && sel < s[CKSelf])
+			sel = sel + (s[CKSelf] - sel) * 1.0;
+	}
+
+	return sel;
+}
+
 Selectivity
 clauselist_selectivity(PlannerInfo *root,
 					   List *clauses,
@@ -121,12 +1277,14 @@ clauselist_selectivity_ext(PlannerInfo *root,
 						   SpecialJoinInfo *sjinfo,
 						   bool use_extended_stats)
 {
-	Selectivity s1 = 1.0;
+	Selectivity s[5 /* per CorrelationKind */]  = {1.0, 1.0, 1.0, 1.0, 1.0};
+	Selectivity s2 = 1.0, s3 = 1.0;
 	RelOptInfo *rel;
 	Bitmapset  *estimatedclauses = NULL;
 	RangeQueryClause *rqlist = NULL;
 	ListCell   *l;
 	int			listidx;
+	CorrelationKind ck;
 
 	/*
 	 * If there's exactly one clause, just go directly to
@@ -150,9 +1308,23 @@ clauselist_selectivity_ext(PlannerInfo *root,
 		 * 'estimatedclauses' is populated with the 0-based list position
 		 * index of clauses estimated here, and that should be ignored below.
 		 */
-		s1 = statext_clauselist_selectivity(root, clauses, varRelid,
+		s2 = statext_clauselist_selectivity(root, clauses, varRelid,
 											jointype, sjinfo, rel,
 											&estimatedclauses, false);
+		appendSelectivityRes(s, s2, CKRestrict);
+	}
+
+	/*
+	 * Check if join conjuncts corresponds to some compound indexes on left and
+	 * right joined relations or indexed columns of one relation is compared
+	 * with constant values. In this case selectivity of join can be calculated
+	 * based on statistic of this compound index.
+	 */
+	while(use_multicolumn_statistic(root, clauses, varRelid, jointype, sjinfo,
+									&s2, &s3, &estimatedclauses, &ck))
+	{
+		appendSelectivityRes(s, s2, CKRestrict);
+		appendSelectivityRes(s, s3, ck);
 	}
 
 	/*
@@ -168,7 +1340,6 @@ clauselist_selectivity_ext(PlannerInfo *root,
 	{
 		Node	   *clause = (Node *) lfirst(l);
 		RestrictInfo *rinfo;
-		Selectivity s2;
 
 		listidx++;
 
@@ -194,7 +1365,7 @@ clauselist_selectivity_ext(PlannerInfo *root,
 			rinfo = (RestrictInfo *) clause;
 			if (rinfo->pseudoconstant)
 			{
-				s1 = s1 * s2;
+				appendSelectivityRes(s, s2, CKRestrict);
 				continue;
 			}
 			clause = (Node *) rinfo->clause;
@@ -208,11 +1379,16 @@ clauselist_selectivity_ext(PlannerInfo *root,
 		 * the simple way we are expecting.)  Most of the tests here can be
 		 * done more efficiently with rinfo than without.
 		 */
+		ck = treat_as_join_clause(root, clause, rinfo, varRelid, sjinfo) ?
+				CKIndepend : CKRestrict;
 		if (is_opclause(clause) && list_length(((OpExpr *) clause)->args) == 2)
 		{
 			OpExpr	   *expr = (OpExpr *) clause;
 			bool		varonleft = true;
 			bool		ok;
+
+			if (ck == CKIndepend)
+				ck = get_correlation_kind(root, varRelid, expr);
 
 			if (rinfo)
 			{
@@ -252,7 +1428,7 @@ clauselist_selectivity_ext(PlannerInfo *root,
 						break;
 					default:
 						/* Just merge the selectivity in generically */
-						s1 = s1 * s2;
+						appendSelectivityRes(s, s2, ck);
 						break;
 				}
 				continue;		/* drop to loop bottom */
@@ -260,7 +1436,7 @@ clauselist_selectivity_ext(PlannerInfo *root,
 		}
 
 		/* Not the right form, so treat it generically. */
-		s1 = s1 * s2;
+		appendSelectivityRes(s, s2, ck);
 	}
 
 	/*
@@ -273,7 +1449,6 @@ clauselist_selectivity_ext(PlannerInfo *root,
 		if (rqlist->have_lobound && rqlist->have_hibound)
 		{
 			/* Successfully matched a pair of range clauses */
-			Selectivity s2;
 
 			/*
 			 * Exact equality to the default value probably means the
@@ -322,15 +1497,13 @@ clauselist_selectivity_ext(PlannerInfo *root,
 				}
 			}
 			/* Merge in the selectivity of the pair of clauses */
-			s1 *= s2;
+			appendSelectivityRes(s, s2, CKRestrict);
 		}
 		else
 		{
 			/* Only found one of a pair, merge it in generically */
-			if (rqlist->have_lobound)
-				s1 *= rqlist->lobound;
-			else
-				s1 *= rqlist->hibound;
+			appendSelectivityRes(s, (rqlist->have_lobound) ? rqlist->lobound :
+								 rqlist->hibound, CKRestrict);
 		}
 		/* release storage and advance */
 		rqnext = rqlist->next;
@@ -338,7 +1511,7 @@ clauselist_selectivity_ext(PlannerInfo *root,
 		rqlist = rqnext;
 	}
 
-	return s1;
+	return finalizeSelectivityRes(s);
 }
 
 /*
@@ -624,6 +1797,137 @@ treat_as_join_clause(PlannerInfo *root, Node *clause, RestrictInfo *rinfo,
 	}
 }
 
+typedef struct RangeTblEntryContext {
+	RangeTblEntry	*rte;
+	int				count;
+} RangeTblEntryContext;
+
+static bool
+find_rte_walker(Node *node, RangeTblEntryContext *context)
+{
+	if (node == NULL)
+		return false;
+
+	if (context->count > 1)
+		return true; /* skip rest */
+
+	if (IsA(node, RangeTblEntry)) {
+		RangeTblEntry	*rte = (RangeTblEntry*)node;
+
+		if (rte->rtekind == RTE_RELATION)
+		{
+			if (context->count == 0)
+			{
+				context->count++;
+				context->rte=rte;
+			}
+			else if (rte->relid != context->rte->relid)
+			{
+				context->count++;
+				return true; /* more that one relation in subtree */
+			}
+		}
+		else if (!(rte->rtekind == RTE_SUBQUERY || rte->rtekind == RTE_JOIN ||
+				   rte->rtekind == RTE_CTE))
+		{
+			context->count++;
+			return true; /* more that one relation in subtree */
+		}
+
+		return false; /* allow range_table_walker to continue */
+	}
+
+	if (IsA(node, Query))
+		return query_tree_walker((Query *) node, find_rte_walker,
+								 (void *) context, QTW_EXAMINE_RTES_BEFORE);
+
+	return expression_tree_walker(node, find_rte_walker, (void *) context);
+}
+
+static RangeTblEntry*
+find_single_rte(RangeTblEntry *node)
+{
+	RangeTblEntryContext	context;
+
+	context.rte = NULL;
+	context.count = 0;
+
+	(void)range_table_walker(list_make1(node),
+							 find_rte_walker,
+							 (void *) &context, QTW_EXAMINE_RTES_BEFORE);
+
+	return context.count == 1 ? context.rte : NULL;
+}
+
+#define IsSameRelationRTE(a, b)	( \
+	(a)->rtekind == (b)->rtekind && \
+	(a)->rtekind == RTE_RELATION && \
+	(a)->relid == (b)->relid \
+)
+
+
+/*
+ * Any self join or join with aggregation over the same table
+ */
+
+static CorrelationKind
+get_correlation_kind(PlannerInfo *root, int varRelid, OpExpr* expr)
+{
+	Node	*left_arg, *right_arg;
+	Relids	left_varnos, right_varnos;
+	int		left_varno, right_varno;
+	RangeTblEntry	*left_rte, *right_rte;
+
+	if (varRelid != 0)
+		/* We consider only case of joins, not restriction mode */
+		return CKIndepend;
+
+	/* Check if it is equality comparison */
+	if (get_oprrest(expr->opno) != F_EQSEL)
+		return CKIndepend;
+
+	left_arg = linitial(expr->args);
+	right_arg = lsecond(expr->args);
+
+	/*
+	 * Check if it is join of two different relations
+	 */
+	left_varnos = pull_varnos(root, left_arg);
+	right_varnos = pull_varnos(root, right_arg);
+	if (!bms_get_singleton_member(left_varnos, &left_varno) ||
+		!bms_get_singleton_member(right_varnos, &right_varno) ||
+		left_varno == right_varno)
+		return CKIndepend;
+
+	left_rte = planner_rt_fetch(left_varno, root);
+	right_rte = planner_rt_fetch(right_varno, root);
+
+	if (IsSameRelationRTE(left_rte, right_rte))
+	{
+		Var *lvar = get_var(left_arg),
+			*rvar = get_var(right_arg);
+
+		/* self join detected, check if it simple a=b clause */
+		if (lvar == NULL || rvar == NULL)
+			return CKLikelySelf;
+		return (lvar->varattno == rvar->varattno) ?
+											CKSelf : CKLikelySelf;
+	}
+
+	if ((left_rte = find_single_rte(left_rte)) == NULL)
+		return CKIndepend;
+	if ((right_rte = find_single_rte(right_rte)) == NULL)
+		return CKIndepend;
+
+	if (IsSameRelationRTE(left_rte, right_rte))
+	{
+		/* self join detected, but over some transformation which cannot be
+		 * flatten */
+		return CKLikelySelf;
+	}
+
+	return CKIndepend;
+}
 
 /*
  * clause_selectivity -

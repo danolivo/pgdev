@@ -50,6 +50,7 @@ struct RBTree
 	rbt_combiner combiner;
 	rbt_allocfunc allocfunc;
 	rbt_freefunc freefunc;
+	rbt_fixfunc fixfunc;
 	/* Passthrough arg passed to all manipulation functions */
 	void	   *arg;
 };
@@ -104,6 +105,7 @@ rbt_create(Size node_size,
 		   rbt_combiner combiner,
 		   rbt_allocfunc allocfunc,
 		   rbt_freefunc freefunc,
+		   rbt_fixfunc fixfunc,
 		   void *arg)
 {
 	RBTree	   *tree = (RBTree *) palloc(sizeof(RBTree));
@@ -116,6 +118,7 @@ rbt_create(Size node_size,
 	tree->combiner = combiner;
 	tree->allocfunc = allocfunc;
 	tree->freefunc = freefunc;
+	tree->fixfunc = fixfunc;
 
 	tree->arg = arg;
 
@@ -127,6 +130,8 @@ static inline void
 rbt_copy_data(RBTree *rbt, RBTNode *dest, const RBTNode *src)
 {
 	memcpy(dest + 1, src + 1, rbt->node_size - sizeof(RBTNode));
+	if (rbt->fixfunc)
+		rbt->fixfunc(dest, rbt->arg);
 }
 
 /**********************************************************************

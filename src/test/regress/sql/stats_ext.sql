@@ -6,6 +6,8 @@
 -- from auto-analyze happening when we didn't expect it.
 --
 
+set default_statistics_target=10000; --prevent random subset for joinsel
+
 -- check the number of estimated/actual rows in the top node
 create function check_estimated_rows(text) returns table (estimated int, actual int)
 language plpgsql as

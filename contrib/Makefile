@@ -7,6 +7,7 @@ include $(top_builddir)/src/Makefile.global
 SUBDIRS = \
 		amcheck		\
 		auth_delay	\
+		auto_dump	\
 		auto_explain	\
 		basic_archive	\
 		basebackup_to_shell	\
@@ -19,17 +20,22 @@ SUBDIRS = \
 		dict_int	\
 		dict_xsyn	\
 		earthdistance	\
+		fasttrun	\
 		file_fdw	\
 		fuzzystrmatch	\
+		fulleq	\
 		hstore		\
 		intagg		\
 		intarray	\
 		isn		\
 		lo		\
 		ltree		\
+		mchar		\
 		oid2name	\
+		online_analyze	\
 		pageinspect	\
 		passwordcheck	\
+		plantuner	\
 		pg_buffercache	\
 		pg_freespacemap \
 		pg_prewarm	\
@@ -39,6 +45,7 @@ SUBDIRS = \
 		pgrowlocks	\
 		pgstattuple	\
 		pg_visibility	\
+		pg_wait_sampling	\
 		pg_walinspect	\
 		postgres_fdw	\
 		seg		\
@@ -49,7 +56,8 @@ SUBDIRS = \
 		tsm_system_rows \
 		tsm_system_time \
 		unaccent	\
-		vacuumlo
+		vacuumlo \
+        dbcopies_decoding
 
 ifeq ($(with_ssl),openssl)
 SUBDIRS += pgcrypto sslinfo

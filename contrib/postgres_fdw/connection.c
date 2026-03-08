@@ -1043,6 +1043,9 @@ pgfdw_xact_callback(XactEvent event, void *arg)
 					else
 						pgfdw_abort_cleanup(entry, true);
 					break;
+				case XACT_EVENT_PRE_ABORT:
+				case XACT_EVENT_PARALLEL_PRE_ABORT:
+					break;
 			}
 		}
 

@@ -4,6 +4,7 @@
 -- with autovacuum_enabled = off, so that we don't have unstable results
 -- from auto-analyze happening when we didn't expect it.
 --
+set default_statistics_target=10000; --prevent random subset for joinsel
 -- check the number of estimated/actual rows in the top node
 create function check_estimated_rows(text) returns table (estimated int, actual int)
 language plpgsql as
@@ -1113,43 +1114,43 @@ SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a IN (1, 51) AND b = ''1''');
  estimated | actual 
 -----------+--------
-         2 |    100
+        99 |    100
 (1 row)
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a IN (1, 51) AND b IN (''1'', ''2'')');
  estimated | actual 
 -----------+--------
-         4 |    100
+       100 |    100
 (1 row)
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a IN (1, 2, 51, 52) AND b IN (''1'', ''2'')');
  estimated | actual 
 -----------+--------
-         8 |    200
+       197 |    200
 (1 row)
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a IN (1, 2, 51, 52) AND b = ''1''');
  estimated | actual 
 -----------+--------
-         4 |    100
+       100 |    100
 (1 row)
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a IN (1, 26, 51, 76) AND b IN (''1'', ''26'') AND c = 1');
  estimated | actual 
 -----------+--------
-         1 |    200
+       197 |    200
 (1 row)
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a IN (1, 26, 51, 76) AND b IN (''1'', ''26'') AND c IN (1)');
  estimated | actual 
 -----------+--------
-         1 |    200
+       197 |    200
 (1 row)
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a IN (1, 2, 26, 27, 51, 52, 76, 77) AND b IN (''1'', ''2'', ''26'', ''27'') AND c IN (1, 2)');
  estimated | actual 
 -----------+--------
-         3 |    400
+       386 |    400
 (1 row)
 
 -- OR clauses referencing the same attribute
@@ -1182,37 +1183,37 @@ SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a = ANY (ARRAY[1, 51]) AND b = ''1''');
  estimated | actual 
 -----------+--------
-         2 |    100
+        99 |    100
 (1 row)
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a = ANY (ARRAY[1, 51]) AND b = ANY (ARRAY[''1'', ''2''])');
  estimated | actual 
 -----------+--------
-         4 |    100
+       100 |    100
 (1 row)
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a = ANY (ARRAY[1, 2, 51, 52]) AND b = ANY (ARRAY[''1'', ''2''])');
  estimated | actual 
 -----------+--------
-         8 |    200
+       197 |    200
 (1 row)
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a = ANY (ARRAY[1, 26, 51, 76]) AND b = ANY (ARRAY[''1'', ''26'']) AND c = 1');
  estimated | actual 
 -----------+--------
-         1 |    200
+       197 |    200
 (1 row)
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a = ANY (ARRAY[1, 26, 51, 76]) AND b = ANY (ARRAY[''1'', ''26'']) AND c = ANY (ARRAY[1])');
  estimated | actual 
 -----------+--------
-         1 |    200
+       197 |    200
 (1 row)
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a = ANY (ARRAY[1, 2, 26, 27, 51, 52, 76, 77]) AND b = ANY (ARRAY[''1'', ''2'', ''26'', ''27'']) AND c = ANY (ARRAY[1, 2])');
  estimated | actual 
 -----------+--------
-         3 |    400
+       386 |    400
 (1 row)
 
 -- ANY with inequalities should not benefit from functional dependencies
@@ -1878,7 +1879,7 @@ ANALYZE mcv_lists;
 SELECT * FROM check_estimated_rows('SELECT * FROM mcv_lists WHERE a = 1 AND b = ''1''');
  estimated | actual 
 -----------+--------
-         3 |      4
+         4 |      4
 (1 row)
 
 SELECT * FROM check_estimated_rows('SELECT * FROM mcv_lists WHERE a = 1 AND b = ''1'' AND c = 1');
@@ -2815,7 +2816,7 @@ SELECT * FROM check_estimated_rows('SELECT * FROM mcv_lists_partial WHERE a = 0 
 SELECT * FROM check_estimated_rows('SELECT * FROM mcv_lists_partial WHERE a = 0 OR b = 0 OR c = 0');
  estimated | actual 
 -----------+--------
-        96 |    102
+       102 |    102
 (1 row)
 
 SELECT * FROM check_estimated_rows('SELECT * FROM mcv_lists_partial WHERE a = 10 AND b = 10 AND c = 10');
@@ -2839,7 +2840,7 @@ SELECT * FROM check_estimated_rows('SELECT * FROM mcv_lists_partial WHERE a = 0 
 SELECT * FROM check_estimated_rows('SELECT * FROM mcv_lists_partial WHERE a = 0 OR b = 0 OR c = 10');
  estimated | actual 
 -----------+--------
-       102 |    104
+       104 |    104
 (1 row)
 
 SELECT * FROM check_estimated_rows('SELECT * FROM mcv_lists_partial WHERE (a = 0 AND b = 0 AND c = 0) OR (a = 1 AND b = 1 AND c = 1) OR (a = 2 AND b = 2 AND c = 2)');
@@ -2851,7 +2852,7 @@ SELECT * FROM check_estimated_rows('SELECT * FROM mcv_lists_partial WHERE (a = 0
 SELECT * FROM check_estimated_rows('SELECT * FROM mcv_lists_partial WHERE (a = 0 AND b = 0) OR (a = 0 AND c = 0) OR (b = 0 AND c = 0)');
  estimated | actual 
 -----------+--------
-       108 |    102
+       102 |    102
 (1 row)
 
 DROP TABLE mcv_lists_partial;

@@ -258,12 +258,32 @@ ExecInitQual(List *qual, PlanState *parent)
 
 	foreach_ptr(Expr, node, qual)
 	{
+		ExprEvalStep *lastStep;
 		/* first evaluate expression */
 		ExecInitExprRec(node, state, &state->resvalue, &state->resnull);
 
 		/* then emit EEOP_QUAL to detect if it's false (or null) */
 		scratch.d.qualexpr.jumpdone = -1;
+
+		lastStep = &state->steps[state->steps_len-1];
+		if (list_length(qual) == 1 &&
+			(lastStep->opcode == EEOP_BOOL_OR_STEP_LAST ||
+			 lastStep->opcode == EEOP_BOOL_AND_STEP_LAST))
+			scratch.d.qualexpr.guaranteed_empty =
+				lastStep->d.boolexpr.guaranteed_empty;
+		else if (list_length(qual) == 1 &&
+				 lastStep->opcode == EEOP_SUBPLAN)
+		{
+			scratch.d.qualexpr.guaranteed_empty =
+				lastStep->d.subplan.guaranteed_empty =
+					palloc(sizeof(bool));
+			*scratch.d.qualexpr.guaranteed_empty = false;
+		}
+		else
+			scratch.d.qualexpr.guaranteed_empty = NULL;
+
 		ExprEvalPushStep(state, &scratch);
+
 		adjust_jumps = lappend_int(adjust_jumps,
 								   state->steps_len - 1);
 	}
@@ -1334,8 +1354,15 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				ListCell   *lc;
 
 				/* allocate scratch memory used by all steps of AND/OR */
+				scratch.d.boolexpr.guaranteed_empty = NULL;
 				if (boolexpr->boolop != NOT_EXPR)
+				{
 					scratch.d.boolexpr.anynull = (bool *) palloc(sizeof(bool));
+					scratch.d.boolexpr.guaranteed_empty = (bool *) palloc(sizeof(bool));
+					scratch.d.boolexpr.count_guaranteed_empty = (int *) palloc(sizeof(int));
+					*scratch.d.boolexpr.guaranteed_empty = false;
+					scratch.d.boolexpr.nargs = nargs;
+				}
 
 				/*
 				 * For each argument evaluate the argument itself, then
@@ -1354,9 +1381,15 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				foreach(lc, boolexpr->args)
 				{
 					Expr	   *arg = (Expr *) lfirst(lc);
+					ExprEvalStep	*lastStep;
 
 					/* Evaluate argument into our output variable */
 					ExecInitExprRec(arg, state, resv, resnull);
+
+					lastStep = &state->steps[state->steps_len-1];
+					if (lastStep->opcode == EEOP_SUBPLAN)
+						lastStep->d.subplan.guaranteed_empty =
+							scratch.d.boolexpr.guaranteed_empty;
 
 					/* Perform the appropriate step type */
 					switch (boolexpr->boolop)
@@ -1442,6 +1475,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 
 				scratch.opcode = EEOP_SUBPLAN;
 				scratch.d.subplan.sstate = sstate;
+				scratch.d.subplan.guaranteed_empty = false;
 
 				ExprEvalPushStep(state, &scratch);
 				break;
@@ -4067,6 +4101,7 @@ ExecBuildGroupingEqual(TupleDesc ldesc, TupleDesc rdesc,
 
 		/* then emit EEOP_QUAL to detect if result is false (or null) */
 		scratch.opcode = EEOP_QUAL;
+		scratch.d.qualexpr.guaranteed_empty = NULL;
 		scratch.d.qualexpr.jumpdone = -1;
 		scratch.resvalue = &state->resvalue;
 		scratch.resnull = &state->resnull;

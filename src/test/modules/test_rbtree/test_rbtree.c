@@ -84,6 +84,7 @@ create_int_rbtree(void)
 					  irbt_combine,
 					  irbt_alloc,
 					  irbt_free,
+					  NULL,
 					  NULL);
 }
 

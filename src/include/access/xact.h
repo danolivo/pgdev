@@ -133,6 +133,8 @@ typedef enum
 	XACT_EVENT_PRE_COMMIT,
 	XACT_EVENT_PARALLEL_PRE_COMMIT,
 	XACT_EVENT_PRE_PREPARE,
+	XACT_EVENT_PRE_ABORT,
+	XACT_EVENT_PARALLEL_PRE_ABORT,
 } XactEvent;
 
 typedef void (*XactCallback) (XactEvent event, void *arg);
@@ -143,6 +145,7 @@ typedef enum
 	SUBXACT_EVENT_COMMIT_SUB,
 	SUBXACT_EVENT_ABORT_SUB,
 	SUBXACT_EVENT_PRE_COMMIT_SUB,
+	SUBXACT_EVENT_PRE_ABORT_SUB,
 } SubXactEvent;
 
 typedef void (*SubXactCallback) (SubXactEvent event, SubTransactionId mySubid,

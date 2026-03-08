@@ -1210,10 +1210,12 @@ check_default_with_oids(bool *newval, void **extra, GucSource source)
 	if (*newval)
 	{
 		/* check the GUC's definition for an explanation */
-		GUC_check_errcode(ERRCODE_FEATURE_NOT_SUPPORTED);
+		ereport(WARNING,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("tables declared WITH OIDS are not supported, ignored")));
 		GUC_check_errmsg("tables declared WITH OIDS are not supported");
 
-		return false;
+		*newval = false;
 	}
 
 	return true;

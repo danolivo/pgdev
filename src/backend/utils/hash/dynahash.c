@@ -1388,8 +1388,35 @@ hash_seq_init(HASH_SEQ_STATUS *status, HTAB *hashp)
 	status->hashp = hashp;
 	status->curBucket = 0;
 	status->curEntry = NULL;
+	status->hasHashVal = false;
 	if (!hashp->frozen)
 		register_seq_scan(hashp);
+}
+
+void
+hash_seq_init_with_hash_value(HASH_SEQ_STATUS *status, HTAB *hashp,
+							  uint32 hashvalue)
+{
+	HASHHDR		*hctl = hashp->hctl;
+	long		 segment_num;
+	long		 segment_ndx;
+	HASHSEGMENT	 segp;
+
+	hash_seq_init(status, hashp);
+	status->hasHashVal = true;
+	status->hashvalue = hashvalue;
+
+	status->curBucket = calc_bucket(hctl, hashvalue);
+
+	segment_num = status->curBucket >> hashp->sshift;
+	segment_ndx = MOD(status->curBucket, hashp->ssize);
+
+	segp = hashp->dir[segment_num];
+
+	if (segp == NULL)
+		hash_corrupted(hashp);
+
+	status->curEntry = segp[segment_ndx];
 }
 
 void *
@@ -1404,6 +1431,20 @@ hash_seq_search(HASH_SEQ_STATUS *status)
 	HASHSEGMENT segp;
 	uint32		curBucket;
 	HASHELEMENT *curElem;
+
+	if (status->hasHashVal)
+	{
+		while ((curElem = status->curEntry) != NULL)
+		{
+			status->curEntry = curElem->link;
+			if (status->hashvalue != curElem->hashvalue)
+				continue;
+			return (void *) ELEMENTKEY(curElem);
+		}
+
+		hash_seq_term(status);
+		return NULL;
+	}
 
 	if ((curElem = status->curEntry) != NULL)
 	{

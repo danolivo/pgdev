@@ -1234,7 +1234,8 @@ explain (costs off)
   select distinct min(f1), max(f1) from minmaxtest;
                                          QUERY PLAN                                          
 ---------------------------------------------------------------------------------------------
- Unique
+ HashAggregate
+   Group Key: (InitPlan 1).col1, (InitPlan 2).col1
    InitPlan 1
      ->  Limit
            ->  Merge Append
@@ -1257,10 +1258,8 @@ explain (costs off)
                  ->  Index Only Scan using minmaxtest2i on minmaxtest2 minmaxtest_8
                        Index Cond: (f1 IS NOT NULL)
                  ->  Index Only Scan Backward using minmaxtest3i on minmaxtest3 minmaxtest_9
-   ->  Sort
-         Sort Key: ((InitPlan 1).col1), ((InitPlan 2).col1)
-         ->  Result
-(26 rows)
+   ->  Result
+(25 rows)
 
 select distinct min(f1), max(f1) from minmaxtest;
  min | max 
@@ -2872,19 +2871,18 @@ SELECT count(*)
                                   QUERY PLAN                                   
 -------------------------------------------------------------------------------
  GroupAggregate
-   Group Key: t1.z, t1.w, t1.x, t1.y
-   ->  Incremental Sort
-         Sort Key: t1.z, t1.w, t1.x, t1.y
-         Presorted Key: t1.z, t1.w, t1.x
+   Group Key: t1.x, t1.y, t1.z, t1.w
+   ->  Sort
+         Sort Key: t1.x, t1.y, t1.z, t1.w
          ->  Merge Join
-               Merge Cond: ((t1.z = t2.z) AND (t1.w = t2.w) AND (t1.x = t2.x))
+               Merge Cond: ((t1.w = t2.w) AND (t1.z = t2.z) AND (t1.x = t2.x))
                ->  Sort
-                     Sort Key: t1.z, t1.w, t1.x
+                     Sort Key: t1.w, t1.z, t1.x
                      ->  Index Scan using btg_x_y_idx on btg t1
                ->  Sort
-                     Sort Key: t2.z, t2.w, t2.x
+                     Sort Key: t2.w, t2.z, t2.x
                      ->  Index Scan using btg_x_y_idx on btg t2
-(13 rows)
+(12 rows)
 
 RESET enable_nestloop;
 RESET enable_hashjoin;
@@ -2983,10 +2981,9 @@ GROUP BY c1.y,c1.x,c2.x;
                      QUERY PLAN                      
 -----------------------------------------------------
  Group
-   Group Key: c1.x, c1.y
-   ->  Incremental Sort
-         Sort Key: c1.x, c1.y
-         Presorted Key: c1.x
+   Group Key: c1.y, c1.x
+   ->  Sort
+         Sort Key: c1.y, c1.x
          ->  Merge Join
                Merge Cond: (c1.x = c2.x)
                ->  Sort
@@ -2995,7 +2992,7 @@ GROUP BY c1.y,c1.x,c2.x;
                ->  Sort
                      Sort Key: c2.x
                      ->  Seq Scan on group_agg_pk c2
-(13 rows)
+(12 rows)
 
 EXPLAIN (COSTS OFF)
 SELECT c1.y,c1.x FROM group_agg_pk c1
@@ -3005,10 +3002,9 @@ GROUP BY c1.y,c2.x,c1.x;
                      QUERY PLAN                      
 -----------------------------------------------------
  Group
-   Group Key: c2.x, c1.y
-   ->  Incremental Sort
-         Sort Key: c2.x, c1.y
-         Presorted Key: c2.x
+   Group Key: c1.y, c2.x
+   ->  Sort
+         Sort Key: c1.y, c2.x
          ->  Merge Join
                Merge Cond: (c1.x = c2.x)
                ->  Sort
@@ -3017,7 +3013,7 @@ GROUP BY c1.y,c2.x,c1.x;
                ->  Sort
                      Sort Key: c2.x
                      ->  Seq Scan on group_agg_pk c2
-(13 rows)
+(12 rows)
 
 RESET enable_nestloop;
 RESET enable_hashjoin;

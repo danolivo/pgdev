@@ -77,6 +77,13 @@
 /* The main type cache hashtable searched by lookup_type_cache */
 static HTAB *TypeCacheHash = NULL;
 
+typedef struct mapRelTypeEntry
+{
+	Oid	typrelid;
+	Oid type_id;
+} mapRelTypeEntry;
+static HTAB *mapRelType = NULL;
+
 /* List of type cache entries for domain types */
 static TypeCacheEntry *firstDomainTypeEntry = NULL;
 
@@ -330,6 +337,15 @@ static TupleDesc find_or_make_matching_shared_tupledesc(TupleDesc tupdesc);
 static dsa_pointer share_tupledesc(dsa_area *area, TupleDesc tupdesc,
 								   uint32 typmod);
 
+/*
+ * Hashing function should compatible with syscache hashing function to use
+ * hash_seq_init_with_hash_value()
+ */
+static uint32
+type_cache_hash(const void *key, Size keysize)
+{
+	return GetSysCacheHashValue1(TYPEOID, ObjectIdGetDatum(*(const Oid*)key));
+}
 
 /*
  * lookup_type_cache
@@ -355,8 +371,14 @@ lookup_type_cache(Oid type_id, int flags)
 
 		ctl.keysize = sizeof(Oid);
 		ctl.entrysize = sizeof(TypeCacheEntry);
+		ctl.hash = type_cache_hash;
 		TypeCacheHash = hash_create("Type information cache", 64,
-									&ctl, HASH_ELEM | HASH_BLOBS);
+									&ctl, HASH_ELEM | HASH_FUNCTION);
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(mapRelTypeEntry);
+		mapRelType = hash_create("Map reloid to typeoid", 64,
+								 &ctl, HASH_ELEM | HASH_BLOBS);
 
 		/* Also set up callbacks for SI invalidations */
 		CacheRegisterRelcacheCallback(TypeCacheRelCallback, (Datum) 0);
@@ -407,8 +429,7 @@ lookup_type_cache(Oid type_id, int flags)
 
 		/* These fields can never change, by definition */
 		typentry->type_id = type_id;
-		typentry->type_id_hash = GetSysCacheHashValue1(TYPEOID,
-													   ObjectIdGetDatum(type_id));
+		typentry->type_id_hash = get_hash_value(TypeCacheHash, &type_id);
 
 		/* Keep this part in sync with the code below */
 		typentry->typlen = typtup->typlen;
@@ -427,6 +448,18 @@ lookup_type_cache(Oid type_id, int flags)
 		{
 			typentry->nextDomain = firstDomainTypeEntry;
 			firstDomainTypeEntry = typentry;
+		}
+
+		if (OidIsValid(typtup->typrelid))
+		{
+			mapRelTypeEntry *relentry;
+
+			relentry = (mapRelTypeEntry*) hash_search(mapRelType,
+													  &typentry->typrelid,
+													  HASH_ENTER, NULL);
+
+			relentry->typrelid = typentry->typrelid;
+			relentry->type_id = typentry->type_id;
 		}
 
 		ReleaseSysCache(tp);
@@ -466,6 +499,18 @@ lookup_type_cache(Oid type_id, int flags)
 		typentry->typelem = typtup->typelem;
 		typentry->typcollation = typtup->typcollation;
 		typentry->flags |= TCFLAGS_HAVE_PG_TYPE_DATA;
+
+		if (OidIsValid(typtup->typrelid))
+		{
+			mapRelTypeEntry *relentry;
+
+			relentry = (mapRelTypeEntry*) hash_search(mapRelType,
+													  &typentry->typrelid,
+													  HASH_ENTER, NULL);
+
+			relentry->typrelid = typentry->typrelid;
+			relentry->type_id = typentry->type_id;
+		}
 
 		ReleaseSysCache(tp);
 	}
@@ -2289,57 +2334,71 @@ SharedRecordTypmodRegistryAttach(SharedRecordTypmodRegistry *registry)
 static void
 TypeCacheRelCallback(Datum arg, Oid relid)
 {
-	HASH_SEQ_STATUS status;
 	TypeCacheEntry *typentry;
 
 	/* TypeCacheHash must exist, else this callback wouldn't be registered */
-	hash_seq_init(&status, TypeCacheHash);
-	while ((typentry = (TypeCacheEntry *) hash_seq_search(&status)) != NULL)
+
+	if (OidIsValid(relid))
 	{
-		if (typentry->typtype == TYPTYPE_COMPOSITE)
-		{
-			/* Skip if no match, unless we're zapping all composite types */
-			if (relid != typentry->typrelid && relid != InvalidOid)
-				continue;
+		mapRelTypeEntry *relentry;
 
-			/* Delete tupdesc if we have it */
-			if (typentry->tupDesc != NULL)
+		relentry = (mapRelTypeEntry *) hash_search(mapRelType,
+												  &relid,
+												  HASH_FIND, NULL);
+
+		if (relentry != NULL)
+		{
+			typentry = (TypeCacheEntry *) hash_search(TypeCacheHash,
+													  &relentry->type_id,
+													  HASH_FIND, NULL);
+
+			if (typentry != NULL)
 			{
-				/*
-				 * Release our refcount, and free the tupdesc if none remain.
-				 * (Can't use DecrTupleDescRefCount because this reference is
-				 * not logged in current resource owner.)
-				 */
-				Assert(typentry->tupDesc->tdrefcount > 0);
-				if (--typentry->tupDesc->tdrefcount == 0)
-					FreeTupleDesc(typentry->tupDesc);
-				typentry->tupDesc = NULL;
+				Assert(typentry->typtype == TYPTYPE_COMPOSITE);
+				Assert(relid == typentry->typrelid);
 
-				/*
-				 * Also clear tupDesc_identifier, so that anything watching
-				 * that will realize that the tupdesc has possibly changed.
-				 * (Alternatively, we could specify that to detect possible
-				 * tupdesc change, one must check for tupDesc != NULL as well
-				 * as tupDesc_identifier being the same as what was previously
-				 * seen.  That seems error-prone.)
-				 */
-				typentry->tupDesc_identifier = 0;
-			}
+				/* Delete tupdesc if we have it */
+				if (typentry->tupDesc != NULL)
+				{
+					/*
+					 * Release our refcount, and free the tupdesc if none remain.
+					 * (Can't use DecrTupleDescRefCount because this reference is
+					 * not logged in current resource owner.)
+					 */
+					Assert(typentry->tupDesc->tdrefcount > 0);
+					if (--typentry->tupDesc->tdrefcount == 0)
+						FreeTupleDesc(typentry->tupDesc);
+					typentry->tupDesc = NULL;
 
-			/* Reset equality/comparison/hashing validity information */
-			typentry->flags &= ~TCFLAGS_OPERATOR_FLAGS;
-		}
-		else if (typentry->typtype == TYPTYPE_DOMAIN)
-		{
-			/*
-			 * If it's domain over composite, reset flags.  (We don't bother
-			 * trying to determine whether the specific base type needs a
-			 * reset.)  Note that if we haven't determined whether the base
-			 * type is composite, we don't need to reset anything.
-			 */
-			if (typentry->flags & TCFLAGS_DOMAIN_BASE_IS_COMPOSITE)
+					/*
+					 * Also clear tupDesc_identifier, so that anything watching
+					 * that will realize that the tupdesc has possibly changed.
+					 * (Alternatively, we could specify that to detect possible
+					 * tupdesc change, one must check for tupDesc != NULL as well
+					 * as tupDesc_identifier being the same as what was previously
+					 * seen.  That seems error-prone.)
+					 */
+					typentry->tupDesc_identifier = 0;
+				}
+
+				/* Reset equality/comparison/hashing validity information */
 				typentry->flags &= ~TCFLAGS_OPERATOR_FLAGS;
+			}
 		}
+	}
+
+	for (typentry = firstDomainTypeEntry;
+		 typentry != NULL;
+		 typentry = typentry->nextDomain)
+	{
+		/*
+		 * If it's domain over composite, reset flags.  (We don't bother
+		 * trying to determine whether the specific base type needs a
+		 * reset.)  Note that if we haven't determined whether the base
+		 * type is composite, we don't need to reset anything.
+		 */
+		if (typentry->flags & TCFLAGS_DOMAIN_BASE_IS_COMPOSITE)
+			typentry->flags &= ~TCFLAGS_OPERATOR_FLAGS;
 	}
 }
 
@@ -2358,20 +2417,20 @@ TypeCacheTypCallback(Datum arg, int cacheid, uint32 hashvalue)
 	TypeCacheEntry *typentry;
 
 	/* TypeCacheHash must exist, else this callback wouldn't be registered */
-	hash_seq_init(&status, TypeCacheHash);
+	if (hashvalue == 0)
+		hash_seq_init(&status, TypeCacheHash);
+	else
+		hash_seq_init_with_hash_value(&status, TypeCacheHash, hashvalue);
+
 	while ((typentry = (TypeCacheEntry *) hash_seq_search(&status)) != NULL)
 	{
-		/* Is this the targeted type row (or it's a total cache flush)? */
-		if (hashvalue == 0 || typentry->type_id_hash == hashvalue)
-		{
-			/*
-			 * Mark the data obtained directly from pg_type as invalid.  Also,
-			 * if it's a domain, typnotnull might've changed, so we'll need to
-			 * recalculate its constraints.
-			 */
-			typentry->flags &= ~(TCFLAGS_HAVE_PG_TYPE_DATA |
-								 TCFLAGS_CHECKED_DOMAIN_CONSTRAINTS);
-		}
+		/*
+		 * Mark the data obtained directly from pg_type as invalid.  Also,
+		 * if it's a domain, typnotnull might've changed, so we'll need to
+		 * recalculate its constraints.
+		 */
+		typentry->flags &= ~(TCFLAGS_HAVE_PG_TYPE_DATA |
+							 TCFLAGS_CHECKED_DOMAIN_CONSTRAINTS);
 	}
 }
 

@@ -500,7 +500,8 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 	 * closed our own smgr rel.
 	 */
 	for (i = 0; i < nrels; i++)
-		CacheInvalidateSmgr(rlocators[i]);
+		if (!SmgrIsTemp(rels[i]))
+			CacheInvalidateSmgr(rlocators[i]);
 
 	/*
 	 * Delete the physical file(s).
@@ -745,7 +746,8 @@ smgrtruncate2(SMgrRelation reln, ForkNumber *forknum, int nforks,
 	 * is a performance-critical path.)  As in the unlink code, we want to be
 	 * sure the message is sent before we start changing things on-disk.
 	 */
-	CacheInvalidateSmgr(reln->smgr_rlocator);
+	if (!SmgrIsTemp(reln))
+		CacheInvalidateSmgr(reln->smgr_rlocator);
 
 	/* Do the truncation */
 	for (i = 0; i < nforks; i++)

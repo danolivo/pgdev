@@ -392,7 +392,7 @@ CREATE OR REPLACE FUNCTION perl_spi_prepared_set(INTEGER, INTEGER) RETURNS SETOF
   spi_freeplan($x);
   return;
 $$ LANGUAGE plperl;
-SELECT * from perl_spi_prepared_set(1,2);
+SELECT * from perl_spi_prepared_set(1,2) ORDER BY 1;
 
 --
 -- Test prepare with a type with spaces
