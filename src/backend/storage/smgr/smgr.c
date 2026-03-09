@@ -71,6 +71,7 @@
 #include "storage/ipc.h"
 #include "storage/md.h"
 #include "storage/smgr.h"
+#include "storage/rd.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 
@@ -148,7 +149,29 @@ static const f_smgr smgrsw[] = {
 		.smgr_immedsync = mdimmedsync,
 		.smgr_registersync = mdregistersync,
 		.smgr_fd = mdfd,
-	}
+	},
+
+	/* ram disk */
+	{
+		.smgr_init = rd_init,
+		.smgr_shutdown = rd_shutdown,
+		.smgr_open = rd_open,
+		.smgr_close = rd_close,
+		.smgr_create = rd_create,
+		.smgr_exists = rd_exists,
+		.smgr_unlink = rd_unlink,
+		.smgr_extend = rd_extend,
+		.smgr_zeroextend = rd_zeroextend,
+		.smgr_prefetch = rd_prefetch,
+		.smgr_readv = rd_readv,
+		.smgr_writev = rd_writev,
+		.smgr_writeback = rd_writeback,
+		.smgr_nblocks = rd_nblocks,
+		.smgr_truncate = rd_truncate,
+		.smgr_immedsync = rd_immedsync,
+		.smgr_registersync = rd_registersync,
+		.smgr_fd = rd_fd,
+	},
 };
 
 static const int NSmgr = lengthof(smgrsw);
@@ -272,8 +295,19 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
 		/* hash_search already filled in the lookup key */
 		reln->smgr_targblock = InvalidBlockNumber;
 		for (int i = 0; i <= MAX_FORKNUM; ++i)
+		{
 			reln->smgr_cached_nblocks[i] = InvalidBlockNumber;
-		reln->smgr_which = 0;	/* we only have md.c at present */
+			reln->rd_bufs[i] = NULL;
+			reln->md_num_open_segs[i] = 0;
+		}
+
+		if (RelFileLocatorBackendIsTemp(reln->smgr_rlocator)
+			&& !smgrsw[0].smgr_exists(reln, MAIN_FORKNUM)
+			&& enable_temp_rd_buffers)
+			/* use rd structure until we switch to md after threshold */
+			reln->smgr_which = 1;
+		else
+			reln->smgr_which = 0;
 
 		/* it is not pinned yet */
 		reln->pincount = 0;
@@ -583,7 +617,8 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 	 * closed our own smgr rel.
 	 */
 	for (i = 0; i < nrels; i++)
-		CacheInvalidateSmgr(rlocators[i]);
+		if (!SmgrIsTemp(rels[i]))
+			CacheInvalidateSmgr(rlocators[i]);
 
 	/*
 	 * Delete the physical file(s).
@@ -893,7 +928,8 @@ smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks,
 	 * is a performance-critical path.)  As in the unlink code, we want to be
 	 * sure the message is sent before we start changing things on-disk.
 	 */
-	CacheInvalidateSmgr(reln->smgr_rlocator);
+	if (!SmgrIsTemp(reln))
+		CacheInvalidateSmgr(reln->smgr_rlocator);
 
 	/* Do the truncation */
 	for (i = 0; i < nforks; i++)

@@ -63,7 +63,11 @@ gettimeofday(struct timeval *tp, void *tzp)
 	 */
 	Assert(tzp == NULL);
 
+#if WINVER >= _WIN32_WINNT_WIN8
 	GetSystemTimePreciseAsFileTime(&file_time);
+#else
+	GetSystemTimeAsFileTime(&file_time);
+#endif
 	ularge.LowPart = file_time.dwLowDateTime;
 	ularge.HighPart = file_time.dwHighDateTime;
 

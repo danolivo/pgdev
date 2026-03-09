@@ -493,8 +493,8 @@ MERGE INTO rw_view1 t
  merge_action | a |   b   |             old              |                  new                   | a |   b   |   c   |    d     | a |      b      |   c   |       d        | a |      b      |   c   |       d        
 --------------+---+-------+------------------------------+----------------------------------------+---+-------+-------+----------+---+-------------+-------+----------------+---+-------------+-------+----------------
  UPDATE       | 1 | ROW 1 | (1,"Row 1",Const,"b: Row 1") | (1,"ROW 1",Const,"b: ROW 1")           | 1 | Row 1 | Const | b: Row 1 | 1 | ROW 1       | Const | b: ROW 1       | 1 | ROW 1       | Const | b: ROW 1
- DELETE       | 3 | ROW 3 | (3,"Row 3",Const,"b: Row 3") |                                        | 3 | Row 3 | Const | b: Row 3 |   |             |       |                | 3 | Row 3       | Const | b: Row 3
  INSERT       | 2 | ROW 2 |                              | (2,Unspecified,Const,"b: Unspecified") |   |       |       |          | 2 | Unspecified | Const | b: Unspecified | 2 | Unspecified | Const | b: Unspecified
+ DELETE       | 3 | ROW 3 | (3,"Row 3",Const,"b: Row 3") |                                        | 3 | Row 3 | Const | b: Row 3 |   |             |       |                | 3 | Row 3       | Const | b: Row 3
 (3 rows)
 
 SET jit_above_cost TO DEFAULT;
@@ -565,18 +565,14 @@ EXPLAIN (costs off)
 MERGE INTO rw_view1 t
   USING (SELECT * FROM generate_series(1,5)) AS s(a) ON t.a = s.a
   WHEN MATCHED THEN UPDATE SET b = 'Updated';
-                            QUERY PLAN                             
--------------------------------------------------------------------
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
  Merge on base_tbl
-   ->  Hash Join
-         Hash Cond: (base_tbl.a = generate_series.generate_series)
-         ->  Bitmap Heap Scan on base_tbl
-               Recheck Cond: (a > 0)
-               ->  Bitmap Index Scan on base_tbl_pkey
-                     Index Cond: (a > 0)
-         ->  Hash
-               ->  Function Scan on generate_series
-(9 rows)
+   ->  Nested Loop
+         ->  Function Scan on generate_series
+         ->  Index Scan using base_tbl_pkey on base_tbl
+               Index Cond: ((a = generate_series.generate_series) AND (a > 0))
+(5 rows)
 
 EXPLAIN (costs off)
 MERGE INTO rw_view1 t
@@ -599,18 +595,14 @@ EXPLAIN (costs off)
 MERGE INTO rw_view1 t
   USING (SELECT * FROM generate_series(1,5)) AS s(a) ON t.a = s.a
   WHEN NOT MATCHED THEN INSERT (a) VALUES (s.a);
-                            QUERY PLAN                             
--------------------------------------------------------------------
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
  Merge on base_tbl
-   ->  Hash Right Join
-         Hash Cond: (base_tbl.a = generate_series.generate_series)
-         ->  Bitmap Heap Scan on base_tbl
-               Recheck Cond: (a > 0)
-               ->  Bitmap Index Scan on base_tbl_pkey
-                     Index Cond: (a > 0)
-         ->  Hash
-               ->  Function Scan on generate_series
-(9 rows)
+   ->  Nested Loop Left Join
+         ->  Function Scan on generate_series
+         ->  Index Scan using base_tbl_pkey on base_tbl
+               Index Cond: ((a = generate_series.generate_series) AND (a > 0))
+(5 rows)
 
 -- it's still updatable if we add a DO ALSO rule
 CREATE TABLE base_tbl_hist(ts timestamptz default now(), a int, b text);
@@ -2440,19 +2432,16 @@ UPDATE rw_view1 SET a = a + 1000 FROM other_tbl_parent WHERE a = id;
  Update on base_tbl_parent
    Update on base_tbl_parent base_tbl_parent_1
    Update on base_tbl_child base_tbl_parent_2
-   ->  Merge Join
-         Merge Cond: (base_tbl_parent.a = other_tbl_parent.id)
-         ->  Sort
-               Sort Key: base_tbl_parent.a
-               ->  Append
-                     ->  Seq Scan on base_tbl_parent base_tbl_parent_1
-                     ->  Seq Scan on base_tbl_child base_tbl_parent_2
-         ->  Sort
-               Sort Key: other_tbl_parent.id
+   ->  Hash Join
+         Hash Cond: (base_tbl_parent.a = other_tbl_parent.id)
+         ->  Append
+               ->  Seq Scan on base_tbl_parent base_tbl_parent_1
+               ->  Seq Scan on base_tbl_child base_tbl_parent_2
+         ->  Hash
                ->  Append
                      ->  Seq Scan on other_tbl_parent other_tbl_parent_1
                      ->  Seq Scan on other_tbl_child other_tbl_parent_2
-(15 rows)
+(12 rows)
 
 UPDATE rw_view1 SET a = a + 1000 FROM other_tbl_parent WHERE a = id;
 SELECT * FROM ONLY base_tbl_parent ORDER BY a;
@@ -3502,23 +3491,20 @@ CREATE RULE v1_upd_rule AS ON UPDATE TO v1 DO INSTEAD
 CREATE VIEW v2 WITH (security_barrier = true) AS
   SELECT * FROM v1 WHERE EXISTS (SELECT 1);
 EXPLAIN (COSTS OFF) UPDATE v2 SET a = 1;
-                          QUERY PLAN                          
---------------------------------------------------------------
+                       QUERY PLAN                       
+--------------------------------------------------------
  Update on t1
    InitPlan 1
      ->  Result
-   ->  Merge Join
-         Merge Cond: (t1.a = v1.a)
-         ->  Sort
-               Sort Key: t1.a
+   ->  Hash Join
+         Hash Cond: (v1.a = t1.a)
+         ->  Subquery Scan on v1
+               ->  Result
+                     One-Time Filter: (InitPlan 1).col1
+                     ->  Seq Scan on t1 t1_1
+         ->  Hash
                ->  Seq Scan on t1
-         ->  Sort
-               Sort Key: v1.a
-               ->  Subquery Scan on v1
-                     ->  Result
-                           One-Time Filter: (InitPlan 1).col1
-                           ->  Seq Scan on t1 t1_1
-(14 rows)
+(11 rows)
 
 DROP VIEW v2;
 DROP VIEW v1;

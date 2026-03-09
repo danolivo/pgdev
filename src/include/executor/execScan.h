@@ -241,6 +241,14 @@ ExecScanExtended(ScanState *node,
 				return slot;
 			}
 		}
+		else if (qual && qual->guaranteed_empty)
+		{
+			/* Qual guarantees the absence of results */
+			node->ps.guaranteed_empty = true;
+			ExecClearTuple(slot);
+
+			return slot;
+		}
 		else
 			InstrCountFiltered1(node, 1);
 

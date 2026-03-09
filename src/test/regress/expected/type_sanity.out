@@ -144,10 +144,12 @@ WHERE t1.typinput = p1.oid AND t1.typtype in ('b', 'p') AND NOT
     (t1.typelem != 0 AND t1.typlen < 0) AND NOT
     (p1.prorettype = t1.oid AND NOT p1.proretset)
 ORDER BY 1;
- oid  |  typname  | oid | proname 
-------+-----------+-----+---------
- 1790 | refcursor |  46 | textin
-(1 row)
+  oid  |  typname  | oid  |   proname    
+-------+-----------+------+--------------
+  1790 | refcursor |   46 | textin
+ 14756 | abstime   | 1312 | timestamp_in
+ 14757 | reltime   | 1312 | timestamp_in
+(3 rows)
 
 -- Varlena array types will point to array_in
 -- Exception as of 8.1: int2vector and oidvector have their own I/O routines
@@ -196,10 +198,12 @@ WHERE t1.typoutput = p1.oid AND t1.typtype in ('b', 'p') AND NOT
       (p1.oid = 'array_out'::regproc AND
        t1.typelem != 0 AND t1.typlen = -1)))
 ORDER BY 1;
- oid  |  typname  | oid | proname 
-------+-----------+-----+---------
- 1790 | refcursor |  47 | textout
-(1 row)
+  oid  |  typname  | oid  |    proname    
+-------+-----------+------+---------------
+  1790 | refcursor |   47 | textout
+ 14756 | abstime   | 1313 | timestamp_out
+ 14757 | reltime   | 1313 | timestamp_out
+(3 rows)
 
 SELECT t1.oid, t1.typname, p1.oid, p1.proname
 FROM pg_type AS t1, pg_proc AS p1
@@ -260,10 +264,12 @@ WHERE t1.typreceive = p1.oid AND t1.typtype in ('b', 'p') AND NOT
     (t1.typelem != 0 AND t1.typlen < 0) AND NOT
     (p1.prorettype = t1.oid AND NOT p1.proretset)
 ORDER BY 1;
- oid  |  typname  | oid  | proname  
-------+-----------+------+----------
- 1790 | refcursor | 2414 | textrecv
-(1 row)
+  oid  |  typname  | oid  |    proname     
+-------+-----------+------+----------------
+  1790 | refcursor | 2414 | textrecv
+ 14756 | abstime   | 2474 | timestamp_recv
+ 14757 | reltime   | 2474 | timestamp_recv
+(3 rows)
 
 -- Varlena array types will point to array_recv
 -- Exception as of 8.1: int2vector and oidvector have their own I/O routines
@@ -321,10 +327,12 @@ WHERE t1.typsend = p1.oid AND t1.typtype in ('b', 'p') AND NOT
       (p1.oid = 'array_send'::regproc AND
        t1.typelem != 0 AND t1.typlen = -1)))
 ORDER BY 1;
- oid  |  typname  | oid  | proname  
-------+-----------+------+----------
- 1790 | refcursor | 2415 | textsend
-(1 row)
+  oid  |  typname  | oid  |    proname     
+-------+-----------+------+----------------
+  1790 | refcursor | 2415 | textsend
+ 14756 | abstime   | 2475 | timestamp_send
+ 14757 | reltime   | 2475 | timestamp_send
+(3 rows)
 
 SELECT t1.oid, t1.typname, p1.oid, p1.proname
 FROM pg_type AS t1, pg_proc AS p1

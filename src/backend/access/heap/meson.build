@@ -9,6 +9,8 @@ backend_sources += files(
   'hio.c',
   'pruneheap.c',
   'rewriteheap.c',
+  'tempcat.c',
+  'tupmap.c',
   'vacuumlazy.c',
   'visibilitymap.c',
 )

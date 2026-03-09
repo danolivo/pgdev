@@ -157,7 +157,7 @@ rloop:
 				appendPQExpBufferStr(&conn->errorMessage,
 									 "SSL_read failed but did not provide error information\n");
 				/* assume the connection is broken */
-				result_errno = ECONNRESET;
+				result_errno = SOCK_ECONNRESET;
 			}
 			break;
 		case SSL_ERROR_WANT_READ:
@@ -176,8 +176,11 @@ rloop:
 			if (n < 0 && SOCK_ERRNO != 0)
 			{
 				result_errno = SOCK_ERRNO;
-				if (result_errno == EPIPE ||
-					result_errno == ECONNRESET)
+				if (
+#ifdef SOCK_EPIPE
+					result_errno == SOCK_EPIPE ||
+#endif
+					result_errno == SOCK_ECONNRESET)
 					libpq_append_conn_error(conn, "server closed the connection unexpectedly\n"
 											"\tThis probably means the server terminated abnormally\n"
 											"\tbefore or while processing the request.");
@@ -190,7 +193,7 @@ rloop:
 			{
 				libpq_append_conn_error(conn, "SSL SYSCALL error: EOF detected");
 				/* assume the connection is broken */
-				result_errno = ECONNRESET;
+				result_errno = SOCK_ECONNRESET;
 				n = -1;
 			}
 			break;
@@ -201,7 +204,7 @@ rloop:
 				libpq_append_conn_error(conn, "SSL error: %s", errm);
 				SSLerrfree(errm);
 				/* assume the connection is broken */
-				result_errno = ECONNRESET;
+				result_errno = SOCK_ECONNRESET;
 				n = -1;
 				break;
 			}
@@ -213,13 +216,13 @@ rloop:
 			 * server crash.
 			 */
 			libpq_append_conn_error(conn, "SSL connection has been closed unexpectedly");
-			result_errno = ECONNRESET;
+			result_errno = SOCK_ECONNRESET;
 			n = -1;
 			break;
 		default:
 			libpq_append_conn_error(conn, "unrecognized SSL error code: %d", err);
 			/* assume the connection is broken */
-			result_errno = ECONNRESET;
+			result_errno = SOCK_ECONNRESET;
 			n = -1;
 			break;
 	}
@@ -259,7 +262,7 @@ pgtls_write(PGconn *conn, const void *ptr, size_t len)
 				appendPQExpBufferStr(&conn->errorMessage,
 									 "SSL_write failed but did not provide error information\n");
 				/* assume the connection is broken */
-				result_errno = ECONNRESET;
+				result_errno = SOCK_ECONNRESET;
 			}
 			break;
 		case SSL_ERROR_WANT_READ:
@@ -283,7 +286,11 @@ pgtls_write(PGconn *conn, const void *ptr, size_t len)
 			if (n < 0 && SOCK_ERRNO != 0)
 			{
 				result_errno = SOCK_ERRNO;
-				if (result_errno == EPIPE || result_errno == ECONNRESET)
+				if (
+#ifdef SOCK_EPIPE
+					result_errno == SOCK_EPIPE ||
+#endif
+					result_errno == SOCK_ECONNRESET)
 					libpq_append_conn_error(conn, "server closed the connection unexpectedly\n"
 											"\tThis probably means the server terminated abnormally\n"
 											"\tbefore or while processing the request.");
@@ -296,7 +303,7 @@ pgtls_write(PGconn *conn, const void *ptr, size_t len)
 			{
 				libpq_append_conn_error(conn, "SSL SYSCALL error: EOF detected");
 				/* assume the connection is broken */
-				result_errno = ECONNRESET;
+				result_errno = SOCK_ECONNRESET;
 				n = -1;
 			}
 			break;
@@ -307,7 +314,7 @@ pgtls_write(PGconn *conn, const void *ptr, size_t len)
 				libpq_append_conn_error(conn, "SSL error: %s", errm);
 				SSLerrfree(errm);
 				/* assume the connection is broken */
-				result_errno = ECONNRESET;
+				result_errno = SOCK_ECONNRESET;
 				n = -1;
 				break;
 			}
@@ -319,13 +326,13 @@ pgtls_write(PGconn *conn, const void *ptr, size_t len)
 			 * server crash.
 			 */
 			libpq_append_conn_error(conn, "SSL connection has been closed unexpectedly");
-			result_errno = ECONNRESET;
+			result_errno = SOCK_ECONNRESET;
 			n = -1;
 			break;
 		default:
 			libpq_append_conn_error(conn, "unrecognized SSL error code: %d", err);
 			/* assume the connection is broken */
-			result_errno = ECONNRESET;
+			result_errno = SOCK_ECONNRESET;
 			n = -1;
 			break;
 	}
@@ -1748,13 +1755,13 @@ pgconn_bio_read(BIO *h, char *buf, int size)
 		/* If we were interrupted, tell caller to retry */
 		switch (SOCK_ERRNO)
 		{
-#ifdef EAGAIN
-			case EAGAIN:
+#ifdef SOCK_EAGAIN
+			case SOCK_EAGAIN:
 #endif
-#if defined(EWOULDBLOCK) && (!defined(EAGAIN) || (EWOULDBLOCK != EAGAIN))
-			case EWOULDBLOCK:
+#if defined(SOCK_EWOULDBLOCK) && (!defined(SOCK_EAGAIN) || (SOCK_EWOULDBLOCK != SOCK_EAGAIN))
+			case SOCK_EWOULDBLOCK:
 #endif
-			case EINTR:
+			case SOCK_EINTR:
 				BIO_set_retry_read(h);
 				break;
 
@@ -1781,13 +1788,13 @@ pgconn_bio_write(BIO *h, const char *buf, int size)
 		/* If we were interrupted, tell caller to retry */
 		switch (SOCK_ERRNO)
 		{
-#ifdef EAGAIN
-			case EAGAIN:
+#ifdef SOCK_EAGAIN
+			case SOCK_EAGAIN:
 #endif
-#if defined(EWOULDBLOCK) && (!defined(EAGAIN) || (EWOULDBLOCK != EAGAIN))
-			case EWOULDBLOCK:
+#if defined(SOCK_EWOULDBLOCK) && (!defined(SOCK_EAGAIN) || (SOCK_EWOULDBLOCK != SOCK_EAGAIN))
+			case SOCK_EWOULDBLOCK:
 #endif
-			case EINTR:
+			case SOCK_EINTR:
 				BIO_set_retry_write(h);
 				break;
 

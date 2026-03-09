@@ -827,7 +827,7 @@ reset check_function_bodies;
 set default_with_oids to f;
 -- Should not allow to set it to true.
 set default_with_oids to t;
-ERROR:  tables declared WITH OIDS are not supported
+WARNING:  tables declared WITH OIDS are not supported, ignored
 -- Test that disabling track_activities disables query ID reporting in
 -- pg_stat_activity.
 SET compute_query_id = on;

@@ -1,0 +1,3 @@
+[submodule "pg_wait_sampling"]
+	path = contrib/pg_wait_sampling
+	url  = ../pg_wait_sampling

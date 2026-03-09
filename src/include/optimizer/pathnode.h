@@ -68,11 +68,24 @@ extern TidRangePath *create_tidrangescan_path(PlannerInfo *root,
 											  RelOptInfo *rel,
 											  List *tidrangequals,
 											  Relids required_outer);
-extern AppendPath *create_append_path(PlannerInfo *root, RelOptInfo *rel,
+
+extern AppendPath *create_append_path_ext(PlannerInfo *root, RelOptInfo *rel,
 									  List *subpaths, List *partial_subpaths,
 									  List *pathkeys, Relids required_outer,
 									  int parallel_workers, bool parallel_aware,
-									  double rows);
+									  double rows, bool pull_tlist);
+
+static inline AppendPath *create_append_path(PlannerInfo *root, RelOptInfo *rel,
+									  List *subpaths, List *partial_subpaths,
+									  List *pathkeys, Relids required_outer,
+									  int parallel_workers, bool parallel_aware,
+									  double rows)
+{
+	return create_append_path_ext(root, rel, subpaths, partial_subpaths, pathkeys,
+	                              required_outer, parallel_workers, parallel_aware,
+	                              rows, false);
+}
+
 extern MergeAppendPath *create_merge_append_path(PlannerInfo *root,
 												 RelOptInfo *rel,
 												 List *subpaths,

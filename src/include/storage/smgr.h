@@ -60,6 +60,7 @@ typedef struct SMgrRelationData
 	 */
 	int			md_num_open_segs[MAX_FORKNUM + 1];
 	struct _MdfdVec *md_seg_fds[MAX_FORKNUM + 1];
+	struct _RdBuffer *rd_bufs[MAX_FORKNUM + 1];
 
 	/*
 	 * Pinning support.  If unpinned (ie. pincount == 0), 'node' is a list

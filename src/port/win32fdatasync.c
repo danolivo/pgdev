@@ -22,6 +22,15 @@
 int
 fdatasync(int fd)
 {
+#if WINVER < _WIN32_WINNT_WIN8
+#ifndef FRONTEND
+		ereport(LOG,
+			(errmsg_internal("fdatasync is not supported on this Windows version")));
+#else
+		fprintf(stderr, "fdatasync is not supported on this Windows version");
+#endif
+		return -1;
+#else
 	IO_STATUS_BLOCK iosb;
 	NTSTATUS	status;
 	HANDLE		handle;
@@ -48,4 +57,5 @@ fdatasync(int fd)
 
 	_dosmaperr(pg_RtlNtStatusToDosError(status));
 	return -1;
+#endif
 }

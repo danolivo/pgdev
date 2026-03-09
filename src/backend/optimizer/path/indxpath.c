@@ -111,8 +111,6 @@ static List *build_index_paths(PlannerInfo *root, RelOptInfo *rel,
 							   bool *skip_nonnative_saop);
 static List *build_paths_for_OR(PlannerInfo *root, RelOptInfo *rel,
 								List *clauses, List *other_clauses);
-static List *generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
-									  List *clauses, List *other_clauses);
 static Path *choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel,
 							   List *paths);
 static int	path_usage_comparator(const void *a, const void *b);
@@ -1625,7 +1623,7 @@ make_bitmap_paths_for_or_group(PlannerInfo *root, RelOptInfo *rel,
  * for the purpose of generating indexquals, but are not to be searched for
  * ORs.  (See build_paths_for_OR() for motivation.)
  */
-static List *
+List *
 generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
 						 List *clauses, List *other_clauses)
 {
@@ -3911,7 +3909,6 @@ match_clause_to_ordering_op(IndexOptInfo *index,
 
 	return clause;
 }
-
 
 /****************************************************************************
  *				----  ROUTINES TO DO PARTIAL INDEX PREDICATE TESTS	----

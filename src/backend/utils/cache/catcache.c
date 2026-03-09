@@ -20,6 +20,7 @@
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
 #include "common/hashfn.h"
@@ -2373,26 +2374,24 @@ CatCacheCopyKeys(TupleDesc tupdesc, int nkeys, int *attnos,
  *	system relation.
  */
 void
-PrepareToInvalidateCacheTuple(Relation relation,
+PrepareToInvalidateCacheTuple(Oid reloid,
 							  HeapTuple tuple,
 							  HeapTuple newtuple,
 							  void (*function) (int, uint32, Oid, void *),
 							  void *context)
 {
 	slist_iter	iter;
-	Oid			reloid;
+	char		prevTempScope = temp_table_scope;
 
 	CACHE_elog(DEBUG2, "PrepareToInvalidateCacheTuple: called");
 
 	/*
 	 * sanity checks
 	 */
-	Assert(RelationIsValid(relation));
+	Assert(OidIsValid(reloid));
 	Assert(HeapTupleIsValid(tuple));
 	Assert(PointerIsValid(function));
 	Assert(CacheHdr != NULL);
-
-	reloid = RelationGetRelid(relation);
 
 	/* ----------------
 	 *	for each cache
@@ -2407,6 +2406,9 @@ PrepareToInvalidateCacheTuple(Relation relation,
 		CatCache   *ccp = slist_container(CatCache, cc_next, iter.cur);
 		uint32		hashvalue;
 		Oid			dbid;
+		bool		isLocal = false;
+		Oid			relationId = InvalidOid;
+		bool		checkTemp = false;
 
 		if (ccp->cc_reloid != reloid)
 			continue;
@@ -2416,6 +2418,47 @@ PrepareToInvalidateCacheTuple(Relation relation,
 
 		hashvalue = CatalogCacheComputeTupleHashValue(ccp, ccp->cc_nkeys, tuple);
 		dbid = ccp->cc_relisshared ? (Oid) 0 : MyDatabaseId;
+
+		if (reloid == RelationRelationId)
+		{
+			Form_pg_class classtup = (Form_pg_class) GETSTRUCT(tuple);
+
+			isLocal = (classtup->relpersistence == RELPERSISTENCE_TEMP) ?
+				true : false;
+		}
+		else if (reloid == AttributeRelationId)
+		{
+			Form_pg_attribute atttup = (Form_pg_attribute) GETSTRUCT(tuple);
+
+			relationId = atttup->attrelid;
+			checkTemp = true;
+		}
+		else if (reloid == IndexRelationId)
+		{
+			Form_pg_index indextup = (Form_pg_index) GETSTRUCT(tuple);
+
+			relationId = indextup->indexrelid;
+			checkTemp = true;
+		}
+
+		if (checkTemp)
+		{
+			HeapTuple	htup = SearchSysCache1(RELOID,
+											   ObjectIdGetDatum(relationId));
+
+			if (HeapTupleIsValid(htup))
+			{
+				Form_pg_class c = (Form_pg_class)GETSTRUCT(htup);
+
+				isLocal = (c->relisshared == false &&
+						   c->relpersistence == RELPERSISTENCE_TEMP &&
+						   isTempOrTempToastNamespace(c->relnamespace)) ?
+						true : false;
+				ReleaseSysCache(htup);
+			}
+		}
+
+		temp_table_scope = isLocal ? TEMP_TABLE_SCOPE_LOCAL : prevTempScope;
 
 		(*function) (ccp->id, hashvalue, dbid, context);
 
@@ -2429,6 +2472,8 @@ PrepareToInvalidateCacheTuple(Relation relation,
 				(*function) (ccp->id, newhashvalue, dbid, context);
 		}
 	}
+
+	temp_table_scope = prevTempScope;
 }
 
 /* ResourceOwner callbacks */

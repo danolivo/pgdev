@@ -207,18 +207,19 @@ pqsecure_raw_read(PGconn *conn, void *ptr, size_t len)
 		/* Set error message if appropriate */
 		switch (result_errno)
 		{
-#ifdef EAGAIN
-			case EAGAIN:
+#ifdef SOCK_EAGAIN
+			case SOCK_EAGAIN:
 #endif
-#if defined(EWOULDBLOCK) && (!defined(EAGAIN) || (EWOULDBLOCK != EAGAIN))
-			case EWOULDBLOCK:
+#if defined(SOCK_EWOULDBLOCK) && (!defined(SOCK_EAGAIN) || (SOCK_EWOULDBLOCK != SOCK_EAGAIN))
+			case SOCK_EWOULDBLOCK:
 #endif
-			case EINTR:
+			case SOCK_EINTR:
 				/* no error message, caller is expected to retry */
 				break;
-
-			case EPIPE:
-			case ECONNRESET:
+#ifdef SOCK_EPIPE
+			case SOCK_EPIPE:
+#endif
+			case SOCK_ECONNRESET:
 				libpq_append_conn_error(conn, "server closed the connection unexpectedly\n"
 										"\tThis probably means the server terminated abnormally\n"
 										"\tbefore or while processing the request.");
@@ -365,23 +366,23 @@ retry_masked:
 		/* Set error message if appropriate */
 		switch (result_errno)
 		{
-#ifdef EAGAIN
-			case EAGAIN:
+#ifdef SOCK_EAGAIN
+			case SOCK_EAGAIN:
 #endif
-#if defined(EWOULDBLOCK) && (!defined(EAGAIN) || (EWOULDBLOCK != EAGAIN))
-			case EWOULDBLOCK:
+#if defined(SOCK_EWOULDBLOCK) && (!defined(SOCK_EAGAIN) || (SOCK_EWOULDBLOCK != SOCK_EAGAIN))
+			case SOCK_EWOULDBLOCK:
 #endif
-			case EINTR:
+			case SOCK_EINTR:
 				/* no error message, caller is expected to retry */
 				break;
-
-			case EPIPE:
+#ifdef SOCK_EPIPE
+			case SOCK_EPIPE:
 				/* Set flag for EPIPE */
 				REMEMBER_EPIPE(spinfo, true);
-
+#endif
 				/* FALL THRU */
 
-			case ECONNRESET:
+			case SOCK_ECONNRESET:
 				conn->write_failed = true;
 				/* Store error message in conn->write_err_msg, if possible */
 				/* (strdup failure is OK, we'll cope later) */

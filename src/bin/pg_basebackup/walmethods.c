@@ -28,6 +28,7 @@
 #include "common/logging.h"
 #include "pgtar.h"
 #include "walmethods.h"
+#include "streamutil.h"
 
 /* Size of zlib buffer for .tar.gz */
 #define ZLIB_OUT_SIZE 4096
@@ -130,6 +131,8 @@ dir_open_for_write(WalWriteMethod *wwmethod, const char *pathname,
 	size_t		lz4bufsize = 0;
 	void	   *lz4buf = NULL;
 #endif
+	mode_t		mode = (useumask == 1) ?
+		(S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) : (S_IRUSR | S_IWUSR);
 
 	clear_error(wwmethod);
 
@@ -144,7 +147,7 @@ dir_open_for_write(WalWriteMethod *wwmethod, const char *pathname,
 	 * does not do any system calls to fsync() to make changes permanent on
 	 * disk.
 	 */
-	fd = open(tmppath, O_WRONLY | O_CREAT | PG_BINARY, pg_file_create_mode);
+	fd = open(tmppath, O_WRONLY | O_CREAT | PG_BINARY, pg_file_create_mode | mode);
 	if (fd < 0)
 	{
 		wwmethod->lasterrno = errno;
@@ -838,6 +841,8 @@ tar_open_for_write(WalWriteMethod *wwmethod, const char *pathname,
 				   const char *temp_suffix, size_t pad_to_size)
 {
 	TarMethodData *tar_data = (TarMethodData *) wwmethod;
+	mode_t		mode = (useumask == 1) ?
+		(S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) : (S_IRUSR | S_IWUSR);
 	char	   *tmppath;
 
 	clear_error(wwmethod);
@@ -849,7 +854,7 @@ tar_open_for_write(WalWriteMethod *wwmethod, const char *pathname,
 		 */
 		tar_data->fd = open(tar_data->tarfilename,
 							O_WRONLY | O_CREAT | PG_BINARY,
-							pg_file_create_mode);
+							pg_file_create_mode | mode);
 		if (tar_data->fd < 0)
 		{
 			wwmethod->lasterrno = errno;

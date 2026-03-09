@@ -107,6 +107,53 @@ extern void pgfnames_cleanup(char **filenames);
 #define is_absolute_path(filename) is_windows_absolute_path(filename)
 #endif
 
+
+/*
+ * Socket error codes handling constants.
+ * Any socket related routines must use SOCK_ERRNO instead of errno!
+ *
+ * In Windows socket errors are checked using WSAGetLastError instead of errno -
+ * errno might return 0 while WSAGetLastError returns actual socket error codes.
+ * WSAGetLastError uses own error codes different from errno.
+ */
+#ifdef WIN32
+#define SOCK_EWOULDBLOCK WSAEWOULDBLOCK
+#define SOCK_EINTR WSAEINTR
+#define SOCK_EINVAL WSAEINVAL
+#define SOCK_EIO WSAEFAULT /* used only for setting error code */
+#define SOCK_EINPROGRESS WSAEINPROGRESS
+#define SOCK_ECONNRESET WSAECONNRESET
+#define SOCK_ECONNABORTED WSAECONNABORTED
+#define SOCK_EHOSTDOWN WSAEHOSTDOWN
+#define SOCK_EHOSTUNREACH WSAEHOSTUNREACH
+#define SOCK_ENETDOWN WSAENETDOWN
+#define SOCK_ENETRESET WSAENETRESET
+#define SOCK_ENETUNREACH WSAENETUNREACH
+#define SOCK_ETIMEDOUT WSAETIMEDOUT
+#else
+#ifdef EAGAIN
+#define SOCK_EAGAIN EAGAIN
+#endif
+#ifdef EWOULDBLOCK
+#define SOCK_EWOULDBLOCK EWOULDBLOCK
+#endif
+#define SOCK_EINTR EINTR
+#define SOCK_EINVAL EINVAL
+#define SOCK_EIO EIO
+#define SOCK_EINPROGRESS EINPROGRESS
+#define SOCK_ECONNRESET ECONNRESET
+#ifdef EPIPE
+#define SOCK_EPIPE EPIPE
+#endif
+#define SOCK_ECONNABORTED ECONNABORTED
+#define SOCK_EHOSTDOWN EHOSTDOWN
+#define SOCK_EHOSTUNREACH EHOSTUNREACH
+#define SOCK_ENETDOWN ENETDOWN
+#define SOCK_ENETRESET ENETRESET
+#define SOCK_ENETUNREACH ENETUNREACH
+#define SOCK_ETIMEDOUT ETIMEDOUT
+#endif
+
 /*
  * This macro provides a centralized list of all errnos that identify
  * hard failure of a previously-established network connection.
@@ -119,16 +166,22 @@ extern void pgfnames_cleanup(char **filenames);
  * are actually reporting errors typically single out EPIPE and ECONNRESET,
  * while allowing the network failures to be reported generically.
  */
-#define ALL_CONNECTION_FAILURE_ERRNOS \
-	EPIPE: \
-	case ECONNRESET: \
-	case ECONNABORTED: \
-	case EHOSTDOWN: \
-	case EHOSTUNREACH: \
-	case ENETDOWN: \
-	case ENETRESET: \
-	case ENETUNREACH: \
-	case ETIMEDOUT
+
+#define ALL_CONNECTION_FAILURE_ERRNOS_COMMON \
+	SOCK_ECONNRESET: \
+	case SOCK_ECONNABORTED: \
+	case SOCK_EHOSTDOWN: \
+	case SOCK_EHOSTUNREACH: \
+	case SOCK_ENETDOWN: \
+	case SOCK_ENETRESET: \
+	case SOCK_ENETUNREACH: \
+	case SOCK_ETIMEDOUT
+
+#ifdef SOCK_EPIPE
+#define ALL_CONNECTION_FAILURE_ERRNOS SOCK_EPIPE: case ALL_CONNECTION_FAILURE_ERRNOS_COMMON
+#else
+#define ALL_CONNECTION_FAILURE_ERRNOS ALL_CONNECTION_FAILURE_ERRNOS_COMMON
+#endif
 
 /* Portable locale initialization (in exec.c) */
 extern void set_pglocale_pgservice(const char *argv0, const char *app);

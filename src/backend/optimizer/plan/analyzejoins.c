@@ -76,6 +76,9 @@ static bool is_innerrel_unique_for(PlannerInfo *root,
 static int	self_join_candidates_cmp(const void *a, const void *b);
 static bool replace_relid_callback(Node *node,
 								   ChangeVarNodes_context *context);
+// static Bitmapset *replace_relid(Relids relids, int oldId, int newId);
+// static void replace_varno(Node *node, int from, int to);
+// static bool replace_varno_walker(Node *node, ReplaceVarnoContext *ctx);
 
 
 /*

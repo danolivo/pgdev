@@ -655,7 +655,7 @@ retry3:
 	if (connect(tmpsock, (struct sockaddr *) &cancel->raddr.addr,
 				cancel->raddr.salen) < 0)
 	{
-		if (SOCK_ERRNO == EINTR)
+		if (SOCK_ERRNO == SOCK_EINTR)
 			/* Interrupted system call - we'll just try again */
 			goto retry3;
 		strlcpy(errbuf, "PQcancel() -- connect() failed: ", errbufsize);
@@ -672,7 +672,7 @@ retry4:
 	 */
 	if (send(tmpsock, (char *) &cancel->cancel_pkt_len, cancel_pkt_len, 0) != cancel_pkt_len)
 	{
-		if (SOCK_ERRNO == EINTR)
+		if (SOCK_ERRNO == SOCK_EINTR)
 			/* Interrupted system call - we'll just try again */
 			goto retry4;
 		strlcpy(errbuf, "PQcancel() -- send() failed: ", errbufsize);
@@ -689,7 +689,7 @@ retry4:
 retry5:
 	if (recv(tmpsock, &recvbuf, 1, 0) < 0)
 	{
-		if (SOCK_ERRNO == EINTR)
+		if (SOCK_ERRNO == SOCK_EINTR)
 			/* Interrupted system call - we'll just try again */
 			goto retry5;
 		/* we ignore other error conditions */

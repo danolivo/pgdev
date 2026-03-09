@@ -40,6 +40,7 @@
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/tempcat.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/partition.h"
@@ -62,7 +63,7 @@
 #include "utils/partcache.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
-
+#include "utils/syscache.h"
 
 /* Hooks for plugins to get control in ExecutorStart/Run/Finish/End */
 ExecutorStart_hook_type ExecutorStart_hook = NULL;
@@ -621,6 +622,15 @@ ExecCheckPermissions(List *rangeTable, List *rteperminfos,
 		RTEPermissionInfo *perminfo = lfirst_node(RTEPermissionInfo, l);
 
 		Assert(OidIsValid(perminfo->relid));
+
+		if (enable_temp_memory_catalog && IsParallelWorker())
+		{
+			HeapTuple htup = SearchSysCache1(RELOID, ObjectIdGetDatum(perminfo->relid));
+			if (!htup)
+				continue;
+			ReleaseSysCache(htup);
+		}
+
 		result = ExecCheckOneRelPerms(perminfo);
 		if (!result)
 		{

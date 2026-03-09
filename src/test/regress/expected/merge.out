@@ -42,15 +42,12 @@ WHEN MATCHED THEN
                QUERY PLAN               
 ----------------------------------------
  Merge on target t
-   ->  Merge Join
-         Merge Cond: (t.tid = s.sid)
-         ->  Sort
-               Sort Key: t.tid
-               ->  Seq Scan on target t
-         ->  Sort
-               Sort Key: s.sid
+   ->  Hash Join
+         Hash Cond: (t.tid = s.sid)
+         ->  Seq Scan on target t
+         ->  Hash
                ->  Seq Scan on source s
-(9 rows)
+(6 rows)
 
 --
 -- Errors
@@ -1640,17 +1637,13 @@ WHEN MATCHED THEN
 -------------------------------------------------------------------------
  Merge on ex_mtarget t (actual rows=0.00 loops=1)
    Tuples: updated=50
-   ->  Merge Join (actual rows=50.00 loops=1)
-         Merge Cond: (t.a = s.a)
-         ->  Sort (actual rows=50.00 loops=1)
-               Sort Key: t.a
-               Sort Method: quicksort  Memory: xxx
-               ->  Seq Scan on ex_mtarget t (actual rows=50.00 loops=1)
-         ->  Sort (actual rows=100.00 loops=1)
-               Sort Key: s.a
-               Sort Method: quicksort  Memory: xxx
+   ->  Hash Join (actual rows=50.00 loops=1)
+         Hash Cond: (t.a = s.a)
+         ->  Seq Scan on ex_mtarget t (actual rows=50.00 loops=1)
+         ->  Hash (actual rows=100.00 loops=1)
+               Buckets: xxx  Batches: xxx  Memory Usage: xxx
                ->  Seq Scan on ex_msource s (actual rows=100.00 loops=1)
-(12 rows)
+(8 rows)
 
 -- only updates to selected tuples
 SELECT explain_merge('
@@ -1661,17 +1654,13 @@ WHEN MATCHED AND t.a < 10 THEN
 -------------------------------------------------------------------------
  Merge on ex_mtarget t (actual rows=0.00 loops=1)
    Tuples: updated=5 skipped=45
-   ->  Merge Join (actual rows=50.00 loops=1)
-         Merge Cond: (t.a = s.a)
-         ->  Sort (actual rows=50.00 loops=1)
-               Sort Key: t.a
-               Sort Method: quicksort  Memory: xxx
-               ->  Seq Scan on ex_mtarget t (actual rows=50.00 loops=1)
-         ->  Sort (actual rows=100.00 loops=1)
-               Sort Key: s.a
-               Sort Method: quicksort  Memory: xxx
+   ->  Hash Join (actual rows=50.00 loops=1)
+         Hash Cond: (t.a = s.a)
+         ->  Seq Scan on ex_mtarget t (actual rows=50.00 loops=1)
+         ->  Hash (actual rows=100.00 loops=1)
+               Buckets: xxx  Batches: xxx  Memory Usage: xxx
                ->  Seq Scan on ex_msource s (actual rows=100.00 loops=1)
-(12 rows)
+(8 rows)
 
 -- updates + deletes
 SELECT explain_merge('
@@ -1684,38 +1673,30 @@ WHEN MATCHED AND t.a >= 10 AND t.a <= 20 THEN
 -------------------------------------------------------------------------
  Merge on ex_mtarget t (actual rows=0.00 loops=1)
    Tuples: updated=5 deleted=5 skipped=40
-   ->  Merge Join (actual rows=50.00 loops=1)
-         Merge Cond: (t.a = s.a)
-         ->  Sort (actual rows=50.00 loops=1)
-               Sort Key: t.a
-               Sort Method: quicksort  Memory: xxx
-               ->  Seq Scan on ex_mtarget t (actual rows=50.00 loops=1)
-         ->  Sort (actual rows=100.00 loops=1)
-               Sort Key: s.a
-               Sort Method: quicksort  Memory: xxx
+   ->  Hash Join (actual rows=50.00 loops=1)
+         Hash Cond: (t.a = s.a)
+         ->  Seq Scan on ex_mtarget t (actual rows=50.00 loops=1)
+         ->  Hash (actual rows=100.00 loops=1)
+               Buckets: xxx  Batches: xxx  Memory Usage: xxx
                ->  Seq Scan on ex_msource s (actual rows=100.00 loops=1)
-(12 rows)
+(8 rows)
 
 -- only inserts
 SELECT explain_merge('
 MERGE INTO ex_mtarget t USING ex_msource s ON t.a = s.a
 WHEN NOT MATCHED AND s.a < 10 THEN
 	INSERT VALUES (a, b)');
-                              explain_merge                              
--------------------------------------------------------------------------
+                             explain_merge                              
+------------------------------------------------------------------------
  Merge on ex_mtarget t (actual rows=0.00 loops=1)
    Tuples: inserted=4 skipped=96
-   ->  Merge Left Join (actual rows=100.00 loops=1)
-         Merge Cond: (s.a = t.a)
-         ->  Sort (actual rows=100.00 loops=1)
-               Sort Key: s.a
-               Sort Method: quicksort  Memory: xxx
-               ->  Seq Scan on ex_msource s (actual rows=100.00 loops=1)
-         ->  Sort (actual rows=45.00 loops=1)
-               Sort Key: t.a
-               Sort Method: quicksort  Memory: xxx
+   ->  Hash Left Join (actual rows=100.00 loops=1)
+         Hash Cond: (s.a = t.a)
+         ->  Seq Scan on ex_msource s (actual rows=100.00 loops=1)
+         ->  Hash (actual rows=45.00 loops=1)
+               Buckets: xxx  Batches: xxx  Memory Usage: xxx
                ->  Seq Scan on ex_mtarget t (actual rows=45.00 loops=1)
-(12 rows)
+(8 rows)
 
 -- all three
 SELECT explain_merge('
@@ -1726,21 +1707,17 @@ WHEN MATCHED AND t.a >= 30 AND t.a <= 40 THEN
 	DELETE
 WHEN NOT MATCHED AND s.a < 20 THEN
 	INSERT VALUES (a, b)');
-                              explain_merge                              
--------------------------------------------------------------------------
+                             explain_merge                              
+------------------------------------------------------------------------
  Merge on ex_mtarget t (actual rows=0.00 loops=1)
    Tuples: inserted=10 updated=9 deleted=5 skipped=76
-   ->  Merge Left Join (actual rows=100.00 loops=1)
-         Merge Cond: (s.a = t.a)
-         ->  Sort (actual rows=100.00 loops=1)
-               Sort Key: s.a
-               Sort Method: quicksort  Memory: xxx
-               ->  Seq Scan on ex_msource s (actual rows=100.00 loops=1)
-         ->  Sort (actual rows=49.00 loops=1)
-               Sort Key: t.a
-               Sort Method: quicksort  Memory: xxx
+   ->  Hash Left Join (actual rows=100.00 loops=1)
+         Hash Cond: (s.a = t.a)
+         ->  Seq Scan on ex_msource s (actual rows=100.00 loops=1)
+         ->  Hash (actual rows=49.00 loops=1)
+               Buckets: xxx  Batches: xxx  Memory Usage: xxx
                ->  Seq Scan on ex_mtarget t (actual rows=49.00 loops=1)
-(12 rows)
+(8 rows)
 
 -- not matched by source
 SELECT explain_merge('
@@ -1751,17 +1728,13 @@ WHEN NOT MATCHED BY SOURCE and t.a < 10 THEN
 -------------------------------------------------------------------------
  Merge on ex_mtarget t (actual rows=0.00 loops=1)
    Tuples: skipped=54
-   ->  Merge Left Join (actual rows=54.00 loops=1)
-         Merge Cond: (t.a = s.a)
-         ->  Sort (actual rows=54.00 loops=1)
-               Sort Key: t.a
-               Sort Method: quicksort  Memory: xxx
-               ->  Seq Scan on ex_mtarget t (actual rows=54.00 loops=1)
-         ->  Sort (actual rows=100.00 loops=1)
-               Sort Key: s.a
-               Sort Method: quicksort  Memory: xxx
+   ->  Hash Left Join (actual rows=54.00 loops=1)
+         Hash Cond: (t.a = s.a)
+         ->  Seq Scan on ex_mtarget t (actual rows=54.00 loops=1)
+         ->  Hash (actual rows=100.00 loops=1)
+               Buckets: xxx  Batches: xxx  Memory Usage: xxx
                ->  Seq Scan on ex_msource s (actual rows=100.00 loops=1)
-(12 rows)
+(8 rows)
 
 -- not matched by source and target
 SELECT explain_merge('
@@ -1794,18 +1767,15 @@ WHEN MATCHED AND t.a < 10 THEN
                              explain_merge                             
 -----------------------------------------------------------------------
  Merge on ex_mtarget t (actual rows=0.00 loops=1)
-   ->  Merge Join (actual rows=0.00 loops=1)
-         Merge Cond: (t.a = s.a)
-         ->  Sort (actual rows=0.00 loops=1)
-               Sort Key: t.a
-               Sort Method: quicksort  Memory: xxx
+   ->  Hash Join (actual rows=0.00 loops=1)
+         Hash Cond: (s.a = t.a)
+         ->  Seq Scan on ex_msource s (actual rows=1.00 loops=1)
+         ->  Hash (actual rows=0.00 loops=1)
+               Buckets: xxx  Batches: xxx  Memory Usage: xxx
                ->  Seq Scan on ex_mtarget t (actual rows=0.00 loops=1)
                      Filter: (a < '-1000'::integer)
                      Rows Removed by Filter: 54
-         ->  Sort (never executed)
-               Sort Key: s.a
-               ->  Seq Scan on ex_msource s (never executed)
-(12 rows)
+(9 rows)
 
 DROP TABLE ex_msource, ex_mtarget;
 DROP FUNCTION explain_merge(text);
@@ -2347,13 +2317,13 @@ MERGE INTO pa_target t
  merge_action |                    old                     |                              new                              |          logts           | tid | balance |           val            
 --------------+--------------------------------------------+---------------------------------------------------------------+--------------------------+-----+---------+--------------------------
  UPDATE       | ("Tue Jan 31 00:00:00 2017",1,100,initial) | ("Tue Jan 31 00:00:00 2017",1,110,"initial updated by merge") | Tue Jan 31 00:00:00 2017 |   1 |     110 | initial updated by merge
- UPDATE       | ("Tue Feb 28 00:00:00 2017",2,200,initial) | ("Tue Feb 28 00:00:00 2017",2,220,"initial updated by merge") | Tue Feb 28 00:00:00 2017 |   2 |     220 | initial updated by merge
- INSERT       |                                            | ("Sun Jan 15 00:00:00 2017",3,30,"inserted by merge")         | Sun Jan 15 00:00:00 2017 |   3 |      30 | inserted by merge
+ UPDATE       | ("Tue Jan 31 00:00:00 2017",7,700,initial) | ("Tue Jan 31 00:00:00 2017",7,770,"initial updated by merge") | Tue Jan 31 00:00:00 2017 |   7 |     770 | initial updated by merge
  UPDATE       | ("Tue Jan 31 00:00:00 2017",4,400,initial) | ("Tue Jan 31 00:00:00 2017",4,440,"initial updated by merge") | Tue Jan 31 00:00:00 2017 |   4 |     440 | initial updated by merge
  UPDATE       | ("Tue Feb 28 00:00:00 2017",5,500,initial) | ("Tue Feb 28 00:00:00 2017",5,550,"initial updated by merge") | Tue Feb 28 00:00:00 2017 |   5 |     550 | initial updated by merge
- INSERT       |                                            | ("Sun Jan 15 00:00:00 2017",6,60,"inserted by merge")         | Sun Jan 15 00:00:00 2017 |   6 |      60 | inserted by merge
- UPDATE       | ("Tue Jan 31 00:00:00 2017",7,700,initial) | ("Tue Jan 31 00:00:00 2017",7,770,"initial updated by merge") | Tue Jan 31 00:00:00 2017 |   7 |     770 | initial updated by merge
+ UPDATE       | ("Tue Feb 28 00:00:00 2017",2,200,initial) | ("Tue Feb 28 00:00:00 2017",2,220,"initial updated by merge") | Tue Feb 28 00:00:00 2017 |   2 |     220 | initial updated by merge
  UPDATE       | ("Tue Feb 28 00:00:00 2017",8,800,initial) | ("Tue Feb 28 00:00:00 2017",8,880,"initial updated by merge") | Tue Feb 28 00:00:00 2017 |   8 |     880 | initial updated by merge
+ INSERT       |                                            | ("Sun Jan 15 00:00:00 2017",6,60,"inserted by merge")         | Sun Jan 15 00:00:00 2017 |   6 |      60 | inserted by merge
+ INSERT       |                                            | ("Sun Jan 15 00:00:00 2017",3,30,"inserted by merge")         | Sun Jan 15 00:00:00 2017 |   3 |      30 | inserted by merge
  INSERT       |                                            | ("Sun Jan 15 00:00:00 2017",9,90,"inserted by merge")         | Sun Jan 15 00:00:00 2017 |   9 |      90 | inserted by merge
 (9 rows)
 

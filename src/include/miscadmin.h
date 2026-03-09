@@ -105,8 +105,13 @@ extern PGDLLIMPORT volatile uint32 InterruptHoldoffCount;
 extern PGDLLIMPORT volatile uint32 QueryCancelHoldoffCount;
 extern PGDLLIMPORT volatile uint32 CritSectionCount;
 
+/* to allow extensions to handle custom interrupts */
+typedef void (*ProcessInterrupts_hook_type) (void);
+extern PGDLLIMPORT ProcessInterrupts_hook_type ProcessInterrupts_hook;
+
 /* in tcop/postgres.c */
 extern void ProcessInterrupts(void);
+extern void standard_ProcessInterrupts(void);
 
 /* Test whether an interrupt is pending */
 #ifndef WIN32

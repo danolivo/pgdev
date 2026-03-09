@@ -410,6 +410,7 @@ CatalogIdMapEntry
 CatalogIndexState
 ChangeVarNodes_callback
 ChangeVarNodes_context
+ReplaceVarnoContext
 CheckPoint
 CheckPointStmt
 CheckpointStatsData
@@ -4174,6 +4175,7 @@ unicodeStyleColumnFormat
 unicodeStyleFormat
 unicodeStyleRowFormat
 unicode_linestyle
+UniqueRelInfo
 unit_conversion
 unlogged_relation_entry
 utf_local_conversion_func

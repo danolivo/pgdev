@@ -276,6 +276,27 @@ performDeletion(const ObjectAddress *object,
 	Relation	depRel;
 	ObjectAddresses *targetObjects;
 
+	if (flags & PERFORM_DELETION_CONCURRENTLY)
+	{
+		/*
+		 * We must commit our transaction in order to make the first pg_index
+		 * state update visible to other sessions.  If the DROP machinery has
+		 * already performed any other actions (removal of other objects,
+		 * pg_depend entries, etc), the commit would make those actions
+		 * permanent, which would leave us with inconsistent catalog state if
+		 * we fail partway through the following sequence.  Since DROP INDEX
+		 * CONCURRENTLY is restricted to dropping just one index that has no
+		 * dependencies, we should get here before anything's been done ---
+		 * but let's check that to be sure.  We can verify that the current
+		 * transaction has not executed any transactional updates by checking
+		 * that no XID has been assigned.
+		 */
+		if (GetTopTransactionIdIfAny() != InvalidTransactionId)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("DROP INDEX CONCURRENTLY must be first action in transaction")));
+	}
+
 	/*
 	 * We save some cycles by opening pg_depend just once and passing the
 	 * Relation pointer down to all the recursive deletion steps.

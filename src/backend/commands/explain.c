@@ -174,7 +174,7 @@ static void ExplainFlushWorkersState(ExplainState *es);
  */
 void
 ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
-			 ParamListInfo params, DestReceiver *dest)
+			 ParamListInfo params, DestReceiver *dest, uint64 *processed)
 {
 	ExplainState *es = NewExplainState();
 	TupOutputState *tstate;
@@ -182,8 +182,12 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 	Query	   *query;
 	List	   *rewritten;
 
+	if (processed)
+		*processed = 0;
+
 	/* Configure the ExplainState based on the provided options */
 	ParseExplainOptionList(es, stmt->options, pstate);
+
 
 	/* Extract the query and, if enabled, jumble it */
 	query = castNode(Query, stmt->query);
@@ -244,6 +248,9 @@ ExplainQuery(ParseState *pstate, ExplainStmt *stmt,
 	end_tup_output(tstate);
 
 	pfree(es->str->data);
+
+	if (processed)
+		*processed = es->es_processed;
 }
 
 /*
@@ -655,6 +662,8 @@ ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into, ExplainState *es,
 	 * total execution time (although it should be pretty minimal).
 	 */
 	INSTR_TIME_SET_CURRENT(starttime);
+
+	es->es_processed += queryDesc->estate->es_processed;
 
 	ExecutorEnd(queryDesc);
 

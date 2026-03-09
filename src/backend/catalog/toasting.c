@@ -30,6 +30,7 @@
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "utils/fmgroids.h"
+#include "utils/inval.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
@@ -199,6 +200,12 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 			 "pg_toast_%u", relOid);
 	snprintf(toast_idxname, sizeof(toast_idxname),
 			 "pg_toast_%u_index", relOid);
+
+	/*
+	 * Don't send shared invalidation messages for TOASTs created for temporary tables,
+	 * because those TOAST anyway couldn't be accessed from other sessions.
+	 */
+	BEGIN_TEMP_TABLE_SCOPE_LOCAL(rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP);
 
 	/* this is pretty painful...  need a tuple descriptor */
 	tupdesc = CreateTemplateTupleDesc(3);
@@ -390,6 +397,8 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 	 * Make changes visible
 	 */
 	CommandCounterIncrement();
+
+	END_TEMP_TABLE_SCOPE();
 
 	return true;
 }

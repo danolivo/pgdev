@@ -55,6 +55,7 @@ ExecScan(ScanState *node,
 	epqstate = node->ps.state->es_epq_active;
 	qual = node->ps.qual;
 	projInfo = node->ps.ps_ProjInfo;
+	node->ps.guaranteed_empty = false;
 
 	return ExecScanExtended(node,
 							accessMtd,

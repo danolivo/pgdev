@@ -1202,6 +1202,7 @@ transformFromClauseItem(ParseState *pstate, Node *n,
 										  &r_namespace);
 
 		/* Remove the left-side RTEs from the namespace list again */
+
 		pstate->p_namespace = list_truncate(pstate->p_namespace,
 											sv_namespace_length);
 

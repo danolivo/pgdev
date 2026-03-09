@@ -3481,11 +3481,11 @@ keep_going:						/* We will come back to here until there is
 					if (connect(conn->sock, (struct sockaddr *) &addr_cur->addr.addr,
 								addr_cur->addr.salen) < 0)
 					{
-						if (SOCK_ERRNO == EINPROGRESS ||
+						if (SOCK_ERRNO == SOCK_EINPROGRESS ||
 #ifdef WIN32
-							SOCK_ERRNO == EWOULDBLOCK ||
+							SOCK_ERRNO == SOCK_EWOULDBLOCK ||
 #endif
-							SOCK_ERRNO == EINTR)
+							SOCK_ERRNO == SOCK_EINTR)
 						{
 							/*
 							 * This is fine - we're in non-blocking mode, and

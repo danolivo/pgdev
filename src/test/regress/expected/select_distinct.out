@@ -355,15 +355,14 @@ SET max_parallel_workers_per_gather=2;
 -- distinct
 EXPLAIN (COSTS OFF)
 SELECT DISTINCT four FROM tenk1 WHERE four = 10;
-                  QUERY PLAN                  
-----------------------------------------------
- Limit
+               QUERY PLAN               
+----------------------------------------
+ HashAggregate
    ->  Gather
          Workers Planned: 2
-         ->  Limit
-               ->  Parallel Seq Scan on tenk1
-                     Filter: (four = 10)
-(6 rows)
+         ->  Parallel Seq Scan on tenk1
+               Filter: (four = 10)
+(5 rows)
 
 RESET max_parallel_workers_per_gather;
 RESET min_parallel_table_scan_size;

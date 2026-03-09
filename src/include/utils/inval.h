@@ -81,4 +81,74 @@ extern void InvalidateSystemCaches(void);
 extern void InvalidateSystemCachesExtended(bool debug_discard);
 
 extern void LogLogicalInvalidations(void);
+
+/*
+ * Hints that operation being performed is related to temporary tables.
+ */
+extern char temp_table_scope;
+
+#define TEMP_TABLE_SCOPE_NOTEMP 0
+#define TEMP_TABLE_SCOPE_SHARED 1
+#define TEMP_TABLE_SCOPE_LOCAL  2
+
+/*
+ * This is modified PG_TRY/PG_FINALLY/PG_END_TRY block that conditionally sets
+ * and restores `temp_table_scope` on error. It's optimized to do not use
+ * try/catch mechanism when `isTemp` is false. When entering scope by using
+ * `BEGIN_TEMP_TABLE_SCOPE` the previous value of `temp_table_scope` is saved,
+ * and new value is set according to `level`. On upon reaching
+ * `END_TEMP_TABLE_SCOPE` or exception, the value `temp_table_scope` is
+ * restored to saved value. Thus, nesting of scope is possible.
+ * 
+ * When level `level` is `TEMP_TABLE_SCOPE_LOCAL` (or `BEGIN_TEMP_TABLE_SCOPE_LOCAL`
+ * used with non-zero argument), some of shared invalidation messages aren't sent
+ * to other sessions. 
+ * 
+ * When level is `TEMP_TABLE_SCOPE_LOCAL` or `TEMP_TABLE_SCOPE_SHARED`
+ * (or `BEGIN_TEMP_TABLE_SCOPE_*` used with non-zero argument) all created WAL
+ * records won't issue fsync on commit.
+ */
+#define BEGIN_TEMP_TABLE_SCOPE(level) \
+	do { \
+		const char            _temp_scope_level = (level); \
+		const bool            _temp_scope_do = (_temp_scope_level != temp_table_scope); \
+		bool                  _temp_scope_throw = false; \
+		char                  _temp_scope_save_state; \
+		sigjmp_buf*           _temp_scope_save_exception_stack = PG_exception_stack; \
+		ErrorContextCallback* _temp_scope_save_error_stack; \
+		sigjmp_buf            _temp_scope_save_sigjmp_buf; \
+		if (_temp_scope_do) \
+		{ \
+			_temp_scope_save_state = temp_table_scope; \
+			_temp_scope_save_error_stack = error_context_stack; \
+			if (sigsetjmp(_temp_scope_save_sigjmp_buf, 0) == 0) \
+			{ \
+				PG_exception_stack = &_temp_scope_save_sigjmp_buf; \
+				temp_table_scope = level; \
+			} \
+			else \
+				_temp_scope_throw = true; \
+		} \
+		if (!_temp_scope_throw) \
+		{
+
+#define BEGIN_TEMP_TABLE_SCOPE_LOCAL(isTemp)  BEGIN_TEMP_TABLE_SCOPE( (isTemp) ? TEMP_TABLE_SCOPE_LOCAL  : TEMP_TABLE_SCOPE_NOTEMP )
+#define BEGIN_TEMP_TABLE_SCOPE_SHARED(isTemp) BEGIN_TEMP_TABLE_SCOPE( (isTemp) ? TEMP_TABLE_SCOPE_SHARED : TEMP_TABLE_SCOPE_NOTEMP )
+
+#define END_TEMP_TABLE_SCOPE() \
+		} \
+		PG_exception_stack = _temp_scope_save_exception_stack; \
+		if (_temp_scope_do) \
+		{ \
+			error_context_stack = _temp_scope_save_error_stack; \
+			temp_table_scope = _temp_scope_save_state; \
+			if (_temp_scope_throw) \
+				PG_RE_THROW(); \
+		} \
+	} while (0)
+
+#define IsTempTableScope()       (temp_table_scope != TEMP_TABLE_SCOPE_NOTEMP)
+#define IsLocalTempTableScope()  (temp_table_scope == TEMP_TABLE_SCOPE_LOCAL)
+#define IsSharedTempTableScope() (temp_table_scope == TEMP_TABLE_SCOPE_SHARED)
+
 #endif							/* INVAL_H */

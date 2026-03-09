@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "miscadmin.h"
 #include "storage/latch.h"
 #include "storage/sinvaladt.h"

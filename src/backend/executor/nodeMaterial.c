@@ -135,6 +135,8 @@ ExecMaterial(PlanState *pstate)
 		if (TupIsNull(outerslot))
 		{
 			node->eof_underlying = true;
+			if (tuplestore_tuple_count(tuplestorestate) == 0)
+				node->ss.ps.guaranteed_empty = true;
 			return NULL;
 		}
 
@@ -358,6 +360,9 @@ ExecReScanMaterial(MaterialState *node)
 		 */
 		if (outerPlan->chgParam == NULL)
 			ExecReScan(outerPlan);
+		else
+			node->ss.ps.guaranteed_empty = false;
+
 		node->eof_underlying = false;
 	}
 }

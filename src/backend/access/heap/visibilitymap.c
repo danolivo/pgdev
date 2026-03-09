@@ -648,7 +648,8 @@ vm_extend(Relation rel, BlockNumber vm_nblocks)
 	 * to keep checking for creation or extension of the file, which happens
 	 * infrequently.
 	 */
-	CacheInvalidateSmgr(RelationGetSmgr(rel)->smgr_rlocator);
+	if (!RELATION_IS_LOCAL(rel))
+		CacheInvalidateSmgr(RelationGetSmgr(rel)->smgr_rlocator);
 
 	return buf;
 }

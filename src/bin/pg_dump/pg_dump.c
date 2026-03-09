@@ -2072,11 +2072,22 @@ selectDumpableType(TypeInfo *tyinfo, Archive *fout)
 	if (OidIsValid(tyinfo->typrelid) &&
 		tyinfo->typrelkind != RELKIND_COMPOSITE_TYPE)
 	{
-		TableInfo  *tytable = findTableByOid(tyinfo->typrelid);
+		DumpableObject *parentRel;
 
 		tyinfo->dobj.objType = DO_DUMMY_TYPE;
-		if (tytable != NULL)
-			tyinfo->dobj.dump = tytable->dobj.dump;
+
+		/* Get associated relation */
+		if (tyinfo->typrelkind == RELKIND_INDEX)
+			parentRel = (DumpableObject *) findIndexByOid(tyinfo->typrelid);
+		else
+			parentRel = (DumpableObject *) findTableByOid(tyinfo->typrelid);
+
+		/*
+		 * If associated relation found, dump based on if the
+		 * contents of the associated relation are being dumped.
+		 */
+		if (parentRel != NULL)
+			tyinfo->dobj.dump = parentRel->dump;
 		else
 			tyinfo->dobj.dump = DUMP_COMPONENT_NONE;
 		return;
@@ -5563,6 +5574,9 @@ binary_upgrade_set_type_oids_by_type_oid(Archive *fout,
 	Oid			pg_type_multirange_array_oid;
 	TypeInfo   *tinfo;
 
+	if (pg_type_oid == InvalidOid)
+		return;
+
 	appendPQExpBufferStr(upgrade_buffer, "\n-- For binary upgrade, must preserve pg_type oid\n");
 	appendPQExpBuffer(upgrade_buffer,
 					  "SELECT pg_catalog.binary_upgrade_set_next_pg_type_oid('%u'::pg_catalog.oid);\n\n",
@@ -5692,6 +5706,17 @@ collectBinaryUpgradeClassOids(Archive *fout)
 	}
 
 	PQclear(res);
+}
+
+static void
+binary_upgrade_set_type_oids_by_rel_oid(Archive *fout,
+									PQExpBuffer upgrade_buffer,
+									Oid pg_type_oid
+									)
+{
+	if (OidIsValid(pg_type_oid))
+		binary_upgrade_set_type_oids_by_type_oid(fout, upgrade_buffer,
+												 pg_type_oid, false, false);
 }
 
 static void
@@ -7702,6 +7727,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 				i_indnkeyatts,
 				i_indnatts,
 				i_indkey,
+				i_indtype,
 				i_indisclustered,
 				i_indisreplident,
 				i_indnullsnotdistinct,
@@ -7760,7 +7786,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 
 	appendPQExpBufferStr(query,
 						 "pg_catalog.pg_get_indexdef(i.indexrelid) AS indexdef, "
-						 "i.indkey, i.indisclustered, "
+					  "i.indkey, t.reltype AS indtype, i.indisclustered, "
 						 "c.contype, c.conname, "
 						 "c.condeferrable, c.condeferred, "
 						 "c.tableoid AS contableoid, "
@@ -7880,6 +7906,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 	i_indnkeyatts = PQfnumber(res, "indnkeyatts");
 	i_indnatts = PQfnumber(res, "indnatts");
 	i_indkey = PQfnumber(res, "indkey");
+	i_indtype = PQfnumber(res, "indtype");
 	i_indisclustered = PQfnumber(res, "indisclustered");
 	i_indisreplident = PQfnumber(res, "indisreplident");
 	i_indnullsnotdistinct = PQfnumber(res, "indnullsnotdistinct");
@@ -7966,6 +7993,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 			indxinfo[j].indkeys = (Oid *) pg_malloc(indxinfo[j].indnattrs * sizeof(Oid));
 			parseOidArray(PQgetvalue(res, j, i_indkey),
 						  indxinfo[j].indkeys, indxinfo[j].indnattrs);
+			indxinfo[j].indtype = atooid(PQgetvalue(res, j, i_indtype));
 			indxinfo[j].indisclustered = (PQgetvalue(res, j, i_indisclustered)[0] == 't');
 			indxinfo[j].indisreplident = (PQgetvalue(res, j, i_indisreplident)[0] == 't');
 			indxinfo[j].indnullsnotdistinct = (PQgetvalue(res, j, i_indnullsnotdistinct)[0] == 't');
@@ -18129,8 +18157,13 @@ dumpIndex(Archive *fout, const IndxInfo *indxinfo)
 		int			nstatvals = 0;
 
 		if (dopt->binary_upgrade)
+		{
 			binary_upgrade_set_pg_class_oids(fout, q,
 											 indxinfo->dobj.catId.oid);
+			if (indxinfo->indnkeyattrs > 1)
+				binary_upgrade_set_type_oids_by_rel_oid(fout, q,
+														indxinfo->indtype);
+		}
 
 		/* Plain secondary index */
 		appendPQExpBuffer(q, "%s;\n", indxinfo->indexdef);
@@ -18397,8 +18430,14 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 					 coninfo->dobj.name);
 
 		if (dopt->binary_upgrade)
+		{
+			if (indxinfo->indnkeyattrs > 1)
+				binary_upgrade_set_type_oids_by_rel_oid(fout, q,
+														indxinfo->indtype);
+
 			binary_upgrade_set_pg_class_oids(fout, q,
 											 indxinfo->dobj.catId.oid);
+		}
 
 		appendPQExpBuffer(q, "ALTER %sTABLE ONLY %s\n", foreign,
 						  fmtQualifiedDumpable(tbinfo));
@@ -19994,6 +20033,28 @@ addBoundaryDependencies(DumpableObject **dobjs, int numObjs,
 		 */
 		switch (dobj->objType)
 		{
+			case DO_DUMMY_TYPE:
+			{
+				/*
+				 * In Vanilla, dummy types were only created for tables.
+				 * In Postgres Pro for improving join selectivity estimation
+				 * we also create two types for each composite index:
+				 *   1) a type for attributes of the index
+				 *   2) a type which is an array containing elements of type (1)
+				 * These types depend on indexes, so adding preDataBound -> type
+				 * dependency would create a loop; don't do that.
+				 */
+				TypeInfo *tyinfo = (TypeInfo *) dobj;
+				if (tyinfo->isArray)
+					/* If it's an array, take its element type */
+					tyinfo = findTypeByOid(tyinfo->typelem);
+
+				if (OidIsValid(tyinfo->typrelid) &&
+					(tyinfo->typrelkind == RELKIND_INDEX ||
+					tyinfo->typrelkind == RELKIND_PARTITIONED_INDEX))
+					break;
+			}
+			/* FALLTHROUGH */
 			case DO_NAMESPACE:
 			case DO_EXTENSION:
 			case DO_TYPE:
@@ -20011,7 +20072,6 @@ addBoundaryDependencies(DumpableObject **dobjs, int numObjs,
 			case DO_ATTRDEF:
 			case DO_PROCLANG:
 			case DO_CAST:
-			case DO_DUMMY_TYPE:
 			case DO_TSPARSER:
 			case DO_TSDICT:
 			case DO_TSTEMPLATE:

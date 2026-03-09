@@ -2299,8 +2299,8 @@ select ss2.* from
    lateral (select ss1.x as y, * from int8_tbl t4) ss2 on t2.q2 = ss2.q1)
   on t1.q2 = ss2.q1
 order by 1, 2, 3;
-                           QUERY PLAN                           
-----------------------------------------------------------------
+                          QUERY PLAN                          
+--------------------------------------------------------------
  Sort
    Output: (COALESCE(t3.q1)), t4.q1, t4.q2
    Sort Key: (COALESCE(t3.q1)), t4.q1, t4.q2
@@ -2310,15 +2310,15 @@ order by 1, 2, 3;
          ->  Hash Join
                Output: (COALESCE(t3.q1)), t4.q1, t4.q2
                Hash Cond: (t2.q2 = t4.q1)
-               ->  Hash Left Join
+               ->  Hash Right Join
                      Output: t2.q2, (COALESCE(t3.q1))
-                     Hash Cond: (t2.q1 = t3.q2)
-                     ->  Seq Scan on public.int8_tbl t2
-                           Output: t2.q1, t2.q2
+                     Hash Cond: (t3.q2 = t2.q1)
+                     ->  Seq Scan on public.int8_tbl t3
+                           Output: t3.q2, COALESCE(t3.q1)
                      ->  Hash
-                           Output: t3.q2, (COALESCE(t3.q1))
-                           ->  Seq Scan on public.int8_tbl t3
-                                 Output: t3.q2, COALESCE(t3.q1)
+                           Output: t2.q2, t2.q1
+                           ->  Seq Scan on public.int8_tbl t2
+                                 Output: t2.q2, t2.q1
                ->  Hash
                      Output: t4.q1, t4.q2
                      ->  Seq Scan on public.int8_tbl t4
@@ -2373,8 +2373,8 @@ select ss2.* from
    lateral (select ss1.x as y, * from int8_tbl t4) ss2 on t2.q2 = ss2.q1)
   on t1.q2 = ss2.q1
 order by 1, 2, 3;
-                           QUERY PLAN                           
-----------------------------------------------------------------
+                          QUERY PLAN                          
+--------------------------------------------------------------
  Sort
    Output: ((COALESCE(t3.q1))), t4.q1, t4.q2
    Sort Key: ((COALESCE(t3.q1))), t4.q1, t4.q2
@@ -2384,15 +2384,15 @@ order by 1, 2, 3;
          ->  Nested Loop
                Output: t4.q1, t4.q2, ((COALESCE(t3.q1)))
                Join Filter: (t2.q2 = t4.q1)
-               ->  Hash Left Join
+               ->  Hash Right Join
                      Output: t2.q2, (COALESCE(t3.q1))
-                     Hash Cond: (t2.q1 = t3.q2)
-                     ->  Seq Scan on public.int8_tbl t2
-                           Output: t2.q1, t2.q2
+                     Hash Cond: (t3.q2 = t2.q1)
+                     ->  Seq Scan on public.int8_tbl t3
+                           Output: t3.q2, COALESCE(t3.q1)
                      ->  Hash
-                           Output: t3.q2, (COALESCE(t3.q1))
-                           ->  Seq Scan on public.int8_tbl t3
-                                 Output: t3.q2, COALESCE(t3.q1)
+                           Output: t2.q2, t2.q1
+                           ->  Seq Scan on public.int8_tbl t2
+                                 Output: t2.q2, t2.q1
                ->  Seq Scan on public.int8_tbl t4
                      Output: t4.q1, t4.q2, (COALESCE(t3.q1))
          ->  Hash
@@ -2513,23 +2513,19 @@ with x as (select * from (select f1, now() as n from subselect_tbl) ss)
 select * from x, x x2 where x.n = x2.n;
                 QUERY PLAN                 
 -------------------------------------------
- Merge Join
+ Hash Join
    Output: x.f1, x.n, x2.f1, x2.n
-   Merge Cond: (x.n = x2.n)
+   Hash Cond: (x.n = x2.n)
    CTE x
      ->  Seq Scan on public.subselect_tbl
            Output: subselect_tbl.f1, now()
-   ->  Sort
+   ->  CTE Scan on x
          Output: x.f1, x.n
-         Sort Key: x.n
-         ->  CTE Scan on x
-               Output: x.f1, x.n
-   ->  Sort
+   ->  Hash
          Output: x2.f1, x2.n
-         Sort Key: x2.n
          ->  CTE Scan on x x2
                Output: x2.f1, x2.n
-(16 rows)
+(12 rows)
 
 explain (verbose, costs off)
 with x as not materialized (select * from (select f1, now() as n from subselect_tbl) ss)
@@ -2827,13 +2823,15 @@ ON B.hundred in (SELECT min(c.hundred) FROM tenk2 C WHERE c.odd = b.odd);
 EXPLAIN (COSTS OFF)
 SELECT * FROM onek, (VALUES('RFAAAA'), ('VJAAAA')) AS v (i)
   WHERE onek.stringu1 = v.i;
-                         QUERY PLAN                          
--------------------------------------------------------------
+                            QUERY PLAN                             
+-------------------------------------------------------------------
  Nested Loop
    ->  Values Scan on "*VALUES*"
-   ->  Index Scan using onek_stringu1 on onek
-         Index Cond: (stringu1 = ("*VALUES*".column1)::text)
-(4 rows)
+   ->  Bitmap Heap Scan on onek
+         Recheck Cond: (stringu1 = ("*VALUES*".column1)::text)
+         ->  Bitmap Index Scan on onek_stringu1
+               Index Cond: (stringu1 = ("*VALUES*".column1)::text)
+(6 rows)
 
 -- VtA transformation for a composite argument is not supported
 EXPLAIN (COSTS OFF)

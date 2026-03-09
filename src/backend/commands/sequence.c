@@ -48,6 +48,7 @@
 #include "utils/resowner.h"
 #include "utils/syscache.h"
 #include "utils/varlena.h"
+#include "utils/inval.h"
 
 
 /*
@@ -205,6 +206,8 @@ DefineSequence(ParseState *pstate, CreateSeqStmt *seq)
 	stmt->tablespacename = NULL;
 	stmt->if_not_exists = seq->if_not_exists;
 
+	BEGIN_TEMP_TABLE_SCOPE_SHARED(stmt->relation->relpersistence == RELPERSISTENCE_TEMP);
+
 	address = DefineRelation(stmt, RELKIND_SEQUENCE, seq->ownerId, NULL, NULL);
 	seqoid = address.objectId;
 	Assert(seqoid != InvalidOid);
@@ -242,6 +245,8 @@ DefineSequence(ParseState *pstate, CreateSeqStmt *seq)
 
 	heap_freetuple(tuple);
 	table_close(rel, RowExclusiveLock);
+
+	END_TEMP_TABLE_SCOPE();
 
 	return address;
 }
@@ -466,6 +471,8 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 
 	init_sequence(relid, &elm, &seqrel);
 
+	BEGIN_TEMP_TABLE_SCOPE_SHARED(seqrel->rd_rel->relpersistence == RELPERSISTENCE_TEMP);
+
 	rel = table_open(SequenceRelationId, RowExclusiveLock);
 	seqtuple = SearchSysCacheCopy1(SEQRELID,
 								   ObjectIdGetDatum(relid));
@@ -533,6 +540,8 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 
 	table_close(rel, RowExclusiveLock);
 	sequence_close(seqrel, NoLock);
+
+	END_TEMP_TABLE_SCOPE();
 
 	return address;
 }
