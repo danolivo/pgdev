@@ -428,6 +428,7 @@ CREATE TEMP TABLE test AS (SELECT x FROM generate_series(1,100) AS x);
 VACUUM ANALYZE test;
 
 SET max_parallel_workers_per_gather = 1;
+SET write_page_cost = 0.0001;
 SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0;
 SET min_parallel_table_scan_size = 0;

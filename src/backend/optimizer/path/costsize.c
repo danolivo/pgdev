@@ -466,6 +466,10 @@ cost_gather(GatherPath *path, PlannerInfo *root,
 
 	run_cost = path->subpath->total_cost - path->subpath->startup_cost;
 
+	/* Account for flushing dirty temp buffers before launching workers */
+	if (path->subpath->parallel_safe == NEEDS_TEMP_FLUSH)
+		startup_cost += tempbuf_flush_extra_cost();
+
 	/* Parallel setup and communication cost. */
 	startup_cost += parallel_setup_cost;
 	run_cost += parallel_tuple_cost * path->path.rows;
@@ -536,10 +540,22 @@ cost_gather_merge(GatherMergePath *path, PlannerInfo *root,
 	startup_cost += parallel_setup_cost;
 	run_cost += parallel_tuple_cost * path->path.rows * 1.05;
 
+	/*
+	 * Fold in the input (subpath) costs, following the same pattern as
+	 * cost_gather: input startup goes into startup_cost, the incremental
+	 * portion goes into run_cost, so total = startup + run naturally.
+	 */
+	startup_cost += input_startup_cost;
+	run_cost += input_total_cost - input_startup_cost;
+
+	/* Account for flushing dirty temp buffers before launching workers */
+	if (path->subpath->parallel_safe == NEEDS_TEMP_FLUSH)
+		startup_cost += tempbuf_flush_extra_cost();
+
 	path->path.disabled_nodes = input_disabled_nodes
 		+ (enable_gathermerge ? 0 : 1);
-	path->path.startup_cost = startup_cost + input_startup_cost;
-	path->path.total_cost = (startup_cost + run_cost + input_total_cost);
+	path->path.startup_cost = startup_cost;
+	path->path.total_cost = (startup_cost + run_cost);
 }
 
 /*
