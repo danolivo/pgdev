@@ -737,6 +737,7 @@ max_parallel_hazard(Query *parse)
 	context.max_hazard = PROPARALLEL_SAFE;
 	context.max_interesting = PROPARALLEL_UNSAFE;
 	context.safe_param_ids = NIL;
+	context.hasTempObject = false;
 	(void) max_parallel_hazard_walker((Node *) parse, &context);
 	return context.max_hazard;
 }
@@ -772,6 +773,7 @@ is_parallel_safe(PlannerInfo *root, Node *node, bool *needs_temp_flush)
 	context.max_hazard = PROPARALLEL_SAFE;
 	context.max_interesting = PROPARALLEL_RESTRICTED;
 	context.safe_param_ids = NIL;
+	context.hasTempObject = false;
 
 	/*
 	 * The params that refer to the same or parent query level are considered
