@@ -862,6 +862,39 @@ set_plain_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 
 	/* Consider index scans */
 	create_index_paths(root, rel);
+
+	/* Consider pre-sorted SeqScan for useful query_pathkeys prefix */
+	if (root->query_pathkeys)
+	{
+		List	   *useful_pathkeys = NIL;
+		ListCell   *lc;
+
+		foreach(lc, root->query_pathkeys)
+		{
+			PathKey	   *pathkey = (PathKey *) lfirst(lc);
+			EquivalenceClass *ec = pathkey->pk_eclass;
+
+			/*
+			 * Stop at the first pathkey whose equivalence class references
+			 * relations beyond this one.  We only want a prefix that can be
+			 * satisfied entirely by columns of this relation.
+			 */
+			if (!bms_is_subset(ec->ec_relids, rel->relids))
+				break;
+
+			useful_pathkeys = lappend(useful_pathkeys, pathkey);
+		}
+
+		if (useful_pathkeys != NIL)
+		{
+			Path   *seqpath;
+
+			seqpath = create_seqscan_path(root, rel, required_outer, 0);
+			add_path(rel, (Path *)
+					 create_sort_path(root, rel, seqpath,
+									  useful_pathkeys, -1.0));
+		}
+	}
 }
 
 /*
