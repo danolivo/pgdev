@@ -761,6 +761,134 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * copy_path_for_sort
+ *		Make a shallow copy of the path, following the reparameterization
+ *		technique.  Returns NULL for unsupported path types.
+ */
+static Path *
+copy_path_for_sort(Path *path)
+{
+	if (path == NULL)
+		return NULL;
+
+	switch (nodeTag(path))
+	{
+		case T_Path:
+		{
+			/* Plain SeqScan / SampleScan — it's just a base Path */
+			switch (path->pathtype)
+			{
+				case T_SeqScan:
+				case T_SampleScan:
+				{
+					Path *newpath = makeNode(Path);
+
+					memcpy(newpath, path, sizeof(Path));
+					return newpath;
+				}
+				default:
+					/*
+					 * TODO: analyse other types of Scan. Add them carefully,
+					 * one by one, analysing corner cases of their usage
+					 */
+					return NULL;
+			}
+		}
+		case T_IndexPath:
+			{
+				IndexPath *newpath = makeNode(IndexPath);
+				memcpy(newpath, path, sizeof(IndexPath));
+				return (Path *) newpath;
+			}
+		case T_BitmapHeapPath:
+			{
+				BitmapHeapPath *newpath = makeNode(BitmapHeapPath);
+				memcpy(newpath, path, sizeof(BitmapHeapPath));
+				return (Path *) newpath;
+			}
+		case T_TidPath:
+			{
+				TidPath *newpath = makeNode(TidPath);
+				memcpy(newpath, path, sizeof(TidPath));
+				return (Path *) newpath;
+			}
+		case T_CustomPath:
+			{
+				CustomPath *newpath = makeNode(CustomPath);
+				memcpy(newpath, path, sizeof(CustomPath));
+				return (Path *) newpath;
+			}
+		/*
+		 * Add other types as needed. XXX: should we consider ForeignPath here?
+		 */
+		default:
+			elog(DEBUG1, "unknown path type detected");
+			return NULL;  /* unsupported type — bail out */
+	}
+}
+
+/*
+ * generate_presorted_paths
+ *		Consider adding a pre-sorted path for a useful query_pathkeys prefix.
+ *
+ * Currently only called from set_plain_rel_pathlist() for plain base
+ * relations.  In principle it could also apply to append, foreign, or
+ * custom-scan relations, but we intentionally keep the scope narrow: the
+ * primary use case is ORDER BY ... LIMIT over NestLoop joins on plain
+ * tables — a query pattern characteristic of 1C:Enterprise workloads.
+ */
+static void
+generate_presorted_paths(PlannerInfo *root, RelOptInfo *rel)
+{
+	List	   *useful_pathkeys = NIL;
+	ListCell   *lc;
+	Path	   *subpath;
+
+	if (!enable_presorted_scan || root->query_pathkeys == NIL)
+		return;
+
+	foreach(lc, root->query_pathkeys)
+	{
+		PathKey			   *pathkey = (PathKey *) lfirst(lc);
+		EquivalenceClass   *ec = pathkey->pk_eclass;
+
+		/*
+		 * Stop at the first pathkey that can't be computed early from this
+		 * relation.
+		 */
+		if (!relation_can_be_sorted_early(root, rel, ec, true))
+			break;
+
+		useful_pathkeys = lappend(useful_pathkeys, pathkey);
+	}
+
+	/* Already have a path with these pathkeys? */
+	if (useful_pathkeys == NIL ||
+		get_cheapest_path_for_pathkeys(rel->pathlist, useful_pathkeys,
+									   rel->lateral_relids, TOTAL_COST,
+									   false) != NULL)
+		return;
+
+	/*
+	 * Safe here: core planner is done adding to this rel's pathlist.
+	 * The cheapest unsorted path won't be removed by our add_path()
+	 * because Sort(subpath) has higher cost + better pathkeys — neither
+	 * dominates.  To be sure extensions don't make it fragile, copy
+	 * the path and create sorted output only if we know this type of path.
+	 */
+	subpath = get_cheapest_path_for_pathkeys(rel->pathlist, NIL,
+											 rel->lateral_relids, TOTAL_COST,
+											 false);
+	subpath = copy_path_for_sort(subpath);
+
+	if (subpath != NULL)
+	{
+		add_path(rel, (Path *)
+				create_sort_path(root, rel, subpath, useful_pathkeys, -1.0));
+	}
+}
+
+/*
  * set_plain_rel_pathlist
  *	  Build access paths for a plain relation (no subquery, no inheritance)
  */
@@ -796,6 +924,8 @@ set_plain_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 
 	/* Consider index scans */
 	create_index_paths(root, rel);
+
+	generate_presorted_paths(root, rel);
 }
 
 /*

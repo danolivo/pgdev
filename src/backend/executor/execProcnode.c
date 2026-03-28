@@ -978,6 +978,31 @@ ExecSetTupleBound(int64 tuples_needed, PlanState *child_node)
 		ExecSetTupleBound(tuples_needed, outerPlanState(child_node));
 	}
 
+
+	else if (IsA(child_node, NestLoopState))
+	{
+		/*
+		 * For a NestLoop, the bound can be propagated to the side that
+		 * drives the output row count:
+		 *
+		 * - LEFT JOIN: every outer row produces at least one output row
+		 *   (with NULLs if no match), so bound the outer side.
+		 * - RIGHT JOIN: every inner row produces at least one output row,
+		 *   so bound the inner side.
+		 *
+		 * We do not propagate for INNER, ANTI, or FULL joins, since the
+		 * number of output rows can be less than the driving side's count
+		 * (INNER/ANTI may discard rows, FULL may expand both sides).
+		 */
+		NestLoopState *nlstate = (NestLoopState *) child_node;
+		JoinType	jointype = nlstate->js.jointype;
+
+		if (jointype == JOIN_LEFT)
+			ExecSetTupleBound(tuples_needed, outerPlanState(child_node));
+		else if (jointype == JOIN_RIGHT)
+			ExecSetTupleBound(tuples_needed, innerPlanState(child_node));
+	}
+
 	/*
 	 * In principle we could descend through any plan node type that is
 	 * certain not to discard or combine input rows; but on seeing a node that

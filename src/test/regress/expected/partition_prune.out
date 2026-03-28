@@ -1626,17 +1626,24 @@ EXPLAIN (COSTS OFF) SELECT tableoid::regclass as part, a, b FROM part WHERE a IS
 EXPLAIN (VERBOSE, COSTS OFF) SELECT * FROM part p(x) ORDER BY x;
                   QUERY PLAN                   
 -----------------------------------------------
- Sort
-   Output: p.x, p.b
+ Merge Append
    Sort Key: p.x
-   ->  Append
+   ->  Sort
+         Output: p_1.x, p_1.b
+         Sort Key: p_1.x
          ->  Seq Scan on public.part_p1 p_1
                Output: p_1.x, p_1.b
+   ->  Sort
+         Output: p_2.x, p_2.b
+         Sort Key: p_2.x
          ->  Seq Scan on public.part_rev p_2
                Output: p_2.x, p_2.b
+   ->  Sort
+         Output: p_3.x, p_3.b
+         Sort Key: p_3.x
          ->  Seq Scan on public.part_p2_p1 p_3
                Output: p_3.x, p_3.b
-(10 rows)
+(17 rows)
 
 --
 -- some more cases

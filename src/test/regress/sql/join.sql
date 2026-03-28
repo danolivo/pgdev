@@ -3788,3 +3788,19 @@ SELECT COUNT(*) FROM onek t1 LEFT JOIN tenk1 t2
     ON (t2.thousand = t1.tenthous OR t2.thousand = t1.thousand);
 SELECT COUNT(*) FROM onek t1 LEFT JOIN tenk1 t2
     ON (t2.thousand = t1.tenthous OR t2.thousand = t1.thousand);
+
+--
+-- Test pre-sorted SeqScan path for NestLoop joins with ORDER BY ... LIMIT.
+-- The optimizer should push a Sort below the NestLoop so that the outer side
+-- is pre-sorted, avoiding a top-level Sort and enabling top-N heapsort.
+--
+BEGIN;
+SET LOCAL enable_hashjoin = off;
+SET LOCAL enable_mergejoin = off;
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM tenk1 t1 LEFT JOIN tenk1 t2
+  ON (t1.unique1 = t2.unique2 AND t1.ten < 2)
+ORDER BY t1.twenty LIMIT 10;
+
+ROLLBACK;

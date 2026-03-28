@@ -1006,6 +1006,16 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"enable_presorted_scan", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables the planner's use of pre-sorted scan paths to benefit ORDER BY ... LIMIT queries over joins."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&enable_presorted_scan,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"enable_async_append", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of async append plans."),
 			NULL,

@@ -2398,19 +2398,24 @@ order by case when grouping((select t1.v from gstest5 t2 where id = t1.id)) = 0
  Sort
    Output: (GROUPING((SubPlan 1))), ((SubPlan 3)), (CASE WHEN (GROUPING((SubPlan 2)) = 0) THEN ((SubPlan 3)) ELSE NULL::integer END), t1.v
    Sort Key: (CASE WHEN (GROUPING((SubPlan 2)) = 0) THEN ((SubPlan 3)) ELSE NULL::integer END) NULLS FIRST
-   ->  HashAggregate
+   ->  MixedAggregate
          Output: GROUPING((SubPlan 1)), ((SubPlan 3)), CASE WHEN (GROUPING((SubPlan 2)) = 0) THEN ((SubPlan 3)) ELSE NULL::integer END, t1.v
-         Hash Key: t1.v
          Hash Key: (SubPlan 3)
-         ->  Seq Scan on pg_temp.gstest5 t1
+         Group Key: t1.v
+         ->  Result
                Output: (SubPlan 3), t1.v, t1.id
+               ->  Sort
+                     Output: t1.v, t1.id
+                     Sort Key: t1.v
+                     ->  Seq Scan on pg_temp.gstest5 t1
+                           Output: t1.v, t1.id
                SubPlan 3
                  ->  Bitmap Heap Scan on pg_temp.gstest5 t2
                        Output: t1.v
                        Recheck Cond: (t2.id = t1.id)
                        ->  Bitmap Index Scan on gstest5_pkey
                              Index Cond: (t2.id = t1.id)
-(15 rows)
+(20 rows)
 
 select grouping((select t1.v from gstest5 t2 where id = t1.id)),
        (select t1.v from gstest5 t2 where id = t1.id) as s
@@ -2448,19 +2453,24 @@ order by o nulls first;
  Sort
    Output: (GROUPING((SubPlan 1))), ((SubPlan 3)), (CASE WHEN (GROUPING((SubPlan 2)) = 0) THEN ((SubPlan 3)) ELSE NULL::integer END), t1.v
    Sort Key: (CASE WHEN (GROUPING((SubPlan 2)) = 0) THEN ((SubPlan 3)) ELSE NULL::integer END) NULLS FIRST
-   ->  HashAggregate
+   ->  MixedAggregate
          Output: GROUPING((SubPlan 1)), ((SubPlan 3)), CASE WHEN (GROUPING((SubPlan 2)) = 0) THEN ((SubPlan 3)) ELSE NULL::integer END, t1.v
-         Hash Key: t1.v
          Hash Key: (SubPlan 3)
-         ->  Seq Scan on pg_temp.gstest5 t1
+         Group Key: t1.v
+         ->  Result
                Output: (SubPlan 3), t1.v, t1.id
+               ->  Sort
+                     Output: t1.v, t1.id
+                     Sort Key: t1.v
+                     ->  Seq Scan on pg_temp.gstest5 t1
+                           Output: t1.v, t1.id
                SubPlan 3
                  ->  Bitmap Heap Scan on pg_temp.gstest5 t2
                        Output: t1.v
                        Recheck Cond: (t2.id = t1.id)
                        ->  Bitmap Index Scan on gstest5_pkey
                              Index Cond: (t2.id = t1.id)
-(15 rows)
+(20 rows)
 
 select grouping((select t1.v from gstest5 t2 where id = t1.id)),
        (select t1.v from gstest5 t2 where id = t1.id) as s,
