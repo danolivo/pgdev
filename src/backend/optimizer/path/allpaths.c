@@ -827,6 +827,126 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * copy_path_for_sort
+ *		Make a shallow copy of the path, following the reparameterization
+ *		technique.  Returns NULL for unsupported path types.
+ */
+static Path *
+copy_path_for_sort(Path *path)
+{
+	if (path == NULL)
+		return NULL;
+
+	switch (nodeTag(path))
+	{
+		case T_Path:
+			{
+				/* Plain SeqScan / SampleScan — it's just a base Path */
+				Path *newpath = makeNode(Path);
+				memcpy(newpath, path, sizeof(Path));
+				return newpath;
+			}
+		case T_IndexPath:
+			{
+				IndexPath *newpath = makeNode(IndexPath);
+				memcpy(newpath, path, sizeof(IndexPath));
+				return (Path *) newpath;
+			}
+		case T_BitmapHeapPath:
+			{
+				BitmapHeapPath *newpath = makeNode(BitmapHeapPath);
+				memcpy(newpath, path, sizeof(BitmapHeapPath));
+				return (Path *) newpath;
+			}
+		case T_TidPath:
+			{
+				TidPath *newpath = makeNode(TidPath);
+				memcpy(newpath, path, sizeof(TidPath));
+				return (Path *) newpath;
+			}
+		case T_CustomPath:
+			{
+				CustomPath *newpath = makeNode(CustomPath);
+				memcpy(newpath, path, sizeof(CustomPath));
+				return (Path *) newpath;
+			}
+		/* Add other types as needed */
+		default:
+			elog(DEBUG1, "unknown path type detected");
+			return NULL;  /* unsupported type — bail out */
+	}
+}
+
+/*
+ * consider_enforce_ordered_scan
+ *		Consider adding a pre-sorted path for a useful query_pathkeys prefix.
+ */
+static void
+consider_enforce_ordered_scan(PlannerInfo *root, RelOptInfo *rel)
+{
+	List	   *useful_pathkeys = NIL;
+	ListCell   *lc;
+	Path	   *cheapest;
+
+	if (root->query_pathkeys == NIL)
+		return;
+
+	foreach(lc, root->query_pathkeys)
+	{
+		PathKey			   *pathkey = (PathKey *) lfirst(lc);
+		EquivalenceClass   *ec = pathkey->pk_eclass;
+		ListCell		   *lc1;
+
+		/* Fast exit if the EC cannot reference this relation */
+		if (!bms_is_subset(rel->relids, ec->ec_relids))
+			break;
+
+		/*
+		 * Scan ec_members for a matching element.  This list shouldn't be
+		 * too long.
+		 */
+		foreach(lc1, ec->ec_members)
+		{
+			EquivalenceMember *cur_em = (EquivalenceMember *) lfirst(lc1);
+
+			if (bms_equal(rel->relids, cur_em->em_relids))
+				break;
+		}
+
+		/*
+		 * Stop at the first pathkey that doesn't fit this relation columns.
+		 * We only want a prefix that can be satisfied entirely by columns
+		 * of this relation.
+		 */
+		if (lc1 == NULL)
+			break;
+
+		useful_pathkeys = lappend(useful_pathkeys, pathkey);
+	}
+
+	/* Already have a path with these pathkeys? */
+	if (useful_pathkeys == NIL ||
+		get_cheapest_path_for_pathkeys(rel->pathlist, useful_pathkeys,
+									   NULL, TOTAL_COST, false) != NULL)
+		return;
+
+	/*
+	 * Safe here: core planner is done adding to this rel's pathlist.
+	 * The cheapest unsorted path won't be removed by our add_path()
+	 * because Sort(cheapest) has higher cost + better pathkeys —
+	 * neither dominates.  To be sure extensions don't make it fragile, copy
+	 * the path and create sorted output only if we know this type of path.
+	 */
+	cheapest = get_cheapest_path_for_pathkeys(rel->pathlist, NIL,
+											  NULL, TOTAL_COST, false);
+	cheapest = copy_path_for_sort(cheapest);
+
+	if (cheapest != NULL)
+		add_path(rel, (Path *)
+				create_sort_path(root, rel, cheapest, useful_pathkeys, -1.0));
+}
+
+/*
  * set_plain_rel_pathlist
  *	  Build access paths for a plain relation (no subquery, no inheritance)
  */
@@ -863,38 +983,7 @@ set_plain_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	/* Consider index scans */
 	create_index_paths(root, rel);
 
-	/* Consider pre-sorted SeqScan for useful query_pathkeys prefix */
-	if (root->query_pathkeys)
-	{
-		List	   *useful_pathkeys = NIL;
-		ListCell   *lc;
-
-		foreach(lc, root->query_pathkeys)
-		{
-			PathKey	   *pathkey = (PathKey *) lfirst(lc);
-			EquivalenceClass *ec = pathkey->pk_eclass;
-
-			/*
-			 * Stop at the first pathkey whose equivalence class references
-			 * relations beyond this one.  We only want a prefix that can be
-			 * satisfied entirely by columns of this relation.
-			 */
-			if (!bms_is_subset(ec->ec_relids, rel->relids))
-				break;
-
-			useful_pathkeys = lappend(useful_pathkeys, pathkey);
-		}
-
-		if (useful_pathkeys != NIL)
-		{
-			Path   *seqpath;
-
-			seqpath = create_seqscan_path(root, rel, required_outer, 0);
-			add_path(rel, (Path *)
-					 create_sort_path(root, rel, seqpath,
-									  useful_pathkeys, -1.0));
-		}
-	}
+	consider_enforce_ordered_scan(root, rel);
 }
 
 /*
