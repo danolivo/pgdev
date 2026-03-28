@@ -911,30 +911,12 @@ consider_enforce_ordered_scan(PlannerInfo *root, RelOptInfo *rel)
 	{
 		PathKey			   *pathkey = (PathKey *) lfirst(lc);
 		EquivalenceClass   *ec = pathkey->pk_eclass;
-		ListCell		   *lc1;
-
-		/* Fast exit if the EC cannot reference this relation */
-		if (!bms_is_subset(rel->relids, ec->ec_relids))
-			break;
 
 		/*
-		 * Scan ec_members for a matching element.  This list shouldn't be
-		 * too long.
+		 * Stop at the first pathkey that can't be computed early from this
+		 * relation.
 		 */
-		foreach(lc1, ec->ec_members)
-		{
-			EquivalenceMember *cur_em = (EquivalenceMember *) lfirst(lc1);
-
-			if (bms_equal(rel->relids, cur_em->em_relids))
-				break;
-		}
-
-		/*
-		 * Stop at the first pathkey that doesn't fit this relation columns.
-		 * We only want a prefix that can be satisfied entirely by columns
-		 * of this relation.
-		 */
-		if (lc1 == NULL)
+		if (!relation_can_be_sorted_early(root, rel, ec, true))
 			break;
 
 		useful_pathkeys = lappend(useful_pathkeys, pathkey);
@@ -966,9 +948,8 @@ consider_enforce_ordered_scan(PlannerInfo *root, RelOptInfo *rel)
 		/*
 		 * Ensure the pathtarget carries sortgroupref labels for the sort
 		 * expressions.  Without these labels, create_sort_plan's call to
-		 * prepare_sort_from_pathkeys would fail for volatile ORDER BY
-		 * expressions, which rely on get_sortgroupref_tle() to locate the
-		 * sort column in the targetlist.
+		 * prepare_sort_from_pathkeys may fail when get_sortgroupref_tle()
+		 * can't locate the sort column in the targetlist.
 		 */
 		if (target->sortgrouprefs == NULL)
 			target->sortgrouprefs =
@@ -1001,9 +982,6 @@ consider_enforce_ordered_scan(PlannerInfo *root, RelOptInfo *rel)
 			if (sort_expr == NULL)
 				continue;
 
-			if (expression_returns_set((Node *) sort_expr))
-				return;
-
 			/* Find the expression in pathtarget and label it */
 			i = 0;
 			foreach(lc2, target->exprs)
@@ -1016,11 +994,20 @@ consider_enforce_ordered_scan(PlannerInfo *root, RelOptInfo *rel)
 				i++;
 			}
 
-			/* If not found in pathtarget, add it with the label */
+			/*
+			 * If the expression isn't already in the pathtarget, bail out.
+			 * Adding new expressions to the scan's target would force their
+			 * evaluation on every row, which is unsafe for expressions that
+			 * can error on unfiltered data (e.g., regclass casts on toast
+			 * table names).
+			 */
 			if (lc2 == NULL)
-				add_column_to_pathtarget(target, sort_expr,
-										 ec->ec_sortref);
+				break;
 		}
+
+		/* If the labeling loop broke out early, skip the optimization */
+		if (lc != NULL)
+			return;
 
 		add_path(rel, (Path *)
 				create_sort_path(root, rel, cheapest, useful_pathkeys, -1.0));

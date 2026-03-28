@@ -1708,21 +1708,20 @@ explain (costs off)
 select * from
   (select * from tenk1 order by four) t1 join tenk1 t2 on t1.four = t2.four and t1.two = t2.two
 order by t1.four, t1.two limit 1;
-                              QUERY PLAN                               
------------------------------------------------------------------------
+                 QUERY PLAN                 
+--------------------------------------------
  Limit
    ->  Merge Join
-         Merge Cond: ((tenk1.four = t2.four) AND (tenk1.two = t2.two))
-         ->  Incremental Sort
-               Sort Key: tenk1.four, tenk1.two
-               Presorted Key: tenk1.four
-               ->  Sort
-                     Sort Key: tenk1.four
-                     ->  Seq Scan on tenk1
+         Merge Cond: (t2.four = tenk1.four)
+         Join Filter: (tenk1.two = t2.two)
          ->  Sort
                Sort Key: t2.four, t2.two
                ->  Seq Scan on tenk1 t2
-(12 rows)
+         ->  Materialize
+               ->  Sort
+                     Sort Key: tenk1.four
+                     ->  Seq Scan on tenk1
+(11 rows)
 
 --
 -- Test incremental sort for Append/MergeAppend
@@ -1741,12 +1740,11 @@ explain (costs off) select * from prt_tbl order by a, b;
                          QUERY PLAN                         
 ------------------------------------------------------------
  Append
-   ->  Incremental Sort
+   ->  Sort
          Sort Key: prt_tbl_1.a, prt_tbl_1.b
-         Presorted Key: prt_tbl_1.a
          ->  Index Scan using prt_tbl_1_a_idx on prt_tbl_1
    ->  Index Only Scan using prt_tbl_2_a_b_idx on prt_tbl_2
-(6 rows)
+(5 rows)
 
 -- Ensure we get an incremental sort for the subpath of MergeAppend
 explain (costs off) select * from prt_tbl_1 union all select * from prt_tbl_2 order by a, b;
@@ -1754,12 +1752,11 @@ explain (costs off) select * from prt_tbl_1 union all select * from prt_tbl_2 or
 ------------------------------------------------------------
  Merge Append
    Sort Key: prt_tbl_1.a, prt_tbl_1.b
-   ->  Incremental Sort
+   ->  Sort
          Sort Key: prt_tbl_1.a, prt_tbl_1.b
-         Presorted Key: prt_tbl_1.a
          ->  Index Scan using prt_tbl_1_a_idx on prt_tbl_1
    ->  Index Only Scan using prt_tbl_2_a_b_idx on prt_tbl_2
-(7 rows)
+(6 rows)
 
 reset enable_bitmapscan;
 reset enable_seqscan;

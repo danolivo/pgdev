@@ -2623,26 +2623,30 @@ INSERT INTO pagg_tab6 (b, c) SELECT substr('cdCD', (i % 4) + 1 , 1), substr('cdC
 ANALYZE pagg_tab6;
 EXPLAIN (COSTS OFF)
 SELECT t1.c, count(t2.c) FROM pagg_tab5 t1 JOIN pagg_tab6 t2 ON t1.c = t2.c AND t1.c = t2.b GROUP BY 1 ORDER BY t1.c COLLATE "C";
-                      QUERY PLAN                       
--------------------------------------------------------
+                             QUERY PLAN                              
+---------------------------------------------------------------------
  Sort
    Sort Key: t1.c COLLATE "C"
    ->  Append
-         ->  HashAggregate
+         ->  GroupAggregate
                Group Key: t1.c
                ->  Nested Loop
                      Join Filter: (t1.c = t2.c)
-                     ->  Seq Scan on pagg_tab6_p1 t2
-                           Filter: (c = b)
+                     ->  Sort
+                           Sort Key: t2.c COLLATE case_insensitive
+                           ->  Seq Scan on pagg_tab6_p1 t2
+                                 Filter: (c = b)
                      ->  Seq Scan on pagg_tab5_p1 t1
-         ->  HashAggregate
+         ->  GroupAggregate
                Group Key: t1_1.c
                ->  Nested Loop
                      Join Filter: (t1_1.c = t2_1.c)
-                     ->  Seq Scan on pagg_tab6_p2 t2_1
-                           Filter: (c = b)
+                     ->  Sort
+                           Sort Key: t2_1.c COLLATE case_insensitive
+                           ->  Seq Scan on pagg_tab6_p2 t2_1
+                                 Filter: (c = b)
                      ->  Seq Scan on pagg_tab5_p2 t1_1
-(17 rows)
+(21 rows)
 
 SELECT t1.c, count(t2.c) FROM pagg_tab5 t1 JOIN pagg_tab6 t2 ON t1.c = t2.c AND t1.c = t2.b GROUP BY 1 ORDER BY t1.c COLLATE "C";
  c | count 
