@@ -994,20 +994,10 @@ consider_enforce_ordered_scan(PlannerInfo *root, RelOptInfo *rel)
 				i++;
 			}
 
-			/*
-			 * If the expression isn't already in the pathtarget, bail out.
-			 * Adding new expressions to the scan's target would force their
-			 * evaluation on every row, which is unsafe for expressions that
-			 * can error on unfiltered data (e.g., regclass casts on toast
-			 * table names).
-			 */
+			/* If not found in pathtarget, add it with the label */
 			if (lc2 == NULL)
-				break;
+				add_column_to_pathtarget(target, sort_expr, ec->ec_sortref);
 		}
-
-		/* If the labeling loop broke out early, skip the optimization */
-		if (lc != NULL)
-			return;
 
 		add_path(rel, (Path *)
 				create_sort_path(root, rel, cheapest, useful_pathkeys, -1.0));
