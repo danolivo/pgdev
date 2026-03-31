@@ -5898,6 +5898,26 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-enable-presorted-scan" xreflabel="enable_presorted_scan">
+      <term><varname>enable_presorted_scan</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>enable_presorted_scan</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Enables or disables the query planner's ability to add pre-sorted
+        scan paths for base relations when a prefix of the query's
+        <literal>ORDER BY</literal> keys can be satisfied by columns of
+        that relation.  When enabled, the planner may push a
+        <literal>Sort</literal> node below a join, allowing
+        <literal>NestLoop</literal> joins to preserve the sort order and
+        enabling top-N heapsort when a <literal>LIMIT</literal> is present.
+        The default value is <literal>on</literal>.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-enable-self-join-elimination" xreflabel="enable_self_join_elimination">
       <term><varname>enable_self_join_elimination</varname> (<type>boolean</type>)
       <indexterm>

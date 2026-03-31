@@ -963,6 +963,13 @@
   boot_val => 'true',
 },
 
+{ name => 'enable_presorted_scan', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Enables the planner\'s use of pre-sorted scan paths to benefit ORDER BY ... LIMIT queries over joins.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'enable_presorted_scan',
+  boot_val => 'true',
+},
+
 { name => 'enable_self_join_elimination', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
   short_desc => 'Enables removal of unique self-joins.',
   flags => 'GUC_EXPLAIN',

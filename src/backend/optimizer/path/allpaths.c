@@ -910,7 +910,7 @@ generate_presorted_paths(PlannerInfo *root, RelOptInfo *rel)
 	ListCell   *lc;
 	Path	   *subpath;
 
-	if (root->query_pathkeys == NIL)
+	if (!enable_presorted_scan || root->query_pathkeys == NIL)
 		return;
 
 	foreach(lc, root->query_pathkeys)
