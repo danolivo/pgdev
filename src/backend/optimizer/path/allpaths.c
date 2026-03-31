@@ -949,64 +949,6 @@ consider_enforce_ordered_scan(PlannerInfo *root, RelOptInfo *rel)
 
 	if (cheapest != NULL)
 	{
-		PathTarget *target = copy_pathtarget(cheapest->pathtarget);
-
-		cheapest->pathtarget = target;
-
-		/*
-		 * Ensure the pathtarget carries sortgroupref labels for the sort
-		 * expressions.  Without these labels, create_sort_plan's call to
-		 * prepare_sort_from_pathkeys may fail when get_sortgroupref_tle()
-		 * can't locate the sort column in the targetlist.
-		 */
-		if (target->sortgrouprefs == NULL)
-			target->sortgrouprefs =
-				palloc0(list_length(target->exprs) * sizeof(Index));
-
-		foreach(lc, useful_pathkeys)
-		{
-			PathKey		   *pathkey = (PathKey *) lfirst(lc);
-			EquivalenceClass *ec = pathkey->pk_eclass;
-			Expr		   *sort_expr;
-			ListCell	   *lc2;
-			int				i;
-
-			if (ec->ec_sortref == 0)
-				continue;
-
-			/* Find the EC member for this relation */
-			sort_expr = NULL;
-			foreach(lc2, ec->ec_members)
-			{
-				EquivalenceMember *em = (EquivalenceMember *) lfirst(lc2);
-
-				if (bms_equal(rel->relids, em->em_relids))
-				{
-					sort_expr = em->em_expr;
-					break;
-				}
-			}
-
-			if (sort_expr == NULL)
-				continue;
-
-			/* Find the expression in pathtarget and label it */
-			i = 0;
-			foreach(lc2, target->exprs)
-			{
-				if (equal(lfirst(lc2), sort_expr))
-				{
-					target->sortgrouprefs[i] = ec->ec_sortref;
-					break;
-				}
-				i++;
-			}
-
-			/* If not found in pathtarget, add it with the label */
-			if (lc2 == NULL)
-				add_column_to_pathtarget(target, sort_expr, ec->ec_sortref);
-		}
-
 		add_path(rel, (Path *)
 				create_sort_path(root, rel, cheapest, useful_pathkeys, -1.0));
 	}
