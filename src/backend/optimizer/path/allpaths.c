@@ -894,7 +894,7 @@ copy_path_for_sort(Path *path)
 }
 
 /*
- * consider_enforce_ordered_scan
+ * generate_presorted_paths
  *		Consider adding a pre-sorted path for a useful query_pathkeys prefix.
  *
  * Currently only called from set_plain_rel_pathlist() for plain base
@@ -904,11 +904,11 @@ copy_path_for_sort(Path *path)
  * tables — a query pattern characteristic of 1C:Enterprise workloads.
  */
 static void
-consider_enforce_ordered_scan(PlannerInfo *root, RelOptInfo *rel)
+generate_presorted_paths(PlannerInfo *root, RelOptInfo *rel)
 {
 	List	   *useful_pathkeys = NIL;
 	ListCell   *lc;
-	Path	   *cheapest;
+	Path	   *subpath;
 
 	if (root->query_pathkeys == NIL)
 		return;
@@ -938,19 +938,19 @@ consider_enforce_ordered_scan(PlannerInfo *root, RelOptInfo *rel)
 	/*
 	 * Safe here: core planner is done adding to this rel's pathlist.
 	 * The cheapest unsorted path won't be removed by our add_path()
-	 * because Sort(cheapest) has higher cost + better pathkeys —
-	 * neither dominates.  To be sure extensions don't make it fragile, copy
+	 * because Sort(subpath) has higher cost + better pathkeys — neither
+	 * dominates.  To be sure extensions don't make it fragile, copy
 	 * the path and create sorted output only if we know this type of path.
 	 */
-	cheapest = get_cheapest_path_for_pathkeys(rel->pathlist, NIL,
-											  rel->lateral_relids, TOTAL_COST,
-											  false);
-	cheapest = copy_path_for_sort(cheapest);
+	subpath = get_cheapest_path_for_pathkeys(rel->pathlist, NIL,
+											 rel->lateral_relids, TOTAL_COST,
+											 false);
+	subpath = copy_path_for_sort(subpath);
 
-	if (cheapest != NULL)
+	if (subpath != NULL)
 	{
 		add_path(rel, (Path *)
-				create_sort_path(root, rel, cheapest, useful_pathkeys, -1.0));
+				create_sort_path(root, rel, subpath, useful_pathkeys, -1.0));
 	}
 }
 
@@ -991,7 +991,7 @@ set_plain_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	/* Consider index scans */
 	create_index_paths(root, rel);
 
-	consider_enforce_ordered_scan(root, rel);
+	generate_presorted_paths(root, rel);
 }
 
 /*
