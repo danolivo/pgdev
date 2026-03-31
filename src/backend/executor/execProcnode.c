@@ -990,13 +990,14 @@ ExecSetTupleBound(int64 tuples_needed, PlanState *child_node)
 		 * - RIGHT JOIN: every inner row produces at least one output row,
 		 *   so bound the inner side.
 		 *
-		 * We do not propagate for INNER or FULL joins, since rows may be
-		 * discarded from either side.
+		 * We do not propagate for INNER, ANTI, or FULL joins, since the
+		 * number of output rows can be less than the driving side's count
+		 * (INNER/ANTI may discard rows, FULL may expand both sides).
 		 */
 		NestLoopState *nlstate = (NestLoopState *) child_node;
 		JoinType	jointype = nlstate->js.jointype;
 
-		if (jointype == JOIN_LEFT || jointype == JOIN_ANTI)
+		if (jointype == JOIN_LEFT)
 			ExecSetTupleBound(tuples_needed, outerPlanState(child_node));
 		else if (jointype == JOIN_RIGHT)
 			ExecSetTupleBound(tuples_needed, innerPlanState(child_node));

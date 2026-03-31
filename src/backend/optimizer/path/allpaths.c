@@ -896,6 +896,12 @@ copy_path_for_sort(Path *path)
 /*
  * consider_enforce_ordered_scan
  *		Consider adding a pre-sorted path for a useful query_pathkeys prefix.
+ *
+ * Currently only called from set_plain_rel_pathlist() for plain base
+ * relations.  In principle it could also apply to append, foreign, or
+ * custom-scan relations, but we intentionally keep the scope narrow: the
+ * primary use case is ORDER BY ... LIMIT over NestLoop joins on plain
+ * tables — a query pattern characteristic of 1C:Enterprise workloads.
  */
 static void
 consider_enforce_ordered_scan(PlannerInfo *root, RelOptInfo *rel)
@@ -925,7 +931,8 @@ consider_enforce_ordered_scan(PlannerInfo *root, RelOptInfo *rel)
 	/* Already have a path with these pathkeys? */
 	if (useful_pathkeys == NIL ||
 		get_cheapest_path_for_pathkeys(rel->pathlist, useful_pathkeys,
-									   NULL, TOTAL_COST, false) != NULL)
+									   rel->lateral_relids, TOTAL_COST,
+									   false) != NULL)
 		return;
 
 	/*
@@ -936,7 +943,8 @@ consider_enforce_ordered_scan(PlannerInfo *root, RelOptInfo *rel)
 	 * the path and create sorted output only if we know this type of path.
 	 */
 	cheapest = get_cheapest_path_for_pathkeys(rel->pathlist, NIL,
-											  NULL, TOTAL_COST, false);
+											  rel->lateral_relids, TOTAL_COST,
+											  false);
 	cheapest = copy_path_for_sort(cheapest);
 
 	if (cheapest != NULL)
