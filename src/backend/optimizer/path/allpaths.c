@@ -884,7 +884,8 @@ generate_presorted_paths(PlannerInfo *root, RelOptInfo *rel)
 	if (subpath != NULL)
 	{
 		add_path(rel, (Path *)
-				create_sort_path(root, rel, subpath, useful_pathkeys, -1.0));
+				create_sort_path(root, rel, subpath, useful_pathkeys,
+								 root->limit_tuples));
 	}
 }
 
