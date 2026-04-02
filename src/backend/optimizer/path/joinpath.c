@@ -2005,6 +2005,116 @@ match_unsorted_outer(PlannerInfo *root,
 	}
 
 	/*
+	 * If the query has ORDER BY (possibly with LIMIT) and nestloop is
+	 * applicable, consider pre-sorting the outer relation on the query
+	 * pathkeys.  The pre-sorted scan logic in set_plain_rel_pathlist()
+	 * handles plain base relations; here we extend that to join rels as
+	 * outer sides, covering ORDER BY keys that span multiple tables.
+	 * For base relations the sorted path is already in outerrel->pathlist
+	 * and was tried in the loop above; the get_cheapest_path_for_pathkeys
+	 * guard below prevents redundant work in that case.
+	 *
+	 * When root->limit_tuples is set, create_sort_path() uses the bounded
+	 * heap-sort cost model (N*log2(2K) instead of N*log2(N)), giving an
+	 * accurate startup-cost estimate that feeds into fractional path
+	 * comparison correctly.
+	 */
+	if (nestjoinOK && root->query_pathkeys != NIL)
+	{
+		List	   *useful_pathkeys = NIL;
+		ListCell   *lc;
+
+		foreach(lc, root->query_pathkeys)
+		{
+			PathKey			   *pathkey = (PathKey *) lfirst(lc);
+			EquivalenceClass   *ec = pathkey->pk_eclass;
+
+			if (!relation_can_be_sorted_early(root, outerrel, ec, false))
+				break;
+
+			useful_pathkeys = lappend(useful_pathkeys, pathkey);
+		}
+
+		/*
+		 * Only proceed if we found useful pathkeys and the outer rel does not
+		 * already have a path satisfying them — if it does, the foreach loop
+		 * above already considered it.
+		 */
+		if (useful_pathkeys != NIL &&
+			get_cheapest_path_for_pathkeys(outerrel->pathlist,
+										   useful_pathkeys,
+										   outerrel->lateral_relids,
+										   TOTAL_COST, false) == NULL)
+		{
+			Path	   *outerpath =
+					get_cheapest_path_for_pathkeys(outerrel->pathlist, NIL,
+												   outerrel->lateral_relids,
+												   TOTAL_COST, false);
+
+			if (outerpath != NULL && !PATH_PARAM_BY_REL(outerpath, innerrel))
+			{
+				Path	   *sorted_outer;
+				List	   *merge_pathkeys;
+
+				/*
+				 * For LEFT JOIN every outer row produces at least one output
+				 * row (NULL-extended if unmatched), so the LIMIT bound on join
+				 * output safely bounds the outer side — pass it for an
+				 * accurate top-N heap-sort cost estimate.  For INNER, SEMI,
+				 * and ANTI, outer rows can be discarded by the join condition,
+				 * so we conservatively model a full sort.
+				 */
+				sorted_outer = (Path *)
+					create_sort_path(root, outerrel, outerpath,
+									 useful_pathkeys,
+									 (jointype == JOIN_LEFT) ?
+									 root->limit_tuples : -1.0);
+
+				merge_pathkeys = build_join_pathkeys(root, joinrel, jointype,
+													 sorted_outer->pathkeys);
+
+				/*
+				 * cheapest_parameterized_paths always includes the
+				 * cheapest-total unparameterized path, so no need to
+				 * try inner_cheapest_total separately.
+				 */
+				foreach(lc, innerrel->cheapest_parameterized_paths)
+				{
+					Path	   *innerpath = (Path *) lfirst(lc);
+					Path	   *mpath;
+
+					try_nestloop_path(root, joinrel,
+									  sorted_outer, innerpath,
+									  merge_pathkeys,
+									  jointype,
+									  PGS_NESTLOOP_PLAIN,
+									  extra);
+
+					mpath = get_memoize_path(root, innerrel, outerrel,
+											 innerpath, sorted_outer, jointype,
+											 extra);
+					if (mpath != NULL)
+						try_nestloop_path(root, joinrel,
+										  sorted_outer, mpath,
+										  merge_pathkeys,
+										  jointype,
+										  PGS_NESTLOOP_MEMOIZE,
+										  extra);
+				}
+
+				/* Also consider materialized form of the cheapest inner path */
+				if (matpath != NULL)
+					try_nestloop_path(root, joinrel,
+									  sorted_outer, matpath,
+									  merge_pathkeys,
+									  jointype,
+									  PGS_NESTLOOP_MATERIALIZE,
+									  extra);
+			}
+		}
+	}
+
+	/*
 	 * Consider partial nestloop and mergejoin plan if outerrel has any
 	 * partial path and the joinrel is parallel-safe.  However, we can't
 	 * handle joins needing lateral rels, since partial paths must not be
