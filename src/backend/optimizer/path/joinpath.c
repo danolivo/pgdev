@@ -2102,7 +2102,6 @@ match_unsorted_outer(PlannerInfo *root,
 									  sorted_outer, innerpath,
 									  merge_pathkeys,
 									  jointype,
-									  PGS_NESTLOOP_PLAIN,
 									  extra);
 
 					mpath = get_memoize_path(root, innerrel, outerrel,
@@ -2113,7 +2112,6 @@ match_unsorted_outer(PlannerInfo *root,
 										  sorted_outer, mpath,
 										  merge_pathkeys,
 										  jointype,
-										  PGS_NESTLOOP_MEMOIZE,
 										  extra);
 				}
 
@@ -2123,7 +2121,6 @@ match_unsorted_outer(PlannerInfo *root,
 									  sorted_outer, matpath,
 									  merge_pathkeys,
 									  jointype,
-									  PGS_NESTLOOP_MATERIALIZE,
 									  extra);
 			}
 		}

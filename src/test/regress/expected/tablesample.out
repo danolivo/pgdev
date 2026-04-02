@@ -253,13 +253,15 @@ select pct, count(unique1) from
   group by pct;
                        QUERY PLAN                       
 --------------------------------------------------------
- HashAggregate
+ GroupAggregate
    Group Key: "*VALUES*".column1
    ->  Nested Loop
-         ->  Values Scan on "*VALUES*"
+         ->  Sort
+               Sort Key: "*VALUES*".column1
+               ->  Values Scan on "*VALUES*"
          ->  Sample Scan on tenk1
                Sampling: bernoulli ("*VALUES*".column1)
-(6 rows)
+(8 rows)
 
 select pct, count(unique1) from
   (values (0),(100)) v(pct),
