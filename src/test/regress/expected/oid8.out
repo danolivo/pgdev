@@ -217,21 +217,19 @@ SELECT DISTINCT (i || '000000000000' || j)::oid8 f
        generate_series(1, 5) k
   WHERE i <= 10 AND j > 0 AND j <= 10
   ORDER BY f;
-                                    QUERY PLAN                                     
------------------------------------------------------------------------------------
- Sort
-   Sort Key: (((((i.i)::text || '000000000000'::text) || (j.j)::text))::oid8)
-   ->  HashAggregate
-         Group Key: ((((i.i)::text || '000000000000'::text) || (j.j)::text))::oid8
-         ->  Nested Loop
-               ->  Function Scan on generate_series k
-               ->  Materialize
-                     ->  Nested Loop
-                           ->  Function Scan on generate_series j
-                                 Filter: ((j > 0) AND (j <= 10))
-                           ->  Function Scan on generate_series i
-                                 Filter: (i <= 10)
-(12 rows)
+                                        QUERY PLAN                                        
+------------------------------------------------------------------------------------------
+ Unique
+   ->  Nested Loop
+         ->  Sort
+               Sort Key: (((((i.i)::text || '000000000000'::text) || (j.j)::text))::oid8)
+               ->  Nested Loop
+                     ->  Function Scan on generate_series j
+                           Filter: ((j > 0) AND (j <= 10))
+                     ->  Function Scan on generate_series i
+                           Filter: (i <= 10)
+         ->  Function Scan on generate_series k
+(10 rows)
 
 SELECT DISTINCT (i || '000000000000' || j)::oid8 f
   FROM generate_series(1, 10) i,
