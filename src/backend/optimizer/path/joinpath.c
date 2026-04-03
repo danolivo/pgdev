@@ -2034,7 +2034,7 @@ match_unsorted_outer(PlannerInfo *root,
 	 * accurate startup-cost estimate that feeds into fractional path
 	 * comparison correctly.
 	 */
-	if (nestjoinOK && root->query_pathkeys != NIL)
+	if (nestjoinOK && enable_presorted_outer && root->query_pathkeys != NIL)
 	{
 		List	   *useful_pathkeys = NIL;
 		ListCell   *lc;

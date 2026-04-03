@@ -5819,6 +5819,27 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-enable-presorted-outer" xreflabel="enable_presorted_outer">
+      <term><varname>enable_presorted_outer</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>enable_presorted_outer</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Enables or disables the query planner's ability to add a
+        <literal>Sort</literal> node on the outer side of a
+        <literal>NestLoop</literal> join when a prefix of the query's
+        <literal>ORDER BY</literal> keys can be satisfied by columns of
+        the outer relation.  When enabled, the planner may push a sort
+        below the join, allowing <literal>NestLoop</literal> to preserve
+        the output order and enabling a bounded heap-sort when a
+        <literal>LIMIT</literal> is also present.  The default value is
+        <literal>on</literal>.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-enable-self-join-elimination" xreflabel="enable_self_join_elimination">
       <term><varname>enable_self_join_elimination</varname> (<type>boolean</type>)
       <indexterm>
