@@ -34,7 +34,6 @@ SUBDIRS = \
 		pg_freespacemap \
 		pg_logicalinspect \
 		pg_overexplain \
-		pg_plan_advice \
 		pg_prewarm	\
 		pg_stash_advice	\
 		pg_stat_statements \
