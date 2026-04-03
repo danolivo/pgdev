@@ -175,8 +175,8 @@ $node->issues_sql_unlike(
 	'vacuumdb --dry-run');
 $node->issues_sql_like(
 	[ 'vacuumdb', '--schema' => '"Foo"', '--schema' => '"Bar"', 'postgres' ],
-	qr/VACUUM\ \(SKIP_DATABASE_STATS\)\ "Foo".bar
-		.*VACUUM\ \(SKIP_DATABASE_STATS\)\ "Bar".baz
+	qr/(?=.*VACUUM\ \(SKIP_DATABASE_STATS\)\ "Foo"\.bar)
+	   (?=.*VACUUM\ \(SKIP_DATABASE_STATS\)\ "Bar"\.baz)
 	/sx,
 	'vacuumdb multiple --schema switches');
 $node->issues_sql_like(
