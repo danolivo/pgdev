@@ -11,6 +11,8 @@
 #ifndef PG_PRNG_H
 #define PG_PRNG_H
 
+#define CHAOS_MODE 1
+
 /*
  * State vector for PRNG generation.  Callers should treat this as an
  * opaque typedef, but we expose its definition to allow it to be

@@ -14,6 +14,7 @@
 
 #include "access/parallel.h"
 #include "commands/repack.h"
+#include "common/pg_prng.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -862,9 +863,17 @@ BackgroundWorkerMain(const void *startup_data, size_t startup_data_len)
 	/*
 	 * Now invoke the user-defined worker code
 	 */
+#ifdef CHAOS_MODE
+	/* Random delay (1-50 ms) before bgworker starts. */
+	pg_usleep((pg_prng_uint32(&pg_global_prng_state) % 50 + 1) * 1000);
+#endif
 	entrypt(worker->bgw_main_arg);
 
 	/* ... and if it returns, we're done */
+#ifdef CHAOS_MODE
+	/* Random delay (1-50 ms) before bgworker exits. */
+	pg_usleep((pg_prng_uint32(&pg_global_prng_state) % 50 + 1) * 1000);
+#endif
 	proc_exit(0);
 }
 
