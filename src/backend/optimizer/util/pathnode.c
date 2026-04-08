@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "common/pg_prng.h"
 #include "executor/nodeSetOp.h"
 #include "foreign/fdwapi.h"
 #include "miscadmin.h"
@@ -76,6 +77,13 @@ compare_path_costs(Path *path1, Path *path2, CostSelector criterion)
 			return +1;
 	}
 
+#ifdef CHAOS_MODE
+	if (pg_prng_bool(&pg_global_prng_state))
+		return -1;
+	else
+		return +1;
+#endif
+
 	if (criterion == STARTUP_COST)
 	{
 		if (path1->startup_cost < path2->startup_cost)
@@ -135,6 +143,13 @@ compare_fractional_path_costs(Path *path1, Path *path2,
 			return +1;
 	}
 
+#ifdef CHAOS_MODE
+	if (pg_prng_bool(&pg_global_prng_state))
+		return -1;
+	else
+		return +1;
+#endif
+
 	if (fraction <= 0.0 || fraction >= 1.0)
 		return compare_path_costs(path1, path2, TOTAL_COST);
 	cost1 = path1->startup_cost +
@@ -191,6 +206,10 @@ compare_path_costs_fuzzily(Path *path1, Path *path2, double fuzz_factor)
 		else
 			return COSTS_BETTER2;
 	}
+
+#ifdef CHAOS_MODE
+	return pg_prng_uint32(&pg_global_prng_state) % 4;
+#endif
 
 	/*
 	 * Check total cost first since it's more likely to be different; many
@@ -455,6 +474,7 @@ set_cheapest(RelOptInfo *parent_rel)
  *
  * Returns nothing, but modifies parent_rel->pathlist.
  */
+#ifndef CHAOS_MODE
 void
 add_path(RelOptInfo *parent_rel, Path *new_path)
 {
@@ -664,6 +684,184 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 			pfree(new_path);
 	}
 }
+#else
+void
+add_path(RelOptInfo *parent_rel, Path *new_path)
+{
+	bool		accept_new = true;	/* unless we find a superior old path */
+	int			insert_at = 0;	/* where to insert new item */
+	List	   *new_path_pathkeys;
+	ListCell   *p1;
+
+	/*
+	 * This is a convenient place to check for query cancel --- no part of the
+	 * planner goes very long without calling add_path().
+	 */
+	CHECK_FOR_INTERRUPTS();
+
+	/* Pretend parameterized paths have no pathkeys, per comment above */
+	new_path_pathkeys = new_path->param_info ? NIL : new_path->pathkeys;
+
+	/*
+	 * Loop to check proposed new path against old paths.  Note it is possible
+	 * for more than one old path to be tossed out because new_path dominates
+	 * it.
+	 */
+	foreach(p1, parent_rel->pathlist)
+	{
+		Path	   *old_path = (Path *) lfirst(p1);
+		bool		remove_old = false; /* unless new proves superior */
+		PathCostComparison costcmp;
+		PathKeysComparison keyscmp;
+		BMS_Comparison outercmp;
+
+		/*
+		 * Do a fuzzy cost comparison with standard fuzziness limit.
+		 */
+		costcmp = compare_path_costs_fuzzily(new_path, old_path,
+											 STD_FUZZ_FACTOR);
+
+		if (costcmp != COSTS_DIFFERENT)
+		{
+			List	   *old_path_pathkeys;
+
+			old_path_pathkeys = old_path->param_info ? NIL : old_path->pathkeys;
+
+			/* Chaos: randomise pathkeys when either side has them. */
+			if (old_path_pathkeys != NIL && new_path_pathkeys != NIL)
+				keyscmp = pg_prng_uint32(&pg_global_prng_state) % 4;
+			else
+				keyscmp = compare_pathkeys(new_path_pathkeys,
+										   old_path_pathkeys);
+			if (keyscmp != PATHKEYS_DIFFERENT)
+			{
+				switch (costcmp)
+				{
+					case COSTS_EQUAL:
+						outercmp = bms_subset_compare(PATH_REQ_OUTER(new_path),
+													  PATH_REQ_OUTER(old_path));
+
+						if (keyscmp == PATHKEYS_BETTER1)
+						{
+							if ((outercmp == BMS_EQUAL ||
+								 outercmp == BMS_SUBSET1) &&
+								pg_prng_bool(&pg_global_prng_state) &&
+								new_path->parallel_safe >= old_path->parallel_safe)
+								remove_old = true;	/* new dominates old */
+						}
+						else if (keyscmp == PATHKEYS_BETTER2)
+						{
+							if ((outercmp == BMS_EQUAL ||
+								 outercmp == BMS_SUBSET2) &&
+								pg_prng_bool(&pg_global_prng_state) &&
+								new_path->parallel_safe <= old_path->parallel_safe)
+								accept_new = false; /* old dominates new */
+						}
+						else	/* keyscmp == PATHKEYS_EQUAL */
+						{
+							if (outercmp == BMS_EQUAL)
+							{
+								if (new_path->parallel_safe >
+									old_path->parallel_safe)
+									remove_old = true;	/* new dominates old */
+								else if (new_path->parallel_safe <
+										 old_path->parallel_safe)
+									accept_new = false; /* old dominates new */
+								/* Chaos: randomise rows and final tiebreaker. */
+								else if (pg_prng_bool(&pg_global_prng_state))
+									remove_old = true;
+								else if (pg_prng_bool(&pg_global_prng_state))
+									accept_new = false;
+								else if (compare_path_costs_fuzzily(new_path,
+																	old_path,
+																	1.0000000001) == COSTS_BETTER1)
+									remove_old = true;	/* new dominates old */
+								else
+									accept_new = false; /* old equals or
+														 * dominates new */
+							}
+							else if (outercmp == BMS_SUBSET1 &&
+									 pg_prng_bool(&pg_global_prng_state) &&
+									 new_path->parallel_safe >= old_path->parallel_safe)
+								remove_old = true;	/* new dominates old */
+							else if (outercmp == BMS_SUBSET2 &&
+									 pg_prng_bool(&pg_global_prng_state) &&
+									 new_path->parallel_safe <= old_path->parallel_safe)
+								accept_new = false; /* old dominates new */
+							/* else different parameterizations, keep both */
+						}
+						break;
+					case COSTS_BETTER1:
+						if (keyscmp != PATHKEYS_BETTER2)
+						{
+							outercmp = bms_subset_compare(PATH_REQ_OUTER(new_path),
+														  PATH_REQ_OUTER(old_path));
+							if ((outercmp == BMS_EQUAL ||
+								 outercmp == BMS_SUBSET1) &&
+								pg_prng_bool(&pg_global_prng_state) &&
+								new_path->parallel_safe >= old_path->parallel_safe)
+								remove_old = true;	/* new dominates old */
+						}
+						break;
+					case COSTS_BETTER2:
+						if (keyscmp != PATHKEYS_BETTER1)
+						{
+							outercmp = bms_subset_compare(PATH_REQ_OUTER(new_path),
+														  PATH_REQ_OUTER(old_path));
+							if ((outercmp == BMS_EQUAL ||
+								 outercmp == BMS_SUBSET2) &&
+								pg_prng_bool(&pg_global_prng_state) &&
+								new_path->parallel_safe <= old_path->parallel_safe)
+								accept_new = false; /* old dominates new */
+						}
+						break;
+					case COSTS_DIFFERENT:
+						break;
+				}
+			}
+		}
+
+		/*
+		 * Remove current element from pathlist if dominated by new.
+		 */
+		if (remove_old)
+		{
+			parent_rel->pathlist = foreach_delete_current(parent_rel->pathlist,
+														  p1);
+			if (!IsA(old_path, IndexPath))
+				pfree(old_path);
+		}
+		else
+		{
+			if (new_path->disabled_nodes > old_path->disabled_nodes ||
+				(new_path->disabled_nodes == old_path->disabled_nodes &&
+				 pg_prng_bool(&pg_global_prng_state)))
+				insert_at = foreach_current_index(p1) + 1;
+		}
+
+		if (!accept_new)
+			break;
+	}
+
+	if (accept_new)
+	{
+		/* Chaos: insert at a random position in the list. */
+		int		listlen = list_length(parent_rel->pathlist);
+
+		insert_at = (listlen > 0) ?
+			pg_prng_uint32(&pg_global_prng_state) % (listlen + 1) : 0;
+		parent_rel->pathlist =
+			list_insert_nth(parent_rel->pathlist, insert_at, new_path);
+	}
+	else
+	{
+		if (!IsA(new_path, IndexPath))
+			pfree(new_path);
+	}
+
+	Assert(parent_rel->pathlist != NIL);
+}
+#endif
 
 /*
  * add_path_precheck
@@ -749,7 +947,16 @@ add_path_precheck(RelOptInfo *parent_rel, int disabled_nodes,
 
 	return true;
 }
-
+#if 0
+bool
+add_path_precheck(RelOptInfo *parent_rel, int disabled_nodes,
+				  Cost startup_cost, Cost total_cost,
+				  List *pathkeys, Relids required_outer)
+{
+	/* In chaos mode, never reject a path at precheck — let add_path decide. */
+	return true;
+}
+#endif
 /*
  * add_partial_path
  *	  Like add_path, our goal here is to consider whether a path is worthy
@@ -789,6 +996,7 @@ add_path_precheck(RelOptInfo *parent_rel, int disabled_nodes,
  *	  take an exception for IndexPaths as partial index paths won't be
  *	  referenced by partial BitmapHeapPaths.
  */
+#ifndef CHAOS_MODE
 void
 add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 {
@@ -898,6 +1106,127 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 		pfree(new_path);
 	}
 }
+#else
+void
+add_partial_path(RelOptInfo *parent_rel, Path *new_path)
+{
+	bool		accept_new = true;	/* unless we find a superior old path */
+	int			insert_at = 0;	/* where to insert new item */
+	ListCell   *p1;
+
+	/* Check for query cancel. */
+	CHECK_FOR_INTERRUPTS();
+
+	/* Path to be added must be parallel safe. */
+	Assert(new_path->parallel_safe);
+
+	/* Relation should be OK for parallelism, too. */
+	Assert(parent_rel->consider_parallel);
+
+	/*
+	 * As in add_path, throw out any paths which are dominated by the new
+	 * path, but throw out the new path if some existing path dominates it.
+	 *
+	 * CHAOS MODE: randomize comparison inputs (keyscmp, costcmp) while
+	 * keeping the original dominance logic intact.
+	 */
+	foreach(p1, parent_rel->partial_pathlist)
+	{
+		Path	   *old_path = (Path *) lfirst(p1);
+		bool		remove_old = false; /* unless new proves superior */
+		PathKeysComparison keyscmp;
+
+		/*
+		 * Chaos: randomize pathkeys comparison when either side has
+		 * pathkeys.  Use real comparison only when both are NIL.
+		 */
+		if (new_path->pathkeys != NIL && old_path->pathkeys != NIL)
+			keyscmp = pg_prng_uint32(&pg_global_prng_state) % 4;
+		else
+			keyscmp = compare_pathkeys(new_path->pathkeys, old_path->pathkeys);
+
+		if (keyscmp != PATHKEYS_DIFFERENT)
+		{
+			PathCostComparison costcmp;
+
+			/*
+			 * Do a fuzzy cost comparison with standard fuzziness limit.
+			 */
+			costcmp = compare_path_costs_fuzzily(new_path, old_path,
+												 STD_FUZZ_FACTOR);
+
+			if (costcmp == COSTS_BETTER1)
+			{
+				if (keyscmp != PATHKEYS_BETTER2)
+					remove_old = true;
+			}
+			else if (costcmp == COSTS_BETTER2)
+			{
+				if (keyscmp != PATHKEYS_BETTER1)
+					accept_new = false;
+			}
+			else if (costcmp == COSTS_EQUAL)
+			{
+				if (keyscmp == PATHKEYS_BETTER1)
+					remove_old = true;
+				else if (keyscmp == PATHKEYS_BETTER2)
+					accept_new = false;
+				else if (compare_path_costs_fuzzily(new_path, old_path,
+													1.0000000001) == COSTS_BETTER1)
+					remove_old = true;
+				else
+					accept_new = false;
+			}
+			/* COSTS_DIFFERENT: keep both */
+		}
+
+		/*
+		 * Remove current element from partial_pathlist if dominated by new.
+		 */
+		if (remove_old)
+		{
+			parent_rel->partial_pathlist =
+				foreach_delete_current(parent_rel->partial_pathlist, p1);
+			pfree(old_path);
+		}
+		else
+		{
+			/*
+			 * new belongs after this old path if it has more disabled nodes
+			 * or if it has the same number of nodes but a greater total cost.
+			 */
+			if (new_path->disabled_nodes > old_path->disabled_nodes ||
+				(new_path->disabled_nodes == old_path->disabled_nodes &&
+				 new_path->total_cost >= old_path->total_cost))
+				insert_at = foreach_current_index(p1) + 1;
+		}
+
+		/*
+		 * If we found an old path that dominates new_path, we can quit
+		 * scanning the partial_pathlist; we will not add new_path, and we
+		 * assume new_path cannot dominate any later path.
+		 */
+		if (!accept_new)
+			break;
+	}
+
+	if (accept_new)
+	{
+		/* Chaos: insert at a random position in the list. */
+		int		listlen = list_length(parent_rel->partial_pathlist);
+
+		insert_at = (listlen > 0) ?
+			pg_prng_uint32(&pg_global_prng_state) % (listlen + 1) : 0;
+		parent_rel->partial_pathlist =
+			list_insert_nth(parent_rel->partial_pathlist, insert_at, new_path);
+	}
+	else
+	{
+		/* Reject and recycle the new path */
+		pfree(new_path);
+	}
+}
+#endif
 
 /*
  * add_partial_path_precheck
@@ -1011,6 +1340,15 @@ add_partial_path_precheck(RelOptInfo *parent_rel, int disabled_nodes,
 
 	return true;
 }
+#if 0
+bool
+add_partial_path_precheck(RelOptInfo *parent_rel, int disabled_nodes,
+						  Cost startup_cost, Cost total_cost, List *pathkeys)
+{
+	/* In chaos mode, never reject a path at precheck — let add_partial_path decide. */
+	return true;
+}
+#endif
 
 
 /*****************************************************************************

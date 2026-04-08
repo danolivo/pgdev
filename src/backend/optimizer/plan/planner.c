@@ -26,6 +26,7 @@
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "common/pg_prng.h"
 #include "executor/executor.h"
 #include "foreign/fdwapi.h"
 #include "jit/jit.h"
@@ -6928,7 +6929,9 @@ plan_cluster_use_sort(Oid tableOid, Oid indexOid)
 	Cost		comparisonCost;
 	Path	   *seqScanPath;
 	Path		seqScanAndSortPath;
+#ifndef CHAOS_MODE
 	IndexPath  *indexScanPath;
+#endif
 	ListCell   *lc;
 
 	/* We can short-circuit the cost comparison if indexscans are disabled */
@@ -7011,6 +7014,9 @@ plan_cluster_use_sort(Oid tableOid, Oid indexOid)
 			  seqScanPath->total_cost, rel->tuples, rel->reltarget->width,
 			  comparisonCost, maintenance_work_mem, -1.0);
 
+#ifdef CHAOS_MODE
+	return pg_prng_bool(&pg_global_prng_state);
+#else
 	/* Estimate the cost of index scan */
 	indexScanPath = create_index_path(root, indexInfo,
 									  NIL, NIL, NIL, NIL,
@@ -7018,6 +7024,7 @@ plan_cluster_use_sort(Oid tableOid, Oid indexOid)
 									  NULL, 1.0, false);
 
 	return (seqScanAndSortPath.total_cost < indexScanPath->path.total_cost);
+#endif
 }
 
 /*

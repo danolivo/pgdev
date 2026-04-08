@@ -23,6 +23,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
+#include "common/pg_prng.h"
 #include "foreign/fdwapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -1519,7 +1520,12 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 			}
 			else if (nppath == NULL ||
 					 (cheapest_partial_path != NULL &&
-					  cheapest_partial_path->total_cost < nppath->total_cost))
+#ifdef CHAOS_MODE
+					  pg_prng_bool(&pg_global_prng_state)
+#else
+					  cheapest_partial_path->total_cost < nppath->total_cost
+#endif
+					  ))
 			{
 				/* Partial path is cheaper or the only option. */
 				Assert(cheapest_partial_path != NULL);
