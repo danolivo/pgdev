@@ -880,6 +880,7 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
  * At the time this is called, we haven't actually built a Path structure,
  * so the required information has to be passed piecemeal.
  */
+#ifndef CHAOS_MODE
 bool
 add_path_precheck(RelOptInfo *parent_rel, int disabled_nodes,
 				  Cost startup_cost, Cost total_cost,
@@ -947,7 +948,7 @@ add_path_precheck(RelOptInfo *parent_rel, int disabled_nodes,
 
 	return true;
 }
-#if 0
+#else
 bool
 add_path_precheck(RelOptInfo *parent_rel, int disabled_nodes,
 				  Cost startup_cost, Cost total_cost,
@@ -1237,6 +1238,7 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
  * sure we don't add a partial path if there's already a complete path that
  * dominates it, since in that case the proposed path is surely a loser.
  */
+#ifndef CHAOS_MODE
 bool
 add_partial_path_precheck(RelOptInfo *parent_rel, int disabled_nodes,
 						  Cost startup_cost, Cost total_cost, List *pathkeys)
@@ -1340,7 +1342,7 @@ add_partial_path_precheck(RelOptInfo *parent_rel, int disabled_nodes,
 
 	return true;
 }
-#if 0
+#else
 bool
 add_partial_path_precheck(RelOptInfo *parent_rel, int disabled_nodes,
 						  Cost startup_cost, Cost total_cost, List *pathkeys)
