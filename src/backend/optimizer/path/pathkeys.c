@@ -18,6 +18,7 @@
 #include "postgres.h"
 
 #include "access/stratnum.h"
+#include "common/pg_prng.h"
 #include "catalog/pg_opfamily.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/cost.h"
@@ -2204,6 +2205,10 @@ truncate_useless_pathkeys(PlannerInfo *root,
 	int			nuseful;
 	int			nuseful2;
 	int			ntotal = list_length(pathkeys);
+
+#ifdef CHAOS_MODE
+	return pathkeys;
+#endif
 
 	/*
 	 * Here we determine how many items in 'pathkeys' might be useful for
