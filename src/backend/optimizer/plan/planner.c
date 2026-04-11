@@ -8054,6 +8054,17 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 	 * path with a projection path that generates the SRF-free scan/join
 	 * target.  This can't change the ordering of paths within rel->pathlist,
 	 * so we just modify the list in place.
+	 *
+	 * For partitioned joinrels, we must drop any Append or MergeAppend paths
+	 * rather than adjusting them in-place.  These paths hold subpath pointers
+	 * into children's pathlists.  The subsequent recursion into children
+	 * (which rebuilds children's paths via add_paths_to_append_rel) can free
+	 * those children's paths, leaving dangling pointers here.  It is safe to
+	 * drop them because add_paths_to_append_rel below will rebuild equivalent
+	 * Append/MergeAppend paths from the updated children.  Non-Append paths
+	 * (e.g. HashJoin, NestLoop, MergeJoin) operate on the whole partitioned
+	 * input rels, so they carry no per-partition subpath pointers and are
+	 * safe to keep.
 	 */
 	foreach(lc, rel->pathlist)
 	{
@@ -8061,6 +8072,13 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 
 		/* Shouldn't have any parameterized paths anymore */
 		Assert(subpath->param_info == NULL);
+
+		if (rel_is_partitioned && !IS_SIMPLE_REL(rel) &&
+			(IsA(subpath, AppendPath) || IsA(subpath, MergeAppendPath)))
+		{
+			rel->pathlist = foreach_delete_current(rel->pathlist, lc);
+			continue;
+		}
 
 		if (tlist_same_exprs)
 			subpath->pathtarget->sortgrouprefs =
@@ -8082,6 +8100,14 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 
 		/* Shouldn't have any parameterized paths anymore */
 		Assert(subpath->param_info == NULL);
+
+		if (rel_is_partitioned && !IS_SIMPLE_REL(rel) &&
+			(IsA(subpath, AppendPath) || IsA(subpath, MergeAppendPath)))
+		{
+			rel->partial_pathlist =
+				foreach_delete_current(rel->partial_pathlist, lc);
+			continue;
+		}
 
 		if (tlist_same_exprs)
 			subpath->pathtarget->sortgrouprefs =
