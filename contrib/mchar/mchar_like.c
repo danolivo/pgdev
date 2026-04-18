@@ -183,6 +183,13 @@ typedef struct MCharPatternCache
 	const UChar	   *literal;	/* inner literal for fast path */
 	int32			literal_len;
 	/*
+	 * True when every code point in the lowered pattern is its own upper-
+	 * and lower-case (digits, punctuation, non-cased scripts).  If so, no
+	 * text code point can match unless it is byte-identical to a pattern
+	 * code point, and we can skip lowering the text at call time.
+	 */
+	bool			case_neutral;
+	/*
 	 * mchar_like only: set when the pattern ends with space/%/_ and the
 	 * mchar text must therefore be right-padded to its typmod length before
 	 * matching (see removeTrailingSpaces()).  Unused for mvarchar_like.
@@ -217,9 +224,13 @@ lowercase_into(UChar *dst, int dstsz, const UChar *src, int srclen,
 }
 
 /*
- * Examine a lowered LIKE pattern and decide whether it is the
- * "%literal%" shape with no wildcards or escapes in between.  That shape can
- * be matched with a single u_strFindFirst() call.
+ * Examine a lowered LIKE pattern and decide:
+ *   1. whether it has the "%literal%" shape with no wildcards or escapes
+ *      in between (the single-u_strFindFirst fast path), and
+ *   2. whether every code point is case-neutral (allowing the text side to
+ *      bypass u_strToLower() at match time).
+ *
+ * Called once per cache build, not a hot path.
  */
 static void
 classify_pattern(MCharPatternCache *cache)
@@ -227,11 +238,35 @@ classify_pattern(MCharPatternCache *cache)
 	const UChar	   *buf = cache->lowered;
 	int				buflen = cache->lowered_len;
 	int				i;
+	int				pos;
+	bool			neutral;
 
 	SET_UCHAR;
 	cache->is_simple_substring = false;
 	cache->literal = NULL;
 	cache->literal_len = 0;
+	cache->case_neutral = false;
+
+	/*
+	 * Case-neutrality: walk the (code-point-decoded) pattern and check that
+	 * every code point equals its own upper- and lower-case.  buf is the
+	 * output of u_strToLower(), hence well-formed UTF-16, so U16_NEXT_UNSAFE
+	 * is safe.
+	 */
+	pos = 0;
+	neutral = true;
+	while (pos < buflen)
+	{
+		UChar32		c;
+
+		U16_NEXT_UNSAFE(buf, pos, c);
+		if (u_tolower(c) != c || u_toupper(c) != c)
+		{
+			neutral = false;
+			break;
+		}
+	}
+	cache->case_neutral = neutral;
 
 	if (buflen < 2 || buf[0] != UCharPercent || buf[buflen - 1] != UCharPercent)
 		return;
@@ -464,9 +499,16 @@ match_lowered(const UChar *t, int tlen, const UChar *p, int plen)
 }
 
 /*
- * Execute LIKE using the cached lowered pattern.  Lowers the text once,
- * dispatches to u_strFindFirst for the common %literal% shape, and
- * otherwise hands off to match_lowered().
+ * Execute LIKE using the cached lowered pattern.
+ *
+ *   - For the %literal% shape with literal_len > tlen, reject immediately
+ *     without touching the text.
+ *   - For a case-neutral pattern (digits, CJK, punctuation, ...), skip the
+ *     per-row text lowering: no text code point can match unless it is
+ *     byte-identical to a pattern code point, so raw text is effectively
+ *     pre-lowered for this match.
+ *   - Otherwise lower the text once into a stack buffer (palloc only for
+ *     long inputs) and then run the simple-substring or wildcard matcher.
  */
 static bool
 execute_like_cached(const UChar *text, int tlen, MCharPatternCache *pcache)
@@ -474,12 +516,29 @@ execute_like_cached(const UChar *text, int tlen, MCharPatternCache *pcache)
 	UChar		tstack[MCHAR_LOWER_STACK_UCHARS];
 	UChar	   *tbuf;
 	int			tlen_lower;
-	bool		tbuf_palloc;
+	bool		tbuf_palloc = false;
 	bool		result;
 
-	tbuf = lowercase_text(text, tlen,
-						  tstack, MCHAR_LOWER_STACK_UCHARS,
-						  &tlen_lower, &tbuf_palloc);
+	Assert(pcache != NULL);
+	Assert(pcache->lowered != NULL || pcache->lowered_len == 0);
+	Assert(!pcache->is_simple_substring ||
+		   (pcache->literal != NULL || pcache->literal_len == 0));
+
+	/* Cheap early reject: %literal% with literal longer than text. */
+	if (pcache->is_simple_substring && pcache->literal_len > tlen)
+		return false;
+
+	if (pcache->case_neutral)
+	{
+		tbuf = (UChar *) text;
+		tlen_lower = tlen;
+	}
+	else
+	{
+		tbuf = lowercase_text(text, tlen,
+							  tstack, MCHAR_LOWER_STACK_UCHARS,
+							  &tlen_lower, &tbuf_palloc);
+	}
 
 	if (pcache->is_simple_substring)
 	{
