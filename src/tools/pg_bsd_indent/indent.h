@@ -40,8 +40,16 @@ int	count_spaces(int, char *);
 int	count_spaces_until(int, char *, char *);
 int	lexi(struct parser_state *);
 void	diag2(int, const char *);
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wgcc-compat"
+void	diag3(int, const char *, int) __attribute__((format(printf, 2, 3)));
+void	diag4(int, const char *, int, int) __attribute__((format(printf, 2, 3)));
+#pragma clang diagnostic pop
+#else
 void	diag3(int, const char *, int);
 void	diag4(int, const char *, int, int);
+#endif
 void	dump_line(void);
 int	lookahead(void);
 void	lookahead_reset(void);
