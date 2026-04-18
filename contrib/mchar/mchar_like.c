@@ -76,17 +76,18 @@ uchareq(UChar *p1, UChar *p2) {
  * Byte-exact equality on a single UTF-16 character, assuming both operands
  * have already been passed through u_strToLower().  No ICU collator involved.
  */
-static inline int
+static inline bool
 uchareq_lowered(const UChar *p1, const UChar *p2)
 {
-	int l1 = 0, l2 = 0;
+	int			l1 = 0,
+				l2 = 0;
 
 	U16_FWD_1_UNSAFE(p1, l1);
 	U16_FWD_1_UNSAFE(p2, l2);
 
 	if (l1 != l2)
-		return 0;
-	return (u_memcmp(p1, p2, l1) == 0) ? 1 : 0;
+		return false;
+	return u_memcmp(p1, p2, l1) == 0;
 }
 
 #define NextChar(p, plen) 			\
@@ -272,32 +273,35 @@ addTrailingSpace(const MChar *src, int *newlen)
  */
 typedef struct MCharPatternCache
 {
+	/* identity: cache hits when (src, src_len) matches the incoming datum */
 	const UChar	   *src;
 	int32			src_len;
-	UChar		   *lowered;	/* palloc'd in fn_mcxt */
+	/* lowered pattern, owned by fn_mcxt */
+	UChar		   *lowered;
 	int32			lowered_len;
-	bool			is_simple_substring;	/* pattern is %literal% */
-	const UChar	   *literal;	/* inner literal for fast path */
+	/*
+	 * Classification flags filled by classify_pattern().  is_simple_substring
+	 * means the lowered pattern has the shape %LITERAL% with no escapes or
+	 * other wildcards, letting us dispatch to u_strFindFirst() on literal.
+	 * case_neutral means every code point equals its own upper- and
+	 * lower-case, letting execute_like_cached() skip lowering the text.
+	 * needs_text_pad is mchar_like-specific: set when the pattern ends with
+	 * space/%/_ and the mchar text must therefore be right-padded to its
+	 * typmod length before matching.
+	 */
+	bool			is_simple_substring;
+	const UChar	   *literal;
 	int32			literal_len;
-	/*
-	 * True when every code point in the lowered pattern is its own upper-
-	 * and lower-case (digits, punctuation, non-cased scripts).  If so, no
-	 * text code point can match unless it is byte-identical to a pattern
-	 * code point, and we can skip lowering the text at call time.
-	 */
 	bool			case_neutral;
-	/*
-	 * mchar_like only: set when the pattern ends with space/%/_ and the
-	 * mchar text must therefore be right-padded to its typmod length before
-	 * matching (see removeTrailingSpaces()).  Unused for mvarchar_like.
-	 */
 	bool			needs_text_pad;
 } MCharPatternCache;
 
 /*
  * Lowercase a UTF-16 string into dst.  Returns the lowered length.  On
  * U_BUFFER_OVERFLOW_ERROR the caller is expected to grow the buffer and
- * retry.  Any other ICU failure raises ereport(ERROR).
+ * retry; any other ICU failure raises ereport(ERROR).  u_strToLower() is
+ * always called with the empty (root) locale so match semantics don't
+ * depend on the backend's LC_CTYPE; see the WARNING on match_lowered().
  */
 static int
 lowercase_into(UChar *dst, int dstsz, const UChar *src, int srclen,
@@ -313,6 +317,37 @@ lowercase_into(UChar *dst, int dstsz, const UChar *src, int srclen,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("mchar: u_strToLower failed: %s", u_errorName(err))));
 	return n;
+}
+
+/*
+ * Lowercase (src, srclen) into a fresh buffer allocated in mcxt.  Handles
+ * the U_BUFFER_OVERFLOW_ERROR retry so callers don't repeat the dance.
+ * Writes the lowered length to *lowered_len and returns the buffer; the
+ * caller owns it.
+ */
+static UChar *
+lower_alloc_in(MemoryContext mcxt, const UChar *src, int srclen,
+			   int *lowered_len)
+{
+	UErrorCode	err;
+	UChar	   *buf;
+	int			bufsz;
+	int			n;
+
+	/* Case folding can expand a code point (e.g. German sharp-S -> SS). */
+	bufsz = srclen * 2 + 4;
+	buf = (UChar *) MemoryContextAlloc(mcxt, bufsz * sizeof(UChar));
+	n = lowercase_into(buf, bufsz, src, srclen, &err);
+	if (err == U_BUFFER_OVERFLOW_ERROR)
+	{
+		pfree(buf);
+		bufsz = n + 4;
+		buf = (UChar *) MemoryContextAlloc(mcxt, bufsz * sizeof(UChar));
+		n = lowercase_into(buf, bufsz, src, srclen, &err);
+		Assert(!U_FAILURE(err));
+	}
+	*lowered_len = n;
+	return buf;
 }
 
 /*
@@ -396,10 +431,6 @@ ensure_pattern_cache(FmgrInfo *flinfo, const UChar *src, int srclen,
 	int					pattern_len;
 	UChar			   *trimmed = NULL;
 	bool				need_pad = false;
-	UErrorCode			err;
-	UChar			   *buf;
-	int					bufsz;
-	int					buflen;
 
 	if (flinfo == NULL)
 		return NULL;
@@ -447,30 +478,13 @@ ensure_pattern_cache(FmgrInfo *flinfo, const UChar *src, int srclen,
 		pattern_len = srclen;
 	}
 
-	/*
-	 * Allocate a generous first guess (2x + pad).  Case folding can expand a
-	 * code point (e.g. German sharp-S -> SS), so pattern_len alone is not
-	 * always enough.  If ICU signals overflow we grow precisely and retry.
-	 */
-	bufsz = pattern_len * 2 + 4;
-	buf = (UChar *) MemoryContextAlloc(flinfo->fn_mcxt, bufsz * sizeof(UChar));
-	buflen = lowercase_into(buf, bufsz, pattern_src, pattern_len, &err);
-	if (err == U_BUFFER_OVERFLOW_ERROR)
-	{
-		pfree(buf);
-		bufsz = buflen + 4;
-		buf = (UChar *) MemoryContextAlloc(flinfo->fn_mcxt,
-										   bufsz * sizeof(UChar));
-		buflen = lowercase_into(buf, bufsz, pattern_src, pattern_len, &err);
-		Assert(!U_FAILURE(err));
-	}
+	cache->lowered = lower_alloc_in(flinfo->fn_mcxt, pattern_src, pattern_len,
+									&cache->lowered_len);
 
 	/* trimmed is only live when removeTrailingSpaces() actually trimmed. */
 	if (trimmed != NULL && trimmed != src)
 		pfree(trimmed);
 
-	cache->lowered = buf;
-	cache->lowered_len = buflen;
 	cache->src = src;
 	cache->src_len = srclen;
 	cache->needs_text_pad = need_pad;
@@ -545,11 +559,8 @@ lowercase_text(const UChar *src, int srclen,
 	{
 		if (*allocated)
 			pfree(buf);
-		bufsz = n + 4;
-		buf = (UChar *) palloc(bufsz * sizeof(UChar));
+		buf = lower_alloc_in(CurrentMemoryContext, src, srclen, &n);
 		*allocated = true;
-		n = lowercase_into(buf, bufsz, src, srclen, &err);
-		Assert(!U_FAILURE(err));
 	}
 	*lowered_len = n;
 	return buf;
@@ -649,7 +660,6 @@ execute_like_cached(const UChar *text, int tlen, MCharPatternCache *cache)
 	bool		tbuf_allocated = false;
 	bool		result;
 
-	Assert(cache != NULL);
 	Assert(cache->lowered != NULL || cache->lowered_len == 0);
 	Assert(!cache->is_simple_substring ||
 		   (cache->literal != NULL || cache->literal_len == 0));
@@ -861,7 +871,6 @@ do_mchar_like(FunctionCallInfo fcinfo, MChar *str, MVarChar *pat)
 	UChar			   *filled;
 	int					flen;
 	bool				result;
-	bool				filled_allocated;
 
 	cache = ensure_pattern_cache(fcinfo->flinfo, pat->data,
 								 UVARCHARLENGTH(pat), true);
@@ -893,18 +902,16 @@ do_mchar_like(FunctionCallInfo fcinfo, MChar *str, MVarChar *pat)
 	if (cache->needs_text_pad)
 	{
 		filled = addTrailingSpace(str, &flen);
-		filled_allocated = (filled != str->data);
 	}
 	else
 	{
 		filled = str->data;
 		flen = UCHARLENGTH(str);
-		filled_allocated = false;
 	}
 
 	result = execute_like_cached(filled, flen, cache);
 
-	if (filled_allocated)
+	if (filled != str->data)
 		pfree(filled);
 	return result;
 }
