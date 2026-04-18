@@ -289,11 +289,21 @@ classify_pattern(MCharPatternCache *cache)
  * entry if the pattern has changed.  Returns NULL when no FmgrInfo is
  * available (e.g. DirectFunctionCall) -- callers then lower into a local
  * buffer instead of the cache.
+ *
+ * When trim_trailing_spaces is true (mchar_like), removeTrailingSpaces() is
+ * run on the raw pattern first and needs_text_pad is populated so the
+ * caller can right-pad the text per row.  When false (mvarchar_like), the
+ * raw pattern is lowered as-is and needs_text_pad remains false.
  */
 static MCharPatternCache *
-ensure_pattern_cache(FmgrInfo *flinfo, const UChar *src, int srclen)
+ensure_pattern_cache(FmgrInfo *flinfo, const UChar *src, int srclen,
+					 bool trim_trailing_spaces)
 {
 	MCharPatternCache  *cache;
+	const UChar		   *pattern_src;
+	int					pattern_len;
+	UChar			   *trimmed = NULL;
+	bool				need_pad = false;
 	UErrorCode			err;
 	UChar			   *buf;
 	int					bufsz;
@@ -323,27 +333,57 @@ ensure_pattern_cache(FmgrInfo *flinfo, const UChar *src, int srclen)
 	}
 
 	/*
-	 * Allocate a generous first guess (2x + pad).  Case folding can expand a
-	 * code point (e.g. German sharp-S -> SS), so srclen alone is not always
-	 * enough.  If ICU signals overflow we grow precisely and retry.
+	 * For mchar_like, strip trailing spaces (and any trailing wildcard that
+	 * follows them) up front so the trimmed form is what gets cached and
+	 * matched row by row.  removeTrailingSpaces() allocates in the current
+	 * memory context only when it actually trims; otherwise it returns the
+	 * input pointer.  Switch into fn_mcxt so a freshly allocated buffer
+	 * survives until we pfree it below.  The cast is safe because
+	 * removeTrailingSpaces() does not mutate src.
 	 */
-	bufsz = srclen * 2 + 4;
+	if (trim_trailing_spaces)
+	{
+		MemoryContext	oldctx;
+
+		oldctx = MemoryContextSwitchTo(flinfo->fn_mcxt);
+		trimmed = removeTrailingSpaces((UChar *) src, srclen,
+									   &pattern_len, &need_pad);
+		MemoryContextSwitchTo(oldctx);
+		pattern_src = trimmed;
+	}
+	else
+	{
+		pattern_src = src;
+		pattern_len = srclen;
+	}
+
+	/*
+	 * Allocate a generous first guess (2x + pad).  Case folding can expand a
+	 * code point (e.g. German sharp-S -> SS), so pattern_len alone is not
+	 * always enough.  If ICU signals overflow we grow precisely and retry.
+	 */
+	bufsz = pattern_len * 2 + 4;
 	buf = (UChar *) MemoryContextAlloc(flinfo->fn_mcxt, bufsz * sizeof(UChar));
-	buflen = lowercase_into(buf, bufsz, src, srclen, &err);
+	buflen = lowercase_into(buf, bufsz, pattern_src, pattern_len, &err);
 	if (err == U_BUFFER_OVERFLOW_ERROR)
 	{
 		pfree(buf);
 		bufsz = buflen + 4;
 		buf = (UChar *) MemoryContextAlloc(flinfo->fn_mcxt,
 										   bufsz * sizeof(UChar));
-		buflen = lowercase_into(buf, bufsz, src, srclen, &err);
+		buflen = lowercase_into(buf, bufsz, pattern_src, pattern_len, &err);
 		Assert(!U_FAILURE(err));
 	}
+
+	/* trimmed is only live when removeTrailingSpaces() actually trimmed. */
+	if (trimmed != NULL && trimmed != (const UChar *) src)
+		pfree(trimmed);
 
 	cache->lowered = buf;
 	cache->lowered_len = buflen;
 	cache->src = src;
 	cache->src_len = srclen;
+	cache->needs_text_pad = need_pad;
 	classify_pattern(cache);
 
 	return cache;
@@ -684,7 +724,7 @@ do_mvarchar_like(FunctionCallInfo fcinfo, MVarChar *str, MVarChar *pat)
 	MCharPatternCache  *cache;
 
 	cache = ensure_pattern_cache(fcinfo->flinfo, pat->data,
-								  UVARCHARLENGTH(pat));
+								 UVARCHARLENGTH(pat), false);
 	if (cache != NULL)
 		return execute_like_cached(str->data, UVARCHARLENGTH(str), cache);
 
@@ -794,86 +834,6 @@ addTrailingSpace( MChar *src, int *newlen ) {
 }
 
 /*
- * Build (or reuse) a pattern cache for mchar_like.  Runs removeTrailingSpaces
- * up front so the trimmed-and-lowered pattern is cached across rows; the
- * needs_text_pad flag drives per-row addTrailingSpace on the text side.
- */
-static MCharPatternCache *
-ensure_pattern_cache_mchar(FmgrInfo *flinfo, UChar *src, int srclen)
-{
-	MCharPatternCache  *cache;
-	UChar			   *trimmed;
-	int					trimmed_len = 0;
-	bool				need_pad = false;
-	UErrorCode			err;
-	UChar			   *buf;
-	int					bufsz;
-	int					buflen;
-	MemoryContext		oldctx;
-
-	if (flinfo == NULL)
-		return NULL;
-
-	cache = (MCharPatternCache *) flinfo->fn_extra;
-	if (cache != NULL &&
-		cache->src == src && cache->src_len == srclen)
-		return cache;
-
-	if (cache == NULL)
-	{
-		cache = (MCharPatternCache *)
-			MemoryContextAllocZero(flinfo->fn_mcxt, sizeof(*cache));
-		flinfo->fn_extra = cache;
-	}
-	else if (cache->lowered != NULL)
-	{
-		pfree(cache->lowered);
-		cache->lowered = NULL;
-		cache->lowered_len = 0;
-		cache->src = NULL;
-		cache->src_len = 0;
-	}
-
-	/*
-	 * removeTrailingSpaces palloc's a fresh buffer in CurrentMemoryContext
-	 * when it trims; we need the trimmed bytes (and the lowered form) to
-	 * live in fn_mcxt instead.  Run under fn_mcxt so any allocation ends up
-	 * in the right context; the caller-side palloc for the untrimmed case
-	 * just returns the original pointer.
-	 */
-	oldctx = MemoryContextSwitchTo(flinfo->fn_mcxt);
-	trimmed = removeTrailingSpaces(src, srclen, &trimmed_len, &need_pad);
-	MemoryContextSwitchTo(oldctx);
-
-	bufsz = trimmed_len * 2 + 4;
-	buf = (UChar *) MemoryContextAlloc(flinfo->fn_mcxt, bufsz * sizeof(UChar));
-	buflen = lowercase_into(buf, bufsz, trimmed, trimmed_len, &err);
-	if (err == U_BUFFER_OVERFLOW_ERROR)
-	{
-		pfree(buf);
-		bufsz = buflen + 4;
-		buf = (UChar *) MemoryContextAlloc(flinfo->fn_mcxt,
-										   bufsz * sizeof(UChar));
-		buflen = lowercase_into(buf, bufsz, trimmed, trimmed_len, &err);
-		Assert(!U_FAILURE(err));
-	}
-
-	/* If the trimmed buffer was freshly allocated in fn_mcxt, leave it alive
-	 * only while we need it here; the lowered form is what persists. */
-	if (trimmed != src)
-		pfree(trimmed);
-
-	cache->lowered = buf;
-	cache->lowered_len = buflen;
-	cache->src = src;
-	cache->src_len = srclen;
-	cache->needs_text_pad = need_pad;
-	classify_pattern(cache);
-
-	return cache;
-}
-
-/*
  * Shared back-end for mchar_like / mchar_notlike.
  */
 static bool
@@ -885,8 +845,8 @@ do_mchar_like(FunctionCallInfo fcinfo, MChar *str, MVarChar *pat)
 	bool				result;
 	bool				filled_allocated;
 
-	cache = ensure_pattern_cache_mchar(fcinfo->flinfo, pat->data,
-										UVARCHARLENGTH(pat));
+	cache = ensure_pattern_cache(fcinfo->flinfo, pat->data,
+								 UVARCHARLENGTH(pat), true);
 	if (cache == NULL)
 	{
 		/* No fn_extra: legacy per-call path. */
