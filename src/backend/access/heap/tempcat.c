@@ -699,8 +699,10 @@ temp_catalog_beginscan(Relation relation, int nkeys, ScanKey key)
 			lastItem = find_index_tree_item(indexEntry, &tempTuple, -1);
 			endItem  = NULL;
 		}
-		else if (strategy == BTLessStrategyNumber || strategy == BTLessEqualStrategyNumber)
+		else
 		{
+			Assert(strategy == BTLessStrategyNumber ||
+				   strategy == BTLessEqualStrategyNumber);
 			walkDir  = RightLeftWalk;
 			lastItem = find_index_tree_item(indexEntry, &tempTuple, +1);
 			endItem  = NULL;
