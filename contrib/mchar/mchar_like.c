@@ -316,9 +316,14 @@ ensure_pattern_cache(FmgrInfo *flinfo, const UChar *src, int srclen)
 
 /*
  * Lower (src, srclen) into a working buffer for the text side of LIKE.
- * Uses the caller-provided stack buffer when the lowered form fits, and
- * falls back to palloc in CurrentMemoryContext otherwise.  Writes *was_palloc
- * so the caller knows whether to pfree.
+ *
+ * Uses the caller-provided stack buffer when the lowered form fits, falls
+ * back to palloc in CurrentMemoryContext otherwise.  For ASCII-only input we
+ * skip the ICU call entirely and fold [A-Z]|=0x20 inline -- that loop
+ * auto-vectorises and is roughly an order of magnitude cheaper than
+ * u_strToLower() on typical short identifier columns.
+ *
+ * Writes *was_palloc so the caller knows whether to pfree.
  */
 static UChar *
 lowercase_text(const UChar *src, int srclen,
@@ -329,10 +334,18 @@ lowercase_text(const UChar *src, int srclen,
 	UChar	   *buf;
 	int			bufsz;
 	int			n;
+	int			i;
+	bool		all_ascii = true;
 
 	Assert(stack_sz > 0);
 	*was_palloc = false;
 
+	/*
+	 * ASCII folding cannot expand, so srclen UChars is the exact output size
+	 * on the fast path.  Pick a buffer up front; the loop below writes
+	 * through it and only falls back to ICU if a non-ASCII code unit shows
+	 * up, in which case ICU overwrites whatever partial result we left here.
+	 */
 	bufsz = srclen * 2 + 4;
 	if (bufsz <= stack_sz)
 	{
@@ -343,6 +356,23 @@ lowercase_text(const UChar *src, int srclen,
 	{
 		buf = (UChar *) palloc(bufsz * sizeof(UChar));
 		*was_palloc = true;
+	}
+
+	for (i = 0; i < srclen; i++)
+	{
+		UChar		c = src[i];
+
+		if (c >= 0x80)
+		{
+			all_ascii = false;
+			break;
+		}
+		buf[i] = (c >= 'A' && c <= 'Z') ? (UChar) (c | 0x20) : c;
+	}
+	if (all_ascii)
+	{
+		*lowered_len = srclen;
+		return buf;
 	}
 
 	n = lowercase_into(buf, bufsz, src, srclen, &err);
@@ -361,10 +391,16 @@ lowercase_text(const UChar *src, int srclen,
 }
 
 /*
- * LIKE matcher that assumes both t and p have already been lowercased.
- * This is the inner loop of the non-substring case: no ICU collator is
- * invoked, and recursion re-enters this function directly so we do not
- * re-lower on every wildcard retry.
+ * LIKE matcher that assumes both t and p have already been passed through
+ * u_strToLower() at the root locale (or equivalently the pattern is known to
+ * be case-neutral and t is therefore acceptable as-is).  Recursion re-enters
+ * this function directly, so we do not re-lower on every wildcard retry.
+ *
+ * WARNING: this intentionally drops the collation-aware semantics of the
+ * legacy MatchUChar() path.  It will NOT match code points that differ only
+ * in Unicode normalisation (NFC vs NFD) or in locale-specific foldings such
+ * as German sharp-s <-> "ss".  Callers relying on those equivalences must
+ * normalise their input up front.
  */
 static int
 match_lowered(const UChar *t, int tlen, const UChar *p, int plen)
