@@ -167,7 +167,7 @@ m_isspace(UChar c) {
  * once and stashing the result in fn_extra is a large win compared with
  * re-lowering every row.
  *
- * We validate the cache with (src_ptr, src_len): if the caller hands us the
+ * We validate the cache with (src, src_len): if the caller hands us the
  * same MVarChar/MChar datum pointer and byte length, the content is the same
  * and the cached lowered bytes are reusable.  A non-constant pattern simply
  * misses the cache every row but still benefits from the lowered-once path
@@ -175,7 +175,7 @@ m_isspace(UChar c) {
  */
 typedef struct MCharPatternCache
 {
-	const UChar	   *src_ptr;
+	const UChar	   *src;
 	int32			src_len;
 	UChar		   *lowered;	/* palloc'd in fn_mcxt */
 	int32			lowered_len;
@@ -304,7 +304,7 @@ ensure_pattern_cache(FmgrInfo *flinfo, const UChar *src, int srclen)
 
 	cache = (MCharPatternCache *) flinfo->fn_extra;
 	if (cache != NULL &&
-		cache->src_ptr == src && cache->src_len == srclen)
+		cache->src == src && cache->src_len == srclen)
 		return cache;
 
 	if (cache == NULL)
@@ -318,7 +318,7 @@ ensure_pattern_cache(FmgrInfo *flinfo, const UChar *src, int srclen)
 		pfree(cache->lowered);
 		cache->lowered = NULL;
 		cache->lowered_len = 0;
-		cache->src_ptr = NULL;
+		cache->src = NULL;
 		cache->src_len = 0;
 	}
 
@@ -342,7 +342,7 @@ ensure_pattern_cache(FmgrInfo *flinfo, const UChar *src, int srclen)
 
 	cache->lowered = buf;
 	cache->lowered_len = buflen;
-	cache->src_ptr = src;
+	cache->src = src;
 	cache->src_len = srclen;
 	classify_pattern(cache);
 
@@ -358,12 +358,12 @@ ensure_pattern_cache(FmgrInfo *flinfo, const UChar *src, int srclen)
  * auto-vectorises and is roughly an order of magnitude cheaper than
  * u_strToLower() on typical short identifier columns.
  *
- * Writes *was_palloc so the caller knows whether to pfree.
+ * Writes *allocated so the caller knows whether to pfree.
  */
 static UChar *
 lowercase_text(const UChar *src, int srclen,
 			   UChar *stack_buf, int stack_sz,
-			   int *lowered_len, bool *was_palloc)
+			   int *lowered_len, bool *allocated)
 {
 	UErrorCode	err;
 	UChar	   *buf;
@@ -373,7 +373,7 @@ lowercase_text(const UChar *src, int srclen,
 	bool		all_ascii = true;
 
 	Assert(stack_sz > 0);
-	*was_palloc = false;
+	*allocated = false;
 
 	/*
 	 * ASCII folding cannot expand, so srclen UChars is the exact output size
@@ -390,7 +390,7 @@ lowercase_text(const UChar *src, int srclen,
 	else
 	{
 		buf = (UChar *) palloc(bufsz * sizeof(UChar));
-		*was_palloc = true;
+		*allocated = true;
 	}
 
 	for (i = 0; i < srclen; i++)
@@ -413,11 +413,11 @@ lowercase_text(const UChar *src, int srclen,
 	n = lowercase_into(buf, bufsz, src, srclen, &err);
 	if (err == U_BUFFER_OVERFLOW_ERROR)
 	{
-		if (*was_palloc)
+		if (*allocated)
 			pfree(buf);
 		bufsz = n + 4;
 		buf = (UChar *) palloc(bufsz * sizeof(UChar));
-		*was_palloc = true;
+		*allocated = true;
 		n = lowercase_into(buf, bufsz, src, srclen, &err);
 		Assert(!U_FAILURE(err));
 	}
@@ -511,24 +511,24 @@ match_lowered(const UChar *t, int tlen, const UChar *p, int plen)
  *     long inputs) and then run the simple-substring or wildcard matcher.
  */
 static bool
-execute_like_cached(const UChar *text, int tlen, MCharPatternCache *pcache)
+execute_like_cached(const UChar *text, int tlen, MCharPatternCache *cache)
 {
 	UChar		tstack[MCHAR_LOWER_STACK_UCHARS];
 	UChar	   *tbuf;
 	int			tlen_lower;
-	bool		tbuf_palloc = false;
+	bool		tbuf_allocated = false;
 	bool		result;
 
-	Assert(pcache != NULL);
-	Assert(pcache->lowered != NULL || pcache->lowered_len == 0);
-	Assert(!pcache->is_simple_substring ||
-		   (pcache->literal != NULL || pcache->literal_len == 0));
+	Assert(cache != NULL);
+	Assert(cache->lowered != NULL || cache->lowered_len == 0);
+	Assert(!cache->is_simple_substring ||
+		   (cache->literal != NULL || cache->literal_len == 0));
 
 	/* Cheap early reject: %literal% with literal longer than text. */
-	if (pcache->is_simple_substring && pcache->literal_len > tlen)
+	if (cache->is_simple_substring && cache->literal_len > tlen)
 		return false;
 
-	if (pcache->case_neutral)
+	if (cache->case_neutral)
 	{
 		tbuf = (UChar *) text;
 		tlen_lower = tlen;
@@ -537,28 +537,28 @@ execute_like_cached(const UChar *text, int tlen, MCharPatternCache *pcache)
 	{
 		tbuf = lowercase_text(text, tlen,
 							  tstack, MCHAR_LOWER_STACK_UCHARS,
-							  &tlen_lower, &tbuf_palloc);
+							  &tlen_lower, &tbuf_allocated);
 	}
 
-	if (pcache->is_simple_substring)
+	if (cache->is_simple_substring)
 	{
-		if (pcache->literal_len == 0)
+		if (cache->literal_len == 0)
 			result = true;
-		else if (pcache->literal_len > tlen_lower)
+		else if (cache->literal_len > tlen_lower)
 			result = false;
 		else
 			result = (u_strFindFirst(tbuf, tlen_lower,
-									 pcache->literal,
-									 pcache->literal_len) != NULL);
+									 cache->literal,
+									 cache->literal_len) != NULL);
 	}
 	else
 	{
 		int r = match_lowered(tbuf, tlen_lower,
-							  pcache->lowered, pcache->lowered_len);
+							  cache->lowered, cache->lowered_len);
 		result = (r == LIKE_TRUE);
 	}
 
-	if (tbuf_palloc)
+	if (tbuf_allocated)
 		pfree(tbuf);
 	return result;
 }
@@ -679,14 +679,14 @@ MatchUChar(UChar *t, int tlen, UChar *p, int plen) {
  * fast path when fn_extra is available, else falls back to MatchUChar.
  */
 static bool
-mvarchar_like_impl(FunctionCallInfo fcinfo, MVarChar *str, MVarChar *pat)
+do_mvarchar_like(FunctionCallInfo fcinfo, MVarChar *str, MVarChar *pat)
 {
-	MCharPatternCache  *pcache;
+	MCharPatternCache  *cache;
 
-	pcache = ensure_pattern_cache(fcinfo->flinfo, pat->data,
+	cache = ensure_pattern_cache(fcinfo->flinfo, pat->data,
 								  UVARCHARLENGTH(pat));
-	if (pcache != NULL)
-		return execute_like_cached(str->data, UVARCHARLENGTH(str), pcache);
+	if (cache != NULL)
+		return execute_like_cached(str->data, UVARCHARLENGTH(str), cache);
 
 	/* No fn_extra available (e.g. DirectFunctionCall): legacy path. */
 	return MatchUChar(str->data, UVARCHARLENGTH(str),
@@ -699,7 +699,7 @@ Datum
 mvarchar_like( PG_FUNCTION_ARGS ) {
 	MVarChar   *str = PG_GETARG_MVARCHAR(0);
 	MVarChar   *pat = PG_GETARG_MVARCHAR(1);
-	bool		result = mvarchar_like_impl(fcinfo, str, pat);
+	bool		result = do_mvarchar_like(fcinfo, str, pat);
 
 	PG_FREE_IF_COPY(str,0);
 	PG_FREE_IF_COPY(pat,1);
@@ -713,7 +713,7 @@ Datum
 mvarchar_notlike( PG_FUNCTION_ARGS ) {
 	MVarChar   *str = PG_GETARG_MVARCHAR(0);
 	MVarChar   *pat = PG_GETARG_MVARCHAR(1);
-	bool		result = mvarchar_like_impl(fcinfo, str, pat);
+	bool		result = do_mvarchar_like(fcinfo, str, pat);
 
 	PG_FREE_IF_COPY(str,0);
 	PG_FREE_IF_COPY(pat,1);
@@ -816,7 +816,7 @@ ensure_pattern_cache_mchar(FmgrInfo *flinfo, UChar *src, int srclen)
 
 	cache = (MCharPatternCache *) flinfo->fn_extra;
 	if (cache != NULL &&
-		cache->src_ptr == src && cache->src_len == srclen)
+		cache->src == src && cache->src_len == srclen)
 		return cache;
 
 	if (cache == NULL)
@@ -830,7 +830,7 @@ ensure_pattern_cache_mchar(FmgrInfo *flinfo, UChar *src, int srclen)
 		pfree(cache->lowered);
 		cache->lowered = NULL;
 		cache->lowered_len = 0;
-		cache->src_ptr = NULL;
+		cache->src = NULL;
 		cache->src_len = 0;
 	}
 
@@ -865,7 +865,7 @@ ensure_pattern_cache_mchar(FmgrInfo *flinfo, UChar *src, int srclen)
 
 	cache->lowered = buf;
 	cache->lowered_len = buflen;
-	cache->src_ptr = src;
+	cache->src = src;
 	cache->src_len = srclen;
 	cache->needs_text_pad = need_pad;
 	classify_pattern(cache);
@@ -877,17 +877,17 @@ ensure_pattern_cache_mchar(FmgrInfo *flinfo, UChar *src, int srclen)
  * Shared back-end for mchar_like / mchar_notlike.
  */
 static bool
-mchar_like_impl(FunctionCallInfo fcinfo, MChar *str, MVarChar *pat)
+do_mchar_like(FunctionCallInfo fcinfo, MChar *str, MVarChar *pat)
 {
-	MCharPatternCache  *pcache;
+	MCharPatternCache  *cache;
 	UChar			   *filled;
 	int					flen;
 	bool				result;
-	bool				filled_palloc;
+	bool				filled_allocated;
 
-	pcache = ensure_pattern_cache_mchar(fcinfo->flinfo, pat->data,
+	cache = ensure_pattern_cache_mchar(fcinfo->flinfo, pat->data,
 										UVARCHARLENGTH(pat));
-	if (pcache == NULL)
+	if (cache == NULL)
 	{
 		/* No fn_extra: legacy per-call path. */
 		bool		isNeedAdd = false;
@@ -912,21 +912,21 @@ mchar_like_impl(FunctionCallInfo fcinfo, MChar *str, MVarChar *pat)
 		return (r == LIKE_TRUE);
 	}
 
-	if (pcache->needs_text_pad)
+	if (cache->needs_text_pad)
 	{
 		filled = addTrailingSpace(str, &flen);
-		filled_palloc = (filled != str->data);
+		filled_allocated = (filled != str->data);
 	}
 	else
 	{
 		filled = str->data;
 		flen = UCHARLENGTH(str);
-		filled_palloc = false;
+		filled_allocated = false;
 	}
 
-	result = execute_like_cached(filled, flen, pcache);
+	result = execute_like_cached(filled, flen, cache);
 
-	if (filled_palloc)
+	if (filled_allocated)
 		pfree(filled);
 	return result;
 }
@@ -937,7 +937,7 @@ Datum
 mchar_like( PG_FUNCTION_ARGS ) {
 	MChar	   *str = PG_GETARG_MCHAR(0);
 	MVarChar   *pat = PG_GETARG_MVARCHAR(1);
-	bool		result = mchar_like_impl(fcinfo, str, pat);
+	bool		result = do_mchar_like(fcinfo, str, pat);
 
 	PG_FREE_IF_COPY(str,0);
 	PG_FREE_IF_COPY(pat,1);
@@ -951,7 +951,7 @@ Datum
 mchar_notlike( PG_FUNCTION_ARGS ) {
 	MChar	   *str = PG_GETARG_MCHAR(0);
 	MVarChar   *pat = PG_GETARG_MVARCHAR(1);
-	bool		result = mchar_like_impl(fcinfo, str, pat);
+	bool		result = do_mchar_like(fcinfo, str, pat);
 
 	PG_FREE_IF_COPY(str,0);
 	PG_FREE_IF_COPY(pat,1);
