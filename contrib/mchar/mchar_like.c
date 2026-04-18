@@ -162,6 +162,103 @@ m_isspace(UChar c) {
 }
 
 /*
+ * Removes trailing spaces in '111 %' pattern.  Returns the input pointer
+ * when no trimming is needed, otherwise a freshly palloc'd buffer owned by
+ * the caller.  Never mutates src.
+ */
+static UChar *
+removeTrailingSpaces(const UChar *src, int srclen, int *dstlen,
+					 bool *isSpecialLast)
+{
+	UChar	   *dst = (UChar *) src;
+	const UChar *ptr;
+	UChar	   *dptr;
+	const UChar *markptr;
+
+	*dstlen = srclen;
+	ptr = src + srclen - 1;
+	SET_UCHAR;
+
+	*isSpecialLast = (srclen > 0 &&
+					  (u_isspace(*ptr) ||
+					   *ptr == UCharPercent ||
+					   *ptr == UCharUnderLine));
+	while (ptr >= src)
+	{
+		if (*ptr == UCharPercent || *ptr == UCharUnderLine)
+		{
+			if (ptr == src)
+				return dst;		/* first character */
+
+			if (*(ptr - 1) == UCharBackSlesh)
+				return dst;		/* use src as is */
+
+			if (u_isspace(*(ptr - 1)))
+			{
+				ptr--;
+				break;			/* % or _ is after space which should be removed */
+			}
+		}
+		else
+		{
+			return dst;
+		}
+		ptr--;
+	}
+
+	markptr = ptr + 1;
+	dst = (UChar *) palloc(sizeof(UChar) * srclen);
+
+	/* find last non-space character */
+	while (ptr >= src && u_isspace(*ptr))
+		ptr--;
+
+	dptr = dst + (ptr - src + 1);
+
+	if (ptr >= src)
+		memcpy(dst, src, sizeof(UChar) * (ptr - src + 1));
+
+	while (markptr - src < srclen)
+	{
+		*dptr = *markptr;
+		dptr++;
+		markptr++;
+	}
+
+	*dstlen = dptr - dst;
+	return dst;
+}
+
+/*
+ * Right-pad an mchar value with spaces up to its declared typmod length.
+ * Returns src->data unchanged when no padding is needed; otherwise a
+ * freshly palloc'd buffer owned by the caller.
+ */
+static UChar *
+addTrailingSpace(const MChar *src, int *newlen)
+{
+	int			scharlen = u_countChar32(src->data, UCHARLENGTH(src));
+
+	if (src->typmod > scharlen)
+	{
+		UChar	   *res = (UChar *) palloc(sizeof(UChar) *
+										   (UCHARLENGTH(src) + src->typmod));
+
+		memcpy(res, src->data, sizeof(UChar) * UCHARLENGTH(src));
+		FillWhiteSpace(res + UCHARLENGTH(src), src->typmod - scharlen);
+
+		*newlen = src->typmod;
+
+		return res;
+	}
+	else
+	{
+		*newlen = UCHARLENGTH(src);
+		return (UChar *) src->data;
+	}
+}
+
+/*
  * Per-call-site cache of the lowered LIKE pattern.  The LIKE pattern is
  * usually a Const that never changes for the life of a scan, so lowering it
  * once and stashing the result in fn_extra is a large win compared with
@@ -196,11 +293,6 @@ typedef struct MCharPatternCache
 	 */
 	bool			needs_text_pad;
 } MCharPatternCache;
-
-/* forward decl: removeTrailingSpaces is defined later in this file */
-static UChar *removeTrailingSpaces(UChar *src, int srclen, int *dstlen,
-								   bool *isSpecialLast);
-static UChar *addTrailingSpace(MChar *src, int *newlen);
 
 /*
  * Lowercase a UTF-16 string into dst.  Returns the lowered length.  On
@@ -335,18 +427,16 @@ ensure_pattern_cache(FmgrInfo *flinfo, const UChar *src, int srclen,
 	/*
 	 * For mchar_like, strip trailing spaces (and any trailing wildcard that
 	 * follows them) up front so the trimmed form is what gets cached and
-	 * matched row by row.  removeTrailingSpaces() allocates in the current
-	 * memory context only when it actually trims; otherwise it returns the
-	 * input pointer.  Switch into fn_mcxt so a freshly allocated buffer
-	 * survives until we pfree it below.  The cast is safe because
-	 * removeTrailingSpaces() does not mutate src.
+	 * matched row by row.  removeTrailingSpaces() allocates only when it
+	 * actually trims; otherwise it returns the input pointer.  Switch into
+	 * fn_mcxt so any fresh allocation survives until we pfree it below.
 	 */
 	if (trim_trailing_spaces)
 	{
 		MemoryContext	oldctx;
 
 		oldctx = MemoryContextSwitchTo(flinfo->fn_mcxt);
-		trimmed = removeTrailingSpaces((UChar *) src, srclen,
+		trimmed = removeTrailingSpaces(src, srclen,
 									   &pattern_len, &need_pad);
 		MemoryContextSwitchTo(oldctx);
 		pattern_src = trimmed;
@@ -376,7 +466,7 @@ ensure_pattern_cache(FmgrInfo *flinfo, const UChar *src, int srclen,
 	}
 
 	/* trimmed is only live when removeTrailingSpaces() actually trimmed. */
-	if (trimmed != NULL && trimmed != (const UChar *) src)
+	if (trimmed != NULL && trimmed != src)
 		pfree(trimmed);
 
 	cache->lowered = buf;
@@ -759,78 +849,6 @@ mvarchar_notlike( PG_FUNCTION_ARGS ) {
 	PG_FREE_IF_COPY(pat,1);
 
 	PG_RETURN_BOOL(!result);
-}
-
-/*
- * Removes trailing spaces in '111 %' pattern
- */
-static UChar *
-removeTrailingSpaces( UChar *src, int srclen, int *dstlen, bool *isSpecialLast) {
-	UChar* dst = src;
-	UChar *ptr, *dptr, *markptr;
-
-	*dstlen = srclen;
-	ptr = src + srclen-1;
-	SET_UCHAR;
-
-	*isSpecialLast = ( srclen > 0 && (u_isspace(*ptr) || *ptr == UCharPercent || *ptr == UCharUnderLine ) ) ? true : false; 
-	while( ptr>=src ) {
-		if ( *ptr == UCharPercent || *ptr == UCharUnderLine ) {
-			if ( ptr==src )
-				return dst; /* first character */
-
-			if ( *(ptr-1) == UCharBackSlesh )
-				return dst; /* use src as is */
-
-			if ( u_isspace( *(ptr-1) ) ) {
-				ptr--;
-				break; /* % or _ is after space which should be removed */
-			}
-		} else {
-			return dst;
-		}
-		ptr--;
-	}
-
-	markptr = ptr+1;
-	dst = (UChar*)palloc( sizeof(UChar) * srclen );
-
-	/* find last non-space character */
-	while( ptr>=src && u_isspace(*ptr) )
-		ptr--;
-
-	dptr = dst + (ptr-src+1);
-
-	if ( ptr>=src ) 
-		memcpy( dst, src, sizeof(UChar) * (ptr-src+1) );
-
-	while( markptr - src < srclen ) {
-		*dptr = *markptr;
-		dptr++;
-		markptr++;
-	}
-
-	*dstlen = dptr - dst;
-	return dst;
-}
-
-static UChar*
-addTrailingSpace( MChar *src, int *newlen ) {
-	int	scharlen = u_countChar32(src->data, UCHARLENGTH(src));
-
-	if ( src->typmod > scharlen ) {
-		UChar	*res = (UChar*) palloc( sizeof(UChar) * (UCHARLENGTH(src) + src->typmod) );
-
-		memcpy( res, src->data, sizeof(UChar) * UCHARLENGTH(src));
-		FillWhiteSpace( res+UCHARLENGTH(src), src->typmod - scharlen );
-
-		*newlen = src->typmod;
-
-		return res;
-	} else {
-		*newlen = UCHARLENGTH(src);
-		return src->data;
-	}
 }
 
 /*
