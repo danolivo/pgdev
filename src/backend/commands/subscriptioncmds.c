@@ -73,6 +73,7 @@
 #define SUBOPT_FAILOVER				0x00002000
 #define SUBOPT_LSN					0x00004000
 #define SUBOPT_ORIGIN				0x00008000
+#define SUBOPT_MULTI_INSERT			0x00010000
 
 /* check if the 'val' has 'bits' set */
 #define IsSet(val, bits)  (((val) & (bits)) == (bits))
@@ -99,6 +100,7 @@ typedef struct SubOpts
 	bool		runasowner;
 	bool		failover;
 	char	   *origin;
+	bool		multiinsert;
 	XLogRecPtr	lsn;
 } SubOpts;
 
@@ -164,6 +166,8 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 		opts->failover = false;
 	if (IsSet(supported_opts, SUBOPT_ORIGIN))
 		opts->origin = pstrdup(LOGICALREP_ORIGIN_ANY);
+	if (IsSet(supported_opts, SUBOPT_MULTI_INSERT))
+		opts->multiinsert = false;
 
 	/* Parse options */
 	foreach(lc, stmt_options)
@@ -329,6 +333,15 @@ parse_subscription_options(ParseState *pstate, List *stmt_options,
 				ereport(ERROR,
 						errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("unrecognized origin value: \"%s\"", opts->origin));
+		}
+		else if (IsSet(supported_opts, SUBOPT_MULTI_INSERT) &&
+				 strcmp(defel->defname, "multi_insert") == 0)
+		{
+			if (IsSet(opts->specified_opts, SUBOPT_MULTI_INSERT))
+				errorConflictingDefElem(defel, pstate);
+
+			opts->specified_opts |= SUBOPT_MULTI_INSERT;
+			opts->multiinsert = defGetBoolean(defel);
 		}
 		else if (IsSet(supported_opts, SUBOPT_LSN) &&
 				 strcmp(defel->defname, "lsn") == 0)
@@ -589,8 +602,23 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 					  SUBOPT_SYNCHRONOUS_COMMIT | SUBOPT_BINARY |
 					  SUBOPT_STREAMING | SUBOPT_TWOPHASE_COMMIT |
 					  SUBOPT_DISABLE_ON_ERR | SUBOPT_PASSWORD_REQUIRED |
-					  SUBOPT_RUN_AS_OWNER | SUBOPT_FAILOVER | SUBOPT_ORIGIN);
+					  SUBOPT_RUN_AS_OWNER | SUBOPT_FAILOVER | SUBOPT_ORIGIN |
+					  SUBOPT_MULTI_INSERT);
 	parse_subscription_options(pstate, stmt->options, supported_opts, &opts);
+
+	/*
+	 * The pilot multi_insert opt-in (spec §4.12) deliberately excludes the
+	 * streaming apply paths for clarity.  Refuse the combination at DDL
+	 * time so that we never end up with a subscription whose runtime
+	 * would silently fall back to the per-tuple path on every streamed
+	 * chunk.
+	 */
+	if (opts.multiinsert && opts.streaming != LOGICALREP_STREAM_OFF)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("%s and %s cannot be enabled together",
+						"multi_insert", "streaming"),
+				 errhint("Set streaming = off to enable multi_insert.")));
 
 	/*
 	 * Since creating a replication slot is not transactional, rolling back
@@ -696,6 +724,8 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 	values[Anum_pg_subscription_subpasswordrequired - 1] = BoolGetDatum(opts.passwordrequired);
 	values[Anum_pg_subscription_subrunasowner - 1] = BoolGetDatum(opts.runasowner);
 	values[Anum_pg_subscription_subfailover - 1] = BoolGetDatum(opts.failover);
+	values[Anum_pg_subscription_submultiinsert - 1] =
+		BoolGetDatum(opts.multiinsert);
 	values[Anum_pg_subscription_subconninfo - 1] =
 		CStringGetTextDatum(conninfo);
 	if (opts.slot_name)
@@ -1191,10 +1221,35 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 								  SUBOPT_DISABLE_ON_ERR |
 								  SUBOPT_PASSWORD_REQUIRED |
 								  SUBOPT_RUN_AS_OWNER | SUBOPT_FAILOVER |
-								  SUBOPT_ORIGIN);
+								  SUBOPT_ORIGIN |
+								  SUBOPT_MULTI_INSERT);
 
 				parse_subscription_options(pstate, stmt->options,
 										   supported_opts, &opts);
+
+				/*
+				 * Refuse multi_insert + streaming combinations (§4.12).
+				 * Check the *effective* values after this ALTER: anything
+				 * not specified carries over from the existing subscription.
+				 */
+				{
+					char		eff_streaming;
+					bool		eff_multiinsert;
+
+					eff_streaming = IsSet(opts.specified_opts, SUBOPT_STREAMING)
+						? opts.streaming
+						: sub->stream;
+					eff_multiinsert = IsSet(opts.specified_opts, SUBOPT_MULTI_INSERT)
+						? opts.multiinsert
+						: sub->multiinsert;
+
+					if (eff_multiinsert && eff_streaming != LOGICALREP_STREAM_OFF)
+						ereport(ERROR,
+								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								 errmsg("%s and %s cannot be enabled together",
+										"multi_insert", "streaming"),
+								 errhint("Set streaming = off to enable multi_insert.")));
+				}
 
 				if (IsSet(opts.specified_opts, SUBOPT_SLOT_NAME))
 				{
@@ -1356,6 +1411,13 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 					values[Anum_pg_subscription_suborigin - 1] =
 						CStringGetTextDatum(opts.origin);
 					replaces[Anum_pg_subscription_suborigin - 1] = true;
+				}
+
+				if (IsSet(opts.specified_opts, SUBOPT_MULTI_INSERT))
+				{
+					values[Anum_pg_subscription_submultiinsert - 1] =
+						BoolGetDatum(opts.multiinsert);
+					replaces[Anum_pg_subscription_submultiinsert - 1] = true;
 				}
 
 				update_tuple = true;
