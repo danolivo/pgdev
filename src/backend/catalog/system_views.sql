@@ -1527,6 +1527,7 @@ GRANT SELECT (oid, subdbid, subskiplsn, subname, subowner, subenabled,
               subbinary, substream, subtwophasestate, subdisableonerr,
 			  subpasswordrequired, subrunasowner, subfailover,
               subretaindeadtuples, submaxretention, subretentionactive,
+              submultiinsert,
               subserver, subslotname, subsynccommit, subpublications, suborigin)
     ON pg_subscription TO public;
 

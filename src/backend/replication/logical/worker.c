@@ -249,6 +249,7 @@
 
 #include "access/genam.h"
 #include "access/commit_ts.h"
+#include "access/heapam.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/tupconvert.h"
@@ -590,6 +591,19 @@ static void adjust_xid_advance_interval(RetainDeadTuplesData *rdt_data,
 										bool new_xid_found);
 
 static void apply_worker_exit(void);
+
+/* Multi-insert batching (pilot, §4.12) -- forward declarations so the
+ * flush hooks at non-INSERT handlers (which appear earlier in the file
+ * than the apply_mi block) can call them.  The apply_mi_buf pointer is
+ * exposed here for defensive Assert(apply_mi_buf == NULL) usage in
+ * streaming-path handlers without needing the complete struct type. */
+struct ApplyMIBuffer;
+static struct ApplyMIBuffer *apply_mi_buf;
+static void apply_handle_buffer_flush_any(void);
+static void apply_mi_buffer_flush(void);
+static void apply_mi_buffer_destroy(void);
+static void apply_mi_buffer_abandon(void);
+static void apply_mi_reset_xact_state(void);
 
 static void apply_handle_commit_internal(LogicalRepCommitData *commit_data);
 static void apply_handle_insert_internal(ApplyExecutionData *edata,
@@ -1223,6 +1237,10 @@ apply_handle_begin(StringInfo s)
 	Assert(!TransactionIdIsValid(stream_xid));
 
 	logicalrep_read_begin(s, &begin_data);
+
+	/* Fresh remote xact — reset the multi-insert per-xact disable flag. */
+	apply_mi_reset_xact_state();
+
 	set_apply_error_context_xact(begin_data.xid, begin_data.final_lsn);
 
 	remote_final_lsn = begin_data.final_lsn;
@@ -1245,6 +1263,9 @@ apply_handle_commit(StringInfo s)
 	LogicalRepCommitData commit_data;
 
 	logicalrep_read_commit(s, &commit_data);
+
+	/* Flush any pending multi-insert batch into the current xact. */
+	apply_handle_buffer_flush_any();
 
 	if (commit_data.commit_lsn != remote_final_lsn)
 		ereport(ERROR,
@@ -1283,6 +1304,10 @@ apply_handle_begin_prepare(StringInfo s)
 	Assert(!TransactionIdIsValid(stream_xid));
 
 	logicalrep_read_begin_prepare(s, &begin_data);
+
+	/* Fresh remote xact — reset the multi-insert per-xact disable flag. */
+	apply_mi_reset_xact_state();
+
 	set_apply_error_context_xact(begin_data.xid, begin_data.prepare_lsn);
 
 	remote_final_lsn = begin_data.prepare_lsn;
@@ -1360,6 +1385,9 @@ apply_handle_prepare(StringInfo s)
 	 */
 	begin_replication_step();
 
+	/* Flush any pending multi-insert batch before PREPARE. */
+	apply_handle_buffer_flush_any();
+
 	apply_handle_prepare_internal(&prepare_data);
 
 	end_replication_step();
@@ -1414,6 +1442,15 @@ apply_handle_commit_prepared(StringInfo s)
 	LogicalRepCommitPreparedTxnData prepare_data;
 	char		gid[GIDSIZE];
 
+	/*
+	 * The buffer must be empty at COMMIT PREPARED -- the preceding PREPARE
+	 * (live or streamed) already drained it, and no INSERT activity can
+	 * occur between PREPARE and COMMIT PREPARED.  Defensive assert to keep
+	 * this in lock-step with the stream_stop / stream_abort handlers
+	 * (§4.12.3.1).
+	 */
+	Assert(apply_mi_buf == NULL);
+
 	logicalrep_read_commit_prepared(s, &prepare_data);
 	set_apply_error_context_xact(prepare_data.xid, prepare_data.commit_lsn);
 
@@ -1465,6 +1502,9 @@ apply_handle_rollback_prepared(StringInfo s)
 {
 	LogicalRepRollbackPreparedTxnData rollback_data;
 	char		gid[GIDSIZE];
+
+	/* Symmetric with apply_handle_commit_prepared (§4.12.3.1). */
+	Assert(apply_mi_buf == NULL);
 
 	logicalrep_read_rollback_prepared(s, &rollback_data);
 	set_apply_error_context_xact(rollback_data.xid, rollback_data.rollback_end_lsn);
@@ -1557,6 +1597,7 @@ apply_handle_stream_prepare(StringInfo s)
 			 */
 			apply_spooled_messages(MyLogicalRepWorker->stream_fileset,
 								   prepare_data.xid, prepare_data.prepare_lsn);
+			Assert(apply_mi_buf == NULL);
 
 			/* Mark the transaction as prepared. */
 			apply_handle_prepare_internal(&prepare_data);
@@ -1899,6 +1940,9 @@ apply_handle_stream_stop(StringInfo s)
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg_internal("STREAM STOP message without STREAM START")));
 
+	/* Pilot excludes streaming; no buffer should exist here (§4.12). */
+	Assert(apply_mi_buf == NULL);
+
 	apply_action = get_transaction_apply_action(stream_xid, &winfo);
 
 	switch (apply_action)
@@ -2091,6 +2135,9 @@ apply_handle_stream_abort(StringInfo s)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg_internal("STREAM ABORT message without STREAM STOP")));
+
+	/* Pilot excludes streaming; no buffer should exist here (§4.12). */
+	Assert(apply_mi_buf == NULL);
 
 	/* We receive abort information only when we can apply in parallel. */
 	logicalrep_read_stream_abort(s, &abort_data,
@@ -2420,10 +2467,14 @@ apply_handle_stream_commit(StringInfo s)
 
 			/*
 			 * The transaction has been serialized to file, so replay all the
-			 * spooled operations.
+			 * spooled operations.  Multi-insert batching is intentionally
+			 * disabled in streaming mode (§4.12), so there is nothing to
+			 * flush between replay and commit; an Assert in apply_handle_
+			 * buffer_flush_any backstops that.
 			 */
 			apply_spooled_messages(MyLogicalRepWorker->stream_fileset, xid,
 								   commit_data.commit_lsn);
+			Assert(apply_mi_buf == NULL);
 
 			apply_handle_commit_internal(&commit_data);
 
@@ -2574,6 +2625,12 @@ apply_handle_relation(StringInfo s)
 	if (handle_streamed_transaction(LOGICAL_REP_MSG_RELATION, s))
 		return;
 
+	/*
+	 * Flush any pending multi-insert batch before consuming a relation
+	 * update; the buffered tuples were shaped against the old tupdesc.
+	 */
+	apply_handle_buffer_flush_any();
+
 	rel = logicalrep_read_rel(s);
 	logicalrep_relmap_update(rel);
 
@@ -2596,6 +2653,9 @@ apply_handle_type(StringInfo s)
 
 	if (handle_streamed_transaction(LOGICAL_REP_MSG_TYPE, s))
 		return;
+
+	/* Flush any pending multi-insert batch before a TYPE update. */
+	apply_handle_buffer_flush_any();
 
 	logicalrep_read_typ(s, &typ);
 }
@@ -2630,6 +2690,624 @@ TargetPrivilegesCheck(Relation rel, AclMode mode)
 				 errmsg("user \"%s\" cannot replicate into relation with row-level security enabled: \"%s\"",
 						GetUserNameFromId(GetUserId(), true),
 						RelationGetRelationName(rel))));
+}
+
+/* ------------------------------------------------------------------------- *
+ * Batched multi-insert for the apply worker -- pilot (Release N-0).
+ *
+ * Opt-in via the subscription option "multi_insert".  When enabled AND the
+ * target relation satisfies apply_mi_relation_is_safe() (plain table, no
+ * triggers / RLS / constraints / stored-generated / deferrable-unique /
+ * exclusion), consecutive INSERTs against the same relation accumulate in
+ * a single in-memory buffer and are flushed via heap_multi_insert() (+
+ * per-tuple ExecInsertIndexTuples if any indexes) in one WAL record.
+ *
+ * Intra-batch duplicate safety (spec §4.12.4):
+ *   A batch contains only consecutive INSERTs from one publisher/stream
+ *   xact targeting one relation.  UPDATE, DELETE, relation-change, or any
+ *   non-INSERT message flushes.  The publisher would have rejected a
+ *   same-key duplicate at INSERT time; a key-changing UPDATE is a non-
+ *   INSERT and therefore flushes.  Therefore two buffered tuples cannot
+ *   share a unique-key value.  The only conflict source is a pre-existing
+ *   subscriber row, handled by wrapping the flush in a subxact when any
+ *   immediate unique index exists and replaying per-tuple on rollback.
+ *
+ * Lifetime: one active buffer at a time, in ApplyContext.  Destroy after
+ * every flush; next INSERT rebuilds.  This keeps us out of trouble with
+ * TupleDesc pin lifetimes across transaction boundaries.
+ * ------------------------------------------------------------------------- */
+
+#define APPLY_MI_INITIAL_SLOTS	16
+#define APPLY_MI_MAX_SLOTS		10000
+#define APPLY_MI_MAX_BYTES		(8 * 1024 * 1024)
+
+typedef struct ApplyMIBuffer
+{
+	Oid			relid;				/* target relation OID, used for
+									 * relation-switch comparison */
+	Relation	local_rel;			/* buffer-owned Relation (table_open'd at
+									 * init, table_close'd at destroy) --
+									 * decouples buffer lifetime from the
+									 * caller's logicalrep_rel_open/close
+									 * cycle which would otherwise NULL out
+									 * the entry's localrel mid-xact */
+	ResultRelInfo *relinfo;			/* palloc'd, owns ExecOpenIndices state */
+	EState	   *estate;				/* executor state for slot_fill_defaults,
+									 * constraint evaluation, and flush */
+	TupleTableSlot *receiveslot;	/* long-lived virtual slot reused by the
+									 * caller for slot_store_data /
+									 * slot_fill_defaults; avoids a palloc +
+									 * tupdesc-pin pair per inbound INSERT */
+	TupleTableSlot **slots;			/* palloc'd [capacity] virtual slots */
+	int			nslots;
+	int			capacity;
+	Size		cum_bytes;
+	bool		has_immediate_unique;
+	ResourceOwner owner_at_init;
+} ApplyMIBuffer;
+
+static ApplyMIBuffer *apply_mi_buf = NULL;
+static bool apply_mi_disabled_for_xact = false;
+
+/*
+ * apply_mi_reset_xact_state
+ *		Reset the per-xact "disable batching" flag.  Called only at true
+ *		top-level xact boundaries; NOT at STREAM_START (which is a chunk
+ *		boundary within a streamed xact).
+ */
+static void
+apply_mi_reset_xact_state(void)
+{
+	apply_mi_disabled_for_xact = false;
+}
+
+/*
+ * apply_mi_relation_is_safe
+ *		Decide whether a relation is eligible for the batched-insert path,
+ *		and if so whether any immediate unique index exists (caller uses
+ *		that to decide whether to wrap the flush in a subxact).
+ *
+ *		Rejects: non-plain-table, no multi_insert AM, triggers, RLS, any
+ *		tuple constraint (CHECK/stored-generated; NOT-NULL is in
+ *		attnotnull and is implied safe by publisher correctness per
+ *		§4.12.3), exclusion constraints, deferrable unique, indexes that
+ *		aren't valid/ready/live.
+ */
+static bool
+apply_mi_relation_is_safe(LogicalRepRelMapEntry *rel,
+						  bool *has_immediate_unique)
+{
+	Relation	lrel = rel->localrel;
+	Form_pg_class classform = lrel->rd_rel;
+	TupleDesc	tupdesc = RelationGetDescr(lrel);
+	List	   *indlist;
+	ListCell   *lc;
+	bool		saw_immediate_unique = false;
+
+	Assert(lrel != NULL);
+	Assert(has_immediate_unique != NULL);
+
+	*has_immediate_unique = false;
+
+	if (classform->relkind != RELKIND_RELATION)
+		return false;
+
+	if (lrel->rd_tableam == NULL || lrel->rd_tableam->multi_insert == NULL)
+		return false;
+
+	if (lrel->trigdesc != NULL)
+		return false;
+
+	if (classform->relrowsecurity || classform->relforcerowsecurity)
+		return false;
+
+	/*
+	 * Reject only constraints that can raise per tuple: CHECK constraints
+	 * and stored-generated columns.  NOT NULL is represented inside the
+	 * TupleConstr struct too, but the publisher guarantees non-null values
+	 * by its own constraint, and under the pilot's schema-identity
+	 * assumption the subscriber's NOT NULL is satisfied by construction.
+	 * Default values (defval / missing) are evaluated safely by
+	 * slot_fill_defaults before the tuple enters the buffer.
+	 */
+	if (tupdesc->constr != NULL &&
+		(tupdesc->constr->num_check > 0 ||
+		 tupdesc->constr->has_generated_stored))
+		return false;
+
+	indlist = RelationGetIndexList(lrel);
+	foreach(lc, indlist)
+	{
+		Oid			indoid = lfirst_oid(lc);
+		HeapTuple	idxtup;
+		Form_pg_index idxform;
+		bool		reject = false;
+
+		idxtup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(indoid));
+		if (!HeapTupleIsValid(idxtup))
+		{
+			list_free(indlist);
+			return false;
+		}
+		idxform = (Form_pg_index) GETSTRUCT(idxtup);
+
+		if (!idxform->indisvalid || !idxform->indisready || !idxform->indislive)
+			reject = true;
+		else if (idxform->indisexclusion)
+			reject = true;
+		else if ((idxform->indisunique || idxform->indisprimary) &&
+				 !idxform->indimmediate)
+			reject = true;
+		else if (idxform->indisunique || idxform->indisprimary)
+			saw_immediate_unique = true;
+
+		ReleaseSysCache(idxtup);
+
+		if (reject)
+		{
+			list_free(indlist);
+			return false;
+		}
+	}
+	list_free(indlist);
+
+	*has_immediate_unique = saw_immediate_unique;
+	return true;
+}
+
+/*
+ * apply_mi_buffer_init
+ *		Create a new multi-insert buffer for rel.  Buffer lives in
+ *		ApplyContext (worker lifetime) so its storage survives per-message
+ *		context resets between apply_handle_insert() invocations.
+ */
+static void
+apply_mi_buffer_init(LogicalRepRelMapEntry *rel, bool has_immediate_unique)
+{
+	MemoryContext oldctx;
+
+	Assert(apply_mi_buf == NULL);
+	Assert(rel != NULL);
+	Assert(rel->localrel != NULL);
+
+	/*
+	 * Defensive: the pilot excludes streaming (§4.12.3.1).  CREATE /
+	 * ALTER SUBSCRIPTION refuses to combine multi_insert=on with
+	 * streaming != off; hitting any of these asserts means the DDL check
+	 * was bypassed.  Concrete bypass scenarios to be guarded against:
+	 *   - pg_upgrade of a subscription whose source cluster had a
+	 *     different streaming/multi_insert combination than the new
+	 *     cluster allows;
+	 *   - a direct UPDATE pg_subscription SET ... by a superuser;
+	 *   - a future code path (e.g. a new ALTER_SUBSCRIPTION kind) that
+	 *     forgets to run the combination check in parse_subscription_options.
+	 */
+	Assert(MySubscription->stream == LOGICALREP_STREAM_OFF);
+	Assert(!am_parallel_apply_worker());
+	Assert(!in_streamed_transaction);
+
+	oldctx = MemoryContextSwitchTo(ApplyContext);
+
+	apply_mi_buf = palloc0_object(ApplyMIBuffer);
+	apply_mi_buf->relid = RelationGetRelid(rel->localrel);
+
+	/*
+	 * Own the Relation handle for the buffer's lifetime.  The caller's
+	 * logicalrep_rel_close(rel, NoLock) at end of apply_handle_insert sets
+	 * the shared map entry's localrel to NULL; if we kept the caller's
+	 * Relation pointer, the flush at commit/prepare time would deref a
+	 * stale pointer.  A dedicated table_open + table_close pair gives the
+	 * buffer a stable handle.
+	 */
+	apply_mi_buf->local_rel = table_open(apply_mi_buf->relid,
+										 RowExclusiveLock);
+
+	apply_mi_buf->estate = CreateExecutorState();
+
+	/*
+	 * ResultRelInfo palloc'd explicitly (not registered on the estate's
+	 * es_opened_result_relations list) so that FreeExecutorState at
+	 * destroy time does not close our indexes behind our back.
+	 */
+	apply_mi_buf->relinfo = makeNode(ResultRelInfo);
+	InitResultRelInfo(apply_mi_buf->relinfo, apply_mi_buf->local_rel,
+					  1 /* RT index; any positive works here */,
+					  NULL /* partition_root_rri */, 0 /* instrument */);
+	ExecOpenIndices(apply_mi_buf->relinfo, false);
+
+	/*
+	 * Single long-lived receive slot.  The caller fills it once per
+	 * inbound INSERT via slot_store_data; apply_mi_buffer_add copies and
+	 * materialises into a per-tuple slot.  Keeping this slot alive across
+	 * the buffer's lifetime saves a MakeSingleTupleTableSlot +
+	 * ExecDropSingleTupleTableSlot pair (each doing ResourceOwnerRemember
+	 * / Forget on the tupdesc pin) per INSERT message -- a significant
+	 * fraction of apply-worker CPU in profile.
+	 */
+	apply_mi_buf->receiveslot =
+		MakeSingleTupleTableSlot(RelationGetDescr(apply_mi_buf->local_rel),
+								 &TTSOpsVirtual);
+
+	apply_mi_buf->capacity = APPLY_MI_INITIAL_SLOTS;
+	apply_mi_buf->slots = palloc0_array(TupleTableSlot *,
+										apply_mi_buf->capacity);
+	apply_mi_buf->nslots = 0;
+	apply_mi_buf->cum_bytes = 0;
+	apply_mi_buf->has_immediate_unique = has_immediate_unique;
+	apply_mi_buf->owner_at_init = CurrentResourceOwner;
+
+	MemoryContextSwitchTo(oldctx);
+}
+
+/*
+ * apply_mi_buffer_destroy
+ *		Release all slots owned by the buffer.  No AfterTriggerEndQuery:
+ *		the pilot forbids triggers so no after-trigger queue was opened.
+ */
+static void
+apply_mi_buffer_destroy(void)
+{
+	if (apply_mi_buf == NULL)
+		return;
+
+	/*
+	 * Destroy all batched slots (we loop over capacity, not nslots: a mid-
+	 * batch destroy may see nslots == 0 while slots[] still has
+	 * allocations from a previous intermediate flush that chose to keep
+	 * them).
+	 */
+	for (int i = 0; i < apply_mi_buf->capacity; i++)
+	{
+		if (apply_mi_buf->slots[i] != NULL)
+		{
+			ExecDropSingleTupleTableSlot(apply_mi_buf->slots[i]);
+			apply_mi_buf->slots[i] = NULL;
+		}
+	}
+	if (apply_mi_buf->slots != NULL)
+		pfree(apply_mi_buf->slots);
+
+	if (apply_mi_buf->receiveslot != NULL)
+	{
+		ExecDropSingleTupleTableSlot(apply_mi_buf->receiveslot);
+		apply_mi_buf->receiveslot = NULL;
+	}
+
+	if (apply_mi_buf->relinfo != NULL)
+	{
+		ExecCloseIndices(apply_mi_buf->relinfo);
+		pfree(apply_mi_buf->relinfo);
+		apply_mi_buf->relinfo = NULL;
+	}
+
+	if (apply_mi_buf->estate != NULL)
+		FreeExecutorState(apply_mi_buf->estate);
+
+	if (apply_mi_buf->local_rel != NULL)
+	{
+		table_close(apply_mi_buf->local_rel, RowExclusiveLock);
+		apply_mi_buf->local_rel = NULL;
+	}
+
+	pfree(apply_mi_buf);
+	apply_mi_buf = NULL;
+}
+
+/*
+ * apply_mi_buffer_abandon
+ *		Drop the static pointer without freeing any slots.  Called from
+ *		start_apply's top-level PG_CATCH: the ApplyContext allocations are
+ *		reclaimed by transaction abort, so explicit cleanup would touch
+ *		already-released memory.
+ */
+static void
+apply_mi_buffer_abandon(void)
+{
+	apply_mi_buf = NULL;
+}
+
+/*
+ * apply_mi_buffer_add
+ *		Append src's virtual-tuple contents into the buffer.  Slots are
+ *		allocated lazily (geometric growth, capped at APPLY_MI_MAX_SLOTS)
+ *		and then reused across flush cycles; a mid-batch flush calls
+ *		ExecClearTuple on each slot rather than dropping it, so the
+ *		tupdesc-pin ResourceOwner entries stay stable and the next batch
+ *		pays no re-registration cost.
+ *
+ *		When the row/byte cap is hit, this calls apply_mi_buffer_flush()
+ *		directly -- the keep-alive variant -- so successive 1000-tuple
+ *		batches in a long INSERT stream don't thrash buffer init/destroy.
+ */
+static void
+apply_mi_buffer_add(TupleTableSlot *src)
+{
+	MemoryContext oldctx;
+	TupleTableSlot *dst;
+	Size		est_bytes;
+
+	Assert(apply_mi_buf != NULL);
+	Assert(src != NULL);
+	Assert(!TTS_EMPTY(src));
+
+	if (apply_mi_buf->nslots == apply_mi_buf->capacity)
+	{
+		int			newcap;
+
+		Assert(apply_mi_buf->capacity < APPLY_MI_MAX_SLOTS);
+		newcap = Min(apply_mi_buf->capacity * 2, APPLY_MI_MAX_SLOTS);
+		oldctx = MemoryContextSwitchTo(ApplyContext);
+		apply_mi_buf->slots = repalloc_array(apply_mi_buf->slots,
+											 TupleTableSlot *, newcap);
+		memset(&apply_mi_buf->slots[apply_mi_buf->capacity], 0,
+			   sizeof(TupleTableSlot *) *
+			   (newcap - apply_mi_buf->capacity));
+		apply_mi_buf->capacity = newcap;
+		MemoryContextSwitchTo(oldctx);
+	}
+
+	/*
+	 * Lazy slot allocation.  On the first pass through a slot index, create
+	 * a fresh virtual slot in ApplyContext.  On subsequent batches the slot
+	 * already exists (ExecClearTuple'd by the prior intermediate flush); we
+	 * just reuse it.  This keeps the tupdesc-pin count stable across the
+	 * buffer's lifetime.
+	 */
+	dst = apply_mi_buf->slots[apply_mi_buf->nslots];
+	if (dst == NULL)
+	{
+		oldctx = MemoryContextSwitchTo(ApplyContext);
+		dst = MakeSingleTupleTableSlot(RelationGetDescr(apply_mi_buf->local_rel),
+									   &TTSOpsVirtual);
+		MemoryContextSwitchTo(oldctx);
+		apply_mi_buf->slots[apply_mi_buf->nslots] = dst;
+	}
+
+	slot_getallattrs(src);
+	memcpy(dst->tts_values, src->tts_values,
+		   dst->tts_tupleDescriptor->natts * sizeof(Datum));
+	memcpy(dst->tts_isnull, src->tts_isnull,
+		   dst->tts_tupleDescriptor->natts * sizeof(bool));
+	ExecStoreVirtualTuple(dst);
+	ExecMaterializeSlot(dst);
+
+	apply_mi_buf->nslots++;
+
+	/*
+	 * Cheap size estimate: header + per-attribute Datum slot.  We do not
+	 * walk toasted datums; overshoot is fine and triggers an earlier flush.
+	 */
+	est_bytes = MAXALIGN(sizeof(HeapTupleHeaderData)) +
+		MAXALIGN(dst->tts_tupleDescriptor->natts * sizeof(Datum));
+	apply_mi_buf->cum_bytes += est_bytes;
+
+	if (apply_mi_buf->nslots >= APPLY_MI_MAX_SLOTS ||
+		apply_mi_buf->cum_bytes >= APPLY_MI_MAX_BYTES)
+		apply_mi_buffer_flush();
+}
+
+/*
+ * apply_mi_flush_heap_phase
+ *		Run heap_multi_insert + per-tuple ExecInsertIndexTuples for the
+ *		buffer.  Caller has already set up edata with indexes open and the
+ *		active snapshot.  BulkInsertState is allocated here and freed in
+ *		PG_FINALLY so a throw does not leak the pin.
+ */
+static void
+apply_mi_flush_heap_phase(ApplyMIBuffer *buf,
+						  EState *estate,
+						  ResultRelInfo *relinfo)
+{
+	BulkInsertState bistate;
+
+	Assert(buf != NULL);
+	Assert(buf->nslots > 0);
+	Assert(IsTransactionState());
+	Assert(ActiveSnapshotSet());
+
+	bistate = GetBulkInsertState();
+	PG_TRY();
+	{
+		CheckCmdReplicaIdentity(buf->local_rel, CMD_INSERT);
+		TargetPrivilegesCheck(buf->local_rel, ACL_INSERT);
+		table_multi_insert(buf->local_rel,
+						   buf->slots,
+						   buf->nslots,
+						   GetCurrentCommandId(true),
+						   0,
+						   bistate);
+
+		/*
+		 * heap_multi_insert can run long for big batches; give the apply
+		 * worker a responsiveness point before we enter the per-tuple index
+		 * loop below.  Without this, a batched flush widens the
+		 * CHECK_FOR_INTERRUPTS window from ~1 tuple (upstream per-tuple
+		 * apply) to ~max_slots tuples, which shows up as sluggish response
+		 * to pg_terminate_backend / SIGHUP during bulk loads.
+		 */
+		CHECK_FOR_INTERRUPTS();
+
+		for (int i = 0; i < buf->nslots; i++)
+		{
+			List	   *recheck;
+
+			/* Per-tuple interrupt check to match upstream per-tuple apply. */
+			CHECK_FOR_INTERRUPTS();
+
+			recheck = ExecInsertIndexTuples(relinfo, estate, 0,
+											buf->slots[i], NIL, NULL);
+			if (recheck != NIL)
+				list_free(recheck);
+		}
+	}
+	PG_FINALLY();
+	{
+		FreeBulkInsertState(bistate);
+	}
+	PG_END_TRY();
+}
+
+/*
+ * apply_mi_buffer_flush
+ *		Intermediate flush: run the heap phase (and per-tuple index insert
+ *		or replay fallback), clear the buffered slots, reset the counters.
+ *		The buffer object, its per-tuple slots, the ResultRelInfo, the
+ *		EState, the receive slot, and the owned Relation all stay alive.
+ *
+ *		This is the mode used when the size/row cap is hit mid-batch; the
+ *		next tuple reuses the same slots + tupdesc pins, which is a
+ *		significant win against the quadratic-flavoured ResourceOwner
+ *		churn that flush-and-destroy triggers (1000 tupdesc-pin forgets
+ *		against a ResourceArray holding exactly those 1000 pins = O(N²)
+ *		scans -- visible in profile as ~53% of apply-worker CPU).
+ *
+ *		A transaction snapshot is pushed when none is active and popped
+ *		before return.  Does not touch apply_mi_disabled_for_xact beyond
+ *		the normal "fell back to per-row" flag set on conflict.
+ */
+static void
+apply_mi_buffer_flush(void)
+{
+	ApplyMIBuffer *buf = apply_mi_buf;
+	bool		pushed_snap = false;
+	ResourceOwner entry_owner;
+
+	if (buf == NULL || buf->nslots == 0)
+		return;
+
+	Assert(IsTransactionState());
+	Assert(buf->local_rel != NULL);
+	Assert(buf->relinfo != NULL);
+	Assert(buf->estate != NULL);
+	entry_owner = CurrentResourceOwner;
+
+	/*
+	 * Ensure an active snapshot for heap_multi_insert.  When called from
+	 * commit/prepare paths we are outside begin_replication_step(), so
+	 * push a transaction snapshot ourselves and pop on exit.
+	 */
+	if (!ActiveSnapshotSet())
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+		pushed_snap = true;
+	}
+
+	/*
+	 * Relinfo was opened at buffer init with indexes; initialise the
+	 * conflict-arbiter list lazily here (needed only at flush / replay).
+	 */
+	InitConflictIndexes(buf->relinfo);
+
+	if (buf->has_immediate_unique)
+	{
+		MemoryContext subxactcxt = CurrentMemoryContext;
+
+		BeginInternalSubTransaction("logical_rep_apply_multi_insert");
+
+		PG_TRY();
+		{
+			apply_mi_flush_heap_phase(buf, buf->estate, buf->relinfo);
+			ReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(subxactcxt);
+		}
+		PG_CATCH();
+		{
+			ErrorData  *errdata;
+
+			MemoryContextSwitchTo(subxactcxt);
+			errdata = CopyErrorData();
+
+			/*
+			 * Only the unique-violation case is an expected mid-batch
+			 * failure under the pilot's safety-check (§4.12.3) + schema-
+			 * identity assumption.  Everything else -- query cancel (from
+			 * pg_cancel_backend), OOM, WAL full, deadlock, shutdown errors
+			 * that weren't FATAL -- is environmental and must propagate to
+			 * the outer apply error handler in start_apply.  Swallowing it
+			 * here would, for example, silently drop a cancel signal: the
+			 * CHECK_FOR_INTERRUPTS in the heap phase clears
+			 * QueryCancelPending before raising, and a blanket CATCH would
+			 * then finish the replay cleanly with the cancel lost.
+			 */
+			if (errdata->sqlerrcode != ERRCODE_UNIQUE_VIOLATION)
+			{
+				FreeErrorData(errdata);
+				RollbackAndReleaseCurrentSubTransaction();
+				MemoryContextSwitchTo(subxactcxt);
+				PG_RE_THROW();
+			}
+
+			FlushErrorState();
+			RollbackAndReleaseCurrentSubTransaction();
+			MemoryContextSwitchTo(subxactcxt);
+
+			apply_mi_disabled_for_xact = true;
+
+			elog(DEBUG1,
+				 "apply multi-insert batch of %d row(s) hit \"%s\"; retrying row-by-row",
+				 buf->nslots, errdata->message);
+			FreeErrorData(errdata);
+
+			/*
+			 * Retry per-row through the standard path.  Any ERROR here
+			 * propagates through the outer xact.  Per-tuple CFI matches
+			 * upstream per-tuple apply's responsiveness; without it, a
+			 * batch-rollback-then-replay of max_slots tuples runs
+			 * uninterruptible.
+			 */
+			for (int i = 0; i < buf->nslots; i++)
+			{
+				TupleTableSlot *slot = buf->slots[i];
+
+				CHECK_FOR_INTERRUPTS();
+
+				Assert(slot != NULL);
+				ExecSimpleRelationInsert(buf->relinfo, buf->estate, slot);
+			}
+		}
+		PG_END_TRY();
+	}
+	else
+	{
+		apply_mi_flush_heap_phase(buf, buf->estate, buf->relinfo);
+	}
+
+	if (pushed_snap)
+	{
+		Assert(CurrentResourceOwner == entry_owner);
+		PopActiveSnapshot();
+	}
+
+	Assert(CurrentResourceOwner == entry_owner);
+
+	/*
+	 * Clear slots so the next batch can reuse them.  ExecClearTuple on a
+	 * TTSOpsVirtual slot pfrees the materialised data (if present) and
+	 * marks the slot empty, but does NOT release its tupdesc pin -- that
+	 * is what makes the reuse cheap.
+	 */
+	for (int i = 0; i < buf->nslots; i++)
+		ExecClearTuple(buf->slots[i]);
+	buf->nslots = 0;
+	buf->cum_bytes = 0;
+}
+
+/*
+ * apply_handle_buffer_flush_any
+ *		Final flush: drain any pending batch, then tear the buffer down
+ *		entirely.  Called at every non-INSERT entry point (§4.3.3 "flush
+ *		triggers"), at xact/stream boundaries, and on relation-change
+ *		within apply_handle_insert.  Safe to call with a NULL or empty
+ *		buffer.
+ */
+static void
+apply_handle_buffer_flush_any(void)
+{
+	if (apply_mi_buf == NULL)
+		return;
+
+	apply_mi_buffer_flush();
+	apply_mi_buffer_destroy();
 }
 
 /*
@@ -2682,6 +3360,103 @@ apply_handle_insert(StringInfo s)
 
 	/* Set relation for error callback */
 	apply_error_callback_arg.rel = rel;
+
+	/*
+	 * Multi-insert batching fast path (pilot §4.12).  Eligible when: the
+	 * subscription option is on; streaming is off (streamed xacts involve
+	 * chunked / spooled / parallel paths the pilot deliberately excludes
+	 * for clarity -- see §4.12.3 and §4.12.6); we are not in a parallel-
+	 * apply worker; the current apply xact has not hit a conflict that
+	 * forced per-row fallback; the target is a plain (non-partitioned)
+	 * table; and apply_mi_relation_is_safe says the schema satisfies the
+	 * pilot's restrictions.
+	 *
+	 * The streaming/multi_insert combination is also rejected at
+	 * CREATE / ALTER SUBSCRIPTION time (see parse_subscription_options),
+	 * so reaching the runtime with both enabled indicates catalog
+	 * corruption or a catalog-bypass bug.  The Assert in
+	 * apply_mi_buffer_init backstops that.
+	 *
+	 * On relation change, the existing buffer is flushed + destroyed.
+	 */
+	if (MySubscription->multiinsert &&
+		MySubscription->stream == LOGICALREP_STREAM_OFF &&
+		!am_parallel_apply_worker() &&
+		!apply_mi_disabled_for_xact &&
+		rel->localrel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+	{
+		if (apply_mi_buf != NULL &&
+			apply_mi_buf->relid != RelationGetRelid(rel->localrel))
+			apply_handle_buffer_flush_any();
+
+		if (apply_mi_buf == NULL)
+		{
+			bool		has_immediate_unique;
+
+			if (apply_mi_relation_is_safe(rel, &has_immediate_unique))
+			{
+				apply_mi_buffer_init(rel, has_immediate_unique);
+			}
+			else
+			{
+				/*
+				 * Relation not eligible (triggers / RLS / constraint / ...).
+				 * Disable batching for the rest of this apply xact so we
+				 * don't re-check on every INSERT; the next xact starts
+				 * fresh (the flag is reset at xact-boundary hooks).
+				 */
+				apply_mi_disabled_for_xact = true;
+			}
+		}
+
+		if (apply_mi_buf != NULL)
+		{
+			/*
+			 * Deserialise the remote tuple into the buffer's long-lived
+			 * receive slot.  apply_mi_buffer_add copies + materialises into
+			 * one of the buffered slots and, if the row/byte cap is hit,
+			 * flushes internally (intermediate flush; buffer stays alive
+			 * for the next tuple).  Using a persistent receiveslot avoids
+			 * a MakeSingleTupleTableSlot + ExecDropSingleTupleTableSlot
+			 * pair per INSERT message -- visible in profile as a large
+			 * chunk of ResourceOwner churn.
+			 */
+			TupleTableSlot *receiveslot = apply_mi_buf->receiveslot;
+
+			ExecClearTuple(receiveslot);
+
+			slot_store_data(receiveslot, rel, &newtup);
+
+			/*
+			 * slot_fill_defaults unconditionally dereferences its EState to
+			 * fetch the per-tuple expression context, even before checking
+			 * whether any default expressions actually need evaluating.  The
+			 * pilot's safety check ensures the subscriber has no generated
+			 * columns, but plain DEFAULT expressions are still evaluated when
+			 * the subscriber has more columns than the publisher sent.  Use
+			 * the buffer's estate so the ExprContext is real.
+			 */
+			slot_fill_defaults(rel, apply_mi_buf->estate, receiveslot);
+
+			apply_mi_buffer_add(receiveslot);
+
+			apply_error_callback_arg.rel = NULL;
+
+			if (!run_as_owner)
+				RestoreUserContext(&ucxt);
+
+			logicalrep_rel_close(rel, NoLock);
+			end_replication_step();
+			return;
+		}
+	}
+
+	/*
+	 * Fall through to the per-tuple path.  If a buffer is pending from a
+	 * previous relation, flush it before any single-row work.
+	 */
+	if (apply_mi_buf != NULL)
+		apply_handle_buffer_flush_any();
 
 	/* Initialize the executor state. */
 	edata = create_edata_for_relation(rel);
@@ -2816,6 +3591,9 @@ apply_handle_update(StringInfo s)
 	if (is_skipping_changes() ||
 		handle_streamed_transaction(LOGICAL_REP_MSG_UPDATE, s))
 		return;
+
+	/* Flush any pending multi-insert batch before a non-INSERT change. */
+	apply_handle_buffer_flush_any();
 
 	begin_replication_step();
 
@@ -3035,6 +3813,9 @@ apply_handle_delete(StringInfo s)
 	if (is_skipping_changes() ||
 		handle_streamed_transaction(LOGICAL_REP_MSG_DELETE, s))
 		return;
+
+	/* Flush any pending multi-insert batch before a non-INSERT change. */
+	apply_handle_buffer_flush_any();
 
 	begin_replication_step();
 
@@ -3672,6 +4453,9 @@ apply_handle_truncate(StringInfo s)
 		handle_streamed_transaction(LOGICAL_REP_MSG_TRUNCATE, s))
 		return;
 
+	/* Flush any pending multi-insert batch before a non-INSERT change. */
+	apply_handle_buffer_flush_any();
+
 	begin_replication_step();
 
 	remote_relids = logicalrep_read_truncate(s, &cascade, &restart_seqs);
@@ -3835,8 +4619,10 @@ apply_dispatch(StringInfo s)
 			/*
 			 * Logical replication does not use generic logical messages yet.
 			 * Although, it could be used by other applications that use this
-			 * output plugin.
+			 * output plugin.  Flush any pending multi-insert batch so any
+			 * downstream consumer observing the message sees prior INSERTs.
 			 */
+			apply_handle_buffer_flush_any();
 			break;
 
 		case LOGICAL_REP_MSG_STREAM_START:
@@ -5631,6 +6417,15 @@ start_apply(XLogRecPtr origin_startpos)
 	}
 	PG_CATCH();
 	{
+		/*
+		 * Any partial multi-insert batch is part of the xact being rolled
+		 * back; drop the static pointer and reset the disable flag so the
+		 * retried apply starts fresh.  ApplyContext allocations are
+		 * reclaimed by xact abort.
+		 */
+		apply_mi_buffer_abandon();
+		apply_mi_reset_xact_state();
+
 		/*
 		 * Reset the origin state to prevent the advancement of origin
 		 * progress if we fail to apply. Otherwise, this will result in

@@ -92,6 +92,11 @@ CATALOG(pg_subscription,6100,SubscriptionRelationId) BKI_SHARED_RELATION BKI_ROW
 									 * exceeded max_retention_duration, when
 									 * defined */
 
+	bool		submultiinsert; /* True if the apply worker is allowed to
+								 * batch consecutive INSERTs via
+								 * heap_multi_insert(). Pilot opt-in;
+								 * see §4.12. */
+
 	Oid			subserver BKI_LOOKUP_OPT(pg_foreign_server);	/* If connection uses
 																 * server */
 
@@ -164,6 +169,8 @@ typedef struct Subscription
 									 * and the retention duration has not
 									 * exceeded max_retention_duration, when
 									 * defined */
+	bool		multiinsert;	/* Apply worker may batch INSERTs via
+								 * heap_multi_insert (pilot, §4.12) */
 	char	   *conninfo;		/* Connection string to the publisher */
 	char	   *slotname;		/* Name of the replication slot */
 	char	   *synccommit;		/* Synchronous commit setting for worker */
