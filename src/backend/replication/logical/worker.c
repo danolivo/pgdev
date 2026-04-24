@@ -2709,8 +2709,23 @@ TargetPrivilegesCheck(Relation rel, AclMode mode)
  *   same-key duplicate at INSERT time; a key-changing UPDATE is a non-
  *   INSERT and therefore flushes.  Therefore two buffered tuples cannot
  *   share a unique-key value.  The only conflict source is a pre-existing
- *   subscriber row, handled by wrapping the flush in a subxact when any
- *   immediate unique index exists and replaying per-tuple on rollback.
+ *   subscriber row.
+ *
+ * Conflict handling (pilot, intentional simplification):
+ *   The pilot does NOT wrap the flush in a subxact.  A unique-index
+ *   violation against a pre-existing subscriber row propagates to the
+ *   outer apply error handler, aborting the remote xact.  This is a
+ *   regression versus the upstream per-row path (which delivers unique
+ *   violations through CheckAndReportConflict and honours disable_on_
+ *   error / ALTER SUBSCRIPTION SKIP); we accept it for the pilot in
+ *   exchange for materially less code and zero per-flush subxact
+ *   overhead on the common conflict-free case.  A follow-up will add a
+ *   tuple-by-tuple fallback: on unique violation, re-apply the buffered
+ *   tuples through ExecSimpleRelationInsert so the standard conflict-
+ *   reporting path runs unchanged.  The §4.12.3 safety check already
+ *   rules out CHECK, stored-generated, exclusion, and deferred-unique
+ *   failure modes, so unique-index conflicts are the one remaining
+ *   class this affects.
  *
  * Lifetime: one active buffer at a time.  The ApplyMIBuffer struct itself
  * lives in file-scope BSS (apply_mi_buf_storage); its referenced palloc'd
@@ -2768,7 +2783,6 @@ typedef struct ApplyMIBuffer
 									 * so small batches pay proportional
 									 * destroy cost */
 	Size		cum_bytes;
-	bool		has_immediate_unique;
 	ResourceOwner owner_at_init;
 } ApplyMIBuffer;
 
@@ -2797,31 +2811,29 @@ apply_mi_reset_xact_state(void)
 
 /*
  * apply_mi_relation_is_safe
- *		Decide whether a relation is eligible for the batched-insert path,
- *		and if so whether any immediate unique index exists (caller uses
- *		that to decide whether to wrap the flush in a subxact).
+ *		Decide whether a relation is eligible for the batched-insert path.
  *
  *		Rejects: non-plain-table, no multi_insert AM, triggers, RLS, any
  *		tuple constraint (CHECK/stored-generated; NOT-NULL is in
  *		attnotnull and is implied safe by publisher correctness per
  *		§4.12.3), exclusion constraints, deferrable unique, indexes that
  *		aren't valid/ready/live.
+ *
+ *		Immediate UNIQUE / PRIMARY KEY indexes are permitted but no longer
+ *		trigger any special wrap (see apply_mi_buffer_flush): on conflict,
+ *		the error propagates to the outer apply error handler, aborting
+ *		the remote xact.
  */
 static bool
-apply_mi_relation_is_safe(LogicalRepRelMapEntry *rel,
-						  bool *has_immediate_unique)
+apply_mi_relation_is_safe(LogicalRepRelMapEntry *rel)
 {
 	Relation	lrel = rel->localrel;
 	Form_pg_class classform = lrel->rd_rel;
 	TupleDesc	tupdesc = RelationGetDescr(lrel);
 	List	   *indlist;
 	ListCell   *lc;
-	bool		saw_immediate_unique = false;
 
 	Assert(lrel != NULL);
-	Assert(has_immediate_unique != NULL);
-
-	*has_immediate_unique = false;
 
 	if (classform->relkind != RELKIND_RELATION)
 		return false;
@@ -2872,8 +2884,6 @@ apply_mi_relation_is_safe(LogicalRepRelMapEntry *rel,
 		else if ((idxform->indisunique || idxform->indisprimary) &&
 				 !idxform->indimmediate)
 			reject = true;
-		else if (idxform->indisunique || idxform->indisprimary)
-			saw_immediate_unique = true;
 
 		ReleaseSysCache(idxtup);
 
@@ -2885,7 +2895,6 @@ apply_mi_relation_is_safe(LogicalRepRelMapEntry *rel,
 	}
 	list_free(indlist);
 
-	*has_immediate_unique = saw_immediate_unique;
 	return true;
 }
 
@@ -2896,7 +2905,7 @@ apply_mi_relation_is_safe(LogicalRepRelMapEntry *rel,
  *		context resets between apply_handle_insert() invocations.
  */
 static void
-apply_mi_buffer_init(LogicalRepRelMapEntry *rel, bool has_immediate_unique)
+apply_mi_buffer_init(LogicalRepRelMapEntry *rel)
 {
 	MemoryContext oldctx;
 
@@ -2972,7 +2981,6 @@ apply_mi_buffer_init(LogicalRepRelMapEntry *rel, bool has_immediate_unique)
 	apply_mi_buf->nslots = 0;
 	apply_mi_buf->slots_allocated = 0;
 	apply_mi_buf->cum_bytes = 0;
-	apply_mi_buf->has_immediate_unique = has_immediate_unique;
 	apply_mi_buf->owner_at_init = CurrentResourceOwner;
 
 	MemoryContextSwitchTo(oldctx);
@@ -2994,8 +3002,7 @@ apply_mi_buffer_destroy(void)
 	 * mark of indices we lazily allocated during this buffer's lifetime
 	 * (bumped in apply_mi_buffer_add); walking just that range avoids the
 	 * APPLY_MI_MAX_SLOTS-wide NULL scan on small batches.  Indices at or
-	 * above slots_allocated have always been NULL in this lifetime.  The
-	 * array itself is a member of the static struct and is not freed.
+	 * above slots_allocated have always been NULL in this lifetime.
 	 */
 	for (int i = 0; i < apply_mi_buf->slots_allocated; i++)
 	{
@@ -3191,21 +3198,36 @@ apply_mi_flush_heap_phase(ApplyMIBuffer *buf,
 
 /*
  * apply_mi_buffer_flush
- *		Intermediate flush: run the heap phase (and per-tuple index insert
- *		or replay fallback), clear the buffered slots, reset the counters.
- *		The buffer object, its per-tuple slots, the ResultRelInfo, the
- *		EState, the receive slot, and the owned Relation all stay alive.
+ *		Intermediate flush: run the heap phase (heap_multi_insert +
+ *		per-tuple ExecInsertIndexTuples), clear the buffered slots,
+ *		reset the counters.  The buffer object, its per-tuple slots,
+ *		the ResultRelInfo, the EState, the receive slot, and the owned
+ *		Relation all stay alive.
  *
- *		This is the mode used when the size/row cap is hit mid-batch; the
- *		next tuple reuses the same slots + tupdesc pins, which is a
+ *		This is the mode used when the size/row cap is hit mid-batch;
+ *		the next tuple reuses the same slots + tupdesc pins, which is a
  *		significant win against the quadratic-flavoured ResourceOwner
  *		churn that flush-and-destroy triggers (1000 tupdesc-pin forgets
  *		against a ResourceArray holding exactly those 1000 pins = O(N²)
  *		scans -- visible in profile as ~53% of apply-worker CPU).
  *
  *		A transaction snapshot is pushed when none is active and popped
- *		before return.  Does not touch apply_mi_disabled_for_xact beyond
- *		the normal "fell back to per-row" flag set on conflict.
+ *		before return.
+ *
+ *		Conflict handling: deliberately minimal in this pilot.  Any error
+ *		raised by heap_multi_insert or the per-tuple ExecInsertIndexTuples
+ *		loop -- including unique-index violations -- propagates to the
+ *		outer apply error handler in start_apply, aborting the remote
+ *		xact.  That is a regression relative to the upstream per-row path,
+ *		which delivers unique violations through CheckAndReportConflict
+ *		and honours disable_on_error / ALTER SUBSCRIPTION SKIP.  We accept
+ *		the regression for the pilot and plan to add a tuple-by-tuple
+ *		fallback in a follow-up (on unique violation, re-apply the
+ *		buffered tuples through the standard per-row path so conflict
+ *		reporting and SKIP machinery run unchanged).  The schema safety
+ *		check (§4.12.3) rules out the other per-tuple failure classes
+ *		(CHECK, stored-generated, exclusion, deferred unique), so
+ *		unique-index conflicts are the one remaining class this affects.
  */
 static void
 apply_mi_buffer_flush(void)
@@ -3236,83 +3258,11 @@ apply_mi_buffer_flush(void)
 
 	/*
 	 * Relinfo was opened at buffer init with indexes; initialise the
-	 * conflict-arbiter list lazily here (needed only at flush / replay).
+	 * conflict-arbiter list lazily here (needed only at flush).
 	 */
 	InitConflictIndexes(buf->relinfo);
 
-	if (buf->has_immediate_unique)
-	{
-		MemoryContext subxactcxt = CurrentMemoryContext;
-
-		BeginInternalSubTransaction("logical_rep_apply_multi_insert");
-
-		PG_TRY();
-		{
-			apply_mi_flush_heap_phase(buf, buf->estate, buf->relinfo);
-			ReleaseCurrentSubTransaction();
-			MemoryContextSwitchTo(subxactcxt);
-		}
-		PG_CATCH();
-		{
-			ErrorData  *errdata;
-
-			MemoryContextSwitchTo(subxactcxt);
-			errdata = CopyErrorData();
-
-			/*
-			 * Only the unique-violation case is an expected mid-batch
-			 * failure under the pilot's safety-check (§4.12.3) + schema-
-			 * identity assumption.  Everything else -- query cancel (from
-			 * pg_cancel_backend), OOM, WAL full, deadlock, shutdown errors
-			 * that weren't FATAL -- is environmental and must propagate to
-			 * the outer apply error handler in start_apply.  Swallowing it
-			 * here would, for example, silently drop a cancel signal: the
-			 * CHECK_FOR_INTERRUPTS in the heap phase clears
-			 * QueryCancelPending before raising, and a blanket CATCH would
-			 * then finish the replay cleanly with the cancel lost.
-			 */
-			if (errdata->sqlerrcode != ERRCODE_UNIQUE_VIOLATION)
-			{
-				FreeErrorData(errdata);
-				RollbackAndReleaseCurrentSubTransaction();
-				MemoryContextSwitchTo(subxactcxt);
-				PG_RE_THROW();
-			}
-
-			FlushErrorState();
-			RollbackAndReleaseCurrentSubTransaction();
-			MemoryContextSwitchTo(subxactcxt);
-
-			apply_mi_disabled_for_xact = true;
-
-			elog(DEBUG1,
-				 "apply multi-insert batch of %d row(s) hit \"%s\"; retrying row-by-row",
-				 buf->nslots, errdata->message);
-			FreeErrorData(errdata);
-
-			/*
-			 * Retry per-row through the standard path.  Any ERROR here
-			 * propagates through the outer xact.  Per-tuple CFI matches
-			 * upstream per-tuple apply's responsiveness; without it, a
-			 * batch-rollback-then-replay of max_slots tuples runs
-			 * uninterruptible.
-			 */
-			for (int i = 0; i < buf->nslots; i++)
-			{
-				TupleTableSlot *slot = buf->slots[i];
-
-				CHECK_FOR_INTERRUPTS();
-
-				Assert(slot != NULL);
-				ExecSimpleRelationInsert(buf->relinfo, buf->estate, slot);
-			}
-		}
-		PG_END_TRY();
-	}
-	else
-	{
-		apply_mi_flush_heap_phase(buf, buf->estate, buf->relinfo);
-	}
+	apply_mi_flush_heap_phase(buf, buf->estate, buf->relinfo);
 
 	if (pushed_snap)
 	{
@@ -3433,11 +3383,9 @@ apply_handle_insert(StringInfo s)
 
 		if (apply_mi_buf == NULL)
 		{
-			bool		has_immediate_unique;
-
-			if (apply_mi_relation_is_safe(rel, &has_immediate_unique))
+			if (apply_mi_relation_is_safe(rel))
 			{
-				apply_mi_buffer_init(rel, has_immediate_unique);
+				apply_mi_buffer_init(rel);
 			}
 			else
 			{
