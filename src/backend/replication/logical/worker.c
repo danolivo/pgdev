@@ -2779,6 +2779,21 @@ typedef struct ApplyMIBuffer
 									 * caller's logicalrep_rel_open/close
 									 * cycle which would otherwise NULL out
 									 * the entry's localrel mid-xact */
+	TupleDesc	tupdesc;			/* cached RelationGetDescr(local_rel);
+									 * invariant across the buffer's
+									 * lifetime, avoids re-derivation per
+									 * inbound tuple */
+	int			natts;				/* cached tupdesc->natts; same
+									 * invariance / avoidance rationale */
+	bool		has_defaults;		/* cached (tupdesc->natts !=
+									 * rel->remoterel.natts) result; true
+									 * iff slot_fill_defaults could
+									 * possibly fire.  apply_mi_buffer_add
+									 * skips the ResetExprContext / memcpy-
+									 * was_null / slot_fill_defaults / datum
+									 * -copy-loop block entirely when false,
+									 * which is the common narrow-fact-
+									 * table case */
 	ResultRelInfo *relinfo;			/* palloc'd, owns ExecOpenIndices state */
 	EState	   *estate;				/* executor state for slot_fill_defaults,
 									 * constraint evaluation, and flush */
@@ -2976,48 +2991,96 @@ apply_mi_buffer_init(LogicalRepRelMapEntry *rel)
 	 */
 	apply_mi_buf = &apply_mi_buf_storage;
 
-	apply_mi_buf->relid = RelationGetRelid(rel->localrel);
-
 	/*
-	 * Own the Relation handle for the buffer's lifetime.  The caller's
-	 * logicalrep_rel_close(rel, NoLock) at end of apply_handle_insert sets
-	 * the shared map entry's localrel to NULL; if we kept the caller's
-	 * Relation pointer, the flush at commit/prepare time would deref a
-	 * stale pointer.  A dedicated table_open + table_close pair gives the
-	 * buffer a stable handle.
+	 * Wrap the resource-acquiring section so a throw mid-init (e.g.
+	 * ExecOpenIndices on catalog corruption, AllocSetContextCreate on
+	 * OOM) can't leak ApplyContext allocations.  apply_mi_buffer_destroy
+	 * is written to handle arbitrarily-partial state -- every field it
+	 * touches is NULL-checked -- so calling it on an in-progress init is
+	 * safe.  Without this wrapping, the top-level PG_CATCH in start_apply
+	 * would call apply_mi_buffer_abandon, which only deletes batch_mcxt;
+	 * an EState, ResultRelInfo, or opened-index list allocated earlier
+	 * would stay pinned in ApplyContext until the next successful buffer
+	 * destroy (i.e. unbounded for repeated error cycles).
 	 */
-	apply_mi_buf->local_rel = table_open(apply_mi_buf->relid,
-										 RowExclusiveLock);
+	PG_TRY();
+	{
+		apply_mi_buf->relid = RelationGetRelid(rel->localrel);
 
-	apply_mi_buf->estate = CreateExecutorState();
+		/*
+		 * Own the Relation handle for the buffer's lifetime.  The caller's
+		 * logicalrep_rel_close(rel, NoLock) at end of apply_handle_insert
+		 * sets the shared map entry's localrel to NULL; if we kept the
+		 * caller's Relation pointer, the flush at commit/prepare time
+		 * would deref a stale pointer.  A dedicated table_open +
+		 * table_close pair gives the buffer a stable handle.  The second
+		 * RowExclusiveLock acquisition on top of the caller's is an
+		 * idempotent refcount bump in LockRelationOid -- accepted as the
+		 * cost of ownership decoupling.
+		 */
+		apply_mi_buf->local_rel = table_open(apply_mi_buf->relid,
+											 RowExclusiveLock);
 
-	/*
-	 * ResultRelInfo palloc'd explicitly (not registered on the estate's
-	 * es_opened_result_relations list) so that FreeExecutorState at
-	 * destroy time does not close our indexes behind our back.
-	 */
-	apply_mi_buf->relinfo = makeNode(ResultRelInfo);
-	InitResultRelInfo(apply_mi_buf->relinfo, apply_mi_buf->local_rel,
-					  1 /* RT index; any positive works here */,
-					  NULL /* partition_root_rri */, 0 /* instrument */);
-	ExecOpenIndices(apply_mi_buf->relinfo, false);
+		/*
+		 * Cache TupleDesc-derived values.  tupdesc and natts are invariant
+		 * for the buffer's lifetime (schema-stability assumption,
+		 * §4.12.3); reading them once lets apply_mi_buffer_add skip the
+		 * slot -> tupdesc -> natts pointer chase per tuple.  has_defaults
+		 * is the short-circuit gate for the defaults-handling block in
+		 * add: if the publisher sends every column the subscriber has,
+		 * slot_fill_defaults does no work and we shouldn't pay the
+		 * ResetExprContext / memcpy / function-call / post-walk costs
+		 * either.
+		 */
+		apply_mi_buf->tupdesc = RelationGetDescr(apply_mi_buf->local_rel);
+		apply_mi_buf->natts = apply_mi_buf->tupdesc->natts;
+		apply_mi_buf->has_defaults =
+			(apply_mi_buf->natts != rel->remoterel.natts);
 
-	/*
-	 * Per-batch memory context.  slot_store_data's input-function output
-	 * and any datumCopy'd defaulted columns are allocated here; the
-	 * buffered slots' tts_values[] point into this context.  Reset at
-	 * every flush, deleted at destroy.  Keeping Datum storage batch-scoped
-	 * (rather than per-message, which would force an ExecMaterializeSlot
-	 * copy per tuple) is the optimisation this context enables.
-	 */
-	apply_mi_buf->batch_mcxt = AllocSetContextCreate(ApplyContext,
-													 "ApplyMIBatch",
-													 ALLOCSET_DEFAULT_SIZES);
+		apply_mi_buf->estate = CreateExecutorState();
 
-	apply_mi_buf->nslots = 0;
-	apply_mi_buf->slots_allocated = 0;
-	apply_mi_buf->cum_bytes = 0;
-	apply_mi_buf->owner_at_init = CurrentResourceOwner;
+		/*
+		 * ResultRelInfo palloc'd explicitly (not registered on the
+		 * estate's es_opened_result_relations list) so that
+		 * FreeExecutorState at destroy time does not close our indexes
+		 * behind our back.
+		 */
+		apply_mi_buf->relinfo = makeNode(ResultRelInfo);
+		InitResultRelInfo(apply_mi_buf->relinfo, apply_mi_buf->local_rel,
+						  1 /* RT index; any positive works here */,
+						  NULL /* partition_root_rri */, 0 /* instrument */);
+		ExecOpenIndices(apply_mi_buf->relinfo, false);
+
+		/*
+		 * Per-batch memory context.  slot_store_data's input-function
+		 * output and any datumCopy'd defaulted columns are allocated
+		 * here; the buffered slots' tts_values[] point into this context.
+		 * Reset at every flush, deleted at destroy.  Keeping Datum
+		 * storage batch-scoped (rather than per-message, which would
+		 * force an ExecMaterializeSlot copy per tuple) is the
+		 * optimisation this context enables.
+		 */
+		apply_mi_buf->batch_mcxt = AllocSetContextCreate(ApplyContext,
+														 "ApplyMIBatch",
+														 ALLOCSET_DEFAULT_SIZES);
+
+		apply_mi_buf->nslots = 0;
+		apply_mi_buf->slots_allocated = 0;
+		apply_mi_buf->cum_bytes = 0;
+		apply_mi_buf->owner_at_init = CurrentResourceOwner;
+	}
+	PG_CATCH();
+	{
+		/*
+		 * Partial init failure -- unwind whatever was allocated.  destroy
+		 * handles all-NULL fields gracefully, so calling it on an in-
+		 * progress init releases exactly what we've populated so far.
+		 */
+		apply_mi_buffer_destroy();
+		MemoryContextSwitchTo(oldctx);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	MemoryContextSwitchTo(oldctx);
 }
@@ -3108,15 +3171,18 @@ apply_mi_buffer_abandon(void)
  *		Defaults handling: slot_fill_defaults allocates its evaluated
  *		result in the executor's per-tuple expression context (i.e.
  *		GetPerTupleExprContext(estate)->ecxt_per_tuple_memory), NOT in
- *		CurrentMemoryContext.  We ResetExprContext before calling so that
- *		any scratch left over from the previous tuple is reclaimed; then
- *		for each column whose isnull transitioned true -> false during
- *		slot_fill_defaults, we datumCopy the pass-by-reference Datum into
- *		batch_mcxt so it outlives the per-tuple memory context.  Byval
- *		Datums need no copy.  The common narrow-fact-table workload
- *		(publisher sends every column) short-circuits inside
- *		slot_fill_defaults before touching the ExprContext at all, so
- *		the ResetExprContext call is effectively free there.
+ *		CurrentMemoryContext.  The entire defaults block -- memcpy of
+ *		was_null, ResetExprContext, slot_fill_defaults call, and the
+ *		per-attribute datumCopy loop -- is gated on buf->has_defaults
+ *		(computed once at buffer init as tupdesc->natts !=
+ *		rel->remoterel.natts).  For the narrow-fact-table headline case
+ *		where the publisher sends every column, the whole block is
+ *		skipped.  When has_defaults is true, we ResetExprContext before
+ *		calling so any scratch from the previous tuple is reclaimed;
+ *		then for each column whose isnull transitioned true -> false,
+ *		we datumCopy the pass-by-reference Datum into batch_mcxt so it
+ *		outlives the per-tuple memory context.  Byval Datums need no
+ *		copy.
  *
  *		Cache-locality trade-off: the prior design packed each tuple's
  *		data into a contiguous slot->data buffer via ExecMaterializeSlot,
@@ -3153,8 +3219,7 @@ apply_mi_buffer_add(LogicalRepRelMapEntry *rel, LogicalRepTupleData *newtup)
 {
 	MemoryContext oldctx;
 	TupleTableSlot *dst;
-	TupleDesc	tupdesc;
-	int			natts;
+	int			natts = apply_mi_buf->natts;
 	Size		est_bytes;
 
 	Assert(apply_mi_buf != NULL);
@@ -3187,15 +3252,12 @@ apply_mi_buffer_add(LogicalRepRelMapEntry *rel, LogicalRepTupleData *newtup)
 	{
 		Assert(apply_mi_buf->nslots == apply_mi_buf->slots_allocated);
 		oldctx = MemoryContextSwitchTo(ApplyContext);
-		dst = MakeSingleTupleTableSlot(RelationGetDescr(apply_mi_buf->local_rel),
+		dst = MakeSingleTupleTableSlot(apply_mi_buf->tupdesc,
 									   &TTSOpsVirtual);
 		MemoryContextSwitchTo(oldctx);
 		apply_mi_buf->slots[apply_mi_buf->nslots] = dst;
 		apply_mi_buf->slots_allocated++;
 	}
-
-	tupdesc = dst->tts_tupleDescriptor;
-	natts = tupdesc->natts;
 
 	/*
 	 * Populate tts_values[] / tts_isnull[] straight into batch_mcxt, so the
@@ -3209,61 +3271,75 @@ apply_mi_buffer_add(LogicalRepRelMapEntry *rel, LogicalRepTupleData *newtup)
 	slot_store_data(dst, rel, newtup);
 
 	/*
-	 * Snapshot which columns came in NULL before evaluating defaults; the
-	 * defaults pass may flip some of those to non-NULL with Datums
-	 * allocated in PerTupleMemoryContext (via the executor's ExprContext).
-	 * See the datumCopy loop below.
+	 * Defaults handling, gated on has_defaults computed once at buffer
+	 * init.  When the publisher sends every subscriber column,
+	 * slot_fill_defaults would short-circuit internally -- but we still
+	 * pay the ResetExprContext call, the was_null memcpy, the function-
+	 * call overhead, and a full natts-iteration loop just to rediscover
+	 * that nothing changed.  Skipping the whole block when we know
+	 * upfront that no default can fire keeps the narrow-fact-table inner
+	 * loop minimal.
 	 */
-	Assert(natts <= MaxTupleAttributeNumber);
-	memcpy(apply_mi_buf->was_null, dst->tts_isnull, natts * sizeof(bool));
-
-	/*
-	 * Reset the per-tuple ExprContext before evaluating defaults.  Without
-	 * this the scratch left behind by slot_fill_defaults (subexpression
-	 * results, datumCopy'd-out originals) would accumulate in
-	 * ecxt_per_tuple_memory for the buffer's lifetime -- we do not
-	 * otherwise drain that context until FreeExecutorState() at destroy,
-	 * so a long-running apply xact that evaluates defaults per tuple
-	 * would leak proportionally to tuples * default_size.
-	 */
-	ResetExprContext(GetPerTupleExprContext(apply_mi_buf->estate));
-	slot_fill_defaults(rel, apply_mi_buf->estate, dst);
-
-	/*
-	 * For every column whose isnull just transitioned true -> false, a
-	 * default expression fired and the resulting Datum lives in the
-	 * executor's per-tuple expression context (which we'll reset on the
-	 * next call, above).  Copy pass-by-reference Datums into batch_mcxt
-	 * so they survive until flush.  Pass-by-value Datums are self-
-	 * contained and need no copy.  Most apply workloads never enter this
-	 * branch (publisher sends every column; slot_fill_defaults early-
-	 * returns), so the loop cost is amortised away for the headline case.
-	 *
-	 * Note: datumCopy preserves TOAST references as-is.  Default
-	 * expressions in practice produce non-TOAST results (literals,
-	 * NOW(), nextval(), ...), but a pathological default that returns
-	 * a TOAST pointer into another relation's TOAST store would remain
-	 * dereferenceable because TOAST is keyed on OID, not pointer.
-	 */
-	for (int i = 0; i < natts; i++)
+	if (apply_mi_buf->has_defaults)
 	{
-		Form_pg_attribute att;
+		Assert(natts <= MaxTupleAttributeNumber);
+		memcpy(apply_mi_buf->was_null, dst->tts_isnull,
+			   natts * sizeof(bool));
 
-		if (!(apply_mi_buf->was_null[i] && !dst->tts_isnull[i]))
-			continue;
+		/*
+		 * Reset the per-tuple ExprContext before evaluating defaults.
+		 * Without this the scratch left behind by slot_fill_defaults
+		 * (subexpression results, originals of datumCopy'd-out values)
+		 * would accumulate in ecxt_per_tuple_memory for the buffer's
+		 * lifetime -- we do not otherwise drain that context until
+		 * FreeExecutorState() at destroy, so a long-running apply xact
+		 * that evaluates defaults per tuple would leak proportionally
+		 * to tuples * default_size.
+		 */
+		ResetExprContext(GetPerTupleExprContext(apply_mi_buf->estate));
+		slot_fill_defaults(rel, apply_mi_buf->estate, dst);
 
-		att = TupleDescAttr(tupdesc, i);
-		if (!att->attbyval)
-			dst->tts_values[i] = datumCopy(dst->tts_values[i],
-										   false, att->attlen);
+		/*
+		 * For every column whose isnull just transitioned true -> false,
+		 * a default expression fired and the resulting Datum lives in
+		 * the executor's per-tuple expression context (reset on the next
+		 * call through here).  Copy pass-by-reference Datums into
+		 * batch_mcxt so they survive until flush; pass-by-value Datums
+		 * are self-contained and need no copy.
+		 *
+		 * Note: datumCopy preserves TOAST references as-is.  Default
+		 * expressions in practice produce non-TOAST results (literals,
+		 * NOW(), nextval(), ...), but a pathological default returning
+		 * a TOAST pointer into another relation's TOAST store would
+		 * remain dereferenceable because TOAST is keyed on OID, not
+		 * pointer.
+		 */
+		for (int i = 0; i < natts; i++)
+		{
+			Form_pg_attribute att;
+
+			if (!(apply_mi_buf->was_null[i] && !dst->tts_isnull[i]))
+				continue;
+
+			att = TupleDescAttr(apply_mi_buf->tupdesc, i);
+			if (!att->attbyval)
+				dst->tts_values[i] = datumCopy(dst->tts_values[i],
+											   false, att->attlen);
+		}
 	}
 	MemoryContextSwitchTo(oldctx);
 
 	apply_mi_buf->nslots++;
 
 	/*
-	 * Cheap size estimate: header + per-attribute Datum slot.  We do not
-	 * walk toasted datums; overshoot is fine and triggers an earlier flush.
+	 * Cum-bytes estimate: HeapTupleHeader + per-attribute Datum array.
+	 * This deliberately ignores the content of pass-by-reference Datums,
+	 * which in the zero-copy design live in batch_mcxt and can dwarf the
+	 * estimate for varlena-heavy workloads.  The estimate is used as a
+	 * throughput-tuning knob, not a memory-safety bound -- actual
+	 * batch_mcxt footprint can exceed APPLY_MI_MAX_BYTES materially on
+	 * wide TOAST-heavy schemas.  If memory pressure becomes a concern,
+	 * move to a varlena-aware accounting pass (see §9 question 8).
 	 */
 	est_bytes = MAXALIGN(sizeof(HeapTupleHeaderData)) +
 		MAXALIGN(natts * sizeof(Datum));
