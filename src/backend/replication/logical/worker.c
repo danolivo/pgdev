@@ -290,6 +290,7 @@
 #include "storage/procarray.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
+#include "utils/datum.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -2762,10 +2763,17 @@ typedef struct ApplyMIBuffer
 	ResultRelInfo *relinfo;			/* palloc'd, owns ExecOpenIndices state */
 	EState	   *estate;				/* executor state for slot_fill_defaults,
 									 * constraint evaluation, and flush */
-	TupleTableSlot *receiveslot;	/* long-lived virtual slot reused by the
-									 * caller for slot_store_data /
-									 * slot_fill_defaults; avoids a palloc +
-									 * tupdesc-pin pair per inbound INSERT */
+	MemoryContext batch_mcxt;		/* child of ApplyContext; holds all
+									 * per-tuple palloc output from
+									 * slot_store_data (and from datumCopy
+									 * of defaulted columns) until the next
+									 * flush.  Reset at every flush
+									 * (intermediate and final), deleted by
+									 * destroy.  The buffered slots'
+									 * tts_values[] point INTO this context
+									 * -- that is what lets us avoid the
+									 * per-tuple ExecMaterializeSlot copy
+									 * that the prior design paid */
 	TupleTableSlot *slots[APPLY_MI_MAX_SLOTS];	/* fixed-size slot pointer
 												 * array; slots are still
 												 * lazily allocated, but the
@@ -2966,17 +2974,16 @@ apply_mi_buffer_init(LogicalRepRelMapEntry *rel)
 	ExecOpenIndices(apply_mi_buf->relinfo, false);
 
 	/*
-	 * Single long-lived receive slot.  The caller fills it once per
-	 * inbound INSERT via slot_store_data; apply_mi_buffer_add copies and
-	 * materialises into a per-tuple slot.  Keeping this slot alive across
-	 * the buffer's lifetime saves a MakeSingleTupleTableSlot +
-	 * ExecDropSingleTupleTableSlot pair (each doing ResourceOwnerRemember
-	 * / Forget on the tupdesc pin) per INSERT message -- a significant
-	 * fraction of apply-worker CPU in profile.
+	 * Per-batch memory context.  slot_store_data's input-function output
+	 * and any datumCopy'd defaulted columns are allocated here; the
+	 * buffered slots' tts_values[] point into this context.  Reset at
+	 * every flush, deleted at destroy.  Keeping Datum storage batch-scoped
+	 * (rather than per-message, which would force an ExecMaterializeSlot
+	 * copy per tuple) is the optimisation this context enables.
 	 */
-	apply_mi_buf->receiveslot =
-		MakeSingleTupleTableSlot(RelationGetDescr(apply_mi_buf->local_rel),
-								 &TTSOpsVirtual);
+	apply_mi_buf->batch_mcxt = AllocSetContextCreate(ApplyContext,
+													 "ApplyMIBatch",
+													 ALLOCSET_DEFAULT_SIZES);
 
 	apply_mi_buf->nslots = 0;
 	apply_mi_buf->slots_allocated = 0;
@@ -3012,12 +3019,6 @@ apply_mi_buffer_destroy(void)
 	}
 	apply_mi_buf->slots_allocated = 0;
 
-	if (apply_mi_buf->receiveslot != NULL)
-	{
-		ExecDropSingleTupleTableSlot(apply_mi_buf->receiveslot);
-		apply_mi_buf->receiveslot = NULL;
-	}
-
 	if (apply_mi_buf->relinfo != NULL)
 	{
 		ExecCloseIndices(apply_mi_buf->relinfo);
@@ -3034,51 +3035,81 @@ apply_mi_buffer_destroy(void)
 		apply_mi_buf->local_rel = NULL;
 	}
 
+	if (apply_mi_buf->batch_mcxt != NULL)
+	{
+		MemoryContextDelete(apply_mi_buf->batch_mcxt);
+		apply_mi_buf->batch_mcxt = NULL;
+	}
+
 	apply_mi_buf = NULL;
 }
 
 /*
  * apply_mi_buffer_abandon
- *		Drop the active buffer without freeing its children.  Called from
- *		start_apply's top-level PG_CATCH: the ApplyContext allocations are
- *		reclaimed by transaction abort, so explicit per-resource cleanup
- *		would touch already-released memory.  We DO wipe the static storage
- *		to zero here, so the next apply_mi_buffer_init does not have to --
- *		init trusts the storage is clean.  memset on an 80 KB struct costs
- *		a few microseconds and runs only on error paths.
+ *		Drop the active buffer without freeing its ApplyContext children.
+ *		Called from start_apply's top-level PG_CATCH: those allocations
+ *		would be touched by xact abort's ResourceOwner release, so explicit
+ *		per-resource cleanup would free-twice.  We DO explicitly delete
+ *		the per-batch memory context here: it is a child of ApplyContext,
+ *		not xact-scoped, so without manual cleanup it would persist and
+ *		accumulate across every error cycle.  After deletion we memset the
+ *		static storage to zero so the next apply_mi_buffer_init starts
+ *		from a clean state (including a NULL batch_mcxt field).
  */
 static void
 apply_mi_buffer_abandon(void)
 {
+	if (apply_mi_buf_storage.batch_mcxt != NULL)
+		MemoryContextDelete(apply_mi_buf_storage.batch_mcxt);
 	memset(&apply_mi_buf_storage, 0, sizeof(apply_mi_buf_storage));
 	apply_mi_buf = NULL;
 }
 
 /*
  * apply_mi_buffer_add
- *		Append src's virtual-tuple contents into the buffer.  The slot
- *		pointer array is fixed-size (APPLY_MI_MAX_SLOTS) and lives inside
- *		the static ApplyMIBuffer storage, so there is no geometric growth
- *		branch on the hot path.  Individual slots are allocated lazily on
- *		first use at each index and then reused across intermediate
- *		flushes within the buffer's lifetime; a mid-batch flush calls
- *		ExecClearTuple on each slot rather than dropping it, so the
- *		tupdesc-pin ResourceOwner entries stay stable.
+ *		Store one inbound INSERT's tuple directly into the next buffered
+ *		slot (slots[nslots]), with all per-tuple palloc output landing in
+ *		the buffer's batch_mcxt.  Zero-copy with respect to the input
+ *		function output: slot_store_data writes tts_values[] directly
+ *		into slots[nslots], and the Datum pointers it produces remain
+ *		valid until the next flush resets batch_mcxt.  There is no
+ *		intermediate "receive slot" and no ExecMaterializeSlot deep-copy
+ *		pair -- the prior design paid both per tuple.
+ *
+ *		Defaults handling: slot_fill_defaults allocates its evaluated
+ *		result in the executor's per-tuple expression context
+ *		(PerTupleMemoryContext), which is reset at end_replication_step.
+ *		For any column whose isnull transitioned true -> false during
+ *		slot_fill_defaults, we datumCopy the pass-by-reference Datum out
+ *		of that short-lived context into batch_mcxt.  Byval Datums need
+ *		no copy.  The common narrow-fact-table workload (publisher sends
+ *		every column) short-circuits inside slot_fill_defaults before
+ *		touching anything, so the defaults-copy loop is a no-op there.
+ *
+ *		The slot pointer array is fixed-size (APPLY_MI_MAX_SLOTS) and
+ *		lives inside the static ApplyMIBuffer storage, so there is no
+ *		geometric growth branch on the hot path.  Individual slots are
+ *		allocated lazily on first use at each index and then reused
+ *		across intermediate flushes within the buffer's lifetime.
  *
  *		When the row/byte cap is hit, this calls apply_mi_buffer_flush()
  *		directly -- the keep-alive variant -- so successive 10000-tuple
  *		batches in a long INSERT stream don't thrash buffer init/destroy.
  */
 static void
-apply_mi_buffer_add(TupleTableSlot *src)
+apply_mi_buffer_add(LogicalRepRelMapEntry *rel, LogicalRepTupleData *newtup)
 {
 	MemoryContext oldctx;
 	TupleTableSlot *dst;
+	TupleDesc	tupdesc;
+	int			natts;
+	bool		was_null[MaxTupleAttributeNumber];
 	Size		est_bytes;
 
 	Assert(apply_mi_buf != NULL);
-	Assert(src != NULL);
-	Assert(!TTS_EMPTY(src));
+	Assert(rel != NULL);
+	Assert(newtup != NULL);
+	Assert(apply_mi_buf->batch_mcxt != NULL);
 
 	/*
 	 * Internal invariant: the flush-at-end-of-add path resets nslots to 0
@@ -3112,13 +3143,54 @@ apply_mi_buffer_add(TupleTableSlot *src)
 		apply_mi_buf->slots_allocated++;
 	}
 
-	slot_getallattrs(src);
-	memcpy(dst->tts_values, src->tts_values,
-		   dst->tts_tupleDescriptor->natts * sizeof(Datum));
-	memcpy(dst->tts_isnull, src->tts_isnull,
-		   dst->tts_tupleDescriptor->natts * sizeof(bool));
-	ExecStoreVirtualTuple(dst);
-	ExecMaterializeSlot(dst);
+	tupdesc = dst->tts_tupleDescriptor;
+	natts = tupdesc->natts;
+
+	/*
+	 * Populate tts_values[] / tts_isnull[] straight into batch_mcxt, so the
+	 * input-function output (cstrings, varlenas, numerics, ...) lives as
+	 * long as the buffer does.  heap_multi_insert at flush time reads
+	 * these Datums to pack HeapTuples; the batch_mcxt reset at the end of
+	 * flush reclaims everything in one shot.  slot_store_data calls
+	 * ExecClearTuple on the slot internally, so we don't do it here.
+	 */
+	oldctx = MemoryContextSwitchTo(apply_mi_buf->batch_mcxt);
+	slot_store_data(dst, rel, newtup);
+
+	/*
+	 * Before evaluating defaults, snapshot which columns came in NULL from
+	 * the wire; the defaults pass may flip some of those to non-NULL with
+	 * Datums allocated in PerTupleMemoryContext (via the executor's
+	 * ExprContext), not batch_mcxt.  See the loop below.
+	 */
+	Assert(natts <= MaxTupleAttributeNumber);
+	memcpy(was_null, dst->tts_isnull, natts * sizeof(bool));
+
+	slot_fill_defaults(rel, apply_mi_buf->estate, dst);
+
+	/*
+	 * For every column whose isnull just transitioned true -> false, a
+	 * default expression fired and the resulting Datum lives in the
+	 * executor's per-tuple expression context, which is reset at the next
+	 * end_replication_step().  Copy pass-by-reference Datums into
+	 * batch_mcxt so they survive until flush.  Pass-by-value Datums are
+	 * self-contained and need no copy.  Most apply workloads never enter
+	 * this branch (publisher sends every column; slot_fill_defaults early-
+	 * returns), so the loop cost is amortised away for the headline case.
+	 */
+	for (int i = 0; i < natts; i++)
+	{
+		Form_pg_attribute att;
+
+		if (!(was_null[i] && !dst->tts_isnull[i]))
+			continue;
+
+		att = TupleDescAttr(tupdesc, i);
+		if (!att->attbyval)
+			dst->tts_values[i] = datumCopy(dst->tts_values[i],
+										   false, att->attlen);
+	}
+	MemoryContextSwitchTo(oldctx);
 
 	apply_mi_buf->nslots++;
 
@@ -3127,7 +3199,7 @@ apply_mi_buffer_add(TupleTableSlot *src)
 	 * walk toasted datums; overshoot is fine and triggers an earlier flush.
 	 */
 	est_bytes = MAXALIGN(sizeof(HeapTupleHeaderData)) +
-		MAXALIGN(dst->tts_tupleDescriptor->natts * sizeof(Datum));
+		MAXALIGN(natts * sizeof(Datum));
 	apply_mi_buf->cum_bytes += est_bytes;
 
 	if (apply_mi_buf->nslots >= APPLY_MI_MAX_SLOTS ||
@@ -3274,12 +3346,25 @@ apply_mi_buffer_flush(void)
 
 	/*
 	 * Clear slots so the next batch can reuse them.  ExecClearTuple on a
-	 * TTSOpsVirtual slot pfrees the materialised data (if present) and
-	 * marks the slot empty, but does NOT release its tupdesc pin -- that
-	 * is what makes the reuse cheap.
+	 * TTSOpsVirtual slot marks the slot empty and clears tts_nvalid; it
+	 * does NOT release the tupdesc pin or the tts_values array, and with
+	 * the zero-copy Datum-lifetime model it also does NOT pfree any
+	 * per-tuple data (there is no SHOULDFREE data to free -- the Datums
+	 * live in batch_mcxt, which we reset next).
 	 */
 	for (int i = 0; i < buf->nslots; i++)
 		ExecClearTuple(buf->slots[i]);
+
+	/*
+	 * Reset the batch context.  This reclaims every palloc that
+	 * slot_store_data or datumCopy (for defaulted columns) made for the
+	 * buffered tuples in a single pass, without having to free them
+	 * individually.  After the reset, the tts_values[] entries in the
+	 * slots point into freed memory, but they are never read before the
+	 * next apply_mi_buffer_add overwrites them.
+	 */
+	MemoryContextReset(buf->batch_mcxt);
+
 	buf->nslots = 0;
 	buf->cum_bytes = 0;
 }
@@ -3402,33 +3487,15 @@ apply_handle_insert(StringInfo s)
 		if (apply_mi_buf != NULL)
 		{
 			/*
-			 * Deserialise the remote tuple into the buffer's long-lived
-			 * receive slot.  apply_mi_buffer_add copies + materialises into
-			 * one of the buffered slots and, if the row/byte cap is hit,
+			 * Hand the inbound tuple to the batched path.  apply_mi_buffer_
+			 * add writes slot_store_data's output directly into the next
+			 * buffered slot, with every palloc landing in the buffer's
+			 * batch_mcxt so the Datums survive until flush without a
+			 * per-tuple deep copy.  When the row/byte cap is hit, it
 			 * flushes internally (intermediate flush; buffer stays alive
-			 * for the next tuple).  Using a persistent receiveslot avoids
-			 * a MakeSingleTupleTableSlot + ExecDropSingleTupleTableSlot
-			 * pair per INSERT message -- visible in profile as a large
-			 * chunk of ResourceOwner churn.
+			 * for the next tuple).
 			 */
-			TupleTableSlot *receiveslot = apply_mi_buf->receiveslot;
-
-			ExecClearTuple(receiveslot);
-
-			slot_store_data(receiveslot, rel, &newtup);
-
-			/*
-			 * slot_fill_defaults unconditionally dereferences its EState to
-			 * fetch the per-tuple expression context, even before checking
-			 * whether any default expressions actually need evaluating.  The
-			 * pilot's safety check ensures the subscriber has no generated
-			 * columns, but plain DEFAULT expressions are still evaluated when
-			 * the subscriber has more columns than the publisher sent.  Use
-			 * the buffer's estate so the ExprContext is real.
-			 */
-			slot_fill_defaults(rel, apply_mi_buf->estate, receiveslot);
-
-			apply_mi_buffer_add(receiveslot);
+			apply_mi_buffer_add(rel, &newtup);
 
 			apply_error_callback_arg.rel = NULL;
 
