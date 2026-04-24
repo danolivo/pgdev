@@ -2712,12 +2712,25 @@ TargetPrivilegesCheck(Relation rel, AclMode mode)
  *   subscriber row, handled by wrapping the flush in a subxact when any
  *   immediate unique index exists and replaying per-tuple on rollback.
  *
- * Lifetime: one active buffer at a time, in ApplyContext.  Destroy after
- * every flush; next INSERT rebuilds.  This keeps us out of trouble with
- * TupleDesc pin lifetimes across transaction boundaries.
+ * Lifetime: one active buffer at a time.  The ApplyMIBuffer struct itself
+ * lives in file-scope BSS (apply_mi_buf_storage); its referenced palloc'd
+ * children -- Relation handle, EState, ResultRelInfo, slot objects -- live
+ * in ApplyContext and are torn down by apply_mi_buffer_destroy() at every
+ * non-INSERT boundary (flush triggers, spec §4.3.3).  An intermediate flush
+ * (apply_mi_buffer_flush, spec §4.3.1.2) keeps the buffer alive and reuses
+ * its slots across batches; only the final flush (apply_handle_buffer_
+ * flush_any) invokes destroy.  The buffer is never persisted across
+ * transaction boundaries, which keeps us out of trouble with TupleDesc
+ * pin lifetimes.
+ *
+ * Storage sizing: APPLY_MI_MAX_SLOTS is a compile-time cap.  The slot
+ * pointer array is a fixed member of ApplyMIBuffer and consumes
+ * sizeof(void *) * APPLY_MI_MAX_SLOTS in BSS per apply worker.  Raising
+ * the cap without reconsidering the storage model grows the per-worker
+ * footprint linearly; exposing batch size as a subscription option (spec
+ * §4.12.6 → §8 Patch 4) will require revisiting the fixed-array choice.
  * ------------------------------------------------------------------------- */
 
-#define APPLY_MI_INITIAL_SLOTS	16
 #define APPLY_MI_MAX_SLOTS		10000
 #define APPLY_MI_MAX_BYTES		(8 * 1024 * 1024)
 
@@ -2738,14 +2751,35 @@ typedef struct ApplyMIBuffer
 									 * caller for slot_store_data /
 									 * slot_fill_defaults; avoids a palloc +
 									 * tupdesc-pin pair per inbound INSERT */
-	TupleTableSlot **slots;			/* palloc'd [capacity] virtual slots */
+	TupleTableSlot *slots[APPLY_MI_MAX_SLOTS];	/* fixed-size slot pointer
+												 * array; slots are still
+												 * lazily allocated, but the
+												 * array itself is not palloc'd
+												 * per buffer -- see the
+												 * apply_mi_buf_storage /
+												 * _destroy discipline below */
 	int			nslots;
-	int			capacity;
+	int			slots_allocated;	/* high-water mark: the number of
+									 * distinct slot indices that were
+									 * lazily allocated during this
+									 * buffer's lifetime.  destroy walks
+									 * [0, slots_allocated) only, rather
+									 * than the full APPLY_MI_MAX_SLOTS,
+									 * so small batches pay proportional
+									 * destroy cost */
 	Size		cum_bytes;
 	bool		has_immediate_unique;
 	ResourceOwner owner_at_init;
 } ApplyMIBuffer;
 
+/*
+ * Static storage for the one active multi-insert buffer.  Making the struct
+ * (including its slot pointer array) BSS-resident eliminates the palloc +
+ * pfree pair per buffer lifecycle and removes the geometric-growth branch
+ * from apply_mi_buffer_add's hot path.  apply_mi_buf is NULL when no buffer
+ * is active; when active it always equals &apply_mi_buf_storage.
+ */
+static ApplyMIBuffer apply_mi_buf_storage;
 static ApplyMIBuffer *apply_mi_buf = NULL;
 static bool apply_mi_disabled_for_xact = false;
 
@@ -2888,7 +2922,14 @@ apply_mi_buffer_init(LogicalRepRelMapEntry *rel, bool has_immediate_unique)
 
 	oldctx = MemoryContextSwitchTo(ApplyContext);
 
-	apply_mi_buf = palloc0_object(ApplyMIBuffer);
+	/*
+	 * Bind to static storage.  We rely on the invariant that apply_mi_
+	 * buffer_destroy (happy path) and apply_mi_buffer_abandon (error path)
+	 * both leave the storage in a clean state, so init does not memset --
+	 * it sets the fields it cares about and trusts the rest are zero.
+	 */
+	apply_mi_buf = &apply_mi_buf_storage;
+
 	apply_mi_buf->relid = RelationGetRelid(rel->localrel);
 
 	/*
@@ -2928,10 +2969,8 @@ apply_mi_buffer_init(LogicalRepRelMapEntry *rel, bool has_immediate_unique)
 		MakeSingleTupleTableSlot(RelationGetDescr(apply_mi_buf->local_rel),
 								 &TTSOpsVirtual);
 
-	apply_mi_buf->capacity = APPLY_MI_INITIAL_SLOTS;
-	apply_mi_buf->slots = palloc0_array(TupleTableSlot *,
-										apply_mi_buf->capacity);
 	apply_mi_buf->nslots = 0;
+	apply_mi_buf->slots_allocated = 0;
 	apply_mi_buf->cum_bytes = 0;
 	apply_mi_buf->has_immediate_unique = has_immediate_unique;
 	apply_mi_buf->owner_at_init = CurrentResourceOwner;
@@ -2951,21 +2990,20 @@ apply_mi_buffer_destroy(void)
 		return;
 
 	/*
-	 * Destroy all batched slots (we loop over capacity, not nslots: a mid-
-	 * batch destroy may see nslots == 0 while slots[] still has
-	 * allocations from a previous intermediate flush that chose to keep
-	 * them).
+	 * Drop the individual slot objects.  slots_allocated is the high-water
+	 * mark of indices we lazily allocated during this buffer's lifetime
+	 * (bumped in apply_mi_buffer_add); walking just that range avoids the
+	 * APPLY_MI_MAX_SLOTS-wide NULL scan on small batches.  Indices at or
+	 * above slots_allocated have always been NULL in this lifetime.  The
+	 * array itself is a member of the static struct and is not freed.
 	 */
-	for (int i = 0; i < apply_mi_buf->capacity; i++)
+	for (int i = 0; i < apply_mi_buf->slots_allocated; i++)
 	{
-		if (apply_mi_buf->slots[i] != NULL)
-		{
-			ExecDropSingleTupleTableSlot(apply_mi_buf->slots[i]);
-			apply_mi_buf->slots[i] = NULL;
-		}
+		Assert(apply_mi_buf->slots[i] != NULL);
+		ExecDropSingleTupleTableSlot(apply_mi_buf->slots[i]);
+		apply_mi_buf->slots[i] = NULL;
 	}
-	if (apply_mi_buf->slots != NULL)
-		pfree(apply_mi_buf->slots);
+	apply_mi_buf->slots_allocated = 0;
 
 	if (apply_mi_buf->receiveslot != NULL)
 	{
@@ -2989,34 +3027,39 @@ apply_mi_buffer_destroy(void)
 		apply_mi_buf->local_rel = NULL;
 	}
 
-	pfree(apply_mi_buf);
 	apply_mi_buf = NULL;
 }
 
 /*
  * apply_mi_buffer_abandon
- *		Drop the static pointer without freeing any slots.  Called from
+ *		Drop the active buffer without freeing its children.  Called from
  *		start_apply's top-level PG_CATCH: the ApplyContext allocations are
- *		reclaimed by transaction abort, so explicit cleanup would touch
- *		already-released memory.
+ *		reclaimed by transaction abort, so explicit per-resource cleanup
+ *		would touch already-released memory.  We DO wipe the static storage
+ *		to zero here, so the next apply_mi_buffer_init does not have to --
+ *		init trusts the storage is clean.  memset on an 80 KB struct costs
+ *		a few microseconds and runs only on error paths.
  */
 static void
 apply_mi_buffer_abandon(void)
 {
+	memset(&apply_mi_buf_storage, 0, sizeof(apply_mi_buf_storage));
 	apply_mi_buf = NULL;
 }
 
 /*
  * apply_mi_buffer_add
- *		Append src's virtual-tuple contents into the buffer.  Slots are
- *		allocated lazily (geometric growth, capped at APPLY_MI_MAX_SLOTS)
- *		and then reused across flush cycles; a mid-batch flush calls
+ *		Append src's virtual-tuple contents into the buffer.  The slot
+ *		pointer array is fixed-size (APPLY_MI_MAX_SLOTS) and lives inside
+ *		the static ApplyMIBuffer storage, so there is no geometric growth
+ *		branch on the hot path.  Individual slots are allocated lazily on
+ *		first use at each index and then reused across intermediate
+ *		flushes within the buffer's lifetime; a mid-batch flush calls
  *		ExecClearTuple on each slot rather than dropping it, so the
- *		tupdesc-pin ResourceOwner entries stay stable and the next batch
- *		pays no re-registration cost.
+ *		tupdesc-pin ResourceOwner entries stay stable.
  *
  *		When the row/byte cap is hit, this calls apply_mi_buffer_flush()
- *		directly -- the keep-alive variant -- so successive 1000-tuple
+ *		directly -- the keep-alive variant -- so successive 10000-tuple
  *		batches in a long INSERT stream don't thrash buffer init/destroy.
  */
 static void
@@ -3030,25 +3073,22 @@ apply_mi_buffer_add(TupleTableSlot *src)
 	Assert(src != NULL);
 	Assert(!TTS_EMPTY(src));
 
-	if (apply_mi_buf->nslots == apply_mi_buf->capacity)
-	{
-		int			newcap;
-
-		Assert(apply_mi_buf->capacity < APPLY_MI_MAX_SLOTS);
-		newcap = Min(apply_mi_buf->capacity * 2, APPLY_MI_MAX_SLOTS);
-		oldctx = MemoryContextSwitchTo(ApplyContext);
-		apply_mi_buf->slots = repalloc_array(apply_mi_buf->slots,
-											 TupleTableSlot *, newcap);
-		memset(&apply_mi_buf->slots[apply_mi_buf->capacity], 0,
-			   sizeof(TupleTableSlot *) *
-			   (newcap - apply_mi_buf->capacity));
-		apply_mi_buf->capacity = newcap;
-		MemoryContextSwitchTo(oldctx);
-	}
+	/*
+	 * Internal invariant: the flush-at-end-of-add path resets nslots to 0
+	 * whenever the cap is hit, so we should never re-enter with nslots at
+	 * or above APPLY_MI_MAX_SLOTS.  A breach here would be a corruption --
+	 * raise rather than silently overrun the fixed array, in release
+	 * builds too.
+	 */
+	if (unlikely(apply_mi_buf->nslots >= APPLY_MI_MAX_SLOTS))
+		elog(ERROR,
+			 "multi-insert buffer overflow: %d tuples buffered, max is %d",
+			 apply_mi_buf->nslots, APPLY_MI_MAX_SLOTS);
 
 	/*
 	 * Lazy slot allocation.  On the first pass through a slot index, create
-	 * a fresh virtual slot in ApplyContext.  On subsequent batches the slot
+	 * a fresh virtual slot in ApplyContext and bump slots_allocated so a
+	 * later destroy knows how far to walk.  On subsequent batches the slot
 	 * already exists (ExecClearTuple'd by the prior intermediate flush); we
 	 * just reuse it.  This keeps the tupdesc-pin count stable across the
 	 * buffer's lifetime.
@@ -3056,11 +3096,13 @@ apply_mi_buffer_add(TupleTableSlot *src)
 	dst = apply_mi_buf->slots[apply_mi_buf->nslots];
 	if (dst == NULL)
 	{
+		Assert(apply_mi_buf->nslots == apply_mi_buf->slots_allocated);
 		oldctx = MemoryContextSwitchTo(ApplyContext);
 		dst = MakeSingleTupleTableSlot(RelationGetDescr(apply_mi_buf->local_rel),
 									   &TTSOpsVirtual);
 		MemoryContextSwitchTo(oldctx);
 		apply_mi_buf->slots[apply_mi_buf->nslots] = dst;
+		apply_mi_buf->slots_allocated++;
 	}
 
 	slot_getallattrs(src);
