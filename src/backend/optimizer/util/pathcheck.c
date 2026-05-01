@@ -10,15 +10,26 @@
  * require no changes.
  *
  * Contract:
- *	A given Path pointer may appear in at most one of
- *	{RelOptInfo.pathlist, RelOptInfo.partial_pathlist} at any moment of
- *	a single planner invocation.  The membership hash is allocated in
- *	root->planner_cxt at the top of subquery_planner and torn down at
- *	the bottom; recursive subquery_planner invocations save and restore
- *	the file-static so each PlannerInfo sees its own hash.  Because
- *	every Path the planner can record lives in planner_cxt or a child
- *	thereof, hash entries cannot outlive the Paths they reference, and
- *	path_membership_forget may safely Assert(found).
+ *	A given Path pointer is a member of at most one RelOptInfo's pathlist
+ *	at a time.  Membership is established by add_path() / add_partial_path()
+ *	and dissolved by their in-loop deletion branch, by pathcheck_forget_list()
+ *	at wholesale-zap sites, by pathcheck_replace() at in-place "lfirst(lc) =
+ *	newpath" sites, or by the owning RelOptInfo being torn down with its
+ *	planner_cxt.  The single documented exception is grouping_planner's
+ *	final-paths handoff: a path lifted from current_rel->pathlist into
+ *	final_rel without a wrapper calls path_membership_forget() before
+ *	the second add_path(); the underlying current_rel pathlist entry
+ *	remains live for the FDW upper-paths hook and is reaped with
+ *	planner_cxt.  Closing the underlying use-after-free hazard in that
+ *	hook is out of scope here and tracked as a follow-up.
+ *
+ *	The membership hash is allocated in root->planner_cxt at the top of
+ *	subquery_planner and torn down at the bottom; recursive
+ *	subquery_planner invocations save and restore the file-static so each
+ *	PlannerInfo sees its own hash.  Because every Path the planner can
+ *	record lives in planner_cxt or a child thereof, hash entries cannot
+ *	outlive the Paths they reference, and path_membership_forget may
+ *	safely Assert(found).
  *
  * Mechanism: a process-local pointer-keyed simplehash set tracks Path
  * pointers that are currently a member of some pathlist.  The set is
@@ -214,6 +225,41 @@ pathcheck_planner_fini(void)
 }
 
 /*
+ * pathcheck_subscope_enter / pathcheck_subscope_leave
+ *	  Save the current membership hash and install a fresh one allocated
+ *	  in CurrentMemoryContext.  Used by callers that build Paths in a
+ *	  short-lived sub-context which they will MemoryContextDelete at the
+ *	  end of the scope (geqo_eval being the canonical example).  The
+ *	  fresh hash dies with the sub-context, so its keys (which point
+ *	  into that sub-context) cannot outlive their referents.
+ *
+ * Caller pattern (mirrors the existing root->join_rel_hash save/restore):
+ *	saved = pathcheck_subscope_enter();
+ *	... build paths in the sub-context, call add_path ...
+ *	pathcheck_subscope_leave(saved);
+ *	MemoryContextDelete(subcxt);
+ */
+void *
+pathcheck_subscope_enter(void)
+{
+	void	   *saved = path_membership;
+
+	path_membership = pathmembership_create(CurrentMemoryContext, 64, NULL);
+	return saved;
+}
+
+void
+pathcheck_subscope_leave(void *saved)
+{
+	/*
+	 * Storage for the sub-scope hash is in the caller's sub-context and
+	 * will be reaped by the matching MemoryContextDelete; we just put
+	 * the outer pointer back.
+	 */
+	path_membership = (pathmembership_hash *) saved;
+}
+
+/*
  * path_membership_record
  *	  Record that 'path' is now a member of some pathlist.  Fire an
  *	  error if the path is already recorded.
@@ -263,6 +309,34 @@ path_membership_forget(const Path *path)
 			 pathmembership_delete(path_membership, path));
 
 	Assert(found);
+}
+
+/*
+ * pathcheck_replace
+ *	  Account for an in-place pathlist-cell replacement: 'old_path'
+ *	  leaves the list, 'new_path' takes its place.  Equivalent to
+ *	  path_membership_forget(old) followed by path_membership_record(new),
+ *	  with old==new tolerated as a no-op for callers who conditionally
+ *	  rewrite (e.g. apply_projection_to_path which may return its input
+ *	  unchanged).
+ *
+ * Callers: every site that does "lfirst(lc) = newpath" on a pathlist
+ * cell instead of going through add_path / foreach_delete_current.
+ * See planner.c (adjust_paths_for_srfs, apply_scanjoin_target_to_paths)
+ * and prepunion.c.
+ */
+void
+pathcheck_replace(const Path *old_path, const Path *new_path,
+				  const RelOptInfo *rel)
+{
+	Assert(old_path != NULL);
+	Assert(new_path != NULL);
+
+	if (old_path == new_path)
+		return;
+
+	path_membership_forget(old_path);
+	path_membership_record(new_path, rel);
 }
 
 /*

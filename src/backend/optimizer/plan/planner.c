@@ -2187,10 +2187,21 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 	/*
 	 * Generate paths for the final_rel.  Insert all surviving paths, with
 	 * LockRows, Limit, and/or ModifyTable steps added if needed.
+	 *
+	 * Note: when no LockRows/Limit/ModifyTable wrapper is built, the
+	 * caller hands the original Path pointer from current_rel->pathlist
+	 * to add_path(final_rel, ...).  That makes the same pointer a member
+	 * of two pathlists.  Under USE_ASSERT_CHECKING, forget the membership
+	 * record before re-presenting; the path stays in current_rel->pathlist
+	 * (so the FDW upper-paths hook below can still walk it) but is
+	 * accounted for as a member of final_rel only.
 	 */
 	foreach(lc, current_rel->pathlist)
 	{
 		Path	   *path = (Path *) lfirst(lc);
+#ifdef USE_ASSERT_CHECKING
+		Path	   *orig_path = path;
+#endif
 
 		/*
 		 * If there is a FOR [KEY] UPDATE/SHARE clause, add the LockRows node.
@@ -2423,6 +2434,17 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 										assign_special_exec_param(root));
 		}
 
+#ifdef USE_ASSERT_CHECKING
+		/*
+		 * If no wrapper was created, 'path' is still the original from
+		 * current_rel->pathlist; forget its membership record so that
+		 * add_path(final_rel, ...) can record it cleanly.  current_rel's
+		 * list cell is left undisturbed for the FDW hook.
+		 */
+		if (path == orig_path)
+			path_membership_forget(orig_path);
+#endif
+
 		/* And shove it into final_rel */
 		add_path(final_rel, path);
 	}
@@ -2439,6 +2461,10 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 		{
 			Path	   *partial_path = (Path *) lfirst(lc);
 
+#ifdef USE_ASSERT_CHECKING
+			/* Same handoff pattern as the regular pathlist loop above. */
+			path_membership_forget(partial_path);
+#endif
 			add_partial_path(final_rel, partial_path);
 		}
 	}
@@ -6966,6 +6992,9 @@ adjust_paths_for_srfs(PlannerInfo *root, RelOptInfo *rel,
 															thistarget);
 		}
 		lfirst(lc) = newpath;
+#ifdef USE_ASSERT_CHECKING
+		pathcheck_replace(subpath, newpath, rel);
+#endif
 		if (subpath == rel->cheapest_startup_path)
 			rel->cheapest_startup_path = newpath;
 		if (subpath == rel->cheapest_total_path)
@@ -7002,6 +7031,9 @@ adjust_paths_for_srfs(PlannerInfo *root, RelOptInfo *rel,
 			}
 		}
 		lfirst(lc) = newpath;
+#ifdef USE_ASSERT_CHECKING
+		pathcheck_replace(subpath, newpath, rel);
+#endif
 	}
 }
 
@@ -8279,6 +8311,9 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 			newpath = (Path *) create_projection_path(root, rel, subpath,
 													  scanjoin_target);
 			lfirst(lc) = newpath;
+#ifdef USE_ASSERT_CHECKING
+			pathcheck_replace(subpath, newpath, rel);
+#endif
 		}
 	}
 
@@ -8300,6 +8335,9 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 			newpath = (Path *) create_projection_path(root, rel, subpath,
 													  scanjoin_target);
 			lfirst(lc) = newpath;
+#ifdef USE_ASSERT_CHECKING
+			pathcheck_replace(subpath, newpath, rel);
+#endif
 		}
 	}
 

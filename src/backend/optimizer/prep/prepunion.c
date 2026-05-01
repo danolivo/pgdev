@@ -31,6 +31,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/cost.h"
+#include "optimizer/pathcheck.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "optimizer/planner.h"
@@ -328,7 +329,12 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 												subpath, target);
 				/* If we had to add a Result, path is different from subpath */
 				if (path != subpath)
+				{
 					lfirst(lc) = path;
+#ifdef USE_ASSERT_CHECKING
+					pathcheck_replace(subpath, path, rel);
+#endif
+				}
 			}
 
 			/* Apply projection to each partial path */
@@ -343,6 +349,9 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 				path = (Path *) create_projection_path(root, subpath->parent,
 													   subpath, target);
 				lfirst(lc) = path;
+#ifdef USE_ASSERT_CHECKING
+				pathcheck_replace(subpath, path, rel);
+#endif
 			}
 		}
 		postprocess_setop_rel(root, rel);

@@ -36,9 +36,14 @@
 extern void pathcheck_planner_init(PlannerInfo *root);
 extern void pathcheck_planner_fini(void);
 
+extern void *pathcheck_subscope_enter(void);
+extern void pathcheck_subscope_leave(void *saved);
+
 extern void path_membership_record(const Path *path, const RelOptInfo *rel);
 extern void path_membership_forget(const Path *path);
 extern void pathcheck_forget_list(const List *paths);
+extern void pathcheck_replace(const Path *old_path, const Path *new_path,
+							  const RelOptInfo *rel);
 
 #endif							/* USE_ASSERT_CHECKING */
 

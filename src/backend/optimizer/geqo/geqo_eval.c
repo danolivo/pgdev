@@ -26,6 +26,7 @@
 
 #include "optimizer/geqo.h"
 #include "optimizer/joininfo.h"
+#include "optimizer/pathcheck.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 #include "utils/memutils.h"
@@ -61,6 +62,9 @@ geqo_eval(PlannerInfo *root, Gene *tour, int num_gene)
 	Cost		fitness;
 	int			savelength;
 	struct HTAB *savehash;
+#ifdef USE_ASSERT_CHECKING
+	void	   *saved_pathcheck;
+#endif
 
 	/*
 	 * Create a private memory context that will hold all temp storage
@@ -97,6 +101,16 @@ geqo_eval(PlannerInfo *root, Gene *tour, int num_gene)
 
 	root->join_rel_hash = NULL;
 
+#ifdef USE_ASSERT_CHECKING
+	/*
+	 * Same shape as the join_rel_hash save above: every Path that will
+	 * be allocated in this sub-context must be tracked in a hash that
+	 * dies with the sub-context, otherwise the next iteration sees
+	 * pointer aliases of just-freed addresses.
+	 */
+	saved_pathcheck = pathcheck_subscope_enter();
+#endif
+
 	/* construct the best path for the given combination of relations */
 	joinrel = gimme_tree(root, tour, num_gene);
 
@@ -123,6 +137,10 @@ geqo_eval(PlannerInfo *root, Gene *tour, int num_gene)
 	root->join_rel_list = list_truncate(root->join_rel_list,
 										savelength);
 	root->join_rel_hash = savehash;
+
+#ifdef USE_ASSERT_CHECKING
+	pathcheck_subscope_leave(saved_pathcheck);
+#endif
 
 	/* release all the memory acquired within gimme_tree */
 	MemoryContextSwitchTo(oldcxt);
