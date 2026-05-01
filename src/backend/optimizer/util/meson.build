@@ -8,6 +8,7 @@ backend_sources += files(
   'joininfo.c',
   'orclauses.c',
   'paramassign.c',
+  'pathcheck.c',
   'pathnode.c',
   'placeholder.c',
   'plancat.c',

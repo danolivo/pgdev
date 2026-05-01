@@ -20,6 +20,7 @@ OBJS = \
 	joininfo.o \
 	orclauses.o \
 	paramassign.o \
+	pathcheck.o \
 	pathnode.o \
 	placeholder.o \
 	plancat.o \

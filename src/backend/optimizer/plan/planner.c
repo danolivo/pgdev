@@ -8195,6 +8195,15 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 	 * generate_useful_gather_paths to add path(s) to the main list, and
 	 * finally zap the partial pathlist.
 	 */
+	/*
+	 * Note: this wholesale assignment orphans whatever paths were in
+	 * pathlist with respect to the assert-only single-pathlist tracker
+	 * in pathcheck.c.  That is acceptable: orphaned entries cannot
+	 * collide with anything add_path() sees afterward in current code,
+	 * and they are reaped at transaction end.  If a future change ever
+	 * re-presents one of these paths to add_path(), the assertion will
+	 * fire and we will know to instrument this site.
+	 */
 	if (rel_is_partitioned && IS_SIMPLE_REL(rel))
 		rel->pathlist = NIL;
 
@@ -8220,7 +8229,10 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 		rel->consider_parallel = false;
 	}
 
-	/* Finish dropping old paths for a partitioned rel, per comment above */
+	/*
+	 * Finish dropping old paths for a partitioned rel, per comment above.
+	 * Same pathcheck.c caveat applies as for the pathlist zap earlier.
+	 */
 	if (rel_is_partitioned && IS_SIMPLE_REL(rel))
 		rel->partial_pathlist = NIL;
 

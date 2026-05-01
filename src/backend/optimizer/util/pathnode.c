@@ -31,6 +31,8 @@
 #include "utils/memutils.h"
 #include "utils/selfuncs.h"
 
+#include "pathcheck.h"
+
 typedef enum
 {
 	COSTS_EQUAL,				/* path costs are fuzzily equal */
@@ -624,6 +626,16 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 			parent_rel->pathlist = foreach_delete_current(parent_rel->pathlist,
 														  p1);
 
+#ifdef USE_ASSERT_CHECKING
+			/*
+			 * Drop the membership record before we (maybe) pfree.  We track
+			 * pathlist membership, not allocation lifetime — the IndexPath
+			 * exception below leaves storage alive but the path is no
+			 * longer in any list, so it is no longer a member.
+			 */
+			path_membership_forget(old_path);
+#endif
+
 			/*
 			 * Delete the data pointed-to by the deleted cell, if possible
 			 */
@@ -653,6 +665,14 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 
 	if (accept_new)
 	{
+#ifdef USE_ASSERT_CHECKING
+		/*
+		 * Record membership before insertion.  Fires elog(ERROR) if this
+		 * path is already in some pathlist — the bug we want to catch.
+		 */
+		path_membership_record(new_path, parent_rel);
+#endif
+
 		/* Accept the new path: insert it at proper place in pathlist */
 		parent_rel->pathlist =
 			list_insert_nth(parent_rel->pathlist, insert_at, new_path);
@@ -863,6 +883,11 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 		{
 			parent_rel->partial_pathlist =
 				foreach_delete_current(parent_rel->partial_pathlist, p1);
+
+#ifdef USE_ASSERT_CHECKING
+			path_membership_forget(old_path);
+#endif
+
 			pfree(old_path);
 		}
 		else
@@ -888,6 +913,10 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 
 	if (accept_new)
 	{
+#ifdef USE_ASSERT_CHECKING
+		path_membership_record(new_path, parent_rel);
+#endif
+
 		/* Accept the new path: insert it at proper place */
 		parent_rel->partial_pathlist =
 			list_insert_nth(parent_rel->partial_pathlist, insert_at, new_path);
