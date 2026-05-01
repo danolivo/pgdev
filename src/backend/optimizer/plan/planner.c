@@ -2188,13 +2188,20 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 	 * Generate paths for the final_rel.  Insert all surviving paths, with
 	 * LockRows, Limit, and/or ModifyTable steps added if needed.
 	 *
-	 * Note: when no LockRows/Limit/ModifyTable wrapper is built, the
-	 * caller hands the original Path pointer from current_rel->pathlist
-	 * to add_path(final_rel, ...).  That makes the same pointer a member
-	 * of two pathlists.  Under USE_ASSERT_CHECKING, forget the membership
-	 * record before re-presenting; the path stays in current_rel->pathlist
-	 * (so the FDW upper-paths hook below can still walk it) but is
-	 * accounted for as a member of final_rel only.
+	 * Note: when no LockRows/Limit/ModifyTable wrapper is built, we hand
+	 * the original Path pointer from current_rel->pathlist to
+	 * add_path(final_rel, ...).  Under USE_ASSERT_CHECKING, forget the
+	 * membership record before re-presenting; the list cell stays so the
+	 * FDW upper-paths hook below can still walk it, but is accounted for
+	 * as a member of final_rel only.
+	 *
+	 * Pre-existing FDW-contract hazard, predating this tracker: if the
+	 * dominance prune in add_path(final_rel, ...) pfrees the underlying
+	 * Path, the cell in current_rel->pathlist points at freed memory by
+	 * the time GetForeignUpperPaths fires below.  postgres_fdw's
+	 * add_foreign_final_paths walks input_rel->pathlist exactly that
+	 * way; an out-of-core FDW with the same shape is exposed.  Tracked
+	 * separately on -hackers; not introduced by this code.
 	 */
 	foreach(lc, current_rel->pathlist)
 	{
@@ -5710,10 +5717,13 @@ create_ordered_paths(PlannerInfo *root,
 		/*
 		 * If neither the sort branch nor the projection wrapper actually
 		 * produced a new Path node, sorted_path is still the loop's
-		 * input_path which is a member of input_rel->pathlist.  Forget that
-		 * membership so add_path(ordered_rel, ...) can record it cleanly;
-		 * input_rel's list cell is left undisturbed, matching the
-		 * grouping_planner final-paths handoff.
+		 * input_path which is a member of input_rel->pathlist.  Forget
+		 * that membership so add_path(ordered_rel, ...) can record it
+		 * cleanly; input_rel's list cell is left undisturbed, matching
+		 * the grouping_planner final-paths handoff.  The same FDW-contract
+		 * hazard described there applies to postgres_fdw's
+		 * add_foreign_ordered_paths via the GetForeignUpperPaths hook
+		 * below — pre-existing, not introduced here.
 		 */
 		if (sorted_path == input_path)
 			path_membership_forget(input_path);

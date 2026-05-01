@@ -3,10 +3,11 @@
  * pathcheck.h
  *	  Single-pathlist invariant tracker (assert-only).
  *
- * This is an internal core facility, active only when USE_ASSERT_CHECKING
- * is defined.  None of these symbols exist in a non-assert build, so it
- * is harmless that the header is installed alongside the rest of the
- * optimizer headers.
+ * Internal core facility, active only when USE_ASSERT_CHECKING is defined.
+ * The header is installed alongside other src/include/optimizer/ headers
+ * for build uniformity, but the symbols it declares only exist in assert
+ * builds and are not part of the supported FDW or custom-scan ABI.
+ * Out-of-core callers must not rely on these names.
  *
  * Contract:
  *	A given Path pointer may appear in at most one of
@@ -14,10 +15,11 @@
  *	a single planner invocation.  The membership hash is allocated in
  *	root->planner_cxt at the top of subquery_planner and torn down at
  *	the bottom; recursive subquery_planner invocations save and restore
- *	the file-static so each PlannerInfo sees its own hash.  Because
- *	every Path the planner can record lives in planner_cxt or a child
- *	thereof, hash entries cannot outlive the Paths they reference, and
- *	path_membership_forget may safely Assert(found).
+ *	the per-process current-hash pointer so each PlannerInfo sees its
+ *	own hash.  Because every Path the planner can record lives in
+ *	planner_cxt or a child thereof, hash entries cannot outlive the
+ *	Paths they reference, and path_membership_forget may safely
+ *	Assert(found).
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California

@@ -15,21 +15,29 @@
  *	and dissolved by their in-loop deletion branch, by pathcheck_forget_list()
  *	at wholesale-zap sites, by pathcheck_replace() at in-place "lfirst(lc) =
  *	newpath" sites, or by the owning RelOptInfo being torn down with its
- *	planner_cxt.  The single documented exception is grouping_planner's
- *	final-paths handoff: a path lifted from current_rel->pathlist into
- *	final_rel without a wrapper calls path_membership_forget() before
- *	the second add_path(); the underlying current_rel pathlist entry
- *	remains live for the FDW upper-paths hook and is reaped with
- *	planner_cxt.  Closing the underlying use-after-free hazard in that
- *	hook is out of scope here and tracked as a follow-up.
+ *	planner_cxt.  The documented exceptions are grouping_planner's
+ *	final-paths handoff and the matching handoff in create_ordered_paths:
+ *	a path lifted into a new RelOptInfo without a wrapper has its
+ *	membership record forgotten before the second add_path().  The
+ *	original list cell in current_rel (resp. input_rel) is left in place
+ *	so the FDW upper-paths hooks observe the same pathlist shape they
+ *	would have seen before this work.  The underlying Path may be
+ *	pfree'd by add_path()'s dominance prune in the destination
+ *	RelOptInfo, in which case the source list cell points at freed
+ *	memory; that is a pre-existing hazard in the FDW upper-paths hook
+ *	contract (postgres_fdw's add_foreign_final_paths and
+ *	add_foreign_ordered_paths walk the input rel's pathlist after the
+ *	loop), predating this patch.  Closing it requires changing
+ *	externally-visible contract semantics and is left as a separate
+ *	-hackers thread.
  *
  *	The membership hash is allocated in root->planner_cxt at the top of
  *	subquery_planner and torn down at the bottom; recursive
- *	subquery_planner invocations save and restore the file-static so each
- *	PlannerInfo sees its own hash.  Because every Path the planner can
- *	record lives in planner_cxt or a child thereof, hash entries cannot
- *	outlive the Paths they reference, and path_membership_forget may
- *	safely Assert(found).
+ *	subquery_planner invocations save and restore the per-process
+ *	current-hash pointer so each PlannerInfo sees its own hash.  Because
+ *	every Path the planner can record lives in planner_cxt or a child
+ *	thereof, hash entries cannot outlive the Paths they reference, and
+ *	path_membership_forget may safely Assert(found).
  *
  * Mechanism: a process-local pointer-keyed simplehash set tracks Path
  * pointers that are currently a member of some pathlist.  The set is
@@ -89,6 +97,12 @@ typedef struct PathMembershipEntry
 #define SH_ELEMENT_TYPE			PathMembershipEntry
 #define SH_KEY_TYPE				const Path *
 #define SH_KEY					path
+/*
+ * Pointer-keyed hash; murmurhash64 over the pointer value mixes well, and
+ * the explicit (uint32) cast acknowledges simplehash's 32-bit hash slot
+ * (truncating the high half is intentional, the low 32 bits already carry
+ * sufficient entropy).
+ */
 #define SH_HASH_KEY(tb, key)	((uint32) murmurhash64((uint64) (uintptr_t) (key)))
 #define SH_EQUAL(tb, a, b)		((a) == (b))
 #define SH_SCOPE				static inline
@@ -234,10 +248,21 @@ pathcheck_planner_fini(void)
  *	  into that sub-context) cannot outlive their referents.
  *
  * Caller pattern (mirrors the existing root->join_rel_hash save/restore):
+ *	MemoryContextSwitchTo(subcxt);
  *	saved = pathcheck_subscope_enter();
- *	... build paths in the sub-context, call add_path ...
+ *	... build paths in subcxt, call add_path ...
  *	pathcheck_subscope_leave(saved);
  *	MemoryContextDelete(subcxt);
+ *
+ * Caller invariant: CurrentMemoryContext at the point of the enter call
+ * must be the sub-context (typically a fresh AllocSet child of the
+ * planner's working context), not the planner_cxt itself.  Allocating
+ * the inner hash in the planner_cxt would defeat the lifetime fix and
+ * reintroduce the v2 bug.  Caller must also not invoke
+ * pathcheck_planner_init within the subscope: a nested subquery_planner
+ * would push a frame whose saved_membership pointed at the *subscope*
+ * hash, leaving the outer planner trackerless after the inner fini.
+ * gimme_tree does not call subquery_planner today, so this holds.
  */
 void *
 pathcheck_subscope_enter(void)
