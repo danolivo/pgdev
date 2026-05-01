@@ -5706,6 +5706,19 @@ create_ordered_paths(PlannerInfo *root,
 			sorted_path = apply_projection_to_path(root, ordered_rel,
 												   sorted_path, target);
 
+#ifdef USE_ASSERT_CHECKING
+		/*
+		 * If neither the sort branch nor the projection wrapper actually
+		 * produced a new Path node, sorted_path is still the loop's
+		 * input_path which is a member of input_rel->pathlist.  Forget that
+		 * membership so add_path(ordered_rel, ...) can record it cleanly;
+		 * input_rel's list cell is left undisturbed, matching the
+		 * grouping_planner final-paths handoff.
+		 */
+		if (sorted_path == input_path)
+			path_membership_forget(input_path);
+#endif
+
 		add_path(ordered_rel, sorted_path);
 	}
 
