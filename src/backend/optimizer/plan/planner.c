@@ -2445,8 +2445,10 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 		/*
 		 * If no wrapper was created, 'path' is still the original from
 		 * current_rel->pathlist; forget its membership record so that
-		 * add_path(final_rel, ...) can record it cleanly.  current_rel's
-		 * list cell is left undisturbed for the FDW hook.
+		 * add_path(final_rel, ...) can record it cleanly.  See the
+		 * handoff note at the top of this foreach loop for why we leave
+		 * current_rel's list cell in place and which postgres_fdw hooks
+		 * observe the resulting cell.
 		 */
 		if (path == orig_path)
 			path_membership_forget(orig_path);
@@ -5715,15 +5717,10 @@ create_ordered_paths(PlannerInfo *root,
 
 #ifdef USE_ASSERT_CHECKING
 		/*
-		 * If neither the sort branch nor the projection wrapper actually
-		 * produced a new Path node, sorted_path is still the loop's
-		 * input_path which is a member of input_rel->pathlist.  Forget
-		 * that membership so add_path(ordered_rel, ...) can record it
-		 * cleanly; input_rel's list cell is left undisturbed, matching
-		 * the grouping_planner final-paths handoff.  The same FDW-contract
-		 * hazard described there applies to postgres_fdw's
-		 * add_foreign_ordered_paths via the GetForeignUpperPaths hook
-		 * below — pre-existing, not introduced here.
+		 * Same handoff pattern as grouping_planner's final-paths foreach;
+		 * see that comment for the FDW-contract hazard summary.  Here it
+		 * is postgres_fdw's add_foreign_ordered_paths via the
+		 * GetForeignUpperPaths hook below.
 		 */
 		if (sorted_path == input_path)
 			path_membership_forget(input_path);
@@ -8263,7 +8260,7 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 	if (rel_is_partitioned && IS_SIMPLE_REL(rel))
 	{
 #ifdef USE_ASSERT_CHECKING
-		/* Drop tracker entries for the about-to-be-zapped paths; see pathcheck.c */
+		/* Drop the partitioned-rel pathlist tracker entries before zap. */
 		pathcheck_forget_list(rel->pathlist);
 #endif
 		rel->pathlist = NIL;
@@ -8288,7 +8285,7 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 
 		/* Can't use parallel query above this level. */
 #ifdef USE_ASSERT_CHECKING
-		/* Drop tracker entries for the about-to-be-zapped paths; see pathcheck.c */
+		/* Drop the partial-pathlist tracker entries after gather paths were folded in. */
 		pathcheck_forget_list(rel->partial_pathlist);
 #endif
 		rel->partial_pathlist = NIL;
@@ -8299,7 +8296,7 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 	if (rel_is_partitioned && IS_SIMPLE_REL(rel))
 	{
 #ifdef USE_ASSERT_CHECKING
-		/* Drop tracker entries for the about-to-be-zapped paths; see pathcheck.c */
+		/* Drop the partitioned-rel partial-pathlist tracker entries before zap. */
 		pathcheck_forget_list(rel->partial_pathlist);
 #endif
 		rel->partial_pathlist = NIL;

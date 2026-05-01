@@ -9,49 +9,39 @@
  * Active only under USE_ASSERT_CHECKING.  FDW and custom-scan authors
  * require no changes.
  *
- * Contract:
- *	A given Path pointer is a member of at most one RelOptInfo's pathlist
- *	at a time.  Membership is established by add_path() / add_partial_path()
- *	and dissolved by their in-loop deletion branch, by pathcheck_forget_list()
- *	at wholesale-zap sites, by pathcheck_replace() at in-place "lfirst(lc) =
- *	newpath" sites, or by the owning RelOptInfo being torn down with its
- *	planner_cxt.  The documented exceptions are grouping_planner's
- *	final-paths handoff and the matching handoff in create_ordered_paths:
- *	a path lifted into a new RelOptInfo without a wrapper has its
- *	membership record forgotten before the second add_path().  The
- *	original list cell in current_rel (resp. input_rel) is left in place
- *	so the FDW upper-paths hooks observe the same pathlist shape they
- *	would have seen before this work.  The underlying Path may be
- *	pfree'd by add_path()'s dominance prune in the destination
- *	RelOptInfo, in which case the source list cell points at freed
- *	memory; that is a pre-existing hazard in the FDW upper-paths hook
- *	contract (postgres_fdw's add_foreign_final_paths and
- *	add_foreign_ordered_paths walk the input rel's pathlist after the
- *	loop), predating this patch.  Closing it requires changing
- *	externally-visible contract semantics and is left as a separate
- *	-hackers thread.
+ * The user-facing contract lives in pathcheck.h.  Here we cover the
+ * implementation: handoff exceptions, the per-backend hash stack, the
+ * MemoryContextCallback unwind, and the simplehash mechanics.
  *
- *	The membership hash is allocated in root->planner_cxt at the top of
- *	subquery_planner and torn down at the bottom; recursive
- *	subquery_planner invocations save and restore the per-process
- *	current-hash pointer so each PlannerInfo sees its own hash.  Because
- *	every Path the planner can record lives in planner_cxt or a child
- *	thereof, hash entries cannot outlive the Paths they reference, and
- *	path_membership_forget may safely Assert(found).
+ * Handoff exceptions to the at-most-one-pathlist rule.  The sole
+ * documented exceptions are grouping_planner's final-paths handoff and
+ * the matching handoff in create_ordered_paths: a path lifted into a
+ * new RelOptInfo without a wrapper has its membership record forgotten
+ * before the second add_path().  The original list cell in current_rel
+ * (resp. input_rel) is left in place so the FDW upper-paths hooks
+ * observe the same pathlist shape they would have seen before this
+ * work.  The underlying Path may be pfree'd by add_path()'s dominance
+ * prune in the destination RelOptInfo, in which case the source list
+ * cell points at freed memory; that is a pre-existing hazard in the
+ * FDW upper-paths hook contract (postgres_fdw's add_foreign_final_paths
+ * and add_foreign_ordered_paths walk the input rel's pathlist after the
+ * loop), predating this patch.  Closing it requires changing
+ * externally-visible contract semantics and is left as a separate
+ * -hackers thread.
  *
- * Mechanism: a process-local pointer-keyed simplehash set tracks Path
+ * Mechanism: a per-backend pointer-keyed simplehash set tracks Path
  * pointers that are currently a member of some pathlist.  The set is
  * populated at the accept branch of add_path / add_partial_path and
  * depopulated at the in-loop removal branch of the same routines, and
  * also when callers zap a pathlist wholesale via a list assignment to
- * NIL — see pathcheck_forget_list().  Any attempted second insertion
+ * NIL -- see pathcheck_forget_list().  Any attempted second insertion
  * of a pointer already in the set fires elog(ERROR) at the offending
  * add site.
  *
  * Lifetime: pathcheck_planner_init() is called from subquery_planner
  * immediately after root->planner_cxt is set; it allocates a fresh
- * hash in planner_cxt, pushes a frame onto a file-static stack that
- * remembers the previous value of the current-hash static, and
+ * hash in planner_cxt, pushes a frame onto a per-backend stack that
+ * remembers the previous value of the current-hash pointer, and
  * registers a MemoryContextCallback that pops the frame should
  * planner_cxt be torn down by an ereport(ERROR) before
  * pathcheck_planner_fini() runs.  The fini routine pops the frame
@@ -247,22 +237,23 @@ pathcheck_planner_fini(void)
  *	  fresh hash dies with the sub-context, so its keys (which point
  *	  into that sub-context) cannot outlive their referents.
  *
+ * Caller invariants:
+ *	(1) CurrentMemoryContext at entry must be the sub-context, not
+ *	    planner_cxt itself; the inner hash is allocated where
+ *	    CurrentMemoryContext points and must die with the Paths it
+ *	    tracks.
+ *	(2) No nested subquery_planner may run within the subscope; its
+ *	    pathcheck_planner_init would push a frame whose saved pointer
+ *	    referred to the subscope hash, leaving the outer planner
+ *	    trackerless after the inner fini.
+ *	gimme_tree (the only caller today) satisfies both.
+ *
  * Caller pattern (mirrors the existing root->join_rel_hash save/restore):
  *	MemoryContextSwitchTo(subcxt);
  *	saved = pathcheck_subscope_enter();
  *	... build paths in subcxt, call add_path ...
  *	pathcheck_subscope_leave(saved);
  *	MemoryContextDelete(subcxt);
- *
- * Caller invariant: CurrentMemoryContext at the point of the enter call
- * must be the sub-context (typically a fresh AllocSet child of the
- * planner's working context), not the planner_cxt itself.  Allocating
- * the inner hash in the planner_cxt would defeat the lifetime fix and
- * reintroduce the v2 bug.  Caller must also not invoke
- * pathcheck_planner_init within the subscope: a nested subquery_planner
- * would push a frame whose saved_membership pointed at the *subscope*
- * hash, leaving the outer planner trackerless after the inner fini.
- * gimme_tree does not call subquery_planner today, so this holds.
  */
 void *
 pathcheck_subscope_enter(void)

@@ -15,11 +15,13 @@
  *	a single planner invocation.  The membership hash is allocated in
  *	root->planner_cxt at the top of subquery_planner and torn down at
  *	the bottom; recursive subquery_planner invocations save and restore
- *	the per-process current-hash pointer so each PlannerInfo sees its
+ *	the per-backend current-hash pointer so each PlannerInfo sees its
  *	own hash.  Because every Path the planner can record lives in
  *	planner_cxt or a child thereof, hash entries cannot outlive the
  *	Paths they reference, and path_membership_forget may safely
  *	Assert(found).
+ *
+ *	Two narrow handoff exceptions are documented in pathcheck.c.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California

@@ -83,7 +83,7 @@ relation.  For example, the WHERE clause "tab1.col1 = tab2.col1" generates
 entries in both tab1 and tab2's joininfo lists.
 
 Under USE_ASSERT_CHECKING, src/backend/optimizer/util/pathcheck.c maintains
-an in-process invariant tracker that asserts a given Path pointer is a
+a per-backend invariant tracker that asserts a given Path pointer is a
 member of at most one RelOptInfo's pathlist at a time.  The tracker hooks
 into add_path() / add_partial_path() and into the small number of sites
 that wholesale-zap a pathlist or do an in-place "lfirst(lc) = newpath"
