@@ -31,7 +31,7 @@
 #include "utils/memutils.h"
 #include "utils/selfuncs.h"
 
-#include "pathcheck.h"
+#include "optimizer/pathcheck.h"
 
 typedef enum
 {
@@ -682,8 +682,6 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 		/* Accept the new path: insert it at proper place in pathlist */
 		parent_rel->pathlist =
 			list_insert_nth(parent_rel->pathlist, insert_at, new_path);
-
-		Assert(list_nth(parent_rel->pathlist, insert_at) == new_path);
 	}
 	else
 	{
@@ -934,8 +932,6 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 		/* Accept the new path: insert it at proper place */
 		parent_rel->partial_pathlist =
 			list_insert_nth(parent_rel->partial_pathlist, insert_at, new_path);
-
-		Assert(list_nth(parent_rel->partial_pathlist, insert_at) == new_path);
 	}
 	else
 	{

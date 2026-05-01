@@ -3,22 +3,26 @@
  * pathcheck.h
  *	  Single-pathlist invariant tracker (assert-only).
  *
- * This header is private to src/backend/optimizer/util/.  It deliberately
- * lives outside src/include/ so that it is not installed and not visible
- * to extension authors.  The whole facility compiles to nothing when
- * USE_ASSERT_CHECKING is not defined.
+ * This is an internal core facility, active only when USE_ASSERT_CHECKING
+ * is defined.  None of these symbols exist in a non-assert build, so it
+ * is harmless that the header is installed alongside the rest of the
+ * optimizer headers.
  *
  * Contract:
  *	A given Path pointer may appear in at most one of
  *	{RelOptInfo.pathlist, RelOptInfo.partial_pathlist} at any moment of
- *	the planner invocation.  After it is removed (the in-loop deletion
- *	in add_path / add_partial_path, or a wholesale pathcheck_forget_list
- *	zap) it may be re-added.
+ *	a single planner invocation.  The membership hash is allocated in
+ *	root->planner_cxt at the top of subquery_planner and torn down at
+ *	the bottom; recursive subquery_planner invocations save and restore
+ *	the file-static so each PlannerInfo sees its own hash.  Because
+ *	every Path the planner can record lives in planner_cxt or a child
+ *	thereof, hash entries cannot outlive the Paths they reference, and
+ *	path_membership_forget may safely Assert(found).
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * src/backend/optimizer/util/pathcheck.h
+ * src/include/optimizer/pathcheck.h
  *
  *-------------------------------------------------------------------------
  */
@@ -28,6 +32,9 @@
 #ifdef USE_ASSERT_CHECKING
 
 #include "nodes/pathnodes.h"
+
+extern void pathcheck_planner_init(PlannerInfo *root);
+extern void pathcheck_planner_fini(void);
 
 extern void path_membership_record(const Path *path, const RelOptInfo *rel);
 extern void path_membership_forget(const Path *path);

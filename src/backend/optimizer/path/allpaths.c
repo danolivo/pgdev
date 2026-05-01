@@ -50,8 +50,8 @@
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
 
-/* Private header local to optimizer/util/, only used here under USE_ASSERT_CHECKING */
-#include "../util/pathcheck.h"
+/* Symbols only exist under USE_ASSERT_CHECKING */
+#include "optimizer/pathcheck.h"
 
 
 /* Bitmask flags for pushdown_safety_info.unsafeFlags */

@@ -64,8 +64,8 @@
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
 
-/* Private header local to optimizer/util/, only used here under USE_ASSERT_CHECKING */
-#include "../util/pathcheck.h"
+/* Symbols only exist under USE_ASSERT_CHECKING */
+#include "optimizer/pathcheck.h"
 
 /* GUC parameters */
 double		cursor_tuple_fraction = DEFAULT_CURSOR_TUPLE_FRACTION;
@@ -804,6 +804,9 @@ subquery_planner(PlannerGlobal *glob, Query *parse, char *plan_name,
 	root->plan_params = NIL;
 	root->outer_params = NULL;
 	root->planner_cxt = CurrentMemoryContext;
+#ifdef USE_ASSERT_CHECKING
+	pathcheck_planner_init(root);
+#endif
 	root->init_plans = NIL;
 	root->cte_plan_ids = NIL;
 	root->multiexpr_params = NIL;
@@ -1396,6 +1399,10 @@ subquery_planner(PlannerGlobal *glob, Query *parse, char *plan_name,
 	 * the decision, though it's unlikely that will change anything.)
 	 */
 	set_cheapest(final_rel);
+
+#ifdef USE_ASSERT_CHECKING
+	pathcheck_planner_fini();
+#endif
 
 	return root;
 }

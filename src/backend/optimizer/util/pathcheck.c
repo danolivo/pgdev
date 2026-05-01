@@ -5,31 +5,44 @@
  *	  pathlists.
  *
  * Asserts that any Path node is referenced by at most one pathlist
- * (RelOptInfo.pathlist, .partial_pathlist, or equivalent) at a time.
- * The membership hash is allocated in the planner's working memory
- * context on first use and torn down by a MemoryContextCallback when
- * that context resets, so entries never outlive the Paths they
- * reference.  Active only under USE_ASSERT_CHECKING.  Re-presenting an
- * already-recorded Path to add_path() now trips an assertion; this is
- * intentional and catches a real use-after-free hazard.  FDW and
- * custom-scan authors require no changes.
+ * (RelOptInfo.pathlist or RelOptInfo.partial_pathlist) at a time.
+ * Active only under USE_ASSERT_CHECKING.  FDW and custom-scan authors
+ * require no changes.
+ *
+ * Contract:
+ *	A given Path pointer may appear in at most one of
+ *	{RelOptInfo.pathlist, RelOptInfo.partial_pathlist} at any moment of
+ *	a single planner invocation.  The membership hash is allocated in
+ *	root->planner_cxt at the top of subquery_planner and torn down at
+ *	the bottom; recursive subquery_planner invocations save and restore
+ *	the file-static so each PlannerInfo sees its own hash.  Because
+ *	every Path the planner can record lives in planner_cxt or a child
+ *	thereof, hash entries cannot outlive the Paths they reference, and
+ *	path_membership_forget may safely Assert(found).
  *
  * Mechanism: a process-local pointer-keyed simplehash set tracks Path
  * pointers that are currently a member of some pathlist.  The set is
  * populated at the accept branch of add_path / add_partial_path and
  * depopulated at the in-loop removal branch of the same routines, and
- * also when planner.c (and a small number of other call sites) zap a
- * pathlist wholesale via a list assignment to NIL — see
- * pathcheck_forget_list().  Any attempted second insertion of a pointer
- * already in the set fires elog(ERROR) at the offending add site.
+ * also when callers zap a pathlist wholesale via a list assignment to
+ * NIL — see pathcheck_forget_list().  Any attempted second insertion
+ * of a pointer already in the set fires elog(ERROR) at the offending
+ * add site.
  *
- * Lifetime: the hash is allocated lazily in CurrentMemoryContext at
- * the first record() call (which is during the planner's working
- * context).  A MemoryContextCallback registered on that context NULLs
- * the static pointer when the context resets, after which the next
- * record() will re-init in whatever the new CurrentMemoryContext is.
- * Membership entries therefore die with the Paths they describe and
- * cannot leak across statements.
+ * Lifetime: pathcheck_planner_init() is called from subquery_planner
+ * immediately after root->planner_cxt is set; it allocates a fresh
+ * hash in planner_cxt, pushes a frame onto a file-static stack that
+ * remembers the previous value of the current-hash static, and
+ * registers a MemoryContextCallback that pops the frame should
+ * planner_cxt be torn down by an ereport(ERROR) before
+ * pathcheck_planner_fini() runs.  The fini routine pops the frame
+ * normally and lets planner_cxt's teardown reap the hash storage.
+ *
+ * The frame storage lives in planner_cxt itself, so on an error
+ * unwind through that context the callback fires (LIFO at
+ * reset/delete) and pops the stack before the storage is freed; the
+ * outer PlannerInfo's hash, allocated in an enclosing context, is
+ * untouched.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -47,9 +60,8 @@
 #include "nodes/nodes.h"
 #include "nodes/pathnodes.h"
 #include "utils/memutils.h"
-#include "utils/palloc.h"
 
-#include "pathcheck.h"
+#include "optimizer/pathcheck.h"
 
 
 /*
@@ -66,7 +78,7 @@ typedef struct PathMembershipEntry
 #define SH_ELEMENT_TYPE			PathMembershipEntry
 #define SH_KEY_TYPE				const Path *
 #define SH_KEY					path
-#define SH_HASH_KEY(tb, key)	murmurhash64((uint64) (uintptr_t) (key))
+#define SH_HASH_KEY(tb, key)	((uint32) murmurhash64((uint64) (uintptr_t) (key)))
 #define SH_EQUAL(tb, a, b)		((a) == (b))
 #define SH_SCOPE				static inline
 #define SH_DECLARE
@@ -74,44 +86,141 @@ typedef struct PathMembershipEntry
 #include "lib/simplehash.h"
 
 
+/*
+ * Per-subquery_planner save frame.  Linked into the file-static stack
+ * pathcheck_top.  Frames are allocated in root->planner_cxt; their
+ * lifetime is at most the lifetime of that context, so on an error
+ * teardown they are reaped along with the hash they refer to.  The
+ * registered callback is responsible for popping the frame from the
+ * stack before the storage is freed.
+ */
+typedef struct PathCheckFrame
+{
+	pathmembership_hash *saved_membership;	/* enclosing PlannerInfo's hash, or NULL */
+	struct PathCheckFrame *prev;			/* previous top, or NULL */
+	bool		installed;					/* true while we own path_membership */
+	MemoryContextCallback cb;
+} PathCheckFrame;
+
+
 static pathmembership_hash *path_membership = NULL;
-static MemoryContextCallback path_membership_reset_cb;
+static PathCheckFrame *pathcheck_top = NULL;
 
 
-static void path_membership_reset(void *arg);
+static void path_membership_unwind(void *arg);
 
 
 /*
- * path_membership_reset
- *	  MemoryContextCallback fired when the planner working context the
- *	  hash lives in is reset or deleted.  All hash storage is in that
- *	  context, so the simplehash and its bucket array are about to be
- *	  freed wholesale; we just NULL the static pointer so the next
- *	  record() re-initialises.
+ * pop_frame
+ *	  Restore path_membership and pathcheck_top to the values they had
+ *	  before 'frame' was pushed.  Marks the frame as no longer
+ *	  installed; subsequent calls (e.g. the reset callback) are no-ops.
+ *	  Caller must ensure 'frame' is the current top of the stack.
+ */
+static inline void
+pop_frame(PathCheckFrame *frame)
+{
+	Assert(frame == pathcheck_top);
+	Assert(frame->installed);
+	path_membership = frame->saved_membership;
+	pathcheck_top = frame->prev;
+	frame->installed = false;
+}
+
+/*
+ * path_membership_unwind
+ *	  MemoryContextCallback fired when root->planner_cxt is reset or
+ *	  deleted (typically because an ereport(ERROR) is unwinding through
+ *	  the planner).  If our frame is still installed, pop it; the hash
+ *	  storage and the frame itself are in planner_cxt and about to be
+ *	  reaped by the same teardown.
  *
- * Memory-context callbacks fire in LIFO order at reset/delete time.
- * Ours only NULLs a static, so ordering versus other callbacks
- * registered on the same context is irrelevant.
+ * Memory-context callbacks fire in LIFO order at reset/delete, which
+ * matches the LIFO stacking of recursive subquery_planner invocations.
+ * Each frame restores its own saved pointer; the outermost frame
+ * restores NULL.
  */
 static void
-path_membership_reset(void *arg)
+path_membership_unwind(void *arg)
 {
-	path_membership = NULL;
+	PathCheckFrame *frame = (PathCheckFrame *) arg;
+
+	if (frame->installed)
+		pop_frame(frame);
+}
+
+/*
+ * pathcheck_planner_init
+ *	  Save the current path_membership static, allocate a fresh hash in
+ *	  root->planner_cxt, and install it.  Register a MemoryContextCallback
+ *	  on planner_cxt so the static is correctly restored even if an
+ *	  ereport(ERROR) tears the context down before pathcheck_planner_fini
+ *	  runs.
+ *
+ * Must be called from subquery_planner immediately after
+ * root->planner_cxt is assigned, and matched by exactly one
+ * pathcheck_planner_fini at the bottom.
+ */
+void
+pathcheck_planner_init(PlannerInfo *root)
+{
+	PathCheckFrame *frame;
+	MemoryContext oldcxt;
+
+	Assert(root != NULL);
+	Assert(root->planner_cxt != NULL);
+
+	oldcxt = MemoryContextSwitchTo(root->planner_cxt);
+
+	frame = (PathCheckFrame *) palloc0(sizeof(PathCheckFrame));
+	frame->saved_membership = path_membership;
+	frame->prev = pathcheck_top;
+	frame->installed = true;
+	frame->cb.func = path_membership_unwind;
+	frame->cb.arg = frame;
+	MemoryContextRegisterResetCallback(root->planner_cxt, &frame->cb);
+
+	path_membership = pathmembership_create(root->planner_cxt, 256, NULL);
+	pathcheck_top = frame;
+
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * pathcheck_planner_fini
+ *	  Pop the topmost save frame, restoring path_membership to its
+ *	  enclosing-PlannerInfo value.  The hash storage is in planner_cxt
+ *	  and will be reaped with it; we don't bother destroying it
+ *	  explicitly.  The reset callback we registered remains attached
+ *	  but is now a no-op because pop_frame cleared its 'installed'
+ *	  flag.
+ *
+ * Must be called at every normal exit from subquery_planner, paired
+ * with the pathcheck_planner_init at entry.  The error-exit path is
+ * covered by the callback, not this routine.
+ */
+void
+pathcheck_planner_fini(void)
+{
+	PathCheckFrame *frame = pathcheck_top;
+
+	/*
+	 * If there is no top frame, init/fini are mispaired.  Either the
+	 * caller forgot to call init, or fini is being called twice.
+	 */
+	Assert(frame != NULL);
+
+	pop_frame(frame);
 }
 
 /*
  * path_membership_record
- *	  Record that 'path' is now a member of some pathlist.  Fire an error
- *	  if the path is already recorded.
+ *	  Record that 'path' is now a member of some pathlist.  Fire an
+ *	  error if the path is already recorded.
  *
  * Called from add_path() and add_partial_path() at the accept branch,
  * immediately before list_insert_nth().  'rel' is the parent_rel and
  * is used only for the diagnostic.
- *
- * On first call within a planner invocation, allocates the hash in
- * CurrentMemoryContext (which is the planner's working context at the
- * first add_path / add_partial_path) and registers a reset callback so
- * the static pointer is cleared when that context goes away.
  */
 void
 path_membership_record(const Path *path, const RelOptInfo *rel)
@@ -119,17 +228,6 @@ path_membership_record(const Path *path, const RelOptInfo *rel)
 	bool		found;
 
 	Assert(path != NULL);
-
-	if (path_membership == NULL)
-	{
-		path_membership = pathmembership_create(CurrentMemoryContext, 256, NULL);
-
-		path_membership_reset_cb.func = path_membership_reset;
-		path_membership_reset_cb.arg = NULL;
-		MemoryContextRegisterResetCallback(CurrentMemoryContext,
-										   &path_membership_reset_cb);
-	}
-
 	Assert(path_membership != NULL);
 
 	(void) pathmembership_insert(path_membership, path, &found);
@@ -137,11 +235,6 @@ path_membership_record(const Path *path, const RelOptInfo *rel)
 		elog(ERROR,
 			 "path %p (nodeTag %d) already present in a pathlist (rel %u)",
 			 path, (int) nodeTag(path), rel ? (unsigned) rel->relid : 0);
-
-	/*
-	 * simplehash's SH_KEY mapping has already populated entry->path from the
-	 * argument; nothing else to do.
-	 */
 }
 
 /*
@@ -152,11 +245,12 @@ path_membership_record(const Path *path, const RelOptInfo *rel)
  *	  pfree may not run, but the list-removal always does, and we track
  *	  list-membership rather than allocation lifetime).
  *
- * The path must have been recorded earlier; failing to find it is an
- * invariant violation.  We use Assert rather than elog(ERROR) here
- * because this routine is called from inside foreach_delete_current
- * loops where throwing leaves the iterator state mid-walk; an Assert
- * trips a stack trace at the offending frame instead.
+ * Under v3's planner-context-bound hash, the path must have been
+ * recorded earlier; aliasing is impossible because all hash entries
+ * die with planner_cxt.  Failure to find is an invariant violation,
+ * caught by Assert.  We use Assert rather than elog(ERROR) because
+ * this routine is called from inside foreach_delete_current loops
+ * where throwing leaves the iterator state mid-walk.
  */
 void
 path_membership_forget(const Path *path)
@@ -176,10 +270,9 @@ path_membership_forget(const Path *path)
  *	  Forget every Path on a list.  Used at the small number of sites
  *	  that wholesale-zap a pathlist via "rel->pathlist = NIL" instead
  *	  of going through add_path()'s in-loop removal branch.  Without
- *	  this, the zapped paths' membership records would sit stale in the
- *	  hash and a subsequent add_path() of any of those pointers — even
- *	  legitimate, freshly-allocated ones that happen to alias under
- *	  CLOBBER_FREED_MEMORY recycling — would trip a spurious assert.
+ *	  this, the zapped paths' membership records would sit stale in
+ *	  the hash and a subsequent add_path() of any of those pointers
+ *	  would trip a spurious error.
  *
  * Caller is responsible for invoking this *before* assigning the list
  * to NIL.

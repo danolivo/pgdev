@@ -24,8 +24,8 @@
 #include "partitioning/partbounds.h"
 #include "utils/memutils.h"
 
-/* Private header local to optimizer/util/, only used here under USE_ASSERT_CHECKING */
-#include "../util/pathcheck.h"
+/* Symbols only exist under USE_ASSERT_CHECKING */
+#include "optimizer/pathcheck.h"
 
 
 static void make_rels_by_clause_joins(PlannerInfo *root,
