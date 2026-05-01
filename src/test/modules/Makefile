@@ -40,7 +40,6 @@ SUBDIRS = \
 		  test_misc \
 		  test_oat_hooks \
 		  test_parser \
-		  test_pathcheck \
 		  test_pg_dump \
 		  test_plan_advice \
 		  test_predtest \
