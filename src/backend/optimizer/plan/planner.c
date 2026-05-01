@@ -64,6 +64,9 @@
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
 
+/* Private header local to optimizer/util/, only used here under USE_ASSERT_CHECKING */
+#include "../util/pathcheck.h"
+
 /* GUC parameters */
 double		cursor_tuple_fraction = DEFAULT_CURSOR_TUPLE_FRACTION;
 int			debug_parallel_query = DEBUG_PARALLEL_OFF;
@@ -8195,17 +8198,14 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 	 * generate_useful_gather_paths to add path(s) to the main list, and
 	 * finally zap the partial pathlist.
 	 */
-	/*
-	 * Note: this wholesale assignment orphans whatever paths were in
-	 * pathlist with respect to the assert-only single-pathlist tracker
-	 * in pathcheck.c.  That is acceptable: orphaned entries cannot
-	 * collide with anything add_path() sees afterward in current code,
-	 * and they are reaped at transaction end.  If a future change ever
-	 * re-presents one of these paths to add_path(), the assertion will
-	 * fire and we will know to instrument this site.
-	 */
 	if (rel_is_partitioned && IS_SIMPLE_REL(rel))
+	{
+#ifdef USE_ASSERT_CHECKING
+		/* Drop tracker entries for the about-to-be-zapped paths; see pathcheck.c */
+		pathcheck_forget_list(rel->pathlist);
+#endif
 		rel->pathlist = NIL;
+	}
 
 	/*
 	 * If the scan/join target is not parallel-safe, partial paths cannot
@@ -8225,16 +8225,23 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 		generate_useful_gather_paths(root, rel, false);
 
 		/* Can't use parallel query above this level. */
+#ifdef USE_ASSERT_CHECKING
+		/* Drop tracker entries for the about-to-be-zapped paths; see pathcheck.c */
+		pathcheck_forget_list(rel->partial_pathlist);
+#endif
 		rel->partial_pathlist = NIL;
 		rel->consider_parallel = false;
 	}
 
-	/*
-	 * Finish dropping old paths for a partitioned rel, per comment above.
-	 * Same pathcheck.c caveat applies as for the pathlist zap earlier.
-	 */
+	/* Finish dropping old paths for a partitioned rel, per comment above. */
 	if (rel_is_partitioned && IS_SIMPLE_REL(rel))
+	{
+#ifdef USE_ASSERT_CHECKING
+		/* Drop tracker entries for the about-to-be-zapped paths; see pathcheck.c */
+		pathcheck_forget_list(rel->partial_pathlist);
+#endif
 		rel->partial_pathlist = NIL;
+	}
 
 	/* Extract SRF-free scan/join target. */
 	scanjoin_target = linitial_node(PathTarget, scanjoin_targets);

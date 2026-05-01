@@ -39,6 +39,9 @@
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
+/* Private header local to optimizer/util/, only used here under USE_ASSERT_CHECKING */
+#include "../util/pathcheck.h"
+
 
 typedef struct convert_testexpr_context
 {
@@ -2462,6 +2465,10 @@ SS_charge_for_initplans(PlannerInfo *root, RelOptInfo *final_rel)
 	 */
 	if (unsafe_initplans)
 	{
+#ifdef USE_ASSERT_CHECKING
+		/* Drop tracker entries for the about-to-be-zapped paths; see pathcheck.c */
+		pathcheck_forget_list(final_rel->partial_pathlist);
+#endif
 		final_rel->partial_pathlist = NIL;
 		final_rel->consider_parallel = false;
 	}

@@ -24,6 +24,9 @@
 #include "partitioning/partbounds.h"
 #include "utils/memutils.h"
 
+/* Private header local to optimizer/util/, only used here under USE_ASSERT_CHECKING */
+#include "../util/pathcheck.h"
+
 
 static void make_rels_by_clause_joins(PlannerInfo *root,
 									  RelOptInfo *old_rel,
@@ -1526,6 +1529,11 @@ mark_dummy_rel(RelOptInfo *rel)
 	rel->rows = 0;
 
 	/* Evict any previously chosen paths */
+#ifdef USE_ASSERT_CHECKING
+	/* Drop tracker entries for the about-to-be-zapped paths; see pathcheck.c */
+	pathcheck_forget_list(rel->pathlist);
+	pathcheck_forget_list(rel->partial_pathlist);
+#endif
 	rel->pathlist = NIL;
 	rel->partial_pathlist = NIL;
 

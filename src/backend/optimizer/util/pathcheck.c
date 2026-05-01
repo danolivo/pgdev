@@ -4,36 +4,32 @@
  *	  Assert-only tracker that catches the same Path being added to two
  *	  pathlists.
  *
- * The planner's add_path() and add_partial_path() routines pfree paths
- * they reject (with a narrow exception for IndexPath, see the comment
- * in pathnode.c).  As a consequence, a Path that ends up referenced
- * from two different pathlists is a use-after-free in waiting: whichever
- * list rejects it first will pfree the storage out from under the other.
- * The contract is implicit in the code today; this file makes it
- * mechanically enforced under USE_ASSERT_CHECKING.
+ * Asserts that any Path node is referenced by at most one pathlist
+ * (RelOptInfo.pathlist, .partial_pathlist, or equivalent) at a time.
+ * The membership hash is allocated in the planner's working memory
+ * context on first use and torn down by a MemoryContextCallback when
+ * that context resets, so entries never outlive the Paths they
+ * reference.  Active only under USE_ASSERT_CHECKING.  Re-presenting an
+ * already-recorded Path to add_path() now trips an assertion; this is
+ * intentional and catches a real use-after-free hazard.  FDW and
+ * custom-scan authors require no changes.
  *
- * Mechanism: a process-local pointer-keyed simplehash set tracks the
- * Path pointers that are currently a member of some pathlist.  The set
- * is populated at the accept branch of add_path / add_partial_path and
- * depopulated at the in-loop removal branch of the same routines.  Any
- * attempted second insertion of a pointer already in the set fires an
- * elog(ERROR) at the offending add site.
+ * Mechanism: a process-local pointer-keyed simplehash set tracks Path
+ * pointers that are currently a member of some pathlist.  The set is
+ * populated at the accept branch of add_path / add_partial_path and
+ * depopulated at the in-loop removal branch of the same routines, and
+ * also when planner.c (and a small number of other call sites) zap a
+ * pathlist wholesale via a list assignment to NIL — see
+ * pathcheck_forget_list().  Any attempted second insertion of a pointer
+ * already in the set fires elog(ERROR) at the offending add site.
  *
- * The hash is allocated lazily in TopMemoryContext so that it survives
- * across statements within a session and we do not pay reallocation cost
- * on every plan.  An XactCallback clears the hash on transaction end,
- * with a WARNING on commit if it is non-empty (which would indicate
- * either an internal accounting bug or the known multi-planner-pass
- * staleness window — see README at the bottom of this file).
- *
- * The wholesale assignments rel->pathlist = NIL and
- * rel->partial_pathlist = NIL in grouping_planner (see comment in
- * planner.c near those sites) are deliberately not instrumented.  The
- * orphaned hash entries they leave behind cannot collide with any path
- * presented to add_path() afterward in current code, and they are
- * reaped at transaction end.  If a future change ever re-presents an
- * orphaned path to add_path(), the assertion will fire and we'll know
- * to instrument the zap.
+ * Lifetime: the hash is allocated lazily in CurrentMemoryContext at
+ * the first record() call (which is during the planner's working
+ * context).  A MemoryContextCallback registered on that context NULLs
+ * the static pointer when the context resets, after which the next
+ * record() will re-init in whatever the new CurrentMemoryContext is.
+ * Membership entries therefore die with the Paths they describe and
+ * cannot leak across statements.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -47,11 +43,11 @@
 
 #ifdef USE_ASSERT_CHECKING
 
-#include "access/xact.h"
 #include "common/hashfn.h"
 #include "nodes/nodes.h"
 #include "nodes/pathnodes.h"
 #include "utils/memutils.h"
+#include "utils/palloc.h"
 
 #include "pathcheck.h"
 
@@ -70,8 +66,7 @@ typedef struct PathMembershipEntry
 #define SH_ELEMENT_TYPE			PathMembershipEntry
 #define SH_KEY_TYPE				const Path *
 #define SH_KEY					path
-#define SH_HASH_KEY(tb, key)	\
-	hash_bytes((const unsigned char *) &(key), sizeof(const Path *))
+#define SH_HASH_KEY(tb, key)	murmurhash64((uint64) (uintptr_t) (key))
 #define SH_EQUAL(tb, a, b)		((a) == (b))
 #define SH_SCOPE				static inline
 #define SH_DECLARE
@@ -80,41 +75,28 @@ typedef struct PathMembershipEntry
 
 
 static pathmembership_hash *path_membership = NULL;
-static bool xact_callback_registered = false;
+static MemoryContextCallback path_membership_reset_cb;
 
 
-static void path_membership_xact_callback(XactEvent event, void *arg);
-static void path_membership_lazy_init(void);
+static void path_membership_reset(void *arg);
 
 
 /*
- * path_membership_lazy_init
- *	  Create the hash on first use, and register a one-shot xact callback
- *	  that resets it on transaction end.
+ * path_membership_reset
+ *	  MemoryContextCallback fired when the planner working context the
+ *	  hash lives in is reset or deleted.  All hash storage is in that
+ *	  context, so the simplehash and its bucket array are about to be
+ *	  freed wholesale; we just NULL the static pointer so the next
+ *	  record() re-initialises.
+ *
+ * Memory-context callbacks fire in LIFO order at reset/delete time.
+ * Ours only NULLs a static, so ordering versus other callbacks
+ * registered on the same context is irrelevant.
  */
 static void
-path_membership_lazy_init(void)
+path_membership_reset(void *arg)
 {
-	MemoryContext oldcxt;
-
-	if (path_membership != NULL)
-		return;
-
-	/*
-	 * The hash itself lives in TopMemoryContext so that it survives across
-	 * statements within a session.  Initial size of 256 buckets is enough
-	 * to avoid early growth in typical plans; simplehash will grow as
-	 * needed.
-	 */
-	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
-	path_membership = pathmembership_create(TopMemoryContext, 256, NULL);
-	MemoryContextSwitchTo(oldcxt);
-
-	if (!xact_callback_registered)
-	{
-		RegisterXactCallback(path_membership_xact_callback, NULL);
-		xact_callback_registered = true;
-	}
+	path_membership = NULL;
 }
 
 /*
@@ -125,23 +107,41 @@ path_membership_lazy_init(void)
  * Called from add_path() and add_partial_path() at the accept branch,
  * immediately before list_insert_nth().  'rel' is the parent_rel and
  * is used only for the diagnostic.
+ *
+ * On first call within a planner invocation, allocates the hash in
+ * CurrentMemoryContext (which is the planner's working context at the
+ * first add_path / add_partial_path) and registers a reset callback so
+ * the static pointer is cleared when that context goes away.
  */
 void
 path_membership_record(const Path *path, const RelOptInfo *rel)
 {
-	PathMembershipEntry *entry;
 	bool		found;
 
-	path_membership_lazy_init();
+	Assert(path != NULL);
 
-	entry = pathmembership_insert(path_membership, path, &found);
+	if (path_membership == NULL)
+	{
+		path_membership = pathmembership_create(CurrentMemoryContext, 256, NULL);
+
+		path_membership_reset_cb.func = path_membership_reset;
+		path_membership_reset_cb.arg = NULL;
+		MemoryContextRegisterResetCallback(CurrentMemoryContext,
+										   &path_membership_reset_cb);
+	}
+
+	Assert(path_membership != NULL);
+
+	(void) pathmembership_insert(path_membership, path, &found);
 	if (found)
 		elog(ERROR,
 			 "path %p (nodeTag %d) already present in a pathlist (rel %u)",
 			 path, (int) nodeTag(path), rel ? (unsigned) rel->relid : 0);
 
-	/* simplehash leaves the key already populated by SH_KEY mapping */
-	entry->path = path;
+	/*
+	 * simplehash's SH_KEY mapping has already populated entry->path from the
+	 * argument; nothing else to do.
+	 */
 }
 
 /*
@@ -153,54 +153,51 @@ path_membership_record(const Path *path, const RelOptInfo *rel)
  *	  list-membership rather than allocation lifetime).
  *
  * The path must have been recorded earlier; failing to find it is an
- * invariant violation and we elog(ERROR).
+ * invariant violation.  We use Assert rather than elog(ERROR) here
+ * because this routine is called from inside foreach_delete_current
+ * loops where throwing leaves the iterator state mid-walk; an Assert
+ * trips a stack trace at the offending frame instead.
  */
 void
 path_membership_forget(const Path *path)
 {
-	/*
-	 * Cannot reach here without a prior record() — the hook is only called
-	 * for paths the caller pulled out of the pathlist, and getting into the
-	 * pathlist requires going through path_membership_record().
-	 */
-	if (path_membership == NULL ||
-		!pathmembership_delete(path_membership, path))
-		elog(ERROR,
-			 "path %p (nodeTag %d) removed from pathlist but never recorded",
-			 path, (int) nodeTag(path));
+	bool		found;
+
+	Assert(path != NULL);
+
+	found = (path_membership != NULL &&
+			 pathmembership_delete(path_membership, path));
+
+	Assert(found);
 }
 
 /*
- * Transaction end callback.  Reset the hash on abort (definitively
- * needed) and on commit (defensive — under the current spec the hash
- * may still hold orphaned entries from earlier statements within the
- * same xact, since path memory dies with the planner working context
- * but the hash itself does not; see file header).
+ * pathcheck_forget_list
+ *	  Forget every Path on a list.  Used at the small number of sites
+ *	  that wholesale-zap a pathlist via "rel->pathlist = NIL" instead
+ *	  of going through add_path()'s in-loop removal branch.  Without
+ *	  this, the zapped paths' membership records would sit stale in the
+ *	  hash and a subsequent add_path() of any of those pointers — even
+ *	  legitimate, freshly-allocated ones that happen to alias under
+ *	  CLOBBER_FREED_MEMORY recycling — would trip a spurious assert.
+ *
+ * Caller is responsible for invoking this *before* assigning the list
+ * to NIL.
  */
-static void
-path_membership_xact_callback(XactEvent event, void *arg)
+void
+pathcheck_forget_list(const List *paths)
 {
-	if (path_membership == NULL)
+	const ListCell *lc;
+
+	if (path_membership == NULL || paths == NIL)
 		return;
 
-	switch (event)
+	foreach(lc, paths)
 	{
-		case XACT_EVENT_ABORT:
-		case XACT_EVENT_PARALLEL_ABORT:
-			pathmembership_reset(path_membership);
-			break;
-		case XACT_EVENT_COMMIT:
-		case XACT_EVENT_PARALLEL_COMMIT:
-			if (path_membership->members > 0)
-			{
-				elog(WARNING,
-					 "path membership tracker held %u stale entries at commit; resetting",
-					 path_membership->members);
-				pathmembership_reset(path_membership);
-			}
-			break;
-		default:
-			break;
+		const Path *path = (const Path *) lfirst(lc);
+
+		Assert(path != NULL);
+		(void) pathmembership_delete(path_membership, path);
 	}
 }
 

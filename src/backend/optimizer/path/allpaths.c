@@ -50,6 +50,9 @@
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
 
+/* Private header local to optimizer/util/, only used here under USE_ASSERT_CHECKING */
+#include "../util/pathcheck.h"
+
 
 /* Bitmask flags for pushdown_safety_info.unsafeFlags */
 #define UNSAFE_HAS_VOLATILE_FUNC		(1 << 0)
@@ -2372,6 +2375,11 @@ set_dummy_rel_pathlist(RelOptInfo *rel)
 	rel->reltarget->width = 0;
 
 	/* Discard any pre-existing paths; no further need for them */
+#ifdef USE_ASSERT_CHECKING
+	/* Drop tracker entries for the about-to-be-zapped paths; see pathcheck.c */
+	pathcheck_forget_list(rel->pathlist);
+	pathcheck_forget_list(rel->partial_pathlist);
+#endif
 	rel->pathlist = NIL;
 	rel->partial_pathlist = NIL;
 

@@ -465,6 +465,9 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 	List	   *new_path_pathkeys;
 	ListCell   *p1;
 
+	Assert(parent_rel != NULL);
+	Assert(new_path != NULL);
+
 	/*
 	 * This is a convenient place to check for query cancel --- no part of the
 	 * planner goes very long without calling add_path().
@@ -665,6 +668,9 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 
 	if (accept_new)
 	{
+		Assert(insert_at >= 0 &&
+			   insert_at <= list_length(parent_rel->pathlist));
+
 #ifdef USE_ASSERT_CHECKING
 		/*
 		 * Record membership before insertion.  Fires elog(ERROR) if this
@@ -676,6 +682,8 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 		/* Accept the new path: insert it at proper place in pathlist */
 		parent_rel->pathlist =
 			list_insert_nth(parent_rel->pathlist, insert_at, new_path);
+
+		Assert(list_nth(parent_rel->pathlist, insert_at) == new_path);
 	}
 	else
 	{
@@ -816,6 +824,9 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 	int			insert_at = 0;	/* where to insert new item */
 	ListCell   *p1;
 
+	Assert(parent_rel != NULL);
+	Assert(new_path != NULL);
+
 	/* Check for query cancel. */
 	CHECK_FOR_INTERRUPTS();
 
@@ -913,6 +924,9 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 
 	if (accept_new)
 	{
+		Assert(insert_at >= 0 &&
+			   insert_at <= list_length(parent_rel->partial_pathlist));
+
 #ifdef USE_ASSERT_CHECKING
 		path_membership_record(new_path, parent_rel);
 #endif
@@ -920,6 +934,8 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 		/* Accept the new path: insert it at proper place */
 		parent_rel->partial_pathlist =
 			list_insert_nth(parent_rel->partial_pathlist, insert_at, new_path);
+
+		Assert(list_nth(parent_rel->partial_pathlist, insert_at) == new_path);
 	}
 	else
 	{

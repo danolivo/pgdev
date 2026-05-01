@@ -8,11 +8,12 @@
  * to extension authors.  The whole facility compiles to nothing when
  * USE_ASSERT_CHECKING is not defined.
  *
- * Contract (Reading A — current-membership):
+ * Contract:
  *	A given Path pointer may appear in at most one of
  *	{RelOptInfo.pathlist, RelOptInfo.partial_pathlist} at any moment of
  *	the planner invocation.  After it is removed (the in-loop deletion
- *	in add_path / add_partial_path) it may be re-added.
+ *	in add_path / add_partial_path, or a wholesale pathcheck_forget_list
+ *	zap) it may be re-added.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -30,6 +31,7 @@
 
 extern void path_membership_record(const Path *path, const RelOptInfo *rel);
 extern void path_membership_forget(const Path *path);
+extern void pathcheck_forget_list(const List *paths);
 
 #endif							/* USE_ASSERT_CHECKING */
 
