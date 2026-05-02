@@ -2448,7 +2448,10 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 		 * add_path(final_rel, ...) can record it cleanly.  See the
 		 * handoff note at the top of this foreach loop for why we leave
 		 * current_rel's list cell in place and which postgres_fdw hooks
-		 * observe the resulting cell.
+		 * observe the resulting cell.  path_membership_forget tolerates
+		 * paths that were never recorded (substituted into the list via
+		 * "lfirst(lc) = newpath" by an earlier projection pass), which
+		 * is what we want here.
 		 */
 		if (path == orig_path)
 			path_membership_forget(orig_path);
@@ -2471,7 +2474,13 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 			Path	   *partial_path = (Path *) lfirst(lc);
 
 #ifdef USE_ASSERT_CHECKING
-			/* Same handoff pattern as the regular pathlist loop above. */
+			/*
+			 * Same handoff pattern as the regular pathlist loop above.
+			 * Unlike that loop, no wrapper (LockRows/Limit/ModifyTable)
+			 * is built in this branch, so partial_path is always the
+			 * original from current_rel->partial_pathlist; the forget
+			 * is therefore unconditional.
+			 */
 			path_membership_forget(partial_path);
 #endif
 			add_partial_path(final_rel, partial_path);
@@ -5718,9 +5727,12 @@ create_ordered_paths(PlannerInfo *root,
 #ifdef USE_ASSERT_CHECKING
 		/*
 		 * Same handoff pattern as grouping_planner's final-paths foreach;
-		 * see that comment for the FDW-contract hazard summary.  Here it
-		 * is postgres_fdw's add_foreign_ordered_paths via the
-		 * GetForeignUpperPaths hook below.
+		 * see that comment for the FDW-contract hazard summary.  Note
+		 * that postgres_fdw's add_foreign_ordered_paths does not walk
+		 * input_rel->pathlist (it builds a fresh ForeignPath from
+		 * upper_targets), so it is not a current victim of the hazard;
+		 * a hypothetical out-of-core ORDERED hook that did walk would
+		 * be.
 		 */
 		if (sorted_path == input_path)
 			path_membership_forget(input_path);
@@ -7012,9 +7024,6 @@ adjust_paths_for_srfs(PlannerInfo *root, RelOptInfo *rel,
 															thistarget);
 		}
 		lfirst(lc) = newpath;
-#ifdef USE_ASSERT_CHECKING
-		pathcheck_replace(subpath, newpath, rel);
-#endif
 		if (subpath == rel->cheapest_startup_path)
 			rel->cheapest_startup_path = newpath;
 		if (subpath == rel->cheapest_total_path)
@@ -7051,9 +7060,6 @@ adjust_paths_for_srfs(PlannerInfo *root, RelOptInfo *rel,
 			}
 		}
 		lfirst(lc) = newpath;
-#ifdef USE_ASSERT_CHECKING
-		pathcheck_replace(subpath, newpath, rel);
-#endif
 	}
 }
 
@@ -8259,10 +8265,6 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 	 */
 	if (rel_is_partitioned && IS_SIMPLE_REL(rel))
 	{
-#ifdef USE_ASSERT_CHECKING
-		/* Drop the partitioned-rel pathlist tracker entries before zap. */
-		pathcheck_forget_list(rel->pathlist);
-#endif
 		rel->pathlist = NIL;
 	}
 
@@ -8284,10 +8286,6 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 		generate_useful_gather_paths(root, rel, false);
 
 		/* Can't use parallel query above this level. */
-#ifdef USE_ASSERT_CHECKING
-		/* Drop the partial-pathlist tracker entries after gather paths were folded in. */
-		pathcheck_forget_list(rel->partial_pathlist);
-#endif
 		rel->partial_pathlist = NIL;
 		rel->consider_parallel = false;
 	}
@@ -8295,10 +8293,6 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 	/* Finish dropping old paths for a partitioned rel, per comment above. */
 	if (rel_is_partitioned && IS_SIMPLE_REL(rel))
 	{
-#ifdef USE_ASSERT_CHECKING
-		/* Drop the partitioned-rel partial-pathlist tracker entries before zap. */
-		pathcheck_forget_list(rel->partial_pathlist);
-#endif
 		rel->partial_pathlist = NIL;
 	}
 
@@ -8331,9 +8325,6 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 			newpath = (Path *) create_projection_path(root, rel, subpath,
 													  scanjoin_target);
 			lfirst(lc) = newpath;
-#ifdef USE_ASSERT_CHECKING
-			pathcheck_replace(subpath, newpath, rel);
-#endif
 		}
 	}
 
@@ -8355,9 +8346,6 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 			newpath = (Path *) create_projection_path(root, rel, subpath,
 													  scanjoin_target);
 			lfirst(lc) = newpath;
-#ifdef USE_ASSERT_CHECKING
-			pathcheck_replace(subpath, newpath, rel);
-#endif
 		}
 	}
 

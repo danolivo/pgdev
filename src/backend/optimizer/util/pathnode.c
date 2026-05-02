@@ -629,21 +629,21 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 			parent_rel->pathlist = foreach_delete_current(parent_rel->pathlist,
 														  p1);
 
-#ifdef USE_ASSERT_CHECKING
 			/*
-			 * Drop the membership record before we (maybe) pfree.  We track
-			 * pathlist membership, not allocation lifetime — the IndexPath
-			 * exception below leaves storage alive but the path is no
-			 * longer in any list, so it is no longer a member.
-			 */
-			path_membership_forget(old_path);
-#endif
-
-			/*
-			 * Delete the data pointed-to by the deleted cell, if possible
+			 * Delete the data pointed-to by the deleted cell, if possible.
+			 * We forget the membership record only when we actually pfree
+			 * the Path; an IndexPath whose storage we leave behind cannot
+			 * be re-added to any pathlist before planner_cxt is reset, so
+			 * leaving its hash entry in place tightens rather than relaxes
+			 * the invariant: a stray re-add would correctly fire.
 			 */
 			if (!IsA(old_path, IndexPath))
+			{
+#ifdef USE_ASSERT_CHECKING
+				path_membership_forget(old_path);
+#endif
 				pfree(old_path);
+			}
 		}
 		else
 		{
@@ -685,7 +685,11 @@ add_path(RelOptInfo *parent_rel, Path *new_path)
 	}
 	else
 	{
-		/* Reject and recycle the new path */
+		/*
+		 * Reject and recycle the new path.  No path_membership_forget()
+		 * is needed: new_path was never recorded (recording happens only
+		 * in the accept branch above).
+		 */
 		if (!IsA(new_path, IndexPath))
 			pfree(new_path);
 	}
@@ -935,7 +939,11 @@ add_partial_path(RelOptInfo *parent_rel, Path *new_path)
 	}
 	else
 	{
-		/* Reject and recycle the new path */
+		/*
+		 * Reject and recycle the new path.  No path_membership_forget()
+		 * is needed: new_path was never recorded (recording happens only
+		 * in the accept branch above).
+		 */
 		pfree(new_path);
 	}
 }

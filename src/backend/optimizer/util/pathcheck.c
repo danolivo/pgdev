@@ -24,19 +24,23 @@
  * prune in the destination RelOptInfo, in which case the source list
  * cell points at freed memory; that is a pre-existing hazard in the
  * FDW upper-paths hook contract (postgres_fdw's add_foreign_final_paths
- * and add_foreign_ordered_paths walk the input rel's pathlist after the
- * loop), predating this patch.  Closing it requires changing
- * externally-visible contract semantics and is left as a separate
- * -hackers thread.
+ * walks the input rel's pathlist after the loop), predating this patch.
+ * Closing it requires changing externally-visible contract semantics
+ * and is left as a separate -hackers thread.
  *
  * Mechanism: a per-backend pointer-keyed simplehash set tracks Path
  * pointers that are currently a member of some pathlist.  The set is
  * populated at the accept branch of add_path / add_partial_path and
- * depopulated at the in-loop removal branch of the same routines, and
- * also when callers zap a pathlist wholesale via a list assignment to
- * NIL -- see pathcheck_forget_list().  Any attempted second insertion
- * of a pointer already in the set fires elog(ERROR) at the offending
- * add site.
+ * depopulated only when the dominated Path is actually pfree'd; see
+ * pathcheck.h for which removal sites do not pfree and why leaving
+ * stale hash entries there is safe.  path_membership_forget() therefore
+ * tolerates "not present": a Path that was substituted into a list cell
+ * via "lfirst(lc) = newpath" was never recorded, so the prune branch of
+ * add_path() finds nothing to delete when that cell later loses a
+ * dominance check.  The collision check on insert remains strict: any
+ * attempted second insertion of a pointer already in the set fires
+ * elog(ERROR) at the offending add site, which is the property the
+ * tracker exists to enforce.
  *
  * Lifetime: pathcheck_planner_init() is called from subquery_planner
  * immediately after root->planner_cxt is set; it allocates a fresh
@@ -74,12 +78,18 @@
 
 
 /*
- * Hash element.  Pointer-keyed set; no value payload beyond the key and
- * the simplehash bookkeeping byte.
+ * Hash element.  Pointer-keyed set, with a back-reference to the
+ * RelOptInfo that originally recorded the Path.  The back-reference
+ * exists purely for diagnostics: when path_membership_record() detects
+ * a double-add, the elog(ERROR) names the first recording rel so the
+ * 3am debugger doesn't have to guess where the Path came from.  Storing
+ * the pointer (rather than the Bitmapset) keeps the hot path small;
+ * the full relids set is read only on the failure path.
  */
 typedef struct PathMembershipEntry
 {
 	const Path *path;			/* hash key */
+	const RelOptInfo *first_rel;	/* rel that first recorded the path */
 	char		status;			/* simplehash internal */
 } PathMembershipEntry;
 
@@ -120,6 +130,14 @@ typedef struct PathCheckFrame
 
 static pathmembership_hash *path_membership = NULL;
 static PathCheckFrame *pathcheck_top = NULL;
+
+/*
+ * Snapshot of pathcheck_top at the most recent pathcheck_subscope_enter().
+ * Used only by pathcheck_subscope_leave() to assert that no nested
+ * subquery_planner ran inside the subscope (i.e., that the planner-frame
+ * stack came back to the same height we left it at).
+ */
+static PathCheckFrame *pathcheck_subscope_top = NULL;
 
 
 static void path_membership_unwind(void *arg);
@@ -261,6 +279,7 @@ pathcheck_subscope_enter(void)
 	void	   *saved = path_membership;
 
 	path_membership = pathmembership_create(CurrentMemoryContext, 64, NULL);
+	pathcheck_subscope_top = pathcheck_top;
 	return saved;
 }
 
@@ -271,7 +290,15 @@ pathcheck_subscope_leave(void *saved)
 	 * Storage for the sub-scope hash is in the caller's sub-context and
 	 * will be reaped by the matching MemoryContextDelete; we just put
 	 * the outer pointer back.
+	 *
+	 * If a future caller ran subquery_planner from inside the subscope,
+	 * pathcheck_planner_init would have pushed a frame and fini popped
+	 * it, leaving pathcheck_top != snapshot if the pair was unbalanced
+	 * or if an inner frame is still installed.  This Assert backs the
+	 * "no nested subquery_planner" caller invariant declared at
+	 * pathcheck_subscope_enter().
 	 */
+	Assert(pathcheck_top == pathcheck_subscope_top);
 	path_membership = (pathmembership_hash *) saved;
 }
 
@@ -288,100 +315,65 @@ void
 path_membership_record(const Path *path, const RelOptInfo *rel)
 {
 	bool		found;
+	PathMembershipEntry *entry;
 
 	Assert(path != NULL);
 	Assert(path_membership != NULL);
 
-	(void) pathmembership_insert(path_membership, path, &found);
+	entry = pathmembership_insert(path_membership, path, &found);
 	if (found)
+	{
+		const RelOptInfo *first_rel = entry->first_rel;
+		char	   *first_relids;
+		char	   *second_relids;
+
+		first_relids = first_rel && first_rel->relids
+			? bmsToString(first_rel->relids) : pstrdup("(none)");
+		second_relids = rel && rel->relids
+			? bmsToString(rel->relids) : pstrdup("(none)");
 		elog(ERROR,
-			 "path %p (nodeTag %d) already present in a pathlist (rel %u)",
-			 path, (int) nodeTag(path), rel ? (unsigned) rel->relid : 0);
+			 "path %p (nodeTag %d) added to rel %s, already present in rel %s",
+			 path, (int) nodeTag(path), second_relids, first_relids);
+	}
+	entry->first_rel = rel;
 }
 
 /*
  * path_membership_forget
- *	  Remove 'path' from the membership set.  Called from the in-loop
- *	  removal branches of add_path() / add_partial_path(), before the
- *	  conditional pfree (the IndexPath exception in add_path means the
- *	  pfree may not run, but the list-removal always does, and we track
- *	  list-membership rather than allocation lifetime).
+ *	  Remove 'path' from the membership set, if present.
  *
- * Under v3's planner-context-bound hash, the path must have been
- * recorded earlier; aliasing is impossible because all hash entries
- * die with planner_cxt.  Failure to find is an invariant violation,
- * caught by Assert.  We use Assert rather than elog(ERROR) because
- * this routine is called from inside foreach_delete_current loops
- * where throwing leaves the iterator state mid-walk.
+ * Called from add_path() and add_partial_path() at the dominance-prune
+ * branch, paired with the pfree of the dominated Path: forget exactly
+ * when we free.  Also called from the two documented handoff sites
+ * (grouping_planner final-paths, create_ordered_paths) where a Path
+ * pointer is legitimately re-added to a different RelOptInfo.
+ *
+ * We do not Assert that the entry was present.  Some Paths reach a
+ * pathlist without going through add_path() -- specifically, the
+ * "lfirst(lc) = newpath" substitution sites in adjust_paths_for_srfs,
+ * apply_scanjoin_target_to_paths, and recurse_set_operations install a
+ * fresh Path into a list cell without recording it.  When that cell is
+ * later pruned by add_path() or handed off to a new RelOptInfo, this
+ * routine finds nothing to delete and that is fine: the missing entry
+ * is consistent with the relaxed contract ("hash entries are forgotten
+ * only when the Path is pfree'd; substituted Paths that never had an
+ * entry stay invisible until they themselves are added via add_path
+ * somewhere").  The collision check at path_membership_record() still
+ * fires elog(ERROR) on any genuine double-add, which is the property
+ * the tracker exists to enforce.
  */
 void
 path_membership_forget(const Path *path)
 {
-	bool		found;
-
 	Assert(path != NULL);
+	/*
+	 * Every caller is inside subquery_planner -- between
+	 * pathcheck_planner_init() and pathcheck_planner_fini().  A NULL
+	 * here means a stray forget call that escaped the planner; catch it.
+	 */
+	Assert(path_membership != NULL);
 
-	found = (path_membership != NULL &&
-			 pathmembership_delete(path_membership, path));
-
-	Assert(found);
-}
-
-/*
- * pathcheck_replace
- *	  Account for an in-place pathlist-cell replacement: 'old_path'
- *	  leaves the list, 'new_path' takes its place.  Equivalent to
- *	  path_membership_forget(old) followed by path_membership_record(new),
- *	  with old==new tolerated as a no-op for callers who conditionally
- *	  rewrite (e.g. apply_projection_to_path which may return its input
- *	  unchanged).
- *
- * Callers: every site that does "lfirst(lc) = newpath" on a pathlist
- * cell instead of going through add_path / foreach_delete_current.
- * See planner.c (adjust_paths_for_srfs, apply_scanjoin_target_to_paths)
- * and prepunion.c.
- */
-void
-pathcheck_replace(const Path *old_path, const Path *new_path,
-				  const RelOptInfo *rel)
-{
-	Assert(old_path != NULL);
-	Assert(new_path != NULL);
-
-	if (old_path == new_path)
-		return;
-
-	path_membership_forget(old_path);
-	path_membership_record(new_path, rel);
-}
-
-/*
- * pathcheck_forget_list
- *	  Forget every Path on a list.  Used at the small number of sites
- *	  that wholesale-zap a pathlist via "rel->pathlist = NIL" instead
- *	  of going through add_path()'s in-loop removal branch.  Without
- *	  this, the zapped paths' membership records would sit stale in
- *	  the hash and a subsequent add_path() of any of those pointers
- *	  would trip a spurious error.
- *
- * Caller is responsible for invoking this *before* assigning the list
- * to NIL.
- */
-void
-pathcheck_forget_list(const List *paths)
-{
-	const ListCell *lc;
-
-	if (path_membership == NULL || paths == NIL)
-		return;
-
-	foreach(lc, paths)
-	{
-		const Path *path = (const Path *) lfirst(lc);
-
-		Assert(path != NULL);
-		(void) pathmembership_delete(path_membership, path);
-	}
+	(void) pathmembership_delete(path_membership, path);
 }
 
 #endif							/* USE_ASSERT_CHECKING */

@@ -85,10 +85,21 @@ entries in both tab1 and tab2's joininfo lists.
 Under USE_ASSERT_CHECKING, src/backend/optimizer/util/pathcheck.c maintains
 a per-backend invariant tracker that asserts a given Path pointer is a
 member of at most one RelOptInfo's pathlist at a time.  The tracker hooks
-into add_path() / add_partial_path() and into the small number of sites
-that wholesale-zap a pathlist or do an in-place "lfirst(lc) = newpath"
-rewrite.  In a non-assert build the facility compiles to nothing and is
-invisible to extension authors.
+into add_path() / add_partial_path() at the accept and dominance-prune
+branches.  Membership is forgotten only when the dominated Path is actually
+pfree'd; sites that wholesale-zap a pathlist (rel->pathlist = NIL) or do an
+in-place "lfirst(lc) = newpath" rewrite leave the hash entry in place,
+since the underlying Path lives on in planner_cxt and any later attempt to
+re-add it is a real bug rather than a false collision.  Two narrow handoff
+sites (grouping_planner's final-paths loop and create_ordered_paths) lift
+the same Path pointer into a different RelOptInfo's pathlist and forget
+it explicitly before the second add_path().  path_membership_forget() is
+tolerant of "not present" so that a Path substituted into a cell via
+"lfirst(lc) = newpath" -- which never goes through add_path() and so is
+never recorded -- can be pruned by a later add_path() without firing a
+spurious assertion.  The collision check on insert is the property the
+tracker actually enforces.  In a non-assert build the facility compiles
+to nothing and is invisible to extension authors.
 
 If we have only a single base relation in the query, we are done.
 Otherwise we have to figure out how to join the base relations into a
