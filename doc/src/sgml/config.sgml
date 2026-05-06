@@ -5819,6 +5819,29 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-enable-pulled-up-semi-relocation" xreflabel="enable_pulled_up_semi_relocation">
+      <term><varname>enable_pulled_up_semi_relocation</varname> (<type>boolean</type>)
+      <indexterm>
+       <primary><varname>enable_pulled_up_semi_relocation</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        When the planner pulls up an <literal>EXISTS</literal> or
+        <literal>IN</literal> sublink in <literal>WHERE</literal> into a
+        SEMI- or ANTI-join, this setting controls whether the new join is
+        spliced into the join tree adjacent to the relation it references
+        (<literal>on</literal>, the default) or wrapped around the entire
+        scope at the original placement (<literal>off</literal>).  The
+        deeper placement helps when <xref linkend="guc-join-collapse-limit"/>
+        prevents the surrounding join list from being flattened, but adds a
+        small amount of planning work proportional to the join tree size.
+        Disabling it provides a runtime fallback in the unlikely event that
+        the deeper placement causes a plan regression on a particular query.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-enable-self-join-elimination" xreflabel="enable_self_join_elimination">
       <term><varname>enable_self_join_elimination</varname> (<type>boolean</type>)
       <indexterm>
@@ -6533,6 +6556,16 @@ SELECT * FROM parent WHERE key = 2400;
         Setting this value to <xref linkend="guc-geqo-threshold"/> or more
         may trigger use of the GEQO planner, resulting in non-optimal
         plans.  See <xref linkend="runtime-config-query-geqo"/>.
+       </para>
+
+       <para>
+        This limit governs only joins that the user wrote explicitly;
+        SEMI- and ANTI-joins synthesised from pulled-up <literal>EXISTS</literal>
+        or <literal>IN</literal> sublinks in <literal>WHERE</literal> are
+        placed at the deepest legal point in the join tree whose subtree
+        already covers every relation the new join's qualifications
+        reference.  This behaviour can be disabled with
+        <xref linkend="guc-enable-pulled-up-semi-relocation"/>.
        </para>
       </listitem>
      </varlistentry>

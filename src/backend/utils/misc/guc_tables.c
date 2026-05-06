@@ -1026,6 +1026,16 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"enable_pulled_up_semi_relocation", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables relocation of pulled-up SEMI/ANTI joins next to their referenced relations."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&enable_pulled_up_semi_relocation,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"enable_group_by_reordering", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables reordering of GROUP BY keys."),
 			NULL,
