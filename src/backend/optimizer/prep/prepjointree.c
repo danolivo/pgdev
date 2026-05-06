@@ -113,6 +113,9 @@ static Node *pull_up_sublinks_jointree_recurse(PlannerInfo *root, Node *jtnode,
 static Node *pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 										   Node **jtlink1, Relids available_rels1,
 										   Node **jtlink2, Relids available_rels2);
+static Relids graft_pulled_up_sublink_join(PlannerInfo *root, JoinExpr *j,
+										   Node **jtlink, Relids available_rels);
+static Node **find_pushdown_graft_slot(Node **slot, Relids target_rels);
 static Node *pull_up_subqueries_recurse(PlannerInfo *root, Node *jtnode,
 										JoinExpr *lowest_outer_join,
 										AppendRelInfo *containing_appendrel);
@@ -836,6 +839,170 @@ pull_up_sublinks_jointree_recurse(PlannerInfo *root, Node *jtnode,
 }
 
 /*
+ * Graft a SEMI/ANTI JoinExpr produced by convert_*_sublink_to_join into the
+ * jointree, picking the deepest legal slot under *jtlink whose subtree
+ * already contains every relation the new join's quals reference on the
+ * outer side.  Falls back to grafting at *jtlink itself when no deeper slot
+ * is safe -- that matches the behaviour predating this routine.
+ *
+ * The descent only enters non-nullable sides of enclosing outer joins,
+ * mirroring the "available_rels" discipline used elsewhere in
+ * pull_up_sublinks: every rel in the chosen subtree is non-nullable in the
+ * surrounding qual's scope, so pre-filtering with the SEMI cannot drop
+ * outer rows that the original WHERE clause would have preserved.
+ *
+ * Returns the relids of the (post-graft) subtree now occupying j->larg.
+ * Callers that recursively process j->quals must use that set in place of
+ * the caller's wider available_rels, since after a deeper graft j->larg
+ * may cover only a strict subset of the original scope.
+ */
+static Relids
+graft_pulled_up_sublink_join(PlannerInfo *root, JoinExpr *j,
+							 Node **jtlink, Relids available_rels)
+{
+	Relids		target_rels;
+	Node	  **graft_slot;
+
+	/*
+	 * Outer-side relids the new SEMI/ANTI quals reference.  Intersecting with
+	 * available_rels drops the rarg's freshly-added RTE and any varnos from
+	 * outer query levels.
+	 */
+	target_rels = bms_intersect(pull_varnos(root, j->quals), available_rels);
+
+	if (bms_is_empty(target_rels))
+		graft_slot = jtlink;
+	else
+		graft_slot = find_pushdown_graft_slot(jtlink, target_rels);
+
+	bms_free(target_rels);
+
+	j->larg = *graft_slot;
+	*graft_slot = (Node *) j;
+
+	return get_relids_in_jointree(j->larg, true, false);
+}
+
+/*
+ * Walk down from *slot looking for the deepest position whose subtree
+ * relids cover target_rels, descending only through non-nullable sides.
+ *
+ * Returns a pointer to the slot we should overwrite; this is *slot itself
+ * if no deeper slot is safe.
+ */
+static Node **
+find_pushdown_graft_slot(Node **slot, Relids target_rels)
+{
+	Node	   *n = *slot;
+
+	if (n == NULL)
+		return slot;
+
+	if (IsA(n, RangeTblRef))
+		return slot;			/* cannot go deeper */
+
+	if (IsA(n, FromExpr))
+	{
+		FromExpr   *f = (FromExpr *) n;
+		ListCell   *lc;
+
+		/*
+		 * If exactly one fromlist child covers target_rels, descend into it.
+		 * Otherwise target straddles siblings -- graft at this FromExpr.
+		 */
+		foreach(lc, f->fromlist)
+		{
+			Node	   *child = (Node *) lfirst(lc);
+			Relids		child_rels = get_relids_in_jointree(child, true, false);
+
+			if (bms_is_subset(target_rels, child_rels))
+			{
+				bms_free(child_rels);
+				return find_pushdown_graft_slot((Node **) &lfirst(lc),
+												target_rels);
+			}
+			bms_free(child_rels);
+		}
+		return slot;
+	}
+
+	if (IsA(n, JoinExpr))
+	{
+		JoinExpr   *j = (JoinExpr *) n;
+		Relids		side_rels;
+
+		switch (j->jointype)
+		{
+			case JOIN_INNER:
+				/* Both sides non-nullable -- try larg, then rarg. */
+				side_rels = get_relids_in_jointree(j->larg, true, false);
+				if (bms_is_subset(target_rels, side_rels))
+				{
+					bms_free(side_rels);
+					return find_pushdown_graft_slot(&j->larg, target_rels);
+				}
+				bms_free(side_rels);
+
+				side_rels = get_relids_in_jointree(j->rarg, true, false);
+				if (bms_is_subset(target_rels, side_rels))
+				{
+					bms_free(side_rels);
+					return find_pushdown_graft_slot(&j->rarg, target_rels);
+				}
+				bms_free(side_rels);
+				return slot;	/* spans both sides */
+
+			case JOIN_LEFT:
+				/* Only larg is non-nullable in the surrounding scope. */
+				side_rels = get_relids_in_jointree(j->larg, true, false);
+				if (bms_is_subset(target_rels, side_rels))
+				{
+					bms_free(side_rels);
+					return find_pushdown_graft_slot(&j->larg, target_rels);
+				}
+				bms_free(side_rels);
+				return slot;
+
+			case JOIN_RIGHT:
+				side_rels = get_relids_in_jointree(j->rarg, true, false);
+				if (bms_is_subset(target_rels, side_rels))
+				{
+					bms_free(side_rels);
+					return find_pushdown_graft_slot(&j->rarg, target_rels);
+				}
+				bms_free(side_rels);
+				return slot;
+
+			case JOIN_FULL:
+				/* Both sides nullable -- never descend. */
+				return slot;
+
+			case JOIN_SEMI:
+			case JOIN_ANTI:
+				/*
+				 * Pre-existing SEMI/ANTI joins shouldn't normally appear
+				 * before pull_up_sublinks runs, but if they do we may only
+				 * descend into the larg side; the rarg is the existence-test
+				 * side and pre-filtering it would change semantics.
+				 */
+				side_rels = get_relids_in_jointree(j->larg, true, false);
+				if (bms_is_subset(target_rels, side_rels))
+				{
+					bms_free(side_rels);
+					return find_pushdown_graft_slot(&j->larg, target_rels);
+				}
+				bms_free(side_rels);
+				return slot;
+
+			default:
+				return slot;
+		}
+	}
+
+	return slot;
+}
+
+/*
  * Recurse through top-level qual nodes for pull_up_sublinks()
  *
  * jtlink1 points to the link in the jointree where any new JoinExprs should
@@ -882,9 +1049,11 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 			if ((j = convert_ANY_sublink_to_join(root, sublink, false,
 												 available_rels1)) != NULL)
 			{
+				Relids		larg_rels;
+
 				/* Yes; insert the new join node into the join tree */
-				j->larg = *jtlink1;
-				*jtlink1 = (Node *) j;
+				larg_rels = graft_pulled_up_sublink_join(root, j, jtlink1,
+														 available_rels1);
 				/* Recursively process pulled-up jointree nodes */
 				j->rarg = pull_up_sublinks_jointree_recurse(root,
 															j->rarg,
@@ -898,7 +1067,7 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 				j->quals = pull_up_sublinks_qual_recurse(root,
 														 j->quals,
 														 &j->larg,
-														 available_rels1,
+														 larg_rels,
 														 &j->rarg,
 														 child_rels);
 				/* Return NULL representing constant TRUE */
@@ -908,9 +1077,11 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 				(j = convert_ANY_sublink_to_join(root, sublink, false,
 												 available_rels2)) != NULL)
 			{
+				Relids		larg_rels;
+
 				/* Yes; insert the new join node into the join tree */
-				j->larg = *jtlink2;
-				*jtlink2 = (Node *) j;
+				larg_rels = graft_pulled_up_sublink_join(root, j, jtlink2,
+														 available_rels2);
 				/* Recursively process pulled-up jointree nodes */
 				j->rarg = pull_up_sublinks_jointree_recurse(root,
 															j->rarg,
@@ -924,7 +1095,7 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 				j->quals = pull_up_sublinks_qual_recurse(root,
 														 j->quals,
 														 &j->larg,
-														 available_rels2,
+														 larg_rels,
 														 &j->rarg,
 														 child_rels);
 				/* Return NULL representing constant TRUE */
@@ -936,9 +1107,11 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 			if ((j = convert_EXISTS_sublink_to_join(root, sublink, false,
 													available_rels1)) != NULL)
 			{
+				Relids		larg_rels;
+
 				/* Yes; insert the new join node into the join tree */
-				j->larg = *jtlink1;
-				*jtlink1 = (Node *) j;
+				larg_rels = graft_pulled_up_sublink_join(root, j, jtlink1,
+														 available_rels1);
 				/* Recursively process pulled-up jointree nodes */
 				j->rarg = pull_up_sublinks_jointree_recurse(root,
 															j->rarg,
@@ -952,7 +1125,7 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 				j->quals = pull_up_sublinks_qual_recurse(root,
 														 j->quals,
 														 &j->larg,
-														 available_rels1,
+														 larg_rels,
 														 &j->rarg,
 														 child_rels);
 				/* Return NULL representing constant TRUE */
@@ -962,9 +1135,11 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 				(j = convert_EXISTS_sublink_to_join(root, sublink, false,
 													available_rels2)) != NULL)
 			{
+				Relids		larg_rels;
+
 				/* Yes; insert the new join node into the join tree */
-				j->larg = *jtlink2;
-				*jtlink2 = (Node *) j;
+				larg_rels = graft_pulled_up_sublink_join(root, j, jtlink2,
+														 available_rels2);
 				/* Recursively process pulled-up jointree nodes */
 				j->rarg = pull_up_sublinks_jointree_recurse(root,
 															j->rarg,
@@ -978,7 +1153,7 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 				j->quals = pull_up_sublinks_qual_recurse(root,
 														 j->quals,
 														 &j->larg,
-														 available_rels2,
+														 larg_rels,
 														 &j->rarg,
 														 child_rels);
 				/* Return NULL representing constant TRUE */
@@ -1003,8 +1178,8 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 													 available_rels1)) != NULL)
 				{
 					/* Yes; insert the new join node into the join tree */
-					j->larg = *jtlink1;
-					*jtlink1 = (Node *) j;
+					(void) graft_pulled_up_sublink_join(root, j, jtlink1,
+														available_rels1);
 					/* Recursively process pulled-up jointree nodes */
 					j->rarg = pull_up_sublinks_jointree_recurse(root,
 																j->rarg,
@@ -1029,8 +1204,8 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 													 available_rels2)) != NULL)
 				{
 					/* Yes; insert the new join node into the join tree */
-					j->larg = *jtlink2;
-					*jtlink2 = (Node *) j;
+					(void) graft_pulled_up_sublink_join(root, j, jtlink2,
+														available_rels2);
 					/* Recursively process pulled-up jointree nodes */
 					j->rarg = pull_up_sublinks_jointree_recurse(root,
 																j->rarg,
@@ -1057,8 +1232,8 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 														available_rels1)) != NULL)
 				{
 					/* Yes; insert the new join node into the join tree */
-					j->larg = *jtlink1;
-					*jtlink1 = (Node *) j;
+					(void) graft_pulled_up_sublink_join(root, j, jtlink1,
+														available_rels1);
 					/* Recursively process pulled-up jointree nodes */
 					j->rarg = pull_up_sublinks_jointree_recurse(root,
 																j->rarg,
@@ -1083,8 +1258,8 @@ pull_up_sublinks_qual_recurse(PlannerInfo *root, Node *node,
 														available_rels2)) != NULL)
 				{
 					/* Yes; insert the new join node into the join tree */
-					j->larg = *jtlink2;
-					*jtlink2 = (Node *) j;
+					(void) graft_pulled_up_sublink_join(root, j, jtlink2,
+														available_rels2);
 					/* Recursively process pulled-up jointree nodes */
 					j->rarg = pull_up_sublinks_jointree_recurse(root,
 																j->rarg,

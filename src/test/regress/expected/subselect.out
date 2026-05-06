@@ -2975,21 +2975,18 @@ explain (costs off)
 SELECT * FROM tenk1 A INNER JOIN tenk2 B
 ON A.hundred in (SELECT c.hundred FROM tenk2 C WHERE c.odd = b.odd)
 WHERE a.thousand < 750;
-                   QUERY PLAN                    
--------------------------------------------------
- Hash Join
-   Hash Cond: (c.odd = b.odd)
-   ->  Hash Join
+                 QUERY PLAN                 
+--------------------------------------------
+ Nested Loop
+   ->  Seq Scan on tenk2 b
+   ->  Hash Semi Join
          Hash Cond: (a.hundred = c.hundred)
          ->  Seq Scan on tenk1 a
                Filter: (thousand < 750)
          ->  Hash
-               ->  HashAggregate
-                     Group Key: c.odd, c.hundred
-                     ->  Seq Scan on tenk2 c
-   ->  Hash
-         ->  Seq Scan on tenk2 b
-(12 rows)
+               ->  Seq Scan on tenk2 c
+                     Filter: (odd = b.odd)
+(9 rows)
 
 -- we can pull up the aggregate sublink into RHS of a left join.
 explain (costs off)
@@ -3783,5 +3780,135 @@ WHERE id NOT IN (SELECT id FROM notnull_notvalid_tab);
  id | val 
 ----+-----
 (0 rows)
+
+ROLLBACK;
+--
+-- Pulled-up SEMI/ANTI joins should be grafted next to the rel they
+-- reference, so they are not stranded above join_collapse_limit when
+-- many sibling joins exist.
+--
+BEGIN;
+CREATE TEMP TABLE pull_t1 (a int, b int);
+CREATE TEMP TABLE pull_t2 (a int);
+CREATE TEMP TABLE pull_t3 (a int);
+CREATE TEMP TABLE pull_t4 (a int);
+CREATE TEMP TABLE pull_t5 (a int);
+CREATE TEMP TABLE pull_x  (b int);
+SET join_collapse_limit = 2;
+-- The EXISTS only references pull_t1, so the SEMI must end up adjacent
+-- to pull_t1 even though four other joins separate the WHERE from t1.
+EXPLAIN (COSTS OFF)
+SELECT 1
+FROM pull_t1
+JOIN pull_t2 ON pull_t1.a = pull_t2.a
+JOIN pull_t3 ON pull_t1.a = pull_t3.a
+JOIN pull_t4 ON pull_t1.a = pull_t4.a
+JOIN pull_t5 ON pull_t1.a = pull_t5.a
+WHERE EXISTS (SELECT 1 FROM pull_x WHERE pull_x.b = pull_t1.b);
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Merge Join
+   Merge Cond: (pull_t5.a = pull_t1.a)
+   ->  Sort
+         Sort Key: pull_t5.a
+         ->  Seq Scan on pull_t5
+   ->  Materialize
+         ->  Merge Join
+               Merge Cond: (pull_t4.a = pull_t1.a)
+               ->  Sort
+                     Sort Key: pull_t4.a
+                     ->  Seq Scan on pull_t4
+               ->  Materialize
+                     ->  Merge Join
+                           Merge Cond: (pull_t3.a = pull_t1.a)
+                           ->  Sort
+                                 Sort Key: pull_t3.a
+                                 ->  Seq Scan on pull_t3
+                           ->  Materialize
+                                 ->  Merge Join
+                                       Merge Cond: (pull_t1.a = pull_t2.a)
+                                       ->  Sort
+                                             Sort Key: pull_t1.a
+                                             ->  Hash Join
+                                                   Hash Cond: (pull_t1.b = pull_x.b)
+                                                   ->  Seq Scan on pull_t1
+                                                   ->  Hash
+                                                         ->  HashAggregate
+                                                               Group Key: pull_x.b
+                                                               ->  Seq Scan on pull_x
+                                       ->  Sort
+                                             Sort Key: pull_t2.a
+                                             ->  Seq Scan on pull_t2
+(32 rows)
+
+-- The IN's testexpr only references pull_t1, same expectation.
+EXPLAIN (COSTS OFF)
+SELECT 1
+FROM pull_t1
+JOIN pull_t2 ON pull_t1.a = pull_t2.a
+JOIN pull_t3 ON pull_t1.a = pull_t3.a
+JOIN pull_t4 ON pull_t1.a = pull_t4.a
+JOIN pull_t5 ON pull_t1.a = pull_t5.a
+WHERE pull_t1.b IN (SELECT b FROM pull_x);
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Merge Join
+   Merge Cond: (pull_t5.a = pull_t1.a)
+   ->  Sort
+         Sort Key: pull_t5.a
+         ->  Seq Scan on pull_t5
+   ->  Materialize
+         ->  Merge Join
+               Merge Cond: (pull_t4.a = pull_t1.a)
+               ->  Sort
+                     Sort Key: pull_t4.a
+                     ->  Seq Scan on pull_t4
+               ->  Materialize
+                     ->  Merge Join
+                           Merge Cond: (pull_t3.a = pull_t1.a)
+                           ->  Sort
+                                 Sort Key: pull_t3.a
+                                 ->  Seq Scan on pull_t3
+                           ->  Materialize
+                                 ->  Merge Join
+                                       Merge Cond: (pull_t1.a = pull_t2.a)
+                                       ->  Sort
+                                             Sort Key: pull_t1.a
+                                             ->  Hash Join
+                                                   Hash Cond: (pull_t1.b = pull_x.b)
+                                                   ->  Seq Scan on pull_t1
+                                                   ->  Hash
+                                                         ->  HashAggregate
+                                                               Group Key: pull_x.b
+                                                               ->  Seq Scan on pull_x
+                                       ->  Sort
+                                             Sort Key: pull_t2.a
+                                             ->  Seq Scan on pull_t2
+(32 rows)
+
+-- An EXISTS referencing a rel on the nullable side of a LEFT JOIN
+-- must NOT be pushed past the outer join.
+EXPLAIN (COSTS OFF)
+SELECT 1
+FROM pull_t2
+LEFT JOIN pull_t1 ON pull_t1.a = pull_t2.a
+WHERE EXISTS (SELECT 1 FROM pull_x WHERE pull_x.b = pull_t1.b);
+                 QUERY PLAN                  
+---------------------------------------------
+ Hash Join
+   Hash Cond: (pull_t1.b = pull_x.b)
+   ->  Merge Join
+         Merge Cond: (pull_t1.a = pull_t2.a)
+         ->  Sort
+               Sort Key: pull_t1.a
+               ->  Seq Scan on pull_t1
+         ->  Sort
+               Sort Key: pull_t2.a
+               ->  Seq Scan on pull_t2
+   ->  Hash
+         ->  HashAggregate
+               Group Key: pull_x.b
+               ->  Seq Scan on pull_x
+(14 rows)
 
 ROLLBACK;

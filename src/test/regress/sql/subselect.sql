@@ -1647,3 +1647,50 @@ SELECT * FROM not_null_tab
 WHERE id NOT IN (SELECT id FROM notnull_notvalid_tab);
 
 ROLLBACK;
+
+--
+-- Pulled-up SEMI/ANTI joins should be grafted next to the rel they
+-- reference, so they are not stranded above join_collapse_limit when
+-- many sibling joins exist.
+--
+BEGIN;
+
+CREATE TEMP TABLE pull_t1 (a int, b int);
+CREATE TEMP TABLE pull_t2 (a int);
+CREATE TEMP TABLE pull_t3 (a int);
+CREATE TEMP TABLE pull_t4 (a int);
+CREATE TEMP TABLE pull_t5 (a int);
+CREATE TEMP TABLE pull_x  (b int);
+
+SET join_collapse_limit = 2;
+
+-- The EXISTS only references pull_t1, so the SEMI must end up adjacent
+-- to pull_t1 even though four other joins separate the WHERE from t1.
+EXPLAIN (COSTS OFF)
+SELECT 1
+FROM pull_t1
+JOIN pull_t2 ON pull_t1.a = pull_t2.a
+JOIN pull_t3 ON pull_t1.a = pull_t3.a
+JOIN pull_t4 ON pull_t1.a = pull_t4.a
+JOIN pull_t5 ON pull_t1.a = pull_t5.a
+WHERE EXISTS (SELECT 1 FROM pull_x WHERE pull_x.b = pull_t1.b);
+
+-- The IN's testexpr only references pull_t1, same expectation.
+EXPLAIN (COSTS OFF)
+SELECT 1
+FROM pull_t1
+JOIN pull_t2 ON pull_t1.a = pull_t2.a
+JOIN pull_t3 ON pull_t1.a = pull_t3.a
+JOIN pull_t4 ON pull_t1.a = pull_t4.a
+JOIN pull_t5 ON pull_t1.a = pull_t5.a
+WHERE pull_t1.b IN (SELECT b FROM pull_x);
+
+-- An EXISTS referencing a rel on the nullable side of a LEFT JOIN
+-- must NOT be pushed past the outer join.
+EXPLAIN (COSTS OFF)
+SELECT 1
+FROM pull_t2
+LEFT JOIN pull_t1 ON pull_t1.a = pull_t2.a
+WHERE EXISTS (SELECT 1 FROM pull_x WHERE pull_x.b = pull_t1.b);
+
+ROLLBACK;
