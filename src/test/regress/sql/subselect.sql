@@ -1647,3 +1647,79 @@ SELECT * FROM not_null_tab
 WHERE id NOT IN (SELECT id FROM notnull_notvalid_tab);
 
 ROLLBACK;
+
+--
+-- Pulled-up SEMI/ANTI joins should be grafted next to the rel they
+-- reference, so they are not stranded above join_collapse_limit when
+-- many sibling joins exist.
+--
+BEGIN;
+
+CREATE TEMP TABLE pull_t1 (a int, b int);
+CREATE TEMP TABLE pull_t2 (a int);
+CREATE TEMP TABLE pull_t3 (a int);
+CREATE TEMP TABLE pull_t4 (a int);
+CREATE TEMP TABLE pull_t5 (a int);
+CREATE TEMP TABLE pull_x  (b int);
+
+INSERT INTO pull_t1 SELECT g, g FROM generate_series(1, 10) g;
+INSERT INTO pull_t2 SELECT g FROM generate_series(1, 10) g;
+INSERT INTO pull_t3 SELECT g FROM generate_series(1, 10) g;
+INSERT INTO pull_t4 SELECT g FROM generate_series(1, 10) g;
+INSERT INTO pull_t5 SELECT g FROM generate_series(1, 10) g;
+INSERT INTO pull_x  SELECT g FROM generate_series(1, 10) g;
+ANALYZE pull_t1, pull_t2, pull_t3, pull_t4, pull_t5, pull_x;
+
+SET LOCAL join_collapse_limit = 2;
+SET LOCAL max_parallel_workers_per_gather = 0;
+-- Pin a single join method so the test asserts the SEMI/ANTI graft
+-- point and not the planner's hash-vs-merge cost crossover, which has
+-- been observed to flap on 32-bit and non-default-blocksize buildfarm
+-- members.  enable_memoize is pinned for the same reason: a future
+-- planner change that prefers Memoize over Materialize on the inner
+-- side of the SEMI would break the expected output.
+SET LOCAL enable_hashjoin = off;
+SET LOCAL enable_mergejoin = off;
+SET LOCAL enable_memoize = off;
+
+-- The EXISTS only references pull_t1, so the SEMI must end up adjacent
+-- to pull_t1 even though four other joins separate the WHERE from t1.
+-- The Nested Loop with pull_t1 directly underneath the Semi Join is
+-- the load-bearing assertion here.
+EXPLAIN (COSTS OFF)
+SELECT 1
+FROM pull_t1
+JOIN pull_t2 ON pull_t1.a = pull_t2.a
+JOIN pull_t3 ON pull_t1.a = pull_t3.a
+JOIN pull_t4 ON pull_t1.a = pull_t4.a
+JOIN pull_t5 ON pull_t1.a = pull_t5.a
+WHERE EXISTS (SELECT 1 FROM pull_x WHERE pull_x.b = pull_t1.b);
+
+-- The IN's testexpr only references pull_t1, same expectation.
+EXPLAIN (COSTS OFF)
+SELECT 1
+FROM pull_t1
+JOIN pull_t2 ON pull_t1.a = pull_t2.a
+JOIN pull_t3 ON pull_t1.a = pull_t3.a
+JOIN pull_t4 ON pull_t1.a = pull_t4.a
+JOIN pull_t5 ON pull_t1.a = pull_t5.a
+WHERE pull_t1.b IN (SELECT b FROM pull_x);
+
+-- An EXISTS referencing a rel on the nullable side of a LEFT JOIN
+-- must NOT be pushed past the outer join.
+EXPLAIN (COSTS OFF)
+SELECT 1
+FROM pull_t2
+LEFT JOIN pull_t1 ON pull_t1.a = pull_t2.a
+WHERE EXISTS (SELECT 1 FROM pull_x WHERE pull_x.b = pull_t1.b);
+
+-- An IN-sublink whose pulled-up rarg carries a LATERAL reference to a
+-- second outer rel must not be grafted into a subtree that excludes
+-- that rel, even though only pull_t1 appears in the testexpr.  The
+-- result set must match the unoptimised plan.
+SELECT count(*)
+FROM pull_t1, pull_t2
+WHERE pull_t1.a = pull_t2.a
+  AND pull_t1.b IN (SELECT b FROM pull_x WHERE pull_x.b = pull_t2.a);
+
+ROLLBACK;

@@ -6855,6 +6855,13 @@ SELECT * FROM parent WHERE key = 2400;
         may trigger use of the GEQO planner, resulting in non-optimal
         plans.  See <xref linkend="runtime-config-query-geqo"/>.
        </para>
+
+       <para>
+        SEMI- and ANTI-joins introduced by pulling up <literal>EXISTS</literal>
+        or <literal>IN</literal> sublinks in <literal>WHERE</literal> are
+        placed adjacent to the relations they reference, regardless of this
+        setting; the limit governs only joins that the user wrote explicitly.
+       </para>
       </listitem>
      </varlistentry>
 
