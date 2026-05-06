@@ -298,6 +298,54 @@ search has runtime exponential in the number of FROM-items considered.
 Therefore, we don't merge FROM-lists if the result would have too many
 FROM-items in one list.
 
+Pulling Up Sublinks
+-------------------
+
+A separate pass, pull_up_sublinks() in prepjointree.c, runs before
+pull_up_subqueries() and converts WHERE-level EXISTS / IN (ANY) sublinks
+into SEMI/ANTI JoinExprs whenever the surrounding context permits.  When
+it does so, the new JoinExpr is inserted into the jointree at the deepest
+jtlink beneath the current one whose subtree already contains every
+relation the new join's outer-side qualifications reference -- both the
+testexpr / lifted EXISTS qual and any LATERAL references hidden inside
+the rarg subquery.  Inserting "next to the referenced rel" lets the SEMI
+survive join_collapse_limit flattening as a tightly-coupled pair with
+the rel it references, so the planner can consider join orders like
+(T1 SEMI Tx) JOIN T2 JOIN ... for queries shaped like
+
+    SELECT * FROM T1 JOIN T2 ON ... JOIN ... JOIN Tn ON ...
+    WHERE EXISTS (SELECT 1 FROM Tx WHERE clause(Tx, T1));
+
+instead of always inserting the SEMI at the outermost legal point and
+forcing Tx to be joined last whenever the join list exceeds
+join_collapse_limit.
+
+The descent only enters non-nullable sides of enclosing outer joins
+(LEFT.larg, RIGHT.rarg, both sides of INNER, larg-only of any
+already-inserted SEMI/ANTI in the path), mirroring the available_rels
+discipline pull_up_sublinks already maintains for the testexpr.  Every
+rel in the chosen subtree is therefore non-nullable in the surrounding
+qual's vantage point, so pre-filtering with the SEMI cannot drop outer
+rows that the original WHERE clause would have preserved.  FULL JOINs
+and the rarg of any LEFT/RIGHT JOIN are never descended into.
+
+Cost: the descent calls get_relids_in_jointree() at each level it inspects,
+which is O(N) per call where N is the size of the visited subtree.  In the
+worst case (a left-deep join tree of N rels), this sums to O(N^2) bitmapset
+operations per pulled-up sublink.  For typical queries (N <= 30) the cost
+is well under a hundred microseconds and dominated by the surrounding
+planner work; for very large generated queries it can become measurable.
+The runtime kill switch enable_pulled_up_semi_relocation falls back to the
+historical "wrap at the top" placement and bypasses the descent entirely.
+
+Extensions that walk parse->jointree between pull_up_sublinks and
+deconstruct_jointree -- notably planner-shaping extensions like
+pg_hint_plan and AQO that observe or override join order from the
+parse-tree shape -- will see this deeper insertion topology rather than
+the historical "always at the top" placement.  Extensions that cache
+join-order decisions across query rewrites should treat the topology as
+freshly computed per query, not stable across pull-up passes.
+
 
 Vars and PlaceHolderVars
 ------------------------
