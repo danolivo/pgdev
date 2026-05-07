@@ -4416,17 +4416,13 @@ where s.a is not null;
 ---------------------------------------------------
  Nested Loop
    Output: t1.a, (t1.a)
-   ->  Merge Left Join
+   ->  Hash Left Join
          Output: t1.a, t2.a
-         Merge Cond: (t1.a = t2.b)
-         ->  Sort
-               Output: t1.a
-               Sort Key: t1.a
-               ->  Seq Scan on pg_temp.t_append t1
-                     Output: t1.a
-         ->  Sort
+         Hash Cond: (t1.a = t2.b)
+         ->  Seq Scan on pg_temp.t_append t1
+               Output: t1.a, t1.b
+         ->  Hash
                Output: t2.a, t2.b
-               Sort Key: t2.b
                ->  Seq Scan on pg_temp.t_append t2
                      Output: t2.a, t2.b
    ->  Append
@@ -4435,7 +4431,7 @@ where s.a is not null;
          ->  Result
                Output: t2.a
                One-Time Filter: (t2.a IS NOT NULL)
-(21 rows)
+(17 rows)
 
 select t1.a, s.a from t_append t1
   left join t_append t2 on t1.a = t2.b
@@ -8231,16 +8227,19 @@ explain (costs off)
   order by a.q1, a.q2, x.q1, x.q2, ss.z;
                    QUERY PLAN                   
 ------------------------------------------------
- Sort
+ Incremental Sort
    Sort Key: a.q1, a.q2, x.q1, x.q2, (a.q1)
+   Presorted Key: a.q1, a.q2
    ->  Nested Loop
-         ->  Seq Scan on int8_tbl a
+         ->  Sort
+               Sort Key: a.q1, a.q2
+               ->  Seq Scan on int8_tbl a
          ->  Hash Left Join
                Hash Cond: (x.q2 = (a.q1))
                ->  Seq Scan on int8_tbl x
                ->  Hash
                      ->  Seq Scan on int4_tbl y
-(9 rows)
+(12 rows)
 
 select * from int8_tbl a,
   int8_tbl x left join lateral (select a.q1 from int4_tbl y) ss(z)

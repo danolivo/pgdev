@@ -3075,20 +3075,20 @@ EXPLAIN (COSTS OFF)
 SELECT avg(c1.f ORDER BY c1.x, c1.y)
 FROM group_agg_pk c1 JOIN group_agg_pk c2 ON c1.x = c2.x
 GROUP BY c1.w, c1.z;
-                     QUERY PLAN                      
------------------------------------------------------
+                   QUERY PLAN                   
+------------------------------------------------
  GroupAggregate
    Group Key: c1.w, c1.z
-   ->  Sort
-         Sort Key: c1.w, c1.z, c1.x, c1.y
-         ->  Nested Loop
-               Disabled: true
-               Join Filter: (c1.x = c2.x)
+   ->  Nested Loop
+         Disabled: true
+         Join Filter: (c1.x = c2.x)
+         ->  Sort
+               Sort Key: c1.w, c1.z, c1.x, c1.y
                ->  Seq Scan on group_agg_pk c1
                      Disabled: true
-               ->  Materialize
-                     ->  Seq Scan on group_agg_pk c2
-                           Disabled: true
+         ->  Materialize
+               ->  Seq Scan on group_agg_pk c2
+                     Disabled: true
 (12 rows)
 
 SELECT avg(c1.f ORDER BY c1.x, c1.y)
@@ -3108,20 +3108,20 @@ SELECT c1.y,c1.x FROM group_agg_pk c1
   JOIN group_agg_pk c2
   ON c1.x = c2.x
 GROUP BY c1.y,c1.x,c2.x;
-                     QUERY PLAN                      
------------------------------------------------------
+                  QUERY PLAN                   
+-----------------------------------------------
  Group
    Group Key: c1.y, c1.x
-   ->  Sort
-         Sort Key: c1.y, c1.x
-         ->  Nested Loop
-               Disabled: true
-               Join Filter: (c1.x = c2.x)
+   ->  Nested Loop
+         Disabled: true
+         Join Filter: (c1.x = c2.x)
+         ->  Sort
+               Sort Key: c1.y, c1.x
                ->  Seq Scan on group_agg_pk c1
                      Disabled: true
-               ->  Materialize
-                     ->  Seq Scan on group_agg_pk c2
-                           Disabled: true
+         ->  Materialize
+               ->  Seq Scan on group_agg_pk c2
+                     Disabled: true
 (12 rows)
 
 EXPLAIN (COSTS OFF)
@@ -3129,20 +3129,20 @@ SELECT c1.y,c1.x FROM group_agg_pk c1
   JOIN group_agg_pk c2
   ON c1.x = c2.x
 GROUP BY c1.y,c2.x,c1.x;
-                     QUERY PLAN                      
------------------------------------------------------
+                  QUERY PLAN                   
+-----------------------------------------------
  Group
    Group Key: c1.y, c2.x
-   ->  Sort
-         Sort Key: c1.y, c2.x
-         ->  Nested Loop
-               Disabled: true
-               Join Filter: (c1.x = c2.x)
+   ->  Nested Loop
+         Disabled: true
+         Join Filter: (c1.x = c2.x)
+         ->  Sort
+               Sort Key: c1.y, c1.x
                ->  Seq Scan on group_agg_pk c1
                      Disabled: true
-               ->  Materialize
-                     ->  Seq Scan on group_agg_pk c2
-                           Disabled: true
+         ->  Materialize
+               ->  Seq Scan on group_agg_pk c2
+                     Disabled: true
 (12 rows)
 
 RESET enable_nestloop;

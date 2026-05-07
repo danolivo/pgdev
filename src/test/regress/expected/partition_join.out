@@ -5119,46 +5119,36 @@ EXPLAIN (COSTS OFF)
 SELECT t1.*, t2.* FROM alpha t1 INNER JOIN beta t2 ON (t1.a = t2.a AND t1.b = t2.b AND t1.c = t2.c) WHERE ((t1.b >= 100 AND t1.b < 110) OR (t1.b >= 200 AND t1.b < 210)) AND ((t2.b >= 100 AND t2.b < 110) OR (t2.b >= 200 AND t2.b < 210)) AND t1.c IN ('0004', '0009') ORDER BY t1.a, t1.b;
                                                            QUERY PLAN                                                           
 --------------------------------------------------------------------------------------------------------------------------------
- Merge Append
+ Sort
    Sort Key: t1.a, t1.b
-   ->  Merge Join
-         Merge Cond: ((t1_1.a = t2_1.a) AND (t1_1.b = t2_1.b) AND (t1_1.c = t2_1.c))
-         ->  Sort
-               Sort Key: t1_1.a, t1_1.b, t1_1.c
+   ->  Append
+         ->  Hash Join
+               Hash Cond: ((t1_1.a = t2_1.a) AND (t1_1.b = t2_1.b) AND (t1_1.c = t2_1.c))
                ->  Seq Scan on alpha_neg_p1 t1_1
                      Filter: ((c = ANY ('{0004,0009}'::text[])) AND (((b >= 100) AND (b < 110)) OR ((b >= 200) AND (b < 210))))
-         ->  Sort
-               Sort Key: t2_1.a, t2_1.b, t2_1.c
-               ->  Seq Scan on beta_neg_p1 t2_1
-                     Filter: (((b >= 100) AND (b < 110)) OR ((b >= 200) AND (b < 210)))
-   ->  Merge Join
-         Merge Cond: ((t1_2.a = t2_2.a) AND (t1_2.b = t2_2.b) AND (t1_2.c = t2_2.c))
-         ->  Sort
-               Sort Key: t1_2.a, t1_2.b, t1_2.c
+               ->  Hash
+                     ->  Seq Scan on beta_neg_p1 t2_1
+                           Filter: (((b >= 100) AND (b < 110)) OR ((b >= 200) AND (b < 210)))
+         ->  Hash Join
+               Hash Cond: ((t1_2.a = t2_2.a) AND (t1_2.b = t2_2.b) AND (t1_2.c = t2_2.c))
                ->  Seq Scan on alpha_neg_p2 t1_2
                      Filter: ((c = ANY ('{0004,0009}'::text[])) AND (((b >= 100) AND (b < 110)) OR ((b >= 200) AND (b < 210))))
-         ->  Sort
-               Sort Key: t2_2.a, t2_2.b, t2_2.c
-               ->  Seq Scan on beta_neg_p2 t2_2
-                     Filter: (((b >= 100) AND (b < 110)) OR ((b >= 200) AND (b < 210)))
-   ->  Nested Loop
-         Join Filter: ((t1_3.a = t2_3.a) AND (t1_3.b = t2_3.b) AND (t1_3.c = t2_3.c))
-         ->  Sort
-               Sort Key: t2_3.a, t2_3.b
-               ->  Seq Scan on beta_pos_p2 t2_3
-                     Filter: (((b >= 100) AND (b < 110)) OR ((b >= 200) AND (b < 210)))
-         ->  Materialize
+               ->  Hash
+                     ->  Seq Scan on beta_neg_p2 t2_2
+                           Filter: (((b >= 100) AND (b < 110)) OR ((b >= 200) AND (b < 210)))
+         ->  Nested Loop
+               Join Filter: ((t1_3.a = t2_3.a) AND (t1_3.b = t2_3.b) AND (t1_3.c = t2_3.c))
                ->  Seq Scan on alpha_pos_p2 t1_3
                      Filter: ((c = ANY ('{0004,0009}'::text[])) AND (((b >= 100) AND (b < 110)) OR ((b >= 200) AND (b < 210))))
-   ->  Nested Loop
-         Join Filter: ((t1_4.a = t2_4.a) AND (t1_4.b = t2_4.b) AND (t1_4.c = t2_4.c))
-         ->  Sort
-               Sort Key: t2_4.a, t2_4.b
+               ->  Seq Scan on beta_pos_p2 t2_3
+                     Filter: (((b >= 100) AND (b < 110)) OR ((b >= 200) AND (b < 210)))
+         ->  Nested Loop
+               Join Filter: ((t1_4.a = t2_4.a) AND (t1_4.b = t2_4.b) AND (t1_4.c = t2_4.c))
+               ->  Seq Scan on alpha_pos_p3 t1_4
+                     Filter: ((c = ANY ('{0004,0009}'::text[])) AND (((b >= 100) AND (b < 110)) OR ((b >= 200) AND (b < 210))))
                ->  Seq Scan on beta_pos_p3 t2_4
                      Filter: (((b >= 100) AND (b < 110)) OR ((b >= 200) AND (b < 210)))
-         ->  Seq Scan on alpha_pos_p3 t1_4
-               Filter: ((c = ANY ('{0004,0009}'::text[])) AND (((b >= 100) AND (b < 110)) OR ((b >= 200) AND (b < 210))))
-(39 rows)
+(29 rows)
 
 SELECT t1.*, t2.* FROM alpha t1 INNER JOIN beta t2 ON (t1.a = t2.a AND t1.b = t2.b AND t1.c = t2.c) WHERE ((t1.b >= 100 AND t1.b < 110) OR (t1.b >= 200 AND t1.b < 210)) AND ((t2.b >= 100 AND t2.b < 110) OR (t2.b >= 200 AND t2.b < 210)) AND t1.c IN ('0004', '0009') ORDER BY t1.a, t1.b;
  a  |  b  |  c   | a  |  b  |  c   

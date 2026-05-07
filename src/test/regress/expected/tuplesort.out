@@ -635,13 +635,13 @@ EXPLAIN (COSTS OFF) :qry;
          ->  GroupAggregate
                Group Key: a.col12
                Filter: (count(*) > 1)
-               ->  Sort
-                     Sort Key: a.col12 DESC, a.col1
-                     ->  Nested Loop
-                           Disabled: true
-                           Join Filter: (a.col12 = b.col12)
+               ->  Nested Loop
+                     Disabled: true
+                     Join Filter: (a.col12 = b.col12)
+                     ->  Sort
+                           Sort Key: a.col12 DESC, a.col1
                            ->  Seq Scan on test_mark_restore a
-                           ->  Seq Scan on test_mark_restore b
+                     ->  Seq Scan on test_mark_restore b
 (13 rows)
 
 :qry;
@@ -670,13 +670,13 @@ EXPLAIN (COSTS OFF) :qry;
          ->  GroupAggregate
                Group Key: a.col12
                Filter: (count(*) > 1)
-               ->  Sort
-                     Sort Key: a.col12 DESC, a.col1
-                     ->  Nested Loop
-                           Disabled: true
-                           Join Filter: (a.col12 = b.col12)
+               ->  Nested Loop
+                     Disabled: true
+                     Join Filter: (a.col12 = b.col12)
+                     ->  Sort
+                           Sort Key: a.col12 DESC, a.col1
                            ->  Seq Scan on test_mark_restore a
-                           ->  Seq Scan on test_mark_restore b
+                     ->  Seq Scan on test_mark_restore b
 (13 rows)
 
 :qry;
