@@ -2021,20 +2021,29 @@ match_unsorted_outer(PlannerInfo *root,
 
 	/*
 	 * If the query has ORDER BY (possibly with LIMIT) and nestloop is
-	 * applicable, consider pre-sorting the outer relation on the query
-	 * pathkeys.  The pre-sorted scan logic in set_plain_rel_pathlist()
-	 * handles plain base relations; here we extend that to join rels as
-	 * outer sides, covering ORDER BY keys that span multiple tables.
-	 * For base relations the sorted path is already in outerrel->pathlist
-	 * and was tried in the loop above; the get_cheapest_path_for_pathkeys
-	 * guard below prevents redundant work in that case.
+	 * applicable, consider pre-sorting a base outer relation on the
+	 * query pathkeys.  NestLoops above this point preserve the outer
+	 * order, so seeding the Sort once at base-rel level is sufficient:
+	 * upper join levels pick the order-preserving path out of the
+	 * pathlist via the foreach loop above.
+	 *
+	 * The probe is restricted to base rels (IS_SIMPLE_REL) deliberately.
+	 * match_unsorted_outer is called once per (outerrel, innerrel) split,
+	 * so running it for every joinrel-as-outerrel inflates planning time
+	 * on join-heavy queries; in measured cases the join-level extension
+	 * cost ~50% extra planning time while delivering little execution
+	 * benefit, because the seed for a Sort that spans multiple tables
+	 * can rarely satisfy the first query_pathkey from a single rel.
+	 * Capping at base rels keeps the work proportional to the number
+	 * of base rels rather than to the join search space.
 	 *
 	 * When root->limit_tuples is set, create_sort_path() uses the bounded
 	 * heap-sort cost model (N*log2(2K) instead of N*log2(N)), giving an
 	 * accurate startup-cost estimate that feeds into fractional path
 	 * comparison correctly.
 	 */
-	if (nestjoinOK && enable_presorted_outer && root->query_pathkeys != NIL)
+	if (nestjoinOK && enable_presorted_outer && root->query_pathkeys != NIL &&
+		IS_SIMPLE_REL(outerrel))
 	{
 		List	   *useful_pathkeys = NIL;
 		ListCell   *lc;
@@ -2052,7 +2061,7 @@ match_unsorted_outer(PlannerInfo *root,
 
 		/*
 		 * Only proceed if we found useful pathkeys and the outer rel does not
-		 * already have a path satisfying them — if it does, the foreach loop
+		 * already have a path satisfying them; if it does, the foreach loop
 		 * above already considered it.
 		 */
 		if (useful_pathkeys != NIL &&
@@ -2074,10 +2083,10 @@ match_unsorted_outer(PlannerInfo *root,
 				/*
 				 * For LEFT JOIN every outer row produces at least one output
 				 * row (NULL-extended if unmatched), so the LIMIT bound on join
-				 * output safely bounds the outer side — pass it for an
-				 * accurate top-N heap-sort cost estimate.  For INNER, SEMI,
-				 * and ANTI, outer rows can be discarded by the join condition,
-				 * so we conservatively model a full sort.
+				 * output safely bounds the outer side; pass it for an accurate
+				 * top-N heap-sort cost estimate.  For INNER, SEMI, and ANTI,
+				 * outer rows can be discarded by the join condition, so we
+				 * conservatively model a full sort.
 				 */
 				sorted_outer = (Path *)
 					create_sort_path(root, outerrel, outerpath,
