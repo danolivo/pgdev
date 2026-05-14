@@ -700,3 +700,35 @@ SELECT age(timestamptz '-infinity', timestamptz '-infinity');
 -- test timestamp near POSTGRES_EPOCH_JDATE
 select timestamptz '1999-12-31 24:00:00';
 select make_timestamptz(1999, 12, 31, 24, 0, 0);
+
+--
+-- date_trunc_day_eq_support planner rewrite: timestamptz path.
+--
+CREATE INDEX timestamptz_tbl_d1_idx ON timestamptz_tbl (d1);
+SET enable_seqscan = off;
+
+-- Basic transformation: Const date RHS, upper bound folded.
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamptz_tbl
+WHERE date_trunc('day', d1) = DATE '2000-03-15';
+
+-- Var date RHS (self-join): upper bound stays as date_pl_interval OpExpr.
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamptz_tbl t1, timestamptz_tbl t2
+WHERE date_trunc('day', t1.d1) = t2.d1::date;
+
+-- 'year' unit must not rewrite.
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamptz_tbl
+WHERE date_trunc('year', d1) = DATE '2000-03-15';
+
+DROP INDEX timestamptz_tbl_d1_idx;
+RESET enable_seqscan;
+
+-- Result equivalence on the timestamptz path.
+SELECT (SELECT count(*) FROM timestamptz_tbl
+        WHERE date_trunc('day', d1) = DATE '2000-03-15')
+     = (SELECT count(*) FROM timestamptz_tbl
+        WHERE d1 >= DATE '2000-03-15'
+          AND d1 <  DATE '2000-03-15' + interval '1 day')
+       AS rewrite_results_match;
