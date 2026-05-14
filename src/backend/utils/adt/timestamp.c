@@ -27,6 +27,7 @@
 #include "funcapi.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/supportnodes.h"
 #include "optimizer/optimizer.h"
@@ -35,6 +36,7 @@
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/datetime.h"
+#include "utils/fmgroids.h"
 #include "utils/float.h"
 #include "utils/numeric.h"
 #include "utils/skipsupport.h"
@@ -1314,6 +1316,277 @@ interval_support(PG_FUNCTION_ARGS)
 			}
 			if (noop)
 				ret = relabel_to_typmod(source, new_typmod);
+		}
+	}
+
+	PG_RETURN_POINTER(ret);
+}
+
+/*
+ * date_trunc_day_eq_support()
+ *
+ * Planner support function attached to the timestamp(tz) equality functions.
+ * Rewrites
+ *
+ *		date_trunc('day', x) = d
+ *
+ * (where d is a date, or a date implicitly cast to timestamp[tz]) as
+ *
+ *		x >= d::lhstype  AND  x < d::lhstype + interval '1 day'
+ *
+ * which lets a B-tree index on x serve the predicate; the original form
+ * buries the indexable column under date_trunc().  The rewrite is sound only
+ * when d is known to be midnight-aligned, which is the case for a value of
+ * type date (or any FuncExpr that casts date -> timestamp[tz]).
+ *
+ * The same handler is wired up to timestamp_eq, timestamptz_eq,
+ * timestamp_eq_date and timestamptz_eq_date; it dispatches on funcid.
+ *
+ * Returns NULL if the input does not match the pattern, leaving the original
+ * OpExpr untouched.
+ */
+Datum
+date_trunc_day_eq_support(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+	Node	   *ret = NULL;
+
+	if (IsA(rawreq, SupportRequestSimplify))
+	{
+		SupportRequestSimplify *req = (SupportRequestSimplify *) rawreq;
+		FuncExpr   *fexpr = req->fcall;
+		Oid			eqfuncid = fexpr->funcid;
+		Oid			lhstype;
+		Oid			trunc_funcid;
+		Oid			cast_funcid;
+		Oid			ge_opno;
+		Oid			lt_opno;
+		Oid			pl_opno;
+		Oid			pl_funcid;
+		Oid			eq_opno;
+		bool		rhs_is_date;
+		Node	   *left;
+		Node	   *right;
+		FuncExpr   *trunc_call = NULL;
+		Node	   *col_expr;
+		Node	   *date_node;
+		Node	   *unit_node;
+		Const	   *unit_const;
+		char	   *lowunits;
+		int			dtype;
+		int			val;
+		FuncExpr   *lower;
+		FuncExpr   *lower_for_upper;
+		Interval   *iv;
+		Const	   *one_day;
+		OpExpr	   *upper;
+		Expr	   *ge_cl;
+		Expr	   *lt_cl;
+		Expr	   *range_cl;
+		bool		date_is_const = false;
+
+		Assert(list_length(fexpr->args) == 2);
+
+		switch (eqfuncid)
+		{
+			case F_TIMESTAMP_EQ:
+				lhstype = TIMESTAMPOID;
+				trunc_funcid = F_DATE_TRUNC_TEXT_TIMESTAMP;
+				cast_funcid = F_TIMESTAMP_DATE;
+				ge_opno = 2065;		/* timestamp >= timestamp */
+				lt_opno = 2062;		/* timestamp <  timestamp */
+				pl_opno = 2066;		/* timestamp +  interval  */
+				eq_opno = 2060;		/* timestamp =  timestamp */
+				pl_funcid = F_TIMESTAMP_PL_INTERVAL;
+				rhs_is_date = false;
+				break;
+			case F_TIMESTAMPTZ_EQ:
+				lhstype = TIMESTAMPTZOID;
+				trunc_funcid = F_DATE_TRUNC_TEXT_TIMESTAMPTZ;
+				cast_funcid = F_TIMESTAMPTZ_DATE;
+				ge_opno = 1325;		/* timestamptz >= timestamptz */
+				lt_opno = 1322;		/* timestamptz <  timestamptz */
+				pl_opno = 1327;		/* timestamptz +  interval    */
+				eq_opno = 1320;		/* timestamptz =  timestamptz */
+				pl_funcid = F_TIMESTAMPTZ_PL_INTERVAL;
+				rhs_is_date = false;
+				break;
+			case F_TIMESTAMP_EQ_DATE:
+				lhstype = TIMESTAMPOID;
+				trunc_funcid = F_DATE_TRUNC_TEXT_TIMESTAMP;
+				cast_funcid = F_TIMESTAMP_DATE;
+				ge_opno = 2065;
+				lt_opno = 2062;
+				pl_opno = 2066;
+				eq_opno = 2060;
+				pl_funcid = F_TIMESTAMP_PL_INTERVAL;
+				rhs_is_date = true;
+				break;
+			case F_TIMESTAMPTZ_EQ_DATE:
+				lhstype = TIMESTAMPTZOID;
+				trunc_funcid = F_DATE_TRUNC_TEXT_TIMESTAMPTZ;
+				cast_funcid = F_TIMESTAMPTZ_DATE;
+				ge_opno = 1325;
+				lt_opno = 1322;
+				pl_opno = 1327;
+				eq_opno = 1320;
+				pl_funcid = F_TIMESTAMPTZ_PL_INTERVAL;
+				rhs_is_date = true;
+				break;
+			default:
+				/* support function misattached */
+				PG_RETURN_POINTER(NULL);
+		}
+
+		left = (Node *) linitial(fexpr->args);
+		right = (Node *) lsecond(fexpr->args);
+
+		/*
+		 * Locate date_trunc('day', x) on either side.  The cross-type
+		 * eq-date variants only put it on the LHS (the RHS is a date), so we
+		 * skip the swap there.
+		 */
+		if (IsA(left, FuncExpr) &&
+			((FuncExpr *) left)->funcid == trunc_funcid)
+		{
+			trunc_call = (FuncExpr *) left;
+		}
+		else if (!rhs_is_date &&
+				 IsA(right, FuncExpr) &&
+				 ((FuncExpr *) right)->funcid == trunc_funcid)
+		{
+			trunc_call = (FuncExpr *) right;
+			right = left;
+		}
+		else
+		{
+			PG_RETURN_POINTER(NULL);
+		}
+
+		Assert(list_length(trunc_call->args) == 2);
+
+		/* The first arg of date_trunc must be a non-null Const text "day". */
+		unit_node = (Node *) linitial(trunc_call->args);
+		if (!IsA(unit_node, Const))
+			PG_RETURN_POINTER(NULL);
+		unit_const = (Const *) unit_node;
+		if (unit_const->constisnull || unit_const->consttype != TEXTOID)
+			PG_RETURN_POINTER(NULL);
+
+		lowunits = downcase_truncate_identifier(
+								VARDATA_ANY(DatumGetPointer(unit_const->constvalue)),
+								VARSIZE_ANY_EXHDR(DatumGetPointer(unit_const->constvalue)),
+								false);
+		dtype = DecodeUnits(0, lowunits, &val);
+		if (dtype != UNITS || val != DTK_DAY)
+			PG_RETURN_POINTER(NULL);
+
+		col_expr = (Node *) lsecond(trunc_call->args);
+		Assert(exprType(col_expr) == lhstype);
+
+		/* Extract the date on the other side. */
+		if (rhs_is_date)
+		{
+			if (exprType(right) != DATEOID)
+				PG_RETURN_POINTER(NULL);
+			date_node = right;
+		}
+		else
+		{
+			FuncExpr   *castfx;
+
+			if (!IsA(right, FuncExpr))
+				PG_RETURN_POINTER(NULL);
+			castfx = (FuncExpr *) right;
+			if (castfx->funcid != cast_funcid ||
+				list_length(castfx->args) != 1)
+				PG_RETURN_POINTER(NULL);
+			date_node = (Node *) linitial(castfx->args);
+			if (exprType(date_node) != DATEOID)
+				PG_RETURN_POINTER(NULL);
+		}
+
+		/*
+		 * If d is a known-infinite Const date, the half-open range
+		 * [d, d + 1 day) is empty (infinity + interval = infinity), so the
+		 * rewrite would silently drop rows where date_trunc('day', x) = d
+		 * holds.  Leave the original OpExpr in place.
+		 */
+		if (IsA(date_node, Const))
+		{
+			Const	   *dconst = (Const *) date_node;
+
+			if (!dconst->constisnull &&
+				DATE_NOT_FINITE(DatumGetDateADT(dconst->constvalue)))
+				PG_RETURN_POINTER(NULL);
+			date_is_const = true;
+		}
+
+		/*
+		 * Build  lower := d::lhstype  as a fresh FuncExpr.  We make several
+		 * copies because we need to embed it in the >= clause, in the
+		 * (lower + interval) addition, and (in the non-Const case) in the
+		 * eq guard arm; the planner does not expect to encounter shared
+		 * subtrees.
+		 */
+		lower = makeNode(FuncExpr);
+		lower->funcid = cast_funcid;
+		lower->funcresulttype = lhstype;
+		lower->funcretset = false;
+		lower->funcvariadic = false;
+		lower->funcformat = COERCE_IMPLICIT_CAST;
+		lower->funccollid = InvalidOid;
+		lower->inputcollid = InvalidOid;
+		lower->args = list_make1(date_node);
+		lower->location = -1;
+
+		lower_for_upper = copyObject(lower);
+
+		iv = palloc0_object(Interval);
+		iv->day = 1;
+		one_day = makeConst(INTERVALOID,
+							-1,
+							InvalidOid,
+							sizeof(Interval),
+							IntervalPGetDatum(iv),
+							false,
+							false);
+
+		upper = (OpExpr *) make_opclause(pl_opno, lhstype, false,
+										 (Expr *) lower_for_upper,
+										 (Expr *) one_day,
+										 InvalidOid, InvalidOid);
+		upper->opfuncid = pl_funcid;
+
+		ge_cl = make_opclause(ge_opno, BOOLOID, false,
+							  (Expr *) col_expr, (Expr *) lower,
+							  InvalidOid, InvalidOid);
+		lt_cl = make_opclause(lt_opno, BOOLOID, false,
+							  (Expr *) copyObject(col_expr),
+							  (Expr *) upper,
+							  InvalidOid, InvalidOid);
+
+		range_cl = make_andclause(list_make2(ge_cl, lt_cl));
+
+		if (date_is_const)
+		{
+			/* Const RHS is proven finite above; plain range suffices. */
+			ret = (Node *) range_cl;
+		}
+		else
+		{
+			Expr	   *eq_cl;
+
+			/*
+			 * Non-Const d may be ±infinity at runtime; the range arm then
+			 * matches nothing, but x = d still holds.  Catches d = ts =
+			 * ±infinity, where range-based rewrite collapses.
+			 */
+			eq_cl = make_opclause(eq_opno, BOOLOID, false,
+								  (Expr *) copyObject(col_expr),
+								  (Expr *) copyObject(lower),
+								  InvalidOid, InvalidOid);
+			ret = (Node *) make_orclause(list_make2(range_cl, eq_cl));
 		}
 	}
 
