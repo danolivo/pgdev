@@ -43,6 +43,10 @@ typedef struct
 
 int			NLocBuffer = 0;		/* until buffers are initialized */
 
+
+int allocated_localbufs = 0;
+int dirtied_localbufs = 0;
+
 BufferDesc *LocalBufferDescriptors = NULL;
 Block	   *LocalBufferBlockPointers = NULL;
 int32	   *LocalRefCount = NULL;
@@ -183,6 +187,12 @@ FlushLocalBuffer(BufferDesc *bufHdr, SMgrRelation reln)
 {
 	instr_time	io_start;
 	Page		localpage = (char *) LocalBufHdrGetBlock(bufHdr);
+
+	/*
+	 * Parallel temp table scan allows an access to temp tables. So, to be
+	 * paranoid enough we should check it each time, flushing local buffer.
+	 */
+	Assert(!IsParallelWorker());
 
 	Assert(LocalRefCount[-BufferDescriptorGetBuffer(bufHdr) - 1] > 0);
 
@@ -507,7 +517,10 @@ MarkLocalBufferDirty(Buffer buffer)
 	buf_state = pg_atomic_read_u32(&bufHdr->state);
 
 	if (!(buf_state & BM_DIRTY))
+	{
 		pgBufferUsage.local_blks_dirtied++;
+		dirtied_localbufs++;
+	}
 
 	buf_state |= BM_DIRTY;
 
@@ -568,6 +581,12 @@ TerminateLocalBufferIO(BufferDesc *bufHdr, bool clear_dirty, uint32 set_flag_bit
 	/* Clear earlier errors, if this IO failed, it'll be marked again */
 	buf_state &= ~BM_IO_ERROR;
 
+	if (buf_state & BM_DIRTY)
+	{
+		Assert(dirtied_localbufs > 0);
+		dirtied_localbufs--;
+	}
+
 	if (clear_dirty)
 		buf_state &= ~BM_DIRTY;
 
@@ -606,6 +625,12 @@ InvalidateLocalBuffer(BufferDesc *bufHdr, bool check_unreferenced)
 	int			bufid = -buffer - 1;
 	uint32		buf_state;
 	LocalBufferLookupEnt *hresult;
+
+	if (pg_atomic_read_u32(&bufHdr->state) & BM_DIRTY)
+	{
+		Assert(dirtied_localbufs > 0);
+		dirtied_localbufs--;
+	}
 
 	/*
 	 * It's possible that we started IO on this buffer before e.g. aborting
@@ -721,19 +746,6 @@ InitLocalBuffers(void)
 	int			nbufs = num_temp_buffers;
 	HASHCTL		info;
 	int			i;
-
-	/*
-	 * Parallel workers can't access data in temporary tables, because they
-	 * have no visibility into the local buffers of their leader.  This is a
-	 * convenient, low-cost place to provide a backstop check for that.  Note
-	 * that we don't wish to prevent a parallel worker from accessing catalog
-	 * metadata about a temp table, so checks at higher levels would be
-	 * inappropriate.
-	 */
-	if (IsParallelWorker())
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
-				 errmsg("cannot access temporary tables during a parallel operation")));
 
 	/* Allocate and zero buffer headers and auxiliary arrays */
 	LocalBufferDescriptors = (BufferDesc *) calloc(nbufs, sizeof(BufferDesc));
@@ -937,6 +949,7 @@ GetLocalBufferStorage(void)
 	this_buf = cur_block + next_buf_in_block * BLCKSZ;
 	next_buf_in_block++;
 	total_bufs_allocated++;
+	allocated_localbufs++;
 
 	/*
 	 * Caller's PinLocalBuffer() was too early for Valgrind updates, so do it
@@ -1009,4 +1022,37 @@ AtProcExit_LocalBuffers(void)
 	 * drop the temp rels.
 	 */
 	CheckForLocalBufferLeaks();
+}
+
+/*
+ * Flush each temporary buffer page to the disk.
+ *
+ * It is costly operation needed solely to let temporary tables, indexes and
+ * 'toasts' participate in a parallel query plan.
+ */
+void
+FlushAllLocalBuffers(void)
+{
+	int                     i;
+
+	for (i = 0; i < NLocBuffer; i++)
+	{
+		BufferDesc *bufHdr = GetLocalBufferDescriptor(i);
+		uint32		buf_state;
+
+		if (LocalBufHdrGetBlock(bufHdr) == NULL)
+			continue;
+
+		buf_state = pg_atomic_read_u32(&bufHdr->state);
+
+		/* XXX only valid dirty pages need to be flushed? */
+		if ((buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
+		{
+			PinLocalBuffer(bufHdr, false);
+			FlushLocalBuffer(bufHdr, NULL);
+			UnpinLocalBuffer(BufferDescriptorGetBuffer(bufHdr));
+		}
+	}
+
+	Assert(dirtied_localbufs == 0);
 }

@@ -101,7 +101,7 @@ static Gather *create_gather_plan(PlannerInfo *root, GatherPath *best_path);
 static Plan *create_projection_plan(PlannerInfo *root,
 									ProjectionPath *best_path,
 									int flags);
-static Plan *inject_projection_plan(Plan *subplan, List *tlist, bool parallel_safe);
+static Plan *inject_projection_plan(Plan *subplan, List *tlist, ParallelSafe parallel_safe);
 static Sort *create_sort_plan(PlannerInfo *root, SortPath *best_path, int flags);
 static IncrementalSort *create_incrementalsort_plan(PlannerInfo *root,
 													IncrementalSortPath *best_path, int flags);
@@ -297,7 +297,8 @@ static Unique *make_unique_from_sortclauses(Plan *lefttree, List *distinctList);
 static Unique *make_unique_from_pathkeys(Plan *lefttree,
 										 List *pathkeys, int numCols);
 static Gather *make_gather(List *qptlist, List *qpqual,
-						   int nworkers, int rescan_param, bool single_copy, Plan *subplan);
+						   int nworkers, int rescan_param, bool single_copy,
+						   Plan *subplan, bool process_temp_tables);
 static SetOp *make_setop(SetOpCmd cmd, SetOpStrategy strategy,
 						 List *tlist, Plan *lefttree, Plan *righttree,
 						 List *groupList, long numGroups);
@@ -1934,12 +1935,14 @@ create_gather_plan(PlannerInfo *root, GatherPath *best_path)
 
 	tlist = build_path_tlist(root, &best_path->path);
 
+	Assert(best_path->subpath->parallel_safe > PARALLEL_UNSAFE);
 	gather_plan = make_gather(tlist,
 							  NIL,
 							  best_path->num_workers,
 							  assign_special_exec_param(root),
 							  best_path->single_copy,
-							  subplan);
+							  subplan,
+							  best_path->subpath->parallel_safe == NEEDS_TEMP_FLUSH);
 
 	copy_generic_path_info(&gather_plan->plan, &best_path->path);
 
@@ -2114,7 +2117,7 @@ create_projection_plan(PlannerInfo *root, ProjectionPath *best_path, int flags)
  * to apply (since the tlist might be unsafe even if the child plan is safe).
  */
 static Plan *
-inject_projection_plan(Plan *subplan, List *tlist, bool parallel_safe)
+inject_projection_plan(Plan *subplan, List *tlist, ParallelSafe parallel_safe)
 {
 	Plan	   *plan;
 
@@ -2146,7 +2149,7 @@ inject_projection_plan(Plan *subplan, List *tlist, bool parallel_safe)
  * flag of the FDW's own Path node.
  */
 Plan *
-change_plan_targetlist(Plan *subplan, List *tlist, bool tlist_parallel_safe)
+change_plan_targetlist(Plan *subplan, List *tlist, ParallelSafe tlist_parallel_safe)
 {
 	/*
 	 * If the top plan node can't do projections and its existing target list
@@ -2162,7 +2165,7 @@ change_plan_targetlist(Plan *subplan, List *tlist, bool tlist_parallel_safe)
 	{
 		/* Else we can just replace the plan node's tlist */
 		subplan->targetlist = tlist;
-		subplan->parallel_safe &= tlist_parallel_safe;
+		subplan->parallel_safe = tlist_parallel_safe;
 	}
 	return subplan;
 }
@@ -4351,7 +4354,8 @@ create_nestloop_plan(PlannerInfo *root,
 	List	   *otherclauses;
 	List	   *nestParams;
 	List	   *outer_tlist;
-	bool		outer_parallel_safe;
+	ParallelSafe		outer_parallel_safe;
+	bool		needs_temp_flush = false;
 	Relids		saveOuterRels = root->curOuterRels;
 	ListCell   *lc;
 
@@ -4467,8 +4471,13 @@ create_nestloop_plan(PlannerInfo *root,
 							  true);
 		outer_tlist = lappend(outer_tlist, tle);
 		/* ... and track whether tlist is (still) parallel-safe */
-		if (outer_parallel_safe)
-			outer_parallel_safe = is_parallel_safe(root, (Node *) phv);
+		if (outer_parallel_safe > PARALLEL_UNSAFE)
+		{
+			if (!is_parallel_safe(root, (Node *) phv, &needs_temp_flush))
+				outer_parallel_safe = PARALLEL_UNSAFE;
+			else if (needs_temp_flush)
+				outer_parallel_safe = NEEDS_TEMP_FLUSH;
+		}
 	}
 	if (outer_tlist != outer_plan->targetlist)
 		outer_plan = change_plan_targetlist(outer_plan, outer_tlist,
@@ -6992,7 +7001,8 @@ make_gather(List *qptlist,
 			int nworkers,
 			int rescan_param,
 			bool single_copy,
-			Plan *subplan)
+			Plan *subplan,
+			bool process_temp_tables)
 {
 	Gather	   *node = makeNode(Gather);
 	Plan	   *plan = &node->plan;
@@ -7006,6 +7016,7 @@ make_gather(List *qptlist,
 	node->single_copy = single_copy;
 	node->invisible = false;
 	node->initParam = NULL;
+	node->process_temp_tables = process_temp_tables;
 
 	return node;
 }

@@ -496,6 +496,7 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 		gather->num_workers = 1;
 		gather->single_copy = true;
 		gather->invisible = (debug_parallel_query == DEBUG_PARALLEL_REGRESS);
+		gather->process_temp_tables = (best_path->parallel_safe == NEEDS_TEMP_FLUSH);
 
 		/* Transfer any initPlans to the new top node */
 		gather->plan.initPlan = top_plan->initPlan;
@@ -518,7 +519,7 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 		gather->plan.plan_rows = top_plan->plan_rows;
 		gather->plan.plan_width = top_plan->plan_width;
 		gather->plan.parallel_aware = false;
-		gather->plan.parallel_safe = false;
+		gather->plan.parallel_safe = PARALLEL_UNSAFE;
 
 		/*
 		 * Delete the initplans' cost from top_plan.  We needn't add it to the
@@ -1685,6 +1686,7 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 	List	   *final_targets;
 	List	   *final_targets_contain_srfs;
 	bool		final_target_parallel_safe;
+	bool		needs_temp_flush = false;
 	RelOptInfo *current_rel;
 	RelOptInfo *final_rel;
 	FinalPathExtraData extra;
@@ -1736,7 +1738,7 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 
 		/* And check whether it's parallel safe */
 		final_target_parallel_safe =
-			is_parallel_safe(root, (Node *) final_target->exprs);
+			is_parallel_safe(root, (Node *) final_target->exprs, &needs_temp_flush);
 
 		/* The setop result tlist couldn't contain any SRFs */
 		Assert(!parse->hasTargetSRFs);
@@ -1906,7 +1908,7 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 		 */
 		final_target = create_pathtarget(root, root->processed_tlist);
 		final_target_parallel_safe =
-			is_parallel_safe(root, (Node *) final_target->exprs);
+			is_parallel_safe(root, (Node *) final_target->exprs, &needs_temp_flush);
 
 		/*
 		 * If ORDER BY was given, consider whether we should use a post-sort
@@ -1919,7 +1921,7 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 													   final_target,
 													   &have_postponed_srfs);
 			sort_input_target_parallel_safe =
-				is_parallel_safe(root, (Node *) sort_input_target->exprs);
+				is_parallel_safe(root, (Node *) sort_input_target->exprs, &needs_temp_flush);
 		}
 		else
 		{
@@ -1938,7 +1940,7 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 													   final_target,
 													   activeWindows);
 			grouping_target_parallel_safe =
-				is_parallel_safe(root, (Node *) grouping_target->exprs);
+				is_parallel_safe(root, (Node *) grouping_target->exprs, &needs_temp_flush);
 		}
 		else
 		{
@@ -1957,7 +1959,7 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 		{
 			scanjoin_target = make_group_input_target(root, final_target);
 			scanjoin_target_parallel_safe =
-				is_parallel_safe(root, (Node *) scanjoin_target->exprs);
+				is_parallel_safe(root, (Node *) scanjoin_target->exprs, &needs_temp_flush);
 		}
 		else
 		{
@@ -2008,6 +2010,18 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 			scanjoin_targets = list_make1(scanjoin_target);
 			scanjoin_targets_contain_srfs = NIL;
 		}
+
+		/*
+		 * Each path may have individual target containing or not references to
+		 * relations with temporary storages. There were attempts to do it
+		 * smartly that end up with a new Target::needs_temp_flush field that
+		 * seems too invasive for this first attempt.
+		 * So, just set current_rel flag as needed for temp buffers flushing and
+		 * let Gather to do the job earlier than it could be.
+		 * XXX: we need to be sure that no one new path created with all these
+		 * target lists till now.
+		 */
+		 current_rel->needs_temp_safety |= needs_temp_flush;
 
 		/* Apply scan/join target. */
 		scanjoin_target_same_exprs = list_length(scanjoin_targets) == 1
@@ -2117,9 +2131,13 @@ grouping_planner(PlannerInfo *root, double tuple_fraction,
 	 * query.
 	 */
 	if (current_rel->consider_parallel &&
-		is_parallel_safe(root, parse->limitOffset) &&
-		is_parallel_safe(root, parse->limitCount))
+		is_parallel_safe(root, parse->limitOffset, &needs_temp_flush) &&
+		is_parallel_safe(root, parse->limitCount, &needs_temp_flush))
+	{
 		final_rel->consider_parallel = true;
+		final_rel->needs_temp_safety |=
+							current_rel->needs_temp_safety | needs_temp_flush;
+	}
 
 	/*
 	 * If the current_rel belongs to a single FDW, so does the final_rel.
@@ -4163,8 +4181,11 @@ make_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 	 * target list and HAVING quals are parallel-safe.
 	 */
 	if (input_rel->consider_parallel && target_parallel_safe &&
-		is_parallel_safe(root, (Node *) havingQual))
+		is_parallel_safe(root, (Node *) havingQual, &grouped_rel->needs_temp_safety))
+	{
 		grouped_rel->consider_parallel = true;
+		grouped_rel->needs_temp_safety |= input_rel->needs_temp_safety;
+	}
 
 	/*
 	 * If the input rel belongs to a single FDW, so does the grouped rel.
@@ -4792,8 +4813,11 @@ create_window_paths(PlannerInfo *root,
 	 * target list and active windows for non-parallel-safe constructs.
 	 */
 	if (input_rel->consider_parallel && output_target_parallel_safe &&
-		is_parallel_safe(root, (Node *) activeWindows))
+		is_parallel_safe(root, (Node *) activeWindows, &window_rel->needs_temp_safety))
+	{
 		window_rel->consider_parallel = true;
+		window_rel->needs_temp_safety |= input_rel->needs_temp_safety;
+	}
 
 	/*
 	 * If the input rel belongs to a single FDW, so does the window rel.
@@ -7290,10 +7314,12 @@ plan_create_index_workers(Oid tableOid, Oid indexOid)
 	 * Currently, parallel workers can't access the leader's temporary tables.
 	 * Furthermore, any index predicate or index expressions must be parallel
 	 * safe.
+	 * TODO: Is this hard to enable?
 	 */
 	if (heap->rd_rel->relpersistence == RELPERSISTENCE_TEMP ||
-		!is_parallel_safe(root, (Node *) RelationGetIndexExpressions(index)) ||
-		!is_parallel_safe(root, (Node *) RelationGetIndexPredicate(index)))
+		!is_parallel_safe(root, (Node *) RelationGetIndexExpressions(index), &rel->needs_temp_safety) ||
+		!is_parallel_safe(root, (Node *) RelationGetIndexPredicate(index), &rel->needs_temp_safety) ||
+		rel->needs_temp_safety)
 	{
 		parallel_workers = 0;
 		goto done;
