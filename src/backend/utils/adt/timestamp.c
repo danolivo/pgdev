@@ -20,13 +20,16 @@
 #include <limits.h>
 #include <sys/time.h>
 
+#include "access/stratnum.h"
 #include "access/xact.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "common/int.h"
 #include "common/int128.h"
 #include "funcapi.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/supportnodes.h"
 #include "optimizer/optimizer.h"
@@ -35,10 +38,13 @@
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/datetime.h"
+#include "utils/fmgroids.h"
 #include "utils/float.h"
+#include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "utils/skipsupport.h"
 #include "utils/sortsupport.h"
+#include "utils/typcache.h"
 
 
 /* Set at postmaster start */
@@ -1316,6 +1322,214 @@ interval_support(PG_FUNCTION_ARGS)
 			if (noop)
 				ret = relabel_to_typmod(source, new_typmod);
 		}
+	}
+
+	PG_RETURN_POINTER(ret);
+}
+
+/* True iff node is a date_trunc(text, timestamp[tz]) FuncExpr. */
+#define is_date_trunc(node) \
+	(IsA((node), FuncExpr) && \
+			(((FuncExpr *) (node))->funcid == F_DATE_TRUNC_TEXT_TIMESTAMP || \
+			 ((FuncExpr *) (node))->funcid == F_DATE_TRUNC_TEXT_TIMESTAMPTZ))
+
+/*
+ * date_trunc_day_eq_support
+ *
+ * Planner support for the four cross-type =(timestamp[tz], date) variants
+ * (both argument orders).  Rewrites
+ *		date_trunc('day', x) = d		(d of type date, either side)
+ * as
+ *		x >= d  AND  x < d + interval '1 day'
+ * so a btree index on x can serve the predicate; the original form buries
+ * the indexable column under date_trunc().
+ *
+ * Soundness rests on d being midnight-aligned, which is automatic when d
+ * has type date.  Infinity is not defended at runtime: when d is '+infinity'
+ * the half-open range is empty (infinity + interval = infinity), so the
+ * rewrite silently drops the row that the original predicate would match.
+ * Stage 1 targets schemas that exclude infinity dates by constraint - see
+ * date-trunc-rewrite-spec.md §3.2 and the XXX block in timestamp.sql.
+ */
+Datum
+date_trunc_day_eq_support(PG_FUNCTION_ARGS)
+{
+	Node				   *rawreq = (Node *) PG_GETARG_POINTER(0);
+	SupportRequestSimplify *req;
+	FuncExpr			   *fexpr;
+	Oid						eqfuncid;
+	Node				   *left;
+	Node				   *right;
+	Node				   *date_node = NULL;
+	FuncExpr			   *func_node = NULL;
+	Node				   *ret = NULL;
+	Oid						typoid;
+
+	if (unlikely(!IsA(rawreq, SupportRequestSimplify)))
+		PG_RETURN_POINTER(NULL);
+
+	req = (SupportRequestSimplify *) rawreq;
+	fexpr = req->fcall;
+	/* simplify_function() hands us a synthetic FuncExpr; see clauses.c. */
+	Assert(IsA(fexpr, FuncExpr) && list_length(fexpr->args) == 2);
+	eqfuncid = fexpr->funcid;
+
+	switch (eqfuncid)
+	{
+		case F_TIMESTAMP_EQ_DATE:
+		case F_TIMESTAMPTZ_EQ_DATE:
+		case F_DATE_EQ_TIMESTAMP:
+		case F_DATE_EQ_TIMESTAMPTZ:
+			/* One side is date by signature: alignment is free. */
+			break;
+		default:
+			PG_RETURN_POINTER(NULL);
+	}
+
+	left = strip_implicit_coercions(linitial(fexpr->args));
+	right = strip_implicit_coercions((Node *) lsecond(fexpr->args));
+
+	if (is_date_trunc(left))
+	{
+		func_node = (FuncExpr *) left;
+		date_node = right;
+	}
+	else if (is_date_trunc(right))
+	{
+		func_node = (FuncExpr *) right;
+		date_node = left;
+	}
+	else
+		PG_RETURN_POINTER(NULL);
+
+	/* is_date_trunc accepts any overload; gate on the unit text here. */
+	{
+		Node	   *unit_node;
+		Const	   *unit;
+		char	   *lowunits;
+		int			dtype;
+		int			val;
+
+		Assert(list_length(func_node->args) == 2);
+		unit_node = (Node *) linitial(func_node->args);
+		if (!IsA(unit_node, Const))
+			PG_RETURN_POINTER(NULL);
+
+		unit = (Const *) unit_node;
+		if (unit->constisnull || unit->consttype != TEXTOID)
+			PG_RETURN_POINTER(NULL);
+
+		lowunits = downcase_truncate_identifier(
+						VARDATA_ANY(DatumGetPointer(unit->constvalue)),
+						VARSIZE_ANY_EXHDR(DatumGetPointer(unit->constvalue)),
+								false);
+		dtype = DecodeUnits(0, lowunits, &val);
+		if (dtype != UNITS || val != DTK_DAY)
+			PG_RETURN_POINTER(NULL);
+	}
+
+	/*
+	 * Stripping further (e.g. peeling an explicit date::timestamp cast off
+	 * the RHS) would widen the match, but the alignment proof gets harder
+	 * and the win is marginal.  Keep the acceptance narrow for now.
+	 */
+	if (exprType(date_node) != DATEOID)
+		PG_RETURN_POINTER(NULL);
+
+
+	/*
+	 * Cross-type bounds: typoid >= date for the lower, typoid < (date +
+	 * interval '1 day') for the upper.  date + interval returns timestamp
+	 * regardless of typoid, hence the (typoid, TIMESTAMPOID) lookup below.
+	 */
+	typoid = func_node->funcresulttype;
+	Assert(typoid == TIMESTAMPOID || typoid == TIMESTAMPTZOID);
+	{
+		TypeCacheEntry *tce;
+		Oid			ge_opno;
+		Oid			lt_opno;
+		Node	   *col_expr;
+		Expr	   *upper;
+		Expr	   *ge_cl;
+		Expr	   *lt_cl;
+
+		tce = lookup_type_cache(typoid, TYPECACHE_BTREE_OPFAMILY);
+		if (!OidIsValid(tce->btree_opf))
+			PG_RETURN_POINTER(NULL);
+		ge_opno = get_opfamily_member_for_cmptype(tce->btree_opf,
+												  typoid, DATEOID,
+												  COMPARE_GE);
+		lt_opno = get_opfamily_member_for_cmptype(tce->btree_opf,
+												  typoid, TIMESTAMPOID,
+												  COMPARE_LT);
+		if (!OidIsValid(ge_opno) || !OidIsValid(lt_opno))
+			PG_RETURN_POINTER(NULL);
+
+		col_expr = (Node *) lsecond(func_node->args);
+		Assert(exprType(col_expr) == typoid);
+
+		/*
+		 * Fold the upper bound at plan time when we can.  eval_const_
+		 * expressions does not re-walk what we return, so a Const+Const
+		 * subtree would otherwise reach the executor unfolded - per-row in
+		 * Filter plans, per-rescan for parameterised index scans.
+		 */
+		if (IsA(date_node, Const) && !((Const *) date_node)->constisnull)
+		{
+			Interval	iv = {0};	/* transient; consumed by the call below */
+			Datum		tstamp;
+
+			iv.day = 1;
+			tstamp = DirectFunctionCall2(date_pl_interval,
+										 ((Const *) date_node)->constvalue,
+										 IntervalPGetDatum(&iv));
+			upper = (Expr *) makeConst(TIMESTAMPOID,
+									   -1,
+									   InvalidOid,
+									   sizeof(Timestamp),
+									   tstamp,
+									   false,
+									   FLOAT8PASSBYVAL);
+		}
+		else
+		{
+			Interval   *iv;
+			Const	   *one_day;
+			Oid			pl_opno;
+
+			/*
+			 * Schema-qualify "+" to pg_catalog: a user-defined +(date,
+			 * interval) earlier in the search_path must not be able to
+			 * hijack the rewrite.  Do NOT simplify back to a bare name.
+			 */
+			pl_opno = OpernameGetOprid(list_make2(makeString("pg_catalog"),
+												  makeString("+")),
+									   DATEOID, INTERVALOID);
+			if (!OidIsValid(pl_opno))
+				PG_RETURN_POINTER(NULL);
+
+			/* one_day's Datum is by-reference - iv must outlive the Const. */
+			iv = palloc0_object(Interval);
+			iv->day = 1;
+			one_day = makeConst(INTERVALOID, -1, InvalidOid, sizeof(Interval),
+								IntervalPGetDatum(iv), false, false);
+			upper = make_opclause(pl_opno, TIMESTAMPOID, false,
+								  (Expr *) date_node,
+								  (Expr *) one_day,
+								  InvalidOid, InvalidOid);
+		}
+
+		/* date_node is shared with the upper branch above; copy for ge. */
+		ge_cl = make_opclause(ge_opno, BOOLOID, false,
+							  (Expr *) col_expr,
+							  (Expr *) copyObject(date_node),
+							  InvalidOid, InvalidOid);
+		lt_cl = make_opclause(lt_opno, BOOLOID, false,
+							  (Expr *) copyObject(col_expr),
+							  upper,
+							  InvalidOid, InvalidOid);
+
+		ret = (Node *) make_andclause(list_make2(ge_cl, lt_cl));
 	}
 
 	PG_RETURN_POINTER(ret);

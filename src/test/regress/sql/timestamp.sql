@@ -432,3 +432,81 @@ select age(timestamp '-infinity', timestamp '-infinity');
 -- test timestamp near POSTGRES_EPOCH_JDATE
 select timestamp '1999-12-31 24:00:00';
 select make_timestamp(1999, 12, 31, 24, 0, 0);
+
+-- XXX: documented incorrect behaviour.  The date_trunc('day', x) = d planner
+-- rewrite (see src/backend/utils/adt/timestamp.c::date_trunc_day_eq_support)
+-- maps the predicate to (x >= d AND x < d + interval '1 day').  When d is
+-- '+infinity' the half-open range [d, d + '1 day') is empty (infinity +
+-- interval = infinity, infinity < infinity is false), so the rewrite drops
+-- the row that the original predicate matches.  The rewrite is currently
+-- attached only to the cross-type =(timestamp, date) and =(timestamptz, date)
+-- operators; the self-join below uses =(timestamp, timestamp), which falls
+-- through to NULL in the support function, so the rewrite does not fire
+-- here.  This case is recorded so the divergence is visible if the
+-- same-type equality path is ever enabled.  See date-trunc-rewrite-spec.md
+-- §3.2 (the no-infinity deployment assumption).
+CREATE TABLE date_trunc_infinity (x timestamp);
+INSERT INTO date_trunc_infinity VALUES ('+infinity');
+-- original predicate matches the infinity self-join row
+SELECT a.x, b.x FROM date_trunc_infinity a, date_trunc_infinity b
+  WHERE date_trunc('day', a.x) = b.x;
+-- hand-applied rewrite-equivalent matches nothing
+SELECT a.x, b.x FROM date_trunc_infinity a, date_trunc_infinity b
+  WHERE a.x >= b.x AND a.x < b.x + interval '1 day';
+DROP TABLE date_trunc_infinity;
+
+--
+-- date_trunc_day_eq_support planner rewrite: EXPLAIN-shape proofs.
+--
+CREATE INDEX timestamp_tbl_d1_idx ON timestamp_tbl (d1);
+SET enable_seqscan = off;
+
+-- No transformation.  TODO: may be applied later.
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl
+WHERE date_trunc('day', d1) = '2000-03-15';
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl
+WHERE date_trunc('year', d1) = DATE '2000-03-15';
+
+-- Check we don't forget to evaluate underlying arguments.
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl
+WHERE date_trunc('day', d1) = date_trunc('day', '2000-03-15'::timestamp);
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl
+WHERE date_trunc('day', d1) = date_trunc('day', '2000-03-15'::timestamp)::date;
+
+-- Basic transformation.
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl
+WHERE date_trunc('day', d1) = DATE '2000-03-15';
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl t1, timestamp_tbl t2
+WHERE t1.d1 < '2000-03-15' AND date_trunc('day', t1.d1) = t2.d1::date;
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl t1, timestamp_tbl t2
+WHERE date_trunc('day', t1.d1) = date_trunc('day', t2.d1);
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl t1, timestamp_tbl t2
+WHERE date_trunc('day', t1.d1) = date_trunc('day', t2.d1)::date;
+
+-- Reverse argument order: rewrite via =(date, timestamp).
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE DATE '2000-03-15' = date_trunc('day', d1);
+
+DROP INDEX timestamp_tbl_d1_idx;
+RESET enable_seqscan;
+
+-- Result equivalence: rewritten predicate must match the hand-applied range
+-- form on finite data (the deployment assumption excludes infinity).
+SELECT (SELECT count(*) FROM timestamp_tbl
+        WHERE date_trunc('day', d1) = DATE '2000-03-15')
+     = (SELECT count(*) FROM timestamp_tbl
+        WHERE d1 >= DATE '2000-03-15'
+          AND d1 <  DATE '2000-03-15' + interval '1 day')
+       AS rewrite_results_match;
+
+-- NULL RHS: rewrite must preserve NULL semantics (no row selected).
+SELECT count(*) FROM timestamp_tbl WHERE date_trunc('day', d1) = NULL::date;
