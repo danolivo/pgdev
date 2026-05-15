@@ -3500,6 +3500,7 @@ typedef struct SecLabelStmt
 #define CURSOR_OPT_HOLD			0x0020	/* WITH HOLD */
 /* these planner-control flags do not correspond to any SQL grammar: */
 #define CURSOR_OPT_FAST_PLAN	0x0100	/* prefer fast-start plan */
+/* the next two override plan_cache_mode; see choose_custom_plan() */
 #define CURSOR_OPT_GENERIC_PLAN 0x0200	/* force use of generic plan */
 #define CURSOR_OPT_CUSTOM_PLAN	0x0400	/* force use of custom plan */
 #define CURSOR_OPT_PARALLEL_OK	0x0800	/* parallel mode OK */

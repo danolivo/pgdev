@@ -163,6 +163,16 @@ PREPARE <replaceable class="parameter">name</replaceable> [ ( <replaceable class
   </para>
 
   <para>
+   When a prepared statement is created from C code via the SPI interface,
+   the caller can additionally pin the plan kind on a per-statement basis
+   by passing <symbol>CURSOR_OPT_GENERIC_PLAN</symbol> or
+   <symbol>CURSOR_OPT_CUSTOM_PLAN</symbol> to
+   <function>SPI_prepare_cursor</function> (or one of its siblings).
+   Such a per-statement request takes precedence over
+   <varname>plan_cache_mode</varname>.
+  </para>
+
+  <para>
    To examine the query plan <productname>PostgreSQL</productname> is using
    for a prepared statement, use <link linkend="sql-explain"><command>EXPLAIN</command></link>, for example
 <programlisting>

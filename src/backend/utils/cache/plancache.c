@@ -1187,13 +1187,17 @@ choose_custom_plan(CachedPlanSource *plansource, ParamListInfo boundParams)
 	if (!StmtPlanRequiresRevalidation(plansource))
 		return false;
 
-	/* See if caller wants to force the decision */
+	/*
+	 * The caller's explicit request, expressed via cursor_options, takes
+	 * precedence over plan_cache_mode: per-statement intent wins over a
+	 * global session default.  Check it before consulting the GUC.
+	 */
 	if (plansource->cursor_options & CURSOR_OPT_GENERIC_PLAN)
 		return false;
 	if (plansource->cursor_options & CURSOR_OPT_CUSTOM_PLAN)
 		return true;
 
-	/* Let settings force the decision */
+	/* Otherwise, let plan_cache_mode pin the decision if set */
 	if (plan_cache_mode == PLAN_CACHE_MODE_FORCE_GENERIC_PLAN)
 		return false;
 	if (plan_cache_mode == PLAN_CACHE_MODE_FORCE_CUSTOM_PLAN)

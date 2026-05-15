@@ -6881,6 +6881,11 @@ SELECT * FROM parent WHERE key = 2400;
         <literal>force_generic_plan</literal>.
         This setting is considered when a cached plan is to be executed,
         not when it is prepared.
+        If the caller has explicitly requested a generic or custom plan
+        (via <symbol>CURSOR_OPT_GENERIC_PLAN</symbol>
+        or <symbol>CURSOR_OPT_CUSTOM_PLAN</symbol> passed to
+        <function>SPI_prepare_cursor</function> or its siblings), that
+        request takes precedence over this setting.
         For more information see <xref linkend="sql-prepare"/>.
        </para>
       </listitem>
