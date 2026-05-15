@@ -1,0 +1,4 @@
+comment = 'Test the cursor_options vs plan_cache_mode precedence rule'
+default_version = '1.0'
+module_pathname = '$libdir/test_plan_cache'
+relocatable = true
