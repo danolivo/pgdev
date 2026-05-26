@@ -2355,6 +2355,16 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 								   NRM_EQUAL,
 								   NUM_EXEC_QUAL((Plan *) join));
 
+	/* Process rhs_joinqual as well */
+	join->rhs_joinqual = fix_join_expr(root,
+									   join->rhs_joinqual,
+									   outer_itlist,
+									   inner_itlist,
+									   (Index) 0,
+									   rtoffset,
+									   NRM_EQUAL,
+									   NUM_EXEC_QUAL((Plan *) join));
+
 	/* Now do join-type-specific stuff */
 	if (IsA(join, NestLoop))
 	{

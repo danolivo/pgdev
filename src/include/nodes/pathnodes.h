@@ -2236,6 +2236,7 @@ typedef struct JoinPath
 	Path	   *innerjoinpath;	/* path for the inner side of the join */
 
 	List	   *joinrestrictinfo;	/* RestrictInfos to apply to join */
+	List	   *rhs_joinrinfo;	/* Outer-side join clauses (filters) */
 
 	/*
 	 * See the notes for RelOptInfo and ParamPathInfo to understand why

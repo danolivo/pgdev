@@ -2165,6 +2165,12 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			}
 			break;
 		case T_NestLoop:
+			show_upper_qual(((NestLoop *) plan)->join.rhs_joinqual,
+							"Outer Tuple Filter", planstate, ancestors, es);
+			if (((NestLoop *) plan)->join.rhs_joinqual)
+				show_instrumentation_count("Rows Unmatched by Outer Tuple Filter", 3,
+										   planstate, es);
+
 			show_upper_qual(((NestLoop *) plan)->join.joinqual,
 							"Join Filter", planstate, ancestors, es);
 			if (((NestLoop *) plan)->join.joinqual)
@@ -3982,6 +3988,8 @@ show_instrumentation_count(const char *qlabel, int which,
 
 	if (which == 2)
 		nfiltered = planstate->instrument->nfiltered2;
+	else if (which == 3)
+		nfiltered = planstate->instrument->nunmatched;
 	else
 		nfiltered = planstate->instrument->nfiltered1;
 	nloops = planstate->instrument->nloops;

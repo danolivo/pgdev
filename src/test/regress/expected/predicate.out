@@ -115,14 +115,11 @@ SELECT * FROM pred_tab t1
                 QUERY PLAN                 
 -------------------------------------------
  Nested Loop Left Join
-   Join Filter: (t2.a IS NOT NULL)
-   ->  Merge Full Join
-         Merge Cond: (t1.a = t2.a)
-         ->  Sort
-               Sort Key: t1.a
-               ->  Seq Scan on pred_tab t1
-         ->  Sort
-               Sort Key: t2.a
+   Outer Tuple Filter: (t2.a IS NOT NULL)
+   ->  Nested Loop Left Join
+         Outer Tuple Filter: (t1.a = 1)
+         ->  Seq Scan on pred_tab t1
+         ->  Materialize
                ->  Seq Scan on pred_tab t2
    ->  Materialize
          ->  Seq Scan on pred_tab t3
@@ -132,15 +129,20 @@ SELECT * FROM pred_tab t1
 -- NULL column, and b) its Var is not nullable by any outer joins
 EXPLAIN (COSTS OFF)
 SELECT * FROM pred_tab t1
-    LEFT JOIN pred_tab t2 ON t1.a IS NULL;
-           QUERY PLAN           
---------------------------------
+    LEFT JOIN pred_tab t2 ON TRUE
+    LEFT JOIN pred_tab t3 ON t2.a IS NULL AND t2.b = 1;
+                        QUERY PLAN                        
+----------------------------------------------------------
  Nested Loop Left Join
    Join Filter: false
    ->  Seq Scan on pred_tab t1
-   ->  Result
-         One-Time Filter: false
-(5 rows)
+   ->  Materialize
+         ->  Nested Loop Left Join
+               Outer Tuple Filter: (false AND (t2.b = 1))
+               ->  Seq Scan on pred_tab t2
+               ->  Result
+                     One-Time Filter: false
+(8 rows)
 
 -- Ensure the IS_NULL qual is not reduced to constant-FALSE when the column is
 -- nullable by an outer join
@@ -151,9 +153,9 @@ SELECT * FROM pred_tab t1
                 QUERY PLAN                 
 -------------------------------------------
  Nested Loop Left Join
-   Join Filter: (t2.a IS NULL)
+   Outer Tuple Filter: (t2.a IS NULL)
    ->  Nested Loop Left Join
-         Join Filter: (t1.a = 1)
+         Outer Tuple Filter: (t1.a = 1)
          ->  Seq Scan on pred_tab t1
          ->  Materialize
                ->  Seq Scan on pred_tab t2
@@ -182,17 +184,14 @@ EXPLAIN (COSTS OFF)
 SELECT * FROM pred_tab t1
     FULL JOIN pred_tab t2 ON t1.a = t2.a
     LEFT JOIN pred_tab t3 ON t2.a IS NOT NULL OR t2.b = 1;
-                    QUERY PLAN                     
----------------------------------------------------
+                        QUERY PLAN                        
+----------------------------------------------------------
  Nested Loop Left Join
-   Join Filter: ((t2.a IS NOT NULL) OR (t2.b = 1))
-   ->  Merge Full Join
-         Merge Cond: (t1.a = t2.a)
-         ->  Sort
-               Sort Key: t1.a
-               ->  Seq Scan on pred_tab t1
-         ->  Sort
-               Sort Key: t2.a
+   Outer Tuple Filter: ((t2.a IS NOT NULL) OR (t2.b = 1))
+   ->  Nested Loop Left Join
+         Outer Tuple Filter: (t1.a = 1)
+         ->  Seq Scan on pred_tab t1
+         ->  Materialize
                ->  Seq Scan on pred_tab t2
    ->  Materialize
          ->  Seq Scan on pred_tab t3
@@ -202,15 +201,20 @@ SELECT * FROM pred_tab t1
 -- provably false
 EXPLAIN (COSTS OFF)
 SELECT * FROM pred_tab t1
-    LEFT JOIN pred_tab t2 ON (t1.a IS NULL OR t1.c IS NULL);
-           QUERY PLAN           
---------------------------------
+    LEFT JOIN pred_tab t2 ON TRUE
+    LEFT JOIN pred_tab t3 ON (t2.a IS NULL OR t2.c IS NULL) AND t2.b = 1;
+                        QUERY PLAN                        
+----------------------------------------------------------
  Nested Loop Left Join
    Join Filter: false
    ->  Seq Scan on pred_tab t1
-   ->  Result
-         One-Time Filter: false
-(5 rows)
+   ->  Materialize
+         ->  Nested Loop Left Join
+               Outer Tuple Filter: (false AND (t2.b = 1))
+               ->  Seq Scan on pred_tab t2
+               ->  Result
+                     One-Time Filter: false
+(8 rows)
 
 -- Ensure the OR clause is not reduced to constant-FALSE when a column is
 -- made nullable from an outer join
@@ -218,12 +222,12 @@ EXPLAIN (COSTS OFF)
 SELECT * FROM pred_tab t1
     LEFT JOIN pred_tab t2 ON t1.a = 1
     LEFT JOIN pred_tab t3 ON t2.a IS NULL OR t2.c IS NULL;
-                    QUERY PLAN                     
----------------------------------------------------
+                        QUERY PLAN                        
+----------------------------------------------------------
  Nested Loop Left Join
-   Join Filter: ((t2.a IS NULL) OR (t2.c IS NULL))
+   Outer Tuple Filter: ((t2.a IS NULL) OR (t2.c IS NULL))
    ->  Nested Loop Left Join
-         Join Filter: (t1.a = 1)
+         Outer Tuple Filter: (t1.a = 1)
          ->  Seq Scan on pred_tab t1
          ->  Materialize
                ->  Seq Scan on pred_tab t2
@@ -291,24 +295,25 @@ ANALYZE pred_tab;
 ANALYZE pred_tab_notnull;
 -- Ensure the IS_NOT_NULL qual is not reduced to constant true and removed
 EXPLAIN (COSTS OFF)
-SELECT * FROM pred_tab t1
-    LEFT JOIN pred_tab t2 ON TRUE
-    LEFT JOIN pred_tab_notnull t3 ON t2.a = t3.a
-    LEFT JOIN pred_tab t4 ON t3.b IS NOT NULL;
-                          QUERY PLAN                           
----------------------------------------------------------------
- Nested Loop Left Join
-   ->  Seq Scan on pred_tab t1
-   ->  Materialize
+SELECT 1 FROM pred_tab t1
+    LEFT JOIN
+        (pred_tab t2 LEFT JOIN pred_tab t3 ON t2.a = t3.a) ON TRUE
+    LEFT JOIN pred_tab t4 ON t1.a IS NULL AND t1.b = 1
+    RIGHT JOIN pred_tab t5 ON t1.b = t5.b;
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Hash Right Join
+   Hash Cond: (t1.b = t5.b)
+   ->  Nested Loop Left Join
          ->  Nested Loop Left Join
-               Join Filter: (t3.b IS NOT NULL)
-               ->  Nested Loop Left Join
-                     Join Filter: (t2.a = t3.a)
-                     ->  Seq Scan on pred_tab t2
-                     ->  Materialize
-                           ->  Seq Scan on pred_tab_notnull t3
-               ->  Materialize
-                     ->  Seq Scan on pred_tab t4
+               Outer Tuple Filter: (false AND (t1.b = 1))
+               ->  Seq Scan on pred_tab t1
+               ->  Result
+                     One-Time Filter: false
+         ->  Materialize
+               ->  Seq Scan on pred_tab t2
+   ->  Hash
+         ->  Seq Scan on pred_tab t5
 (12 rows)
 
 SELECT * FROM pred_tab t1

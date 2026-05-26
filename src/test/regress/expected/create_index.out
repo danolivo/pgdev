@@ -2244,7 +2244,7 @@ SELECT count(*) FROM tenk1 LEFT JOIN tenk2 ON
 ------------------------------------------------------------------------------------
  Aggregate
    ->  Nested Loop Left Join
-         Join Filter: (tenk1.hundred = 42)
+         Outer Tuple Filter: (tenk1.hundred = 42)
          ->  Index Only Scan using tenk1_hundred on tenk1
          ->  Memoize
                Cache Key: tenk1.hundred

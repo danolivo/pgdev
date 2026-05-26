@@ -231,7 +231,7 @@ static RecursiveUnion *make_recursive_union(List *tlist,
 static BitmapAnd *make_bitmap_and(List *bitmapplans);
 static BitmapOr *make_bitmap_or(List *bitmapplans);
 static NestLoop *make_nestloop(List *tlist,
-							   List *joinclauses, List *otherclauses, List *nestParams,
+							   List *joinclauses, List *rhs_joinclauses, List *otherclauses, List *nestParams,
 							   Plan *lefttree, Plan *righttree,
 							   JoinType jointype, bool inner_unique);
 static HashJoin *make_hashjoin(List *tlist,
@@ -4356,7 +4356,9 @@ create_nestloop_plan(PlannerInfo *root,
 	Relids		outerrelids;
 	List	   *tlist = build_path_tlist(root, &best_path->jpath.path);
 	List	   *joinrestrictclauses = best_path->jpath.joinrestrictinfo;
+	List	   *rhs_joinclauses = NIL;
 	List	   *joinclauses;
+	List	   *rhs_otherclauses = NIL;
 	List	   *otherclauses;
 	List	   *nestParams;
 	List	   *outer_tlist;
@@ -4404,6 +4406,10 @@ create_nestloop_plan(PlannerInfo *root,
 		extract_actual_join_clauses(joinrestrictclauses,
 									best_path->jpath.path.parent->relids,
 									&joinclauses, &otherclauses);
+
+		extract_actual_join_clauses(best_path->jpath.rhs_joinrinfo,
+									best_path->jpath.path.parent->relids,
+									&rhs_joinclauses, &rhs_otherclauses);
 	}
 	else
 	{
@@ -4492,6 +4498,7 @@ create_nestloop_plan(PlannerInfo *root,
 	/* And finally, we can build the join plan node */
 	join_plan = make_nestloop(tlist,
 							  joinclauses,
+							  rhs_joinclauses,
 							  otherclauses,
 							  nestParams,
 							  outer_plan,
@@ -6097,6 +6104,7 @@ make_bitmap_or(List *bitmapplans)
 static NestLoop *
 make_nestloop(List *tlist,
 			  List *joinclauses,
+			  List *rhs_joinclauses,
 			  List *otherclauses,
 			  List *nestParams,
 			  Plan *lefttree,
@@ -6114,6 +6122,24 @@ make_nestloop(List *tlist,
 	node->join.jointype = jointype;
 	node->join.inner_unique = inner_unique;
 	node->join.joinqual = joinclauses;
+
+	{
+		ListCell   *lc;
+
+		/* Remove quals from joinqual which belongs to outer relation */
+		foreach(lc, node->join.joinqual)
+		{
+			Node	   *qual = (Node *) lfirst(lc);
+
+			if (!list_member(rhs_joinclauses, qual))
+				continue;
+
+			node->join.joinqual = foreach_delete_current(node->join.joinqual, lc);
+		}
+
+	}
+
+	node->join.rhs_joinqual = rhs_joinclauses;
 	node->nestParams = nestParams;
 
 	return node;

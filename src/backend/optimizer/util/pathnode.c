@@ -2789,6 +2789,14 @@ create_nestloop_path(PlannerInfo *root,
 	pathnode->jpath.innerjoinpath = inner_path;
 	pathnode->jpath.joinrestrictinfo = restrict_clauses;
 
+	/* If clause_relids belong to outerpath then add it to rhs_joinrinfo list */
+	foreach_node(RestrictInfo, rinfo, restrict_clauses)
+	{
+		if (bms_is_subset(rinfo->clause_relids, outer_path->parent->relids))
+			pathnode->jpath.rhs_joinrinfo =
+				lappend(pathnode->jpath.rhs_joinrinfo, rinfo);
+	}
+
 	final_cost_nestloop(root, pathnode, workspace, extra);
 
 	return pathnode;

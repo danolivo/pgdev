@@ -2418,7 +2418,7 @@ SELECT q.a, ft2.c1 FROM (SELECT 13 FROM ft1 WHERE c1 = 13) q(a) RIGHT JOIN ft2 O
 ---------------------------------------------------------------------------------------------------------------------------
  Nested Loop Left Join
    Output: (13), ft2.c1
-   Join Filter: (13 = ft2.c1)
+   Outer Tuple Filter: (13 = ft2.c1)
    ->  Foreign Scan on public.ft2
          Output: ft2.c1
          Remote SQL: SELECT "C 1" FROM "S 1"."T 1" WHERE (("C 1" >= 10)) AND (("C 1" <= 15)) ORDER BY "C 1" ASC NULLS LAST

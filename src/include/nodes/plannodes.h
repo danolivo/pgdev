@@ -920,8 +920,9 @@ typedef struct Join
 	Plan		plan;
 	JoinType	jointype;
 	bool		inner_unique;
-	/* JOIN quals (in addition to plan.qual) */
-	List	   *joinqual;
+	List	   *joinqual;		/* JOIN quals (in addition to plan.qual) */
+	List	   *rhs_joinqual;	/* JOIN quals which can be executed by using
+								 * only outer tuple */
 } Join;
 
 /* ----------------
