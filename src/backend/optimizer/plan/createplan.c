@@ -231,7 +231,7 @@ static RecursiveUnion *make_recursive_union(List *tlist,
 static BitmapAnd *make_bitmap_and(List *bitmapplans);
 static BitmapOr *make_bitmap_or(List *bitmapplans);
 static NestLoop *make_nestloop(List *tlist,
-							   List *joinclauses, List *rhs_joinclauses, List *otherclauses, List *nestParams,
+							   List *joinclauses, List *otherclauses, List *nestParams,
 							   Plan *lefttree, Plan *righttree,
 							   JoinType jointype, bool inner_unique);
 static HashJoin *make_hashjoin(List *tlist,
@@ -4358,7 +4358,6 @@ create_nestloop_plan(PlannerInfo *root,
 	List	   *joinrestrictclauses = best_path->jpath.joinrestrictinfo;
 	List	   *rhs_joinclauses = NIL;
 	List	   *joinclauses;
-	List	   *rhs_otherclauses = NIL;
 	List	   *otherclauses;
 	List	   *nestParams;
 	List	   *outer_tlist;
@@ -4407,15 +4406,30 @@ create_nestloop_plan(PlannerInfo *root,
 									best_path->jpath.path.parent->relids,
 									&joinclauses, &otherclauses);
 
-		extract_actual_join_clauses(best_path->jpath.rhs_joinrinfo,
-									best_path->jpath.path.parent->relids,
-									&rhs_joinclauses, &rhs_otherclauses);
+		rhs_joinclauses = extract_actual_clauses(best_path->jpath.rhs_joinrinfo,
+												 false);
 	}
 	else
 	{
 		/* We can treat all clauses alike for an inner join */
 		joinclauses = extract_actual_clauses(joinrestrictclauses, false);
 		otherclauses = NIL;
+	}
+
+	/*
+	 * If we have outer-only join clauses (rhs_joinclauses), remove them from
+	 * joinclauses before parameterization so the comparison works on original
+	 * (non-parameterized) expressions.  These clauses will be placed into a
+	 * Result node on the inner side instead.
+	 */
+	if (rhs_joinclauses != NIL)
+	{
+		ListCell   *lc;
+
+		foreach(lc, rhs_joinclauses)
+		{
+			joinclauses = list_delete(joinclauses, lfirst(lc));
+		}
 	}
 
 	/* Replace any outer-relation variables with nestloop params */
@@ -4425,6 +4439,58 @@ create_nestloop_plan(PlannerInfo *root,
 			replace_nestloop_params(root, (Node *) joinclauses);
 		otherclauses = (List *)
 			replace_nestloop_params(root, (Node *) otherclauses);
+	}
+
+	/*
+	 * If we have outer-only join clauses, inject a Result node with a gating
+	 * qual on the inner side.  The Result node's resconstantqual is
+	 * re-evaluated on each rescan; when false it returns zero rows without
+	 * ever launching the inner scan.
+	 *
+	 * We must parameterize the clauses (replace outer Vars with NestLoop
+	 * params) so the Result node can evaluate them using values supplied by
+	 * the outer side of the NestLoop.
+	 */
+	if (rhs_joinclauses != NIL)
+	{
+		Relids		tmpOuterRels = root->curOuterRels;
+
+		/*
+		 * Parameterize: convert outer Var references to PARAM_EXEC.
+		 *
+		 * replace_nestloop_params only converts Vars whose varno is in
+		 * curOuterRels.  At this point curOuterRels has been restored and
+		 * no longer includes THIS nestloop's outer relids, so we must
+		 * temporarily re-add them.
+		 */
+		root->curOuterRels = bms_union(root->curOuterRels, outerrelids);
+
+		rhs_joinclauses = (List *)
+			replace_nestloop_params(root, (Node *) rhs_joinclauses);
+
+		bms_free(root->curOuterRels);
+		root->curOuterRels = tmpOuterRels;
+
+		/*
+		 * Wrap the inner plan with a Result node.  Pass the clause list
+		 * directly as resconstantqual — ExecInitResult passes it to
+		 * ExecInitQual which expects an implicit-AND List of expressions.
+		 *
+		 * Propagate cost estimates from the child plan.  The gating qual
+		 * may reduce the effective row count, but the NestLoop's own cost
+		 * estimate (from the path) already accounts for this.
+		 */
+		{
+			Plan	   *subplan = inner_plan;
+
+			inner_plan = (Plan *) make_result(subplan->targetlist,
+											  (Node *) rhs_joinclauses,
+											  subplan);
+			inner_plan->startup_cost = subplan->startup_cost;
+			inner_plan->total_cost = subplan->total_cost;
+			inner_plan->plan_rows = subplan->plan_rows;
+			inner_plan->plan_width = subplan->plan_width;
+		}
 	}
 
 	/*
@@ -4498,7 +4564,6 @@ create_nestloop_plan(PlannerInfo *root,
 	/* And finally, we can build the join plan node */
 	join_plan = make_nestloop(tlist,
 							  joinclauses,
-							  rhs_joinclauses,
 							  otherclauses,
 							  nestParams,
 							  outer_plan,
@@ -6104,7 +6169,6 @@ make_bitmap_or(List *bitmapplans)
 static NestLoop *
 make_nestloop(List *tlist,
 			  List *joinclauses,
-			  List *rhs_joinclauses,
 			  List *otherclauses,
 			  List *nestParams,
 			  Plan *lefttree,
@@ -6122,24 +6186,6 @@ make_nestloop(List *tlist,
 	node->join.jointype = jointype;
 	node->join.inner_unique = inner_unique;
 	node->join.joinqual = joinclauses;
-
-	{
-		ListCell   *lc;
-
-		/* Remove quals from joinqual which belongs to outer relation */
-		foreach(lc, node->join.joinqual)
-		{
-			Node	   *qual = (Node *) lfirst(lc);
-
-			if (!list_member(rhs_joinclauses, qual))
-				continue;
-
-			node->join.joinqual = foreach_delete_current(node->join.joinqual, lc);
-		}
-
-	}
-
-	node->join.rhs_joinqual = rhs_joinclauses;
 	node->nestParams = nestParams;
 
 	return node;

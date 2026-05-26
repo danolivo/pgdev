@@ -66,7 +66,6 @@ ExecNestLoop(PlanState *pstate)
 	TupleTableSlot *outerTupleSlot;
 	TupleTableSlot *innerTupleSlot;
 	ExprState  *joinqual;
-	ExprState  *rhs_joinqual;
 	ExprState  *otherqual;
 	ExprContext *econtext;
 	ListCell   *lc;
@@ -80,7 +79,6 @@ ExecNestLoop(PlanState *pstate)
 
 	nl = (NestLoop *) node->js.ps.plan;
 	joinqual = node->js.joinqual;
-	rhs_joinqual = node->js.rhs_joinqual;
 	otherqual = node->js.ps.qual;
 	outerPlan = outerPlanState(node);
 	innerPlan = innerPlanState(node);
@@ -154,23 +152,12 @@ ExecNestLoop(PlanState *pstate)
 		}
 
 		/*
-		 * we have an outerTuple, try to execute quals related to it. If the
-		 * result is false then we won't get the next inner tuple. Otherwise,
-		 * extract it.
+		 * we have an outerTuple, try to get the next inner tuple.
 		 */
-		ENL1_printf("executing quals related to outer tuple if any");
+		ENL1_printf("getting new inner tuple");
 
-		if (rhs_joinqual && !ExecQual(rhs_joinqual, econtext))
-		{
-			InstrCountUnmatched(node, 1);
-			innerTupleSlot = NULL;
-		}
-		else
-		{
-			ENL1_printf("getting new inner tuple");
-			innerTupleSlot = ExecProcNode(innerPlan);
-			econtext->ecxt_innertuple = innerTupleSlot;
-		}
+		innerTupleSlot = ExecProcNode(innerPlan);
+		econtext->ecxt_innertuple = innerTupleSlot;
 
 		if (TupIsNull(innerTupleSlot))
 		{
@@ -332,8 +319,6 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	nlstate->js.jointype = node->join.jointype;
 	nlstate->js.joinqual =
 		ExecInitQual(node->join.joinqual, (PlanState *) nlstate);
-	nlstate->js.rhs_joinqual =
-		ExecInitQual(node->join.rhs_joinqual, (PlanState *) nlstate);
 
 	/*
 	 * detect whether we need only consider the first matching inner tuple

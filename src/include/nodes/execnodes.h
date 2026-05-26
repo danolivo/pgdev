@@ -1273,11 +1273,6 @@ typedef struct PlanState
 		if (((PlanState *)(node))->instrument) \
 			((PlanState *)(node))->instrument->nfiltered2 += (delta); \
 	} while(0)
-#define InstrCountUnmatched(node, delta) \
-	do { \
-		if (((PlanState *)(node))->instrument) \
-			((PlanState *)(node))->instrument->nunmatched += (delta); \
-	} while(0)
 
 /*
  * EPQState is state for executing an EvalPlanQual recheck on a candidate
@@ -2163,8 +2158,6 @@ typedef struct JoinState
 	bool		single_match;	/* True if we should skip to next outer tuple
 								 * after finding one inner match */
 	ExprState  *joinqual;		/* JOIN quals (in addition to ps.qual) */
-	ExprState  *rhs_joinqual;	/* JOIN quals which can be executed using only
-								 * outer tuple */
 } JoinState;
 
 /* ----------------
