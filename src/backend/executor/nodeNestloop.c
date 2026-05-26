@@ -290,12 +290,19 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	 *
 	 * If we have no parameters to pass into the inner rel from the outer,
 	 * tell the inner child that cheap rescans would be good.  If we do have
-	 * such parameters, then there is no point in REWIND support at all in the
-	 * inner child, because it will always be rescanned with fresh parameter
-	 * values.
+	 * such parameters, there is normally no point in REWIND support in the
+	 * inner child, because it will be rescanned with fresh parameter values.
+	 *
+	 * The exception is keep_inner_rewind, which create_nestloop_plan sets when
+	 * the only parameters feed a gating Result that caps the inner subtree and
+	 * is re-checked once per outer tuple.  The plan below that gate is then
+	 * parameter-independent and yields the same rows every time, so we keep
+	 * REWIND to let it (typically a Materialize) buffer its output and replay
+	 * it across rescans instead of rebuilding it for every outer tuple that
+	 * passes the gate.
 	 */
 	outerPlanState(nlstate) = ExecInitNode(outerPlan(node), estate, eflags);
-	if (node->nestParams == NIL)
+	if (node->nestParams == NIL || node->keep_inner_rewind)
 		eflags |= EXEC_FLAG_REWIND;
 	else
 		eflags &= ~EXEC_FLAG_REWIND;
