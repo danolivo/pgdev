@@ -4354,8 +4354,10 @@ create_nestloop_plan(PlannerInfo *root,
 	Plan	   *outer_plan;
 	Plan	   *inner_plan;
 	Relids		outerrelids;
+	Relids		joinrelids = best_path->jpath.path.parent->relids;
 	List	   *tlist = build_path_tlist(root, &best_path->jpath.path);
 	List	   *joinrestrictclauses = best_path->jpath.joinrestrictinfo;
+	List	   *gating_clauses = NIL;
 	List	   *joinclauses;
 	List	   *otherclauses;
 	List	   *nestParams;
@@ -4402,8 +4404,25 @@ create_nestloop_plan(PlannerInfo *root,
 	if (IS_OUTER_JOIN(best_path->jpath.jointype))
 	{
 		extract_actual_join_clauses(joinrestrictclauses,
-									best_path->jpath.path.parent->relids,
+									joinrelids,
 									&joinclauses, &otherclauses);
+
+		/*
+		 * Collect the join clauses that reference only the outer rel: they
+		 * are constant for a given outer tuple, so the loop further down can
+		 * gate the inner side with them instead of re-checking them per
+		 * inner row.
+		 */
+		foreach_node(RestrictInfo, rinfo, joinrestrictclauses)
+		{
+			if (bms_is_empty(rinfo->clause_relids) ||
+				!bms_is_subset(rinfo->clause_relids, outerrelids))
+				continue;
+
+			Assert(!RINFO_IS_PUSHED_DOWN(rinfo, joinrelids));
+
+			gating_clauses = lappend(gating_clauses, rinfo->clause);
+		}
 	}
 	else
 	{
@@ -4412,6 +4431,15 @@ create_nestloop_plan(PlannerInfo *root,
 		otherclauses = NIL;
 	}
 
+	/*
+	 * Pull the outer-only clauses out of joinclauses; they become a gating
+	 * qual on the inner side below.  Match by Expr pointer (shared, since
+	 * both lists derive from the same RestrictInfos), and do it before
+	 * parameterization while the expressions are still un-parameterized.
+	 */
+	if (gating_clauses != NIL)
+		joinclauses = list_difference_ptr(joinclauses, gating_clauses);
+
 	/* Replace any outer-relation variables with nestloop params */
 	if (best_path->jpath.path.param_info)
 	{
@@ -4419,6 +4447,67 @@ create_nestloop_plan(PlannerInfo *root,
 			replace_nestloop_params(root, (Node *) joinclauses);
 		otherclauses = (List *)
 			replace_nestloop_params(root, (Node *) otherclauses);
+	}
+
+	/*
+	 * Outer-only clauses are constant across the inner scan for a given
+	 * outer tuple, so applying them as a per-rescan gate on the inner side
+	 * is equivalent to the usual per-row join filter: when the gate is
+	 * false the inner side yields no rows, which for an outer join is the
+	 * same null-extended result, but skips the inner scan entirely.
+	 */
+	if (gating_clauses != NIL)
+	{
+		Relids		tmpOuterRels = root->curOuterRels;
+		Plan	   *subplan = inner_plan;
+		ParallelSafe	gate_parallel_safe;
+
+		Assert(bms_is_subset(pull_varnos(root, (Node *) gating_clauses),
+							  outerrelids));
+
+		/*
+		 * Maintain the parallel-safety flag on the gating Result, mirroring
+		 * create_gating_plan() and change_plan_targetlist().  Check the
+		 * pre-param form: is_parallel_safe() treats NestLoop PARAM_EXEC as
+		 * restricted (clauses.c safe_param_ids), so a post-param check
+		 * would always return false.
+		 */
+		needs_temp_flush = false;
+		if (is_parallel_safe(root, (Node *) gating_clauses, &needs_temp_flush))
+			gate_parallel_safe = needs_temp_flush ? NEEDS_TEMP_FLUSH : PARALLEL_SAFE;
+		else
+			gate_parallel_safe = PARALLEL_UNSAFE;
+
+		root->curOuterRels = bms_union(root->curOuterRels, outerrelids);
+		gating_clauses = (List *)
+			replace_nestloop_params(root, (Node *) gating_clauses);
+		bms_free(root->curOuterRels);
+		root->curOuterRels = tmpOuterRels;
+
+		/*
+		 * Avoid stacking Result nodes: if the inner plan is already a
+		 * Result, merge our parameterized clauses into its resconstantqual
+		 * (implicit-AND List) rather than wrapping it again.
+		 */
+		if (IsA(subplan, Result))
+		{
+			Result	   *existing = (Result *) subplan;
+
+			existing->resconstantqual = (Node *)
+				list_concat(gating_clauses,
+							(List *) existing->resconstantqual);
+			if (existing->plan.parallel_safe > gate_parallel_safe)
+				existing->plan.parallel_safe = gate_parallel_safe;
+		}
+		else
+		{
+			inner_plan = (Plan *) make_result(subplan->targetlist,
+											 (Node *) gating_clauses,
+											 subplan);
+			copy_plan_costsize(inner_plan, subplan);
+			if (inner_plan->parallel_safe > gate_parallel_safe)
+				inner_plan->parallel_safe = gate_parallel_safe;
+		}
 	}
 
 	/*

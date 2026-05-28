@@ -112,10 +112,9 @@ EXPLAIN (COSTS OFF)
 SELECT * FROM pred_tab t1
     FULL JOIN pred_tab t2 ON t1.a = t2.a
     LEFT JOIN pred_tab t3 ON t2.a IS NOT NULL;
-                QUERY PLAN                 
--------------------------------------------
+                 QUERY PLAN                  
+---------------------------------------------
  Nested Loop Left Join
-   Join Filter: (t2.a IS NOT NULL)
    ->  Merge Full Join
          Merge Cond: (t1.a = t2.a)
          ->  Sort
@@ -124,9 +123,11 @@ SELECT * FROM pred_tab t1
          ->  Sort
                Sort Key: t2.a
                ->  Seq Scan on pred_tab t2
-   ->  Materialize
-         ->  Seq Scan on pred_tab t3
-(12 rows)
+   ->  Result
+         One-Time Filter: (t2.a IS NOT NULL)
+         ->  Materialize
+               ->  Seq Scan on pred_tab t3
+(13 rows)
 
 -- Ensure the IS_NULL qual is reduced to constant-FALSE, since a) it's on a NOT
 -- NULL column, and b) its Var is not nullable by any outer joins
@@ -148,18 +149,20 @@ EXPLAIN (COSTS OFF)
 SELECT * FROM pred_tab t1
     LEFT JOIN pred_tab t2 ON t1.a = 1
     LEFT JOIN pred_tab t3 ON t2.a IS NULL;
-                QUERY PLAN                 
--------------------------------------------
+                   QUERY PLAN                    
+-------------------------------------------------
  Nested Loop Left Join
-   Join Filter: (t2.a IS NULL)
    ->  Nested Loop Left Join
-         Join Filter: (t1.a = 1)
          ->  Seq Scan on pred_tab t1
+         ->  Result
+               One-Time Filter: (t1.a = 1)
+               ->  Materialize
+                     ->  Seq Scan on pred_tab t2
+   ->  Result
+         One-Time Filter: (t2.a IS NULL)
          ->  Materialize
-               ->  Seq Scan on pred_tab t2
-   ->  Materialize
-         ->  Seq Scan on pred_tab t3
-(9 rows)
+               ->  Seq Scan on pred_tab t3
+(11 rows)
 
 --
 -- Tests for OR clauses in join clauses
@@ -182,10 +185,9 @@ EXPLAIN (COSTS OFF)
 SELECT * FROM pred_tab t1
     FULL JOIN pred_tab t2 ON t1.a = t2.a
     LEFT JOIN pred_tab t3 ON t2.a IS NOT NULL OR t2.b = 1;
-                    QUERY PLAN                     
----------------------------------------------------
+                         QUERY PLAN                          
+-------------------------------------------------------------
  Nested Loop Left Join
-   Join Filter: ((t2.a IS NOT NULL) OR (t2.b = 1))
    ->  Merge Full Join
          Merge Cond: (t1.a = t2.a)
          ->  Sort
@@ -194,9 +196,11 @@ SELECT * FROM pred_tab t1
          ->  Sort
                Sort Key: t2.a
                ->  Seq Scan on pred_tab t2
-   ->  Materialize
-         ->  Seq Scan on pred_tab t3
-(12 rows)
+   ->  Result
+         One-Time Filter: ((t2.a IS NOT NULL) OR (t2.b = 1))
+         ->  Materialize
+               ->  Seq Scan on pred_tab t3
+(13 rows)
 
 -- Ensure the OR clause is reduced to constant-FALSE when all OR branches are
 -- provably false
@@ -218,18 +222,20 @@ EXPLAIN (COSTS OFF)
 SELECT * FROM pred_tab t1
     LEFT JOIN pred_tab t2 ON t1.a = 1
     LEFT JOIN pred_tab t3 ON t2.a IS NULL OR t2.c IS NULL;
-                    QUERY PLAN                     
----------------------------------------------------
+                         QUERY PLAN                          
+-------------------------------------------------------------
  Nested Loop Left Join
-   Join Filter: ((t2.a IS NULL) OR (t2.c IS NULL))
    ->  Nested Loop Left Join
-         Join Filter: (t1.a = 1)
          ->  Seq Scan on pred_tab t1
+         ->  Result
+               One-Time Filter: (t1.a = 1)
+               ->  Materialize
+                     ->  Seq Scan on pred_tab t2
+   ->  Result
+         One-Time Filter: ((t2.a IS NULL) OR (t2.c IS NULL))
          ->  Materialize
-               ->  Seq Scan on pred_tab t2
-   ->  Materialize
-         ->  Seq Scan on pred_tab t3
-(9 rows)
+               ->  Seq Scan on pred_tab t3
+(11 rows)
 
 DROP TABLE pred_tab;
 -- Validate we handle IS NULL and IS NOT NULL quals correctly with inheritance
@@ -301,15 +307,16 @@ SELECT * FROM pred_tab t1
    ->  Seq Scan on pred_tab t1
    ->  Materialize
          ->  Nested Loop Left Join
-               Join Filter: (t3.b IS NOT NULL)
                ->  Nested Loop Left Join
                      Join Filter: (t2.a = t3.a)
                      ->  Seq Scan on pred_tab t2
                      ->  Materialize
                            ->  Seq Scan on pred_tab_notnull t3
-               ->  Materialize
-                     ->  Seq Scan on pred_tab t4
-(12 rows)
+               ->  Result
+                     One-Time Filter: (t3.b IS NOT NULL)
+                     ->  Materialize
+                           ->  Seq Scan on pred_tab t4
+(13 rows)
 
 SELECT * FROM pred_tab t1
     LEFT JOIN pred_tab t2 ON TRUE
@@ -331,21 +338,22 @@ SELECT * FROM pred_tab t1
     LEFT JOIN pred_tab t2 ON TRUE
     LEFT JOIN pred_tab_notnull t3 ON t2.a = t3.a
     LEFT JOIN pred_tab t4 ON t3.b IS NULL AND t3.a IS NOT NULL;
-                             QUERY PLAN                             
---------------------------------------------------------------------
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
  Nested Loop Left Join
    ->  Seq Scan on pred_tab t1
    ->  Materialize
          ->  Nested Loop Left Join
-               Join Filter: ((t3.b IS NULL) AND (t3.a IS NOT NULL))
                ->  Nested Loop Left Join
                      Join Filter: (t2.a = t3.a)
                      ->  Seq Scan on pred_tab t2
                      ->  Materialize
                            ->  Seq Scan on pred_tab_notnull t3
-               ->  Materialize
-                     ->  Seq Scan on pred_tab t4
-(12 rows)
+               ->  Result
+                     One-Time Filter: ((t3.b IS NULL) AND (t3.a IS NOT NULL))
+                     ->  Materialize
+                           ->  Seq Scan on pred_tab t4
+(13 rows)
 
 SELECT * FROM pred_tab t1
     LEFT JOIN pred_tab t2 ON TRUE
