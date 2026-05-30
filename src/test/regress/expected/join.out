@@ -9020,6 +9020,59 @@ select * from
   0 | 9998 |  0
 (1 row)
 
+-- check that a laterally-parameterized outer rel is not fed to a presorted
+-- nestloop outer.  create_sort_path() strips parameterization, so sorting such
+-- an outer would yield a nestloop with required_outer == NULL for a joinrel
+-- that still has lateral_relids, tripping an assertion in the planner.
+set enable_presorted_outer = on;
+explain (costs off)
+select x.u
+from int8_tbl a, int8_tbl b, lateral unnest(array[a.q1, a.q2]) as x(u)
+where x.u = b.q1
+order by x.u;
+                 QUERY PLAN                  
+---------------------------------------------
+ Sort
+   Sort Key: x.u
+   ->  Hash Join
+         Hash Cond: (x.u = b.q1)
+         ->  Nested Loop
+               ->  Seq Scan on int8_tbl a
+               ->  Function Scan on unnest x
+         ->  Hash
+               ->  Seq Scan on int8_tbl b
+(9 rows)
+
+select x.u
+from int8_tbl a, int8_tbl b, lateral unnest(array[a.q1, a.q2]) as x(u)
+where x.u = b.q1
+order by x.u;
+        u         
+------------------
+              123
+              123
+              123
+              123
+              123
+              123
+ 4567890123456789
+ 4567890123456789
+ 4567890123456789
+ 4567890123456789
+ 4567890123456789
+ 4567890123456789
+ 4567890123456789
+ 4567890123456789
+ 4567890123456789
+ 4567890123456789
+ 4567890123456789
+ 4567890123456789
+ 4567890123456789
+ 4567890123456789
+ 4567890123456789
+(21 rows)
+
+reset enable_presorted_outer;
 -- check proper extParam/allParam handling (this isn't exactly a LATERAL issue,
 -- but we can make the test case much more compact with LATERAL)
 explain (verbose, costs off)
