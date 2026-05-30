@@ -2018,8 +2018,14 @@ match_unsorted_outer(PlannerInfo *root,
 	 * heap-sort cost model (N*log2(2K) instead of N*log2(N)), giving an
 	 * accurate startup-cost estimate that feeds into fractional path
 	 * comparison correctly.
+	 *
+	 * The bms_is_empty(outerrel->lateral_relids) test is a performance
+	 * early-out, not a correctness guard: a rel with lateral_relids has no
+	 * unparameterized path, so the PATH_REQ_OUTER(outerpath) check below
+	 * would reject every candidate anyway.
 	 */
-	if (nestjoinOK && root->query_pathkeys != NIL)
+	if (nestjoinOK && root->query_pathkeys != NIL &&
+		bms_is_empty(outerrel->lateral_relids))
 	{
 		List	   *useful_pathkeys = NIL;
 		ListCell   *lc;
@@ -2051,7 +2057,13 @@ match_unsorted_outer(PlannerInfo *root,
 												   outerrel->lateral_relids,
 												   TOTAL_COST, false);
 
-			if (outerpath != NULL && !PATH_PARAM_BY_REL(outerpath, innerrel))
+			/*
+			 * create_sort_path() discards parameterization, so we must only
+			 * sort an unparameterized outer.
+			 */
+			if (outerpath != NULL &&
+				bms_is_empty(PATH_REQ_OUTER(outerpath)) &&
+				!PATH_PARAM_BY_REL(outerpath, innerrel))
 			{
 				Path	   *sorted_outer;
 				List	   *merge_pathkeys;

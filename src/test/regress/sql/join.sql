@@ -3500,6 +3500,24 @@ select * from
            where f1 = any (select unique1 from tenk1
                            where unique2 = v.x offset 0)) ss;
 
+-- check that a laterally-parameterized outer rel is not fed to a presorted
+-- nestloop outer.  create_sort_path() strips parameterization, so sorting such
+-- an outer would yield a nestloop with required_outer == NULL for a joinrel
+-- that still has lateral_relids, tripping an assertion in the planner.
+set enable_mergejoin = off;
+set enable_hashjoin = off;
+explain (costs off)
+select x.u
+from int8_tbl a, int8_tbl b, lateral unnest(array[a.q1, a.q2]) as x(u)
+where x.u = b.q1
+order by x.u;
+select x.u
+from int8_tbl a, int8_tbl b, lateral unnest(array[a.q1, a.q2]) as x(u)
+where x.u = b.q1
+order by x.u;
+reset enable_mergejoin;
+reset enable_hashjoin;
+
 -- check proper extParam/allParam handling (this isn't exactly a LATERAL issue,
 -- but we can make the test case much more compact with LATERAL)
 explain (verbose, costs off)
