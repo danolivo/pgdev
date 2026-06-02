@@ -414,6 +414,7 @@
 #enable_gathermerge = on
 #enable_hashagg = on
 #enable_hashjoin = on
+#enable_hashjoin_bloom = on
 #enable_incremental_sort = on
 #enable_indexscan = on
 #enable_indexonlyscan = on

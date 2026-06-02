@@ -550,6 +550,9 @@ ExecInitTidScan(TidScan *node, EState *estate, int eflags)
 	tidstate->ss.ps.qual =
 		ExecInitQual(node->scan.plan.qual, (PlanState *) tidstate);
 
+	ExecInitBloomFilters((PlanState *) tidstate,
+						 tidstate->ss.ss_ScanTupleSlot);
+
 	TidExprListCreate(tidstate);
 
 	/*

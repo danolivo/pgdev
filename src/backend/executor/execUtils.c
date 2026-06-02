@@ -154,6 +154,8 @@ CreateExecutorState(void)
 
 	estate->es_auxmodifytables = NIL;
 
+	estate->es_bloom_producers = NIL;
+
 	estate->es_per_tuple_exprcontext = NULL;
 
 	estate->es_sourceText = NULL;

@@ -161,6 +161,7 @@ static Node *fix_scan_expr(PlannerInfo *root, Node *node,
 						   int rtoffset, double num_exec);
 static Node *fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context);
 static bool fix_scan_expr_walker(Node *node, fix_scan_expr_context *context);
+static void fix_scan_bloom_filters(PlannerInfo *root, Plan *plan, int rtoffset);
 static void set_join_references(PlannerInfo *root, Join *join, int rtoffset);
 static void set_upper_references(PlannerInfo *root, Plan *plan, int rtoffset);
 static void set_param_references(PlannerInfo *root, Plan *plan);
@@ -642,6 +643,9 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->scan.plan.qual =
 					fix_scan_list(root, splan->scan.plan.qual,
 								  rtoffset, NUM_EXEC_QUAL(plan));
+
+				/* pushed-down bloom filters */
+				fix_scan_bloom_filters(root, plan, rtoffset);
 			}
 			break;
 		case T_SampleScan:
@@ -658,6 +662,9 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->tablesample = (TableSampleClause *)
 					fix_scan_expr(root, (Node *) splan->tablesample,
 								  rtoffset, 1);
+
+				/* pushed-down bloom filters */
+				fix_scan_bloom_filters(root, plan, rtoffset);
 			}
 			break;
 		case T_IndexScan:
@@ -683,6 +690,9 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->indexorderbyorig =
 					fix_scan_list(root, splan->indexorderbyorig,
 								  rtoffset, NUM_EXEC_QUAL(plan));
+
+				/* pushed-down bloom filters */
+				fix_scan_bloom_filters(root, plan, rtoffset);
 			}
 			break;
 		case T_IndexOnlyScan:
@@ -721,6 +731,9 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->bitmapqualorig =
 					fix_scan_list(root, splan->bitmapqualorig,
 								  rtoffset, NUM_EXEC_QUAL(plan));
+
+				/* pushed-down bloom filters */
+				fix_scan_bloom_filters(root, plan, rtoffset);
 			}
 			break;
 		case T_TidScan:
@@ -737,6 +750,9 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->tidquals =
 					fix_scan_list(root, splan->tidquals,
 								  rtoffset, 1);
+
+				/* pushed-down bloom filters */
+				fix_scan_bloom_filters(root, plan, rtoffset);
 			}
 			break;
 		case T_TidRangeScan:
@@ -753,6 +769,9 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->tidrangequals =
 					fix_scan_list(root, splan->tidrangequals,
 								  rtoffset, 1);
+
+				/* pushed-down bloom filters */
+				fix_scan_bloom_filters(root, plan, rtoffset);
 			}
 			break;
 		case T_SubqueryScan:
@@ -1381,6 +1400,30 @@ set_indexonlyscan_references(PlannerInfo *root,
 					   rtoffset,
 					   NRM_EQUAL,
 					   NUM_EXEC_QUAL((Plan *) plan));
+	/*
+	 * Bloom filter pushdown: any RuntimeBloomFilter recipient lists also need
+	 * their key expressions rewritten to reference the index tuple, since
+	 * that's what the recipient scan returns and what ExecBloomFilters
+	 * will evaluate against.
+	 */
+	if (plan->scan.plan.bloom_filters != NIL)
+	{
+		ListCell   *lc2;
+
+		foreach(lc2, plan->scan.plan.bloom_filters)
+		{
+			RuntimeBloomFilter *bf = lfirst_node(RuntimeBloomFilter, lc2);
+
+			bf->filter_exprs = (List *)
+				fix_upper_expr(root,
+							   (Node *) bf->filter_exprs,
+							   index_itlist,
+							   INDEX_VAR,
+							   rtoffset,
+							   NRM_EQUAL,
+							   NUM_EXEC_QUAL((Plan *) plan));
+		}
+	}
 	/* indexqual is already transformed to reference index columns */
 	plan->indexqual = fix_scan_list(root, plan->indexqual,
 									rtoffset, 1);
@@ -2318,6 +2361,26 @@ fix_scan_expr_walker(Node *node, fix_scan_expr_context *context)
 	Assert(!IsA(node, AlternativeSubPlan));
 	fix_expr_common(context->root, node);
 	return expression_tree_walker(node, fix_scan_expr_walker, context);
+}
+
+/*
+ * Fix references in hashkey expressions of bloom filters pushed down.
+ */
+static void
+fix_scan_bloom_filters(PlannerInfo *root, Plan *plan, int rtoffset)
+{
+	ListCell   *lc;
+
+	if (plan->bloom_filters == NIL)
+		return;
+
+	foreach(lc, plan->bloom_filters)
+	{
+		RuntimeBloomFilter *bf = lfirst_node(RuntimeBloomFilter, lc);
+
+		bf->filter_exprs = fix_scan_list(root, bf->filter_exprs, rtoffset,
+										 NUM_EXEC_QUAL(plan));
+	}
 }
 
 /*

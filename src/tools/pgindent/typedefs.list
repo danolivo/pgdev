@@ -2406,6 +2406,8 @@ RTEPermissionInfo
 RWConflict
 RWConflictData
 RWConflictPoolHeader
+RuntimeBloomFilter
+RuntimeBloomFilterState
 Range
 RangeBound
 RangeBox

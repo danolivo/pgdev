@@ -943,6 +943,16 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"enable_hashjoin_bloom", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables hash join bloom filter pushdown to the outer side."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&enable_hashjoin_bloom,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"enable_gathermerge", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of gather merge plans."),
 			NULL,
