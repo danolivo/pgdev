@@ -1055,6 +1055,23 @@ typedef struct RelOptInfo
 	List	   *cheapest_parameterized_paths;
 
 	/*
+	 * Cached prefix of root->query_pathkeys that this rel can sort on early
+	 * (see relation_can_be_sorted_early()).  Populated lazily on first call
+	 * to get_useful_query_pathkeys(); the *_done flag distinguishes "not yet
+	 * computed" from "computed and result is empty".  Two slots are kept
+	 * because callers differ in their parallel-safety requirement: the
+	 * unsuffixed slot allows parallel-unsafe EC members, the _ps slot
+	 * requires parallel-safe members only.  The cached List lives in the
+	 * same memory context as this RelOptInfo, so it follows the rel's own
+	 * lifetime (important under GEQO, where joinrels live only for one
+	 * tour).
+	 */
+	bool		useful_query_pathkeys_done;
+	List	   *useful_query_pathkeys;
+	bool		useful_query_pathkeys_ps_done;
+	List	   *useful_query_pathkeys_ps;
+
+	/*
 	 * parameterization information needed for both base rels and join rels
 	 * (see also lateral_vars and lateral_referencers)
 	 */

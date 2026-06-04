@@ -2014,6 +2014,12 @@ match_unsorted_outer(PlannerInfo *root,
 	 * and was tried in the loop above; the get_cheapest_path_for_pathkeys
 	 * guard below prevents redundant work in that case.
 	 *
+	 * get_useful_query_pathkeys() caches the prefix on outerrel, so the
+	 * expensive walk over rel->reltarget exprs and EC members runs at most
+	 * once per RelOptInfo regardless of how many (outerrel, innerrel)
+	 * splits visit it.  Without that cache this block was the dominant
+	 * source of the previously-observed planning-time blow-up.
+	 *
 	 * When root->limit_tuples is set, create_sort_path() uses the bounded
 	 * heap-sort cost model (N*log2(2K) instead of N*log2(N)), giving an
 	 * accurate startup-cost estimate that feeds into fractional path
@@ -2027,23 +2033,14 @@ match_unsorted_outer(PlannerInfo *root,
 	if (nestjoinOK && root->query_pathkeys != NIL &&
 		bms_is_empty(outerrel->lateral_relids))
 	{
-		List	   *useful_pathkeys = NIL;
+		List	   *useful_pathkeys;
 		ListCell   *lc;
 
-		foreach(lc, root->query_pathkeys)
-		{
-			PathKey			   *pathkey = (PathKey *) lfirst(lc);
-			EquivalenceClass   *ec = pathkey->pk_eclass;
-
-			if (!relation_can_be_sorted_early(root, outerrel, ec, false))
-				break;
-
-			useful_pathkeys = lappend(useful_pathkeys, pathkey);
-		}
+		useful_pathkeys = get_useful_query_pathkeys(root, outerrel, false);
 
 		/*
 		 * Only proceed if we found useful pathkeys and the outer rel does not
-		 * already have a path satisfying them — if it does, the foreach loop
+		 * already have a path satisfying them; if it does, the foreach loop
 		 * above already considered it.
 		 */
 		if (useful_pathkeys != NIL &&
@@ -2071,10 +2068,10 @@ match_unsorted_outer(PlannerInfo *root,
 				/*
 				 * For LEFT JOIN every outer row produces at least one output
 				 * row (NULL-extended if unmatched), so the LIMIT bound on join
-				 * output safely bounds the outer side — pass it for an
-				 * accurate top-N heap-sort cost estimate.  For INNER, SEMI,
-				 * and ANTI, outer rows can be discarded by the join condition,
-				 * so we conservatively model a full sort.
+				 * output safely bounds the outer side; pass it for an accurate
+				 * top-N heap-sort cost estimate.  For INNER, SEMI, and ANTI,
+				 * outer rows can be discarded by the join condition, so we
+				 * conservatively model a full sort.
 				 */
 				sorted_outer = (Path *)
 					create_sort_path(root, outerrel, outerpath,

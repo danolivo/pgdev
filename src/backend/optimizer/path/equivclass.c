@@ -1138,6 +1138,104 @@ relation_can_be_sorted_early(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * get_useful_query_pathkeys
+ *		Return the longest prefix of root->query_pathkeys that this rel can
+ *		sort on early, under the rules of relation_can_be_sorted_early().
+ *
+ * The answer depends only on (root, rel, require_parallel_safe) and is
+ * cached on rel for the duration of its lifetime.  Two cache slots are
+ * kept on RelOptInfo, one for each value of require_parallel_safe.  When
+ * the full query_pathkeys list is satisfied, root->query_pathkeys itself
+ * is returned (no copy), preserving pointer-equality comparisons used by
+ * callers such as get_useful_pathkeys_for_relation().  Otherwise a fresh
+ * truncated copy is allocated in the rel's own memory context, so it
+ * shares the rel's lifetime.
+ *
+ * Returns NIL when no useful prefix exists.
+ */
+List *
+get_useful_query_pathkeys(PlannerInfo *root, RelOptInfo *rel,
+						  bool require_parallel_safe)
+{
+	bool	   *done_p;
+	List	  **cache_p;
+	List	   *result;
+	int			npathkeys;
+	ListCell   *lc;
+
+	if (root->query_pathkeys == NIL)
+		return NIL;
+
+	/* Pick the cache slot matching the parallel-safety requirement. */
+	if (require_parallel_safe)
+	{
+		done_p = &rel->useful_query_pathkeys_ps_done;
+		cache_p = &rel->useful_query_pathkeys_ps;
+	}
+	else
+	{
+		done_p = &rel->useful_query_pathkeys_done;
+		cache_p = &rel->useful_query_pathkeys;
+	}
+
+	if (*done_p)
+		return *cache_p;
+
+	/*
+	 * Walk root->query_pathkeys, stopping at the first pathkey whose EC has
+	 * no early-sortable member computable from rel's reltarget.
+	 */
+	npathkeys = 0;
+	foreach(lc, root->query_pathkeys)
+	{
+		PathKey		   *pathkey = (PathKey *) lfirst(lc);
+		EquivalenceClass *ec = pathkey->pk_eclass;
+
+		/*
+		 * Cheap bitmap prefilter.  relation_can_be_sorted_early would fail
+		 * for an EC whose relids do not overlap rel anyway, but its
+		 * expression walk costs orders of magnitude more than this test.
+		 */
+		if (!bms_overlap(ec->ec_relids, rel->relids))
+			break;
+
+		if (!relation_can_be_sorted_early(root, rel, ec, require_parallel_safe))
+			break;
+
+		npathkeys++;
+	}
+
+	if (npathkeys == 0)
+		result = NIL;
+	else if (npathkeys == list_length(root->query_pathkeys))
+	{
+		/*
+		 * Full match.  Reuse root->query_pathkeys directly so callers that
+		 * compare pathkeys by pointer (e.g. get_useful_pathkeys_for_relation)
+		 * still see a single shared list.
+		 */
+		result = root->query_pathkeys;
+	}
+	else
+	{
+		MemoryContext oldcxt;
+
+		/*
+		 * Partial prefix: must allocate.  Switch into the rel's own context
+		 * so the cached list outlives any per-call scratch context the
+		 * planner has switched to (notably GEQO's per-tour context).
+		 */
+		oldcxt = MemoryContextSwitchTo(GetMemoryChunkContext(rel));
+		result = list_copy_head(root->query_pathkeys, npathkeys);
+		MemoryContextSwitchTo(oldcxt);
+	}
+
+	*cache_p = result;
+	*done_p = true;
+	return result;
+}
+
+/*
  * generate_base_implied_equalities
  *	  Generate any restriction clauses that we can deduce from equivalence
  *	  classes.

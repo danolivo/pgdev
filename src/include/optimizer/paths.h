@@ -157,6 +157,8 @@ extern EquivalenceMember *find_computable_ec_member(PlannerInfo *root,
 extern bool relation_can_be_sorted_early(PlannerInfo *root, RelOptInfo *rel,
 										 EquivalenceClass *ec,
 										 bool require_parallel_safe);
+extern List *get_useful_query_pathkeys(PlannerInfo *root, RelOptInfo *rel,
+									   bool require_parallel_safe);
 extern void generate_base_implied_equalities(PlannerInfo *root);
 extern List *generate_join_implied_equalities(PlannerInfo *root,
 											  Relids join_relids,
