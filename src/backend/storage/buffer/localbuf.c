@@ -180,6 +180,44 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 }
 
 /*
+ * Report a violation of the "no writes to temporary-relation local buffers
+ * during a parallel section" invariant.
+ *
+ * Parallel scanning of temporary tables lets the leader and its workers read
+ * the same on-disk file, each through its own private local buffer pool.  If
+ * any participant dirties and then writes back such a buffer, that write races
+ * with the others reading the file and leaves torn or "invalid" pages behind.
+ *
+ * In assert-enabled builds the callers stop hard (see the Assert()s below), so
+ * this is reached only in production builds.  We must not crash a production
+ * server here, but we also must not silently corrupt the file, so the callers
+ * leave the buffer clean and we emit a single LOG line per backend (to keep the
+ * server log from flooding if a stray path keeps hitting this).  One report is
+ * enough to point at the offending code path.
+ */
+static void
+ReportParallelLocalBufferViolation(const char *what, BufferDesc *bufHdr,
+								   bool *already_logged)
+{
+	RelFileLocator rlocator;
+
+	if (*already_logged)
+		return;
+	*already_logged = true;
+
+	rlocator = BufTagGetRelFileLocator(&bufHdr->tag);
+	ereport(LOG,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			 errmsg_internal("%s for a temporary relation during a parallel operation",
+							 what),
+			 errdetail_internal("relation %u/%u/%u, fork %d, block %u; leaving the buffer clean to avoid corrupting the shared file (further such reports from this backend are suppressed)",
+								rlocator.spcOid, rlocator.dbOid,
+								rlocator.relNumber,
+								(int) BufTagGetForkNum(&bufHdr->tag),
+								bufHdr->tag.blockNum)));
+}
+
+/*
  * Like FlushBuffer(), just for local buffers.
  */
 void
@@ -189,10 +227,27 @@ FlushLocalBuffer(BufferDesc *bufHdr, SMgrRelation reln)
 	Page		localpage = (char *) LocalBufHdrGetBlock(bufHdr);
 
 	/*
-	 * Parallel temp table scan allows an access to temp tables. So, to be
-	 * paranoid enough we should check it each time, flushing local buffer.
+	 * A parallel worker must never write a local (temporary-relation) buffer
+	 * back to disk: it shares the on-disk file with the leader and the other
+	 * workers, so the write would race with their reads.  The leader itself is
+	 * allowed to flush (e.g. the pre-launch FlushAllLocalBuffers()), hence this
+	 * is gated on IsParallelWorker(), not IsInParallelMode().
+	 *
+	 * This is the last line of defence; MarkLocalBufferDirty() should already
+	 * have prevented the buffer from being dirtied in the first place.  We
+	 * check before StartLocalBufferIO(), so an early return here is safe: the
+	 * caller (GetLocalVictimBuffer) will simply invalidate the still-dirty
+	 * buffer, discarding the page instead of writing it.
 	 */
-	Assert(!IsParallelWorker());
+	if (unlikely(IsParallelWorker()))
+	{
+		static bool already_logged = false;
+
+		Assert(!IsParallelWorker());
+		ReportParallelLocalBufferViolation("refusing to write a local buffer",
+										   bufHdr, &already_logged);
+		return;
+	}
 
 	Assert(LocalRefCount[-BufferDescriptorGetBuffer(bufHdr) - 1] > 0);
 
@@ -513,6 +568,38 @@ MarkLocalBufferDirty(Buffer buffer)
 	Assert(LocalRefCount[bufid] > 0);
 
 	bufHdr = GetLocalBufferDescriptor(bufid);
+
+	/*
+	 * A parallel *worker* must never dirty a local (temporary-relation)
+	 * buffer.  Workers only ever read temporary relations -- the temp tables
+	 * being scanned -- through their own private local buffer pool backed by
+	 * the shared on-disk file; were a worker to dirty such a buffer it would be
+	 * written back on eviction (FlushLocalBuffer) and race with the leader and
+	 * the other workers reading that file, leaving torn / "invalid" pages.
+	 *
+	 * The leader is deliberately NOT covered here.  It legitimately writes
+	 * temporary relations while in a parallel section -- e.g. CREATE TABLE AS /
+	 * SELECT INTO a temp table, or the temporary transient heap that REFRESH
+	 * MATERIALIZED VIEW fills -- using the transaction's existing XID while the
+	 * data-source query runs in parallel.  Those destination relations are
+	 * private to the leader and are never scanned by the workers, so dirtying
+	 * them is safe.  (The leader's read-time dirtying of the *scanned* temp
+	 * tables -- hint bits and opportunistic pruning -- is suppressed separately
+	 * in MarkBufferDirtyHint() and heap_page_prune_opt().)
+	 *
+	 * Under assert builds we fail hard; in production we log once and leave the
+	 * buffer clean, which is safe because a worker has no legitimate temporary
+	 * write to lose.
+	 */
+	if (unlikely(IsParallelWorker()))
+	{
+		static bool already_logged = false;
+
+		Assert(!IsParallelWorker());
+		ReportParallelLocalBufferViolation("refusing to dirty a local buffer",
+										   bufHdr, &already_logged);
+		return;
+	}
 
 	buf_state = pg_atomic_read_u32(&bufHdr->state);
 
