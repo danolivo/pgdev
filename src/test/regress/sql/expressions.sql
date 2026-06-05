@@ -134,6 +134,11 @@ select return_text_input('a') not in ('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i
 -- Check tha explain marks the hashed decision.
 explain (verbose, costs off)
 select return_int_input(1) in (10, 9, 2, 8, 3, 7, 4, 6, 5, 1);
+-- An anonymous-record SAOP whose columns are all hashable also hashes: the
+-- planner cannot rely on the typcache for bare RECORD, so it inspects the
+-- constant array's actual rowtype and recovers the hashed plan.
+explain (verbose, costs off)
+select (return_int_input(1), return_int_input(2)) = any (array[(1,2),(3,4),(5,6),(7,8),(9,10),(11,12),(13,14),(15,16),(17,18)]);
 
 rollback;
 

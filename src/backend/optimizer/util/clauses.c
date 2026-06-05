@@ -52,6 +52,7 @@
 #include "rewrite/rewriteManip.h"
 #include "tcop/tcopprot.h"
 #include "utils/acl.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
@@ -2536,20 +2537,135 @@ convert_saop_to_hashed_saop(Node *node)
 }
 
 /*
+ * record_const_array_is_hashable
+ *		Are all column types of every element of a constant record[] array
+ *		hashable?
+ *
+ * Used to recover hashing for an anonymous-RECORD ScalarArrayOpExpr.  The
+ * typcache deliberately refuses to report bare RECORD as field-hashable
+ * because it cannot know the columns of an arbitrary anonymous record (see
+ * cache_record_field_properties()).  But a hashed SAOP always has the array
+ * as a Const, so here we do have the concrete records in hand: resolve each
+ * element's actual rowtype and check that every (non-dropped) column type has
+ * a hash function.  If so, hash_record() cannot fail on this array.
+ *
+ * We examine every element, not just the first: an array of RECORD is uniform
+ * only in element type, and individual elements may carry different blessed
+ * rowtypes (different typmods).  A later element with a non-hashable column
+ * would otherwise trip the very failure this guards against.
+ *
+ * The left-hand input need not be examined separately.  record_eq() compares
+ * by physical columns and errors out on dissimilar column types, so at runtime
+ * the LHS record either shares the array elements' column layout (hence is
+ * equally hashable) or the comparison errors regardless of hashing.
+ */
+static bool
+record_const_array_is_hashable(Const *arrayConst)
+{
+	ArrayType  *arr;
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			nelems;
+	bool		result = true;
+	int32		lastTypmod = -1;
+	Oid			lastType = InvalidOid;
+
+	Assert(arrayConst != NULL && !arrayConst->constisnull);
+
+	arr = DatumGetArrayTypeP(arrayConst->constvalue);
+	if (ARR_ELEMTYPE(arr) != RECORDOID)
+		return false;
+
+	get_typlenbyvalalign(RECORDOID, &elmlen, &elmbyval, &elmalign);
+	deconstruct_array(arr, RECORDOID, elmlen, elmbyval, elmalign,
+					  &elems, &nulls, &nelems);
+
+	for (int i = 0; i < nelems && result; i++)
+	{
+		HeapTupleHeader rec;
+		Oid			tupType;
+		int32		tupTypmod;
+		TupleDesc	tupdesc;
+
+		if (nulls[i])
+			continue;
+
+		rec = DatumGetHeapTupleHeader(elems[i]);
+		tupType = HeapTupleHeaderGetTypeId(rec);
+		tupTypmod = HeapTupleHeaderGetTypMod(rec);
+
+		/* Skip the rowtype lookup when this element matches the previous one */
+		if (tupType == lastType && tupTypmod == lastTypmod)
+			continue;
+		lastType = tupType;
+		lastTypmod = tupTypmod;
+
+		/*
+		 * Use the no-error variant: an unregistered blessed typmod must never
+		 * turn this planner-time optimization decision into an ERROR.  Treat a
+		 * missing tupdesc as "not hashable" and fall back to a linear search.
+		 */
+		tupdesc = lookup_rowtype_tupdesc_noerror(tupType, tupTypmod, true);
+		if (tupdesc == NULL)
+		{
+			result = false;
+			break;
+		}
+		for (int j = 0; j < tupdesc->natts; j++)
+		{
+			Form_pg_attribute att = TupleDescAttr(tupdesc, j);
+			TypeCacheEntry *fieldentry;
+
+			if (att->attisdropped)
+				continue;
+			fieldentry = lookup_type_cache(att->atttypid, TYPECACHE_HASH_PROC);
+			if (!OidIsValid(fieldentry->hash_proc))
+			{
+				result = false;
+				break;
+			}
+		}
+		ReleaseTupleDesc(tupdesc);
+	}
+
+	pfree(elems);
+	pfree(nulls);
+	return result;
+}
+
+/*
  * saop_hashable_for_type
  *		Can a hashed ScalarArrayOpExpr safely use equality operator 'eqop'
- *		for left-hand input type 'lefttype'?
+ *		for left-hand input type 'lefttype' over constant array 'arrayConst'?
  *
  * get_op_hash_functions() reports record_eq and array_eq as hashable
  * unconditionally.  But hashability actually depends on the specific input
  * type: every column/element type must itself be hashable.  Re-check such
  * operators through op_hashjoinable().
+ *
+ * op_hashjoinable() conservatively returns false for anonymous RECORD, since
+ * the typcache cannot inspect an arbitrary record's columns.  In that one case
+ * we have more information than the typcache -- the constant array itself --
+ * so we examine the actual element rowtypes and allow hashing when they are
+ * all hashable.
  */
 static bool
-saop_hashable_for_type(Oid eqop, Oid lefttype)
+saop_hashable_for_type(Oid eqop, Oid lefttype, Const *arrayConst)
 {
-	if (eqop == RECORD_EQ_OP || eqop == ARRAY_EQ_OP)
+	if (eqop == ARRAY_EQ_OP)
 		return op_hashjoinable(eqop, lefttype);
+	if (eqop == RECORD_EQ_OP)
+	{
+		if (op_hashjoinable(eqop, lefttype))
+			return true;
+		/* Recover hashing for anonymous RECORD with hashable columns. */
+		if (lefttype == RECORDOID)
+			return record_const_array_is_hashable(arrayConst);
+		return false;
+	}
 	return true;
 }
 
@@ -2574,7 +2690,8 @@ convert_saop_to_hashed_saop_walker(Node *node, void *context)
 				if (get_op_hash_functions(saop->opno, &lefthashfunc, &righthashfunc) &&
 					lefthashfunc == righthashfunc &&
 					saop_hashable_for_type(saop->opno,
-										   exprType(linitial(saop->args))))
+										   exprType(linitial(saop->args)),
+										   (Const *) arrayarg))
 				{
 					Datum		arrdatum = ((Const *) arrayarg)->constvalue;
 					ArrayType  *arr = (ArrayType *) DatumGetPointer(arrdatum);
@@ -2608,7 +2725,8 @@ convert_saop_to_hashed_saop_walker(Node *node, void *context)
 					get_op_hash_functions(negator, &lefthashfunc, &righthashfunc) &&
 					lefthashfunc == righthashfunc &&
 					saop_hashable_for_type(negator,
-										   exprType(linitial(saop->args))))
+										   exprType(linitial(saop->args)),
+										   (Const *) arrayarg))
 				{
 					Datum		arrdatum = ((Const *) arrayarg)->constvalue;
 					ArrayType  *arr = (ArrayType *) DatumGetPointer(arrdatum);
