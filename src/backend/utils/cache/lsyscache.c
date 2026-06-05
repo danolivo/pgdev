@@ -1659,9 +1659,9 @@ op_mergejoinable(Oid opno, Oid inputtype)
  * Returns true if the operator is hashjoinable.  (There must be a suitable
  * hash opfamily entry for this operator if it is so marked.)
  *
- * In some cases (currently only array_eq), hashjoinability depends on the
- * specific input data type the operator is invoked for, so that must be
- * passed as well.  We currently assume that only one input's type is needed
+ * In some cases (currently array_eq and record_eq), hashjoinability depends
+ * on the specific input data type the operator is invoked for, so that must
+ * be passed as well.  We currently assume that only one input's type is needed
  * to check this --- by convention, pass the left input's data type.
  */
 bool

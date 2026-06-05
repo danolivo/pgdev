@@ -301,3 +301,23 @@ select
 from inttest;
 
 rollback;
+
+--
+-- Hashed SAOP must not be selected for a composite type that is not actually
+-- hashable.
+--
+
+CREATE TABLE hashed_saop_tbl (a int, b tsvector);
+INSERT INTO hashed_saop_tbl
+  SELECT g, ('w' || g)::tsvector FROM generate_series(1, 1000) g;
+ANALYZE hashed_saop_tbl;
+
+-- Throws an ERROR if the hashed strategy has been chosen
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, BUFFERS OFF, SUMMARY OFF)
+SELECT count(*) FROM hashed_saop_tbl
+WHERE (a,b) = ANY (ARRAY[
+  (1, 'w1'::tsvector), (2, 'w2'::tsvector), (3, 'w3'::tsvector),
+  (4, 'w4'::tsvector), (5, 'w5'::tsvector), (6, 'w6'::tsvector),
+  (7, 'w7'::tsvector), (8, 'w8'::tsvector), (9, 'w9'::tsvector)
+  ]);
+DROP TABLE hashed_saop_tbl;

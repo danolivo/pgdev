@@ -2535,6 +2535,24 @@ convert_saop_to_hashed_saop(Node *node)
 	(void) convert_saop_to_hashed_saop_walker(node, NULL);
 }
 
+/*
+ * saop_hashable_for_type
+ *		Can a hashed ScalarArrayOpExpr safely use equality operator 'eqop'
+ *		for left-hand input type 'lefttype'?
+ *
+ * get_op_hash_functions() reports record_eq and array_eq as hashable
+ * unconditionally.  But hashability actually depends on the specific input
+ * type: every column/element type must itself be hashable.  Re-check such
+ * operators through op_hashjoinable().
+ */
+static bool
+saop_hashable_for_type(Oid eqop, Oid lefttype)
+{
+	if (eqop == RECORD_EQ_OP || eqop == ARRAY_EQ_OP)
+		return op_hashjoinable(eqop, lefttype);
+	return true;
+}
+
 static bool
 convert_saop_to_hashed_saop_walker(Node *node, void *context)
 {
@@ -2554,7 +2572,9 @@ convert_saop_to_hashed_saop_walker(Node *node, void *context)
 			if (saop->useOr)
 			{
 				if (get_op_hash_functions(saop->opno, &lefthashfunc, &righthashfunc) &&
-					lefthashfunc == righthashfunc)
+					lefthashfunc == righthashfunc &&
+					saop_hashable_for_type(saop->opno,
+										   exprType(linitial(saop->args))))
 				{
 					Datum		arrdatum = ((Const *) arrayarg)->constvalue;
 					ArrayType  *arr = (ArrayType *) DatumGetPointer(arrdatum);
@@ -2586,7 +2606,9 @@ convert_saop_to_hashed_saop_walker(Node *node, void *context)
 				 */
 				if (OidIsValid(negator) &&
 					get_op_hash_functions(negator, &lefthashfunc, &righthashfunc) &&
-					lefthashfunc == righthashfunc)
+					lefthashfunc == righthashfunc &&
+					saop_hashable_for_type(negator,
+										   exprType(linitial(saop->args))))
 				{
 					Datum		arrdatum = ((Const *) arrayarg)->constvalue;
 					ArrayType  *arr = (ArrayType *) DatumGetPointer(arrdatum);
