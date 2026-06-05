@@ -131,6 +131,9 @@ select return_int_input(1) not in (null, null, null, null, null, null, null, nul
 select return_int_input(null::int) not in (10, 9, 2, 8, 3, 7, 4, 6, 5, 1);
 select return_int_input(null::int) not in (10, 9, 2, 8, 3, 7, 4, 6, 5, null);
 select return_text_input('a') not in ('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j');
+-- Check tha explain marks the hashed decision.
+explain (verbose, costs off)
+select return_int_input(1) in (10, 9, 2, 8, 3, 7, 4, 6, 5, 1);
 
 rollback;
 

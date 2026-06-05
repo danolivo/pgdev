@@ -327,6 +327,15 @@ select return_text_input('a') not in ('a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i
  f
 (1 row)
 
+-- Check tha explain marks the hashed decision.
+explain (verbose, costs off)
+select return_int_input(1) in (10, 9, 2, 8, 3, 7, 4, 6, 5, 1);
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Result
+   Output: (return_int_input(1) = hashed ANY ('{10,9,2,8,3,7,4,6,5,1}'::integer[]))
+(2 rows)
+
 rollback;
 -- Test with non-strict equality function.
 -- We need to create our own type for this.
