@@ -49,8 +49,18 @@
 #define FIRST_BLOCKHDRSZ	(MAXALIGN(sizeof(BumpContext)) + \
 							 Bump_BLOCKHDRSZ)
 
-/* No chunk header unless built with MEMORY_CONTEXT_CHECKING */
+/*
+ * Bump chunks normally have no chunk header.  We add one in
+ * MEMORY_CONTEXT_CHECKING builds, to detect accidental usage of the
+ * disallowed chunk operations.  BUMP_CHUNK_HEADERS controls the header
+ * layout itself; the checking-only extras (requested_size, the sentinel
+ * byte) remain conditional on MEMORY_CONTEXT_CHECKING.
+ */
 #ifdef MEMORY_CONTEXT_CHECKING
+#define BUMP_CHUNK_HEADERS
+#endif
+
+#ifdef BUMP_CHUNK_HEADERS
 #define Bump_CHUNKHDRSZ	sizeof(MemoryChunk)
 #else
 #define Bump_CHUNKHDRSZ	0
@@ -314,7 +324,7 @@ BumpAllocLarge(MemoryContext context, Size size, int flags)
 {
 	BumpContext *set = (BumpContext *) context;
 	BumpBlock  *block;
-#ifdef MEMORY_CONTEXT_CHECKING
+#ifdef BUMP_CHUNK_HEADERS
 	MemoryChunk *chunk;
 #endif
 	Size		chunk_size;
@@ -346,20 +356,24 @@ BumpAllocLarge(MemoryContext context, Size size, int flags)
 	/* the block is completely full */
 	block->freeptr = block->endptr = ((char *) block) + blksize;
 
-#ifdef MEMORY_CONTEXT_CHECKING
+#ifdef BUMP_CHUNK_HEADERS
 	/* block with a single (used) chunk */
+#ifdef MEMORY_CONTEXT_CHECKING
 	block->context = set;
+#endif
 
 	chunk = (MemoryChunk *) (((char *) block) + Bump_BLOCKHDRSZ);
 
 	/* mark the MemoryChunk as externally managed */
 	MemoryChunkSetHdrMaskExternal(chunk, MCTX_BUMP_ID);
 
+#ifdef MEMORY_CONTEXT_CHECKING
 	chunk->requested_size = size;
 	/* set mark to catch clobber of "unused" space */
 	Assert(size < chunk_size);
 	set_sentinel(MemoryChunkGetPointer(chunk), size);
 #endif
+#endif							/* BUMP_CHUNK_HEADERS */
 #ifdef RANDOMIZE_ALLOCATED_MEMORY
 	/* fill the allocated space with junk */
 	randomize_mem((char *) MemoryChunkGetPointer(chunk), size);
@@ -372,7 +386,7 @@ BumpAllocLarge(MemoryContext context, Size size, int flags)
 	 */
 	dlist_push_tail(&set->blocks, &block->node);
 
-#ifdef MEMORY_CONTEXT_CHECKING
+#ifdef BUMP_CHUNK_HEADERS
 	/* Ensure any padding bytes are marked NOACCESS. */
 	VALGRIND_MAKE_MEM_NOACCESS((char *) MemoryChunkGetPointer(chunk) + size,
 							   chunk_size - size);
@@ -394,7 +408,7 @@ static inline void *
 BumpAllocChunkFromBlock(MemoryContext context, BumpBlock *block, Size size,
 						Size chunk_size)
 {
-#ifdef MEMORY_CONTEXT_CHECKING
+#ifdef BUMP_CHUNK_HEADERS
 	MemoryChunk *chunk;
 #else
 	void	   *ptr;
@@ -404,7 +418,7 @@ BumpAllocChunkFromBlock(MemoryContext context, BumpBlock *block, Size size,
 	Assert(block != NULL);
 	Assert((block->endptr - block->freeptr) >= Bump_CHUNKHDRSZ + chunk_size);
 
-#ifdef MEMORY_CONTEXT_CHECKING
+#ifdef BUMP_CHUNK_HEADERS
 	chunk = (MemoryChunk *) block->freeptr;
 #else
 	ptr = block->freeptr;
@@ -414,15 +428,17 @@ BumpAllocChunkFromBlock(MemoryContext context, BumpBlock *block, Size size,
 	block->freeptr += (Bump_CHUNKHDRSZ + chunk_size);
 	Assert(block->freeptr <= block->endptr);
 
-#ifdef MEMORY_CONTEXT_CHECKING
+#ifdef BUMP_CHUNK_HEADERS
 	/* Prepare to initialize the chunk header. */
 	VALGRIND_MAKE_MEM_UNDEFINED(chunk, Bump_CHUNKHDRSZ);
 
 	MemoryChunkSetHdrMask(chunk, block, chunk_size, MCTX_BUMP_ID);
+#ifdef MEMORY_CONTEXT_CHECKING
 	chunk->requested_size = size;
 	/* set mark to catch clobber of "unused" space */
 	Assert(size < chunk_size);
 	set_sentinel(MemoryChunkGetPointer(chunk), size);
+#endif
 
 #ifdef RANDOMIZE_ALLOCATED_MEMORY
 	/* fill the allocated space with junk */
@@ -439,7 +455,7 @@ BumpAllocChunkFromBlock(MemoryContext context, BumpBlock *block, Size size,
 	return MemoryChunkGetPointer(chunk);
 #else
 	return ptr;
-#endif							/* MEMORY_CONTEXT_CHECKING */
+#endif							/* BUMP_CHUNK_HEADERS */
 }
 
 /*
