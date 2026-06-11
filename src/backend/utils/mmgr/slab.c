@@ -66,6 +66,14 @@
  *-------------------------------------------------------------------------
  */
 
+/*
+ * The mempool requests in this file operate on block and context-header
+ * pointers, which heaptrack already tracks through its interposed
+ * malloc/free hooks.  Have memdebug.h turn them into no-ops under
+ * USE_HEAPTRACK; see there for the details.
+ */
+#define HEAPTRACK_SUPPRESS_BLOCK_LEVEL_REQUESTS
+
 #include "postgres.h"
 
 #include "lib/ilist.h"
@@ -73,6 +81,11 @@
 #include "utils/memutils.h"
 #include "utils/memutils_internal.h"
 #include "utils/memutils_memorychunk.h"
+
+/* Verify the define-before-include contract held; see aset.c */
+#if defined(USE_HEAPTRACK) && !defined(HEAPTRACK_BLOCK_LEVEL_REQUESTS_SUPPRESSED)
+#error "memdebug.h was included before HEAPTRACK_SUPPRESS_BLOCK_LEVEL_REQUESTS took effect"
+#endif
 
 #define Slab_BLOCKHDRSZ	MAXALIGN(sizeof(SlabBlock))
 
@@ -425,6 +438,49 @@ SlabContextCreate(MemoryContext parent,
 	return (MemoryContext) slab;
 }
 
+#ifdef USE_HEAPTRACK
+/*
+ * SlabBlockReportChunksFreed
+ *		Report each chunk slot in the given block as freed to heaptrack.
+ *
+ * As in aset.c, heaptrack cannot mimic the Valgrind pool trim/destroy
+ * requests, so chunks discarded wholesale on context reset or delete must
+ * be reported individually.  Slots at or beyond the "unused" high
+ * watermark were never handed out, so the walk stops there.  Slots below
+ * it that are currently free were already reported by SlabFree; they are
+ * skipped when the MEMORY_CONTEXT_CHECKING header records that, otherwise
+ * the redundant report is harmless since heaptrack ignores frees of
+ * pointers it does not track.
+ */
+static void
+SlabBlockReportChunksFreed(SlabContext *slab, SlabBlock *block)
+{
+	int			nused;
+	int			i;
+
+	nused = slab->chunksPerBlock - block->nunused;
+	Assert(nused >= 0 && nused <= slab->chunksPerBlock);
+
+	for (i = 0; i < nused; i++)
+	{
+		MemoryChunk *chunk = SlabBlockGetChunk(slab, block, i);
+
+		/* Skip chunks known to be freed already (see memdebug.h) */
+		if (HEAPTRACK_CHUNK_IS_LIVE(chunk))
+			heaptrack_report_free(MemoryChunkGetPointer(chunk));
+	}
+}
+
+/* As in aset.c, skip the walk when heaptrack is not actually loaded */
+#define HEAPTRACK_MEMPOOL_FREE(slab, block) \
+	do { \
+		if (heaptrack_free) \
+			SlabBlockReportChunksFreed(slab, block); \
+	} while (0)
+#else
+#define HEAPTRACK_MEMPOOL_FREE(slab, block)		do {} while (0)
+#endif							/* USE_HEAPTRACK */
+
 /*
  * SlabReset
  *		Frees all memory which is allocated in the given set.
@@ -472,6 +528,13 @@ SlabReset(MemoryContext context)
 			SlabBlock  *block = dlist_container(SlabBlock, node, miter.cur);
 
 			dlist_delete(miter.cur);
+
+			/*
+			 * Report discarded chunks before the contents get wiped.  Blocks
+			 * on the emptyblocks list need no such treatment: all their
+			 * chunks were already reported free by SlabFree.
+			 */
+			HEAPTRACK_MEMPOOL_FREE(slab, block);
 
 #ifdef CLOBBER_FREED_MEMORY
 			wipe_mem(block, slab->blockSize);

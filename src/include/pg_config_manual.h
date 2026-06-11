@@ -261,6 +261,48 @@
 /* #define USE_VALGRIND */
 
 /*
+ * Report memory context chunk allocations to heaptrack, by mapping the
+ * Valgrind mempool client requests onto heaptrack's API (see
+ * src/include/utils/memdebug.h).  This lets heaptrack profile palloc/pfree
+ * traffic instead of only the underlying malloc'd blocks.  Requires
+ * heaptrack_api.h on the include path and is mutually exclusive with
+ * USE_VALGRIND, e.g.
+ *
+ *   CPPFLAGS='-DUSE_HEAPTRACK -I$(top_srcdir)/contrib/heaptrack/src/track'
+ *
+ * heaptrack's API is declared with weak symbols that stay NULL unless the
+ * heaptrack preload library is loaded.  On macOS the linker rejects such
+ * unresolved references by default, so also pass
+ * LDFLAGS='-Wl,-undefined,dynamic_lookup' there.  Note that macOS support
+ * is build-only: heaptrack's tracker runs on Linux and FreeBSD, so actual
+ * profiling requires one of those.
+ *
+ * When built with this but run without the heaptrack preload library, each
+ * palloc/pfree/repalloc and each memory context reset pays only a
+ * weak-symbol NULL test; this is cheap but not free, so do not enable this
+ * in production builds.  When profiling is active, expect a substantial
+ * slowdown and large data files: every palloc-level event takes heaptrack's
+ * global lock and records a stack trace, and palloc traffic far exceeds
+ * malloc traffic.
+ *
+ * heaptrack still tracks the underlying malloc'd blocks as well, so its
+ * headline consumption totals count block-level and chunk-level records
+ * on top of each other; filter by call site to separate the two layers.
+ *
+ * Bump contexts grow per-chunk headers under USE_HEAPTRACK, since those
+ * are the only way to recover chunk pointers when a bump context is reset
+ * or deleted.  In builds that also have MEMORY_CONTEXT_CHECKING (e.g.
+ * --enable-cassert), the allocators report exactly the chunks still
+ * allocated at context reset; without it, chunks already pfree'd are
+ * redundantly reported, which heaptrack ignores.
+ *
+ * Known accounting gap: chunks made by palloc_aligned() cannot be reported
+ * as freed on context reset or delete and appear as leaked in the profile
+ * (see memdebug.h).
+ */
+/* #define USE_HEAPTRACK */
+
+/*
  * Define this to cause pfree()'d memory to be cleared immediately, to
  * facilitate catching bugs that refer to already-freed values.
  * Right now, this gets defined automatically if --enable-cassert.

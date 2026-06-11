@@ -143,6 +143,18 @@ AlignedAllocRealloc(void *pointer, Size size, int flags)
 
 	pfree(unaligned);
 
+#ifdef USE_HEAPTRACK
+	/*
+	 * MemoryContextAllocAligned has just registered newptr with heaptrack,
+	 * but our caller (repalloc) is about to register it again via
+	 * VALGRIND_MEMPOOL_CHANGE.  heaptrack matches records by exact pointer,
+	 * so the duplicate would orphan the first record in its pointer map as
+	 * a permanent "leak".  Retract it here and let the caller's report be
+	 * the only one.
+	 */
+	heaptrack_report_free(newptr);
+#endif
+
 	return newptr;
 }
 

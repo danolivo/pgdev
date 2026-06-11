@@ -44,6 +44,17 @@
  *-------------------------------------------------------------------------
  */
 
+/*
+ * The mempool requests in this file operate on block and context-header
+ * pointers (including VALGRIND_MEMPOOL_CHANGE, which AllocSetRealloc uses
+ * to move a dedicated block's header vchunk after realloc()), which
+ * heaptrack already tracks through its interposed malloc/free hooks.  Have
+ * memdebug.h turn them into no-ops under USE_HEAPTRACK; see there for the
+ * details.  Chunk-level reporting (mcxt.c and the HEAPTRACK_MEMPOOL_FREE
+ * reset walker below) is unaffected.
+ */
+#define HEAPTRACK_SUPPRESS_BLOCK_LEVEL_REQUESTS
+
 #include "postgres.h"
 
 #include "port/pg_bitutils.h"
@@ -51,6 +62,16 @@
 #include "utils/memutils.h"
 #include "utils/memutils_internal.h"
 #include "utils/memutils_memorychunk.h"
+
+/*
+ * If this fails, memdebug.h was already included through some other header
+ * before the HEAPTRACK_SUPPRESS_BLOCK_LEVEL_REQUESTS define at the top of
+ * this file could take effect, and the block-level mempool requests below
+ * would silently corrupt heaptrack's accounting.  Fix the include order.
+ */
+#if defined(USE_HEAPTRACK) && !defined(HEAPTRACK_BLOCK_LEVEL_REQUESTS_SUPPRESSED)
+#error "memdebug.h was included before HEAPTRACK_SUPPRESS_BLOCK_LEVEL_REQUESTS took effect"
+#endif
 
 /*--------------------
  * Chunk freelist k holds chunks of size 1 << (k + ALLOC_MINBITS),
@@ -530,6 +551,70 @@ AllocSetContextCreateInternal(MemoryContext parent,
 	return (MemoryContext) set;
 }
 
+#ifdef USE_HEAPTRACK
+/*
+ * AllocBlockReportChunksFreed
+ *		Report each chunk in the given block as freed to heaptrack.
+ *
+ * heaptrack cannot mimic VALGRIND_MEMPOOL_TRIM/VALGRIND_DESTROY_MEMPOOL, so
+ * when a block is discarded wholesale on context reset or delete we must
+ * report each chunk it carries ourselves, else heaptrack would consider
+ * them still allocated.  Chunks sitting on a freelist were already reported
+ * free by AllocSetFree; in MEMORY_CONTEXT_CHECKING builds their header
+ * records that and we skip them, otherwise the redundant report is
+ * harmless since heaptrack ignores frees of pointers it does not track.
+ *
+ * Note: chunks handed out by palloc_aligned() are tracked under their
+ * aligned (redirected) pointer, which cannot be recovered from the block
+ * layout; such chunks still appear allocated after a reset.
+ *
+ * This must run before the block contents are wiped, while the chunk
+ * headers are still readable.
+ */
+static void
+AllocBlockReportChunksFreed(AllocBlock block)
+{
+	char	   *ptr = ((char *) block) + ALLOC_BLOCKHDRSZ;
+
+	while (ptr < block->freeptr)
+	{
+		MemoryChunk *chunk = (MemoryChunk *) ptr;
+		int			fidx;
+
+		/* Skip chunks known to be freed already (see memdebug.h) */
+		if (HEAPTRACK_CHUNK_IS_LIVE(chunk))
+			heaptrack_report_free(MemoryChunkGetPointer(chunk));
+
+		/* An external chunk occupies its whole (dedicated) block */
+		if (MemoryChunkIsExternal(chunk))
+			return;
+
+		/* Catch a corrupted header before the walk wanders off the block */
+		fidx = MemoryChunkGetValue(chunk);
+		Assert(FreeListIdxIsValid(fidx));
+
+		ptr += ALLOC_CHUNKHDRSZ + GetChunkSizeFromFreeListIdx(fidx);
+	}
+
+	/* Chunks are carved contiguously, so we must land exactly on freeptr */
+	Assert(ptr == block->freeptr);
+}
+
+/*
+ * Skip the walk entirely when the heaptrack preload library is not loaded:
+ * the weak heaptrack_free symbol is NULL then and every report would be a
+ * no-op.  Context resets run in hot paths (per-tuple contexts), so don't
+ * touch the chunk headers unless someone is listening.
+ */
+#define HEAPTRACK_MEMPOOL_FREE(set, block) \
+	do { \
+		if (heaptrack_free) \
+			AllocBlockReportChunksFreed(block); \
+	} while (0)
+#else
+#define HEAPTRACK_MEMPOOL_FREE(set, block)	do {} while (0)
+#endif							/* USE_HEAPTRACK */
+
 /*
  * AllocSetReset
  *		Frees all memory which is allocated in the given set.
@@ -570,6 +655,9 @@ AllocSetReset(MemoryContext context)
 	while (block != NULL)
 	{
 		AllocBlock	next = block->next;
+
+		/* Report discarded chunks before the contents get wiped */
+		HEAPTRACK_MEMPOOL_FREE(set, block);
 
 		if (IsKeeperBlock(set, block))
 		{
@@ -694,6 +782,9 @@ AllocSetDelete(MemoryContext context)
 	while (block != NULL)
 	{
 		AllocBlock	next = block->next;
+
+		/* Report discarded chunks before the contents get wiped */
+		HEAPTRACK_MEMPOOL_FREE(set, block);
 
 		if (!IsKeeperBlock(set, block))
 			context->mem_allocated -= block->endptr - ((char *) block);

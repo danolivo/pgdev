@@ -28,13 +28,25 @@
  *	that some code will try to perform a pfree or one of the other operations
  *	which are made impossible due to the lack of chunk header.  In order to
  *	detect accidental usage of the various disallowed operations, we do add a
- *	MemoryChunk chunk header in MEMORY_CONTEXT_CHECKING builds and have the
- *	various disallowed functions raise an ERROR.
+ *	MemoryChunk chunk header in MEMORY_CONTEXT_CHECKING and USE_HEAPTRACK
+ *	builds and have the various disallowed functions raise an ERROR.
  *
  *	Allocations are MAXALIGNed.
  *
  *-------------------------------------------------------------------------
  */
+
+/*
+ * The mempool requests in this file operate on block and context-header
+ * pointers, which heaptrack already tracks through its interposed
+ * malloc/free hooks.  Have memdebug.h turn them into no-ops under
+ * USE_HEAPTRACK; see there for the details.
+ *
+ * Note that the heaptrack reset walker below is only possible because
+ * USE_HEAPTRACK adds chunk headers to bump chunks (see BUMP_CHUNK_HEADERS),
+ * the sole means of recovering chunk pointers from a bump block.
+ */
+#define HEAPTRACK_SUPPRESS_BLOCK_LEVEL_REQUESTS
 
 #include "postgres.h"
 
@@ -45,6 +57,11 @@
 #include "utils/memutils_memorychunk.h"
 #include "utils/memutils_internal.h"
 
+/* Verify the define-before-include contract held; see aset.c */
+#if defined(USE_HEAPTRACK) && !defined(HEAPTRACK_BLOCK_LEVEL_REQUESTS_SUPPRESSED)
+#error "memdebug.h was included before HEAPTRACK_SUPPRESS_BLOCK_LEVEL_REQUESTS took effect"
+#endif
+
 #define Bump_BLOCKHDRSZ		MAXALIGN(sizeof(BumpBlock))
 #define FIRST_BLOCKHDRSZ	(MAXALIGN(sizeof(BumpContext)) + \
 							 Bump_BLOCKHDRSZ)
@@ -52,11 +69,12 @@
 /*
  * Bump chunks normally have no chunk header.  We add one in
  * MEMORY_CONTEXT_CHECKING builds, to detect accidental usage of the
- * disallowed chunk operations.  BUMP_CHUNK_HEADERS controls the header
- * layout itself; the checking-only extras (requested_size, the sentinel
- * byte) remain conditional on MEMORY_CONTEXT_CHECKING.
+ * disallowed chunk operations, and in USE_HEAPTRACK builds, where walking
+ * the headers at context reset is the only way to report the discarded
+ * chunks to heaptrack.  The checking-only extras (requested_size, the
+ * sentinel byte) remain conditional on MEMORY_CONTEXT_CHECKING.
  */
-#ifdef MEMORY_CONTEXT_CHECKING
+#if defined(MEMORY_CONTEXT_CHECKING) || defined(USE_HEAPTRACK)
 #define BUMP_CHUNK_HEADERS
 #endif
 
@@ -250,6 +268,53 @@ BumpContextCreate(MemoryContext parent, const char *name, Size minContextSize,
 	return (MemoryContext) set;
 }
 
+#ifdef USE_HEAPTRACK
+/*
+ * BumpBlockReportChunksFreed
+ *		Report each chunk in the given block as freed to heaptrack.
+ *
+ * As in aset.c, heaptrack cannot mimic the Valgrind pool trim/destroy
+ * requests, so chunks discarded wholesale on context reset or delete must
+ * be reported individually.  Bump chunks cannot be pfree'd, so every chunk
+ * in the block is still allocated.  The chunk headers we walk here exist
+ * only because USE_HEAPTRACK defines BUMP_CHUNK_HEADERS; they carry the
+ * chunk size as their value.
+ *
+ * This must run before the block contents are wiped, while the chunk
+ * headers are still readable.
+ */
+static void
+BumpBlockReportChunksFreed(BumpBlock *block)
+{
+	char	   *ptr = ((char *) block) + Bump_BLOCKHDRSZ;
+
+	while (ptr < block->freeptr)
+	{
+		MemoryChunk *chunk = (MemoryChunk *) ptr;
+
+		heaptrack_report_free(MemoryChunkGetPointer(chunk));
+
+		/* An external chunk occupies its whole (dedicated) block */
+		if (MemoryChunkIsExternal(chunk))
+			return;
+
+		ptr += Bump_CHUNKHDRSZ + MemoryChunkGetValue(chunk);
+	}
+
+	/* Chunks are carved contiguously, so we must land exactly on freeptr */
+	Assert(ptr == block->freeptr);
+}
+
+/* As in aset.c, skip the walk when heaptrack is not actually loaded */
+#define HEAPTRACK_MEMPOOL_FREE(set, block) \
+	do { \
+		if (heaptrack_free) \
+			BumpBlockReportChunksFreed(block); \
+	} while (0)
+#else
+#define HEAPTRACK_MEMPOOL_FREE(set, block)	do {} while (0)
+#endif							/* USE_HEAPTRACK */
+
 /*
  * BumpReset
  *		Frees all memory which is allocated in the given set.
@@ -273,6 +338,9 @@ BumpReset(MemoryContext context)
 	dlist_foreach_modify(miter, &set->blocks)
 	{
 		BumpBlock  *block = dlist_container(BumpBlock, node, miter.cur);
+
+		/* Report discarded chunks before the contents get wiped */
+		HEAPTRACK_MEMPOOL_FREE(set, block);
 
 		if (IsKeeperBlock(set, block))
 			BumpBlockMarkEmpty(block);

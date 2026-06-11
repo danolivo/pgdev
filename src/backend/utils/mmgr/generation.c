@@ -33,6 +33,14 @@
  *-------------------------------------------------------------------------
  */
 
+/*
+ * The mempool requests in this file operate on block and context-header
+ * pointers, which heaptrack already tracks through its interposed
+ * malloc/free hooks.  Have memdebug.h turn them into no-ops under
+ * USE_HEAPTRACK; see there for the details.
+ */
+#define HEAPTRACK_SUPPRESS_BLOCK_LEVEL_REQUESTS
+
 #include "postgres.h"
 
 #include "lib/ilist.h"
@@ -41,6 +49,11 @@
 #include "utils/memutils.h"
 #include "utils/memutils_internal.h"
 #include "utils/memutils_memorychunk.h"
+
+/* Verify the define-before-include contract held; see aset.c */
+#if defined(USE_HEAPTRACK) && !defined(HEAPTRACK_BLOCK_LEVEL_REQUESTS_SUPPRESSED)
+#error "memdebug.h was included before HEAPTRACK_SUPPRESS_BLOCK_LEVEL_REQUESTS took effect"
+#endif
 
 
 #define Generation_BLOCKHDRSZ	MAXALIGN(sizeof(GenerationBlock))
@@ -278,6 +291,56 @@ GenerationContextCreate(MemoryContext parent,
 	return (MemoryContext) set;
 }
 
+#ifdef USE_HEAPTRACK
+/*
+ * GenerationBlockReportChunksFreed
+ *		Report each chunk in the given block as freed to heaptrack.
+ *
+ * As in aset.c, heaptrack cannot mimic the Valgrind pool trim/destroy
+ * requests, so chunks discarded wholesale on context reset or delete must
+ * be reported individually.  Chunks that GenerationFree already reported
+ * are skipped when the MEMORY_CONTEXT_CHECKING header records that;
+ * otherwise the redundant report is harmless, since heaptrack ignores
+ * frees of pointers it does not track.
+ *
+ * This must run before the block contents are wiped, while the chunk
+ * headers are still readable.
+ */
+static void
+GenerationBlockReportChunksFreed(GenerationBlock *block)
+{
+	char	   *ptr = ((char *) block) + Generation_BLOCKHDRSZ;
+
+	while (ptr < block->freeptr)
+	{
+		MemoryChunk *chunk = (MemoryChunk *) ptr;
+
+		/* Skip chunks known to be freed already (see memdebug.h) */
+		if (HEAPTRACK_CHUNK_IS_LIVE(chunk))
+			heaptrack_report_free(MemoryChunkGetPointer(chunk));
+
+		/* An external chunk occupies its whole (dedicated) block */
+		if (MemoryChunkIsExternal(chunk))
+			return;
+
+		/* Generation chunk headers carry the chunk size as their value */
+		ptr += Generation_CHUNKHDRSZ + MemoryChunkGetValue(chunk);
+	}
+
+	/* Chunks are carved contiguously, so we must land exactly on freeptr */
+	Assert(ptr == block->freeptr);
+}
+
+/* As in aset.c, skip the walk when heaptrack is not actually loaded */
+#define HEAPTRACK_MEMPOOL_FREE(set, block) \
+	do { \
+		if (heaptrack_free) \
+			GenerationBlockReportChunksFreed(block); \
+	} while (0)
+#else
+#define HEAPTRACK_MEMPOOL_FREE(set, block)	do {} while (0)
+#endif							/* USE_HEAPTRACK */
+
 /*
  * GenerationReset
  *		Frees all memory which is allocated in the given set.
@@ -310,6 +373,9 @@ GenerationReset(MemoryContext context)
 	dlist_foreach_modify(miter, &set->blocks)
 	{
 		GenerationBlock *block = dlist_container(GenerationBlock, node, miter.cur);
+
+		/* Report discarded chunks before the contents get wiped */
+		HEAPTRACK_MEMPOOL_FREE(set, block);
 
 		if (IsKeeperBlock(set, block))
 			GenerationBlockMarkEmpty(block);
