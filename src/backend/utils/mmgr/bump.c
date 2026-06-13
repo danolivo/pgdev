@@ -305,10 +305,10 @@ BumpBlockReportChunksFreed(BumpBlock *block)
 	Assert(ptr == block->freeptr);
 }
 
-/* As in aset.c, skip the walk when heaptrack is not actually loaded */
+/* As in aset.c, skip the walk unless the engine is recording */
 #define HEAPTRACK_MEMPOOL_FREE(set, block) \
 	do { \
-		if (heaptrack_free) \
+		if (pg_heaptrack_active) \
 			BumpBlockReportChunksFreed(block); \
 	} while (0)
 #else

@@ -1,0 +1,24 @@
+# contrib/pg_heaptrack/Makefile
+
+MODULE_big = pg_heaptrack
+OBJS = \
+	$(WIN32RES) \
+	pg_heaptrack.o
+PGFILEDESC = "pg_heaptrack - enable heaptrack heap profiling at run time"
+
+EXTENSION = pg_heaptrack
+DATA = pg_heaptrack--1.0.sql
+
+# dlopen()/dlsym() of the injection library at run time
+SHLIB_LINK += -ldl
+
+ifdef USE_PGXS
+PG_CONFIG = pg_config
+PGXS := $(shell $(PG_CONFIG) --pgxs)
+include $(PGXS)
+else
+subdir = contrib/pg_heaptrack
+top_builddir = ../..
+include $(top_builddir)/src/Makefile.global
+include $(top_srcdir)/contrib/contrib-global.mk
+endif

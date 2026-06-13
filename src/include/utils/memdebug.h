@@ -27,26 +27,36 @@
 #elif defined(USE_HEAPTRACK)
 
 /*
- * Map the Valgrind mempool client requests onto heaptrack's API, so that
- * heaptrack can attribute palloc/pfree traffic to individual chunks instead
- * of whole memory context blocks.  heaptrack_api.h must be reachable on the
- * include path, e.g.
+ * Map the Valgrind mempool client requests onto heaptrack, so that heaptrack
+ * can attribute palloc/pfree traffic to individual chunks instead of whole
+ * memory context blocks.
  *
- *   CPPFLAGS='-DUSE_HEAPTRACK -I$(top_srcdir)/contrib/heaptrack/src/track'
+ * The heaptrack recording engine is compiled directly into the backend when
+ * building with USE_HEAPTRACK (see src/backend/utils/mmgr/Makefile and
+ * contrib/heaptrack), so heaptrack_malloc()/free()/realloc() are ordinary
+ * in-binary symbols.  The engine stays dormant until the pg_heaptrack
+ * extension (contrib/pg_heaptrack) calls heaptrack_init().  We additionally
+ * gate every report on pg_heaptrack_active, a core-owned switch the extension
+ * flips: an un-profiled backend then pays only one predicted-not-taken branch,
+ * and -- more importantly -- the per-reset chunk walk in the allocators stays
+ * out of hot paths until the engine is actually recording.  A USE_HEAPTRACK
+ * core build needs no heaptrack header on the include path.
  *
- * We deliberately do not use heaptrack_api.h's own Valgrind-macro emulation
- * (HEAPTRACK_DEFINE_VALGRIND_MACROS): its report macros expand to brace-less
- * "if" statements, which would silently mis-bind an "else" at an unbraced
- * call site.  Instead, take only the heaptrack_report_* macros from it and
- * define the full Valgrind macro set here as proper single statements.  The
- * memory (un)definedness requests have no heaptrack equivalent and are
+ * The memory (un)definedness requests have no heaptrack equivalent and are
  * no-ops, as are the pool create/destroy/trim requests.
  */
-#ifdef HEAPTRACK_API_DLSYM
-#error "USE_HEAPTRACK requires heaptrack's weak-symbol API; do not define HEAPTRACK_API_DLSYM"
-#endif
+extern void heaptrack_malloc(void *ptr, size_t size);
+extern void heaptrack_free(void *ptr);
+extern void heaptrack_realloc(void *ptr_in, size_t size, void *ptr_out);
 
-#include "heaptrack_api.h"
+extern PGDLLIMPORT bool pg_heaptrack_active;
+
+#define heaptrack_report_alloc(ptr, size) \
+	do { if (pg_heaptrack_active) heaptrack_malloc((ptr), (size)); } while (0)
+#define heaptrack_report_free(ptr) \
+	do { if (pg_heaptrack_active) heaptrack_free((ptr)); } while (0)
+#define heaptrack_report_realloc(ptr_in, size, ptr_out) \
+	do { if (pg_heaptrack_active) heaptrack_realloc((ptr_in), (size), (ptr_out)); } while (0)
 
 #define VALGRIND_CHECK_MEM_IS_DEFINED(addr, size)			do {} while (0)
 #define VALGRIND_CREATE_MEMPOOL(context, redzones, zeroed)	do {} while (0)

@@ -1,0 +1,108 @@
+# pg_heaptrack
+
+Enable [heaptrack](https://github.com/KDE/heaptrack) heap profiling for a
+running PostgreSQL backend, on demand, from SQL.
+
+## Why this exists
+
+A server built with `-DUSE_HEAPTRACK` (see `src/include/pg_config_manual.h`)
+carries weak references to heaptrack's reporting API.  They are NULL — and the
+instrumentation inert — unless heaptrack's tracker is loaded into the process.
+
+The normal way to load it, the `heaptrack` wrapper, `LD_PRELOAD`s the tracker
+into the postmaster; but heaptrack disables itself in forked children to avoid
+two processes writing one data file, so every backend runs unprofiled.
+Attaching with `heaptrack -p <pid>` records only block-level (malloc) traffic,
+because the backend's weak `heaptrack_*` symbols were already bound to NULL at
+startup.
+
+`pg_heaptrack` loads heaptrack from *inside* an already-forked backend, where
+the fork guard never tripped, and rewrites the backend's own GOT so the
+instrumentation comes alive — including, optionally, the chunk-level
+(palloc/pfree) layer.
+
+## Requirements
+
+- A server built with `-DUSE_HEAPTRACK` (needed only for chunk-level tracking;
+  block-level works on any build).
+- heaptrack installed, with `libheaptrack_inject.so` reachable by the dynamic
+  loader (it is in the system library path per the deployment here).
+- Linux or FreeBSD.  Loading the module on other platforms raises an error.
+
+## Build and install
+
+```sh
+cd contrib/pg_heaptrack
+make
+make install
+```
+
+## Usage
+
+Profile a single session:
+
+```sql
+LOAD 'pg_heaptrack';        -- recording starts immediately
+-- run the queries you want to profile
+SELECT pg_heaptrack_stop(); -- optional: flush now instead of at backend exit
+```
+
+Profile every backend (data file per PID):
+
+```
+session_preload_libraries = 'pg_heaptrack'
+```
+
+Do **not** use `shared_preload_libraries`: that loads the tracker into the
+postmaster and re-creates the forked-child problem.  The module refuses it.
+
+### Chunk-level tracking
+
+By default only block-level (malloc) allocations are recorded.  To also
+attribute individual `palloc`/`pfree` traffic — which requires a
+`-DUSE_HEAPTRACK` server — set, before loading:
+
+```sql
+SET pg_heaptrack.track_chunks = on;
+LOAD 'pg_heaptrack';
+```
+
+A build with `--enable-cassert` (hence `MEMORY_CONTEXT_CHECKING`) additionally
+lets the context-reset reporting be exact rather than over-reporting freed
+chunks.
+
+## Configuration
+
+| GUC | Default | Meaning |
+| --- | --- | --- |
+| `pg_heaptrack.inject_library` | `libheaptrack_inject.so` | Path or soname of heaptrack's injection library. |
+| `pg_heaptrack.output_prefix` | `/tmp/heaptrack.postgres` | Data-file prefix; the backend PID is appended. |
+| `pg_heaptrack.track_chunks` | `off` | Also record palloc/pfree (needs `-DUSE_HEAPTRACK`). |
+
+All three are `SUSET` (superuser-only).
+
+## Analysing the result
+
+Each backend writes one file, e.g. `/tmp/heaptrack.postgres.12345`:
+
+```sh
+heaptrack_gui   /tmp/heaptrack.postgres.12345
+heaptrack_print /tmp/heaptrack.postgres.12345 | less
+```
+
+When chunk tracking is on, the profile contains two layers: block-level records
+on `malloc`/`AllocSetAllocFromNewBlock` stacks, and chunk-level records on
+`palloc`/`MemoryContextAlloc` stacks with the real call site above them.
+Headline totals count both layers, so filter by call site to read one at a
+time.
+
+## Limitations
+
+- Allocations made before `LOAD` are unknown to heaptrack; frees of them are
+  ignored, and "leaked" means "allocated since LOAD and not yet freed".
+- `palloc_aligned()` chunks are reported under their aligned pointer and show
+  as leaked after a context reset (a `-DUSE_HEAPTRACK` limitation, not specific
+  to this module).
+- Recording carries heaptrack's usual cost: a global lock and a stack unwind
+  per allocation, with palloc traffic far exceeding malloc traffic.  Profile
+  focused workloads, not full benchmark runs.

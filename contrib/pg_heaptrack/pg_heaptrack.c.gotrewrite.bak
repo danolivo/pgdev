@@ -1,0 +1,471 @@
+/*-------------------------------------------------------------------------
+ *
+ * pg_heaptrack.c
+ *		Turn on heaptrack profiling for the current backend at run time.
+ *
+ * A backend built with -DUSE_HEAPTRACK carries weak references to heaptrack's
+ * reporting API (heaptrack_malloc/heaptrack_free/heaptrack_realloc); they stay
+ * NULL unless heaptrack's library is present, so the instrumentation is inert
+ * in a normally-started server.  The usual way to populate those symbols ---
+ * launching the process under the heaptrack wrapper, which LD_PRELOADs the
+ * tracker --- does not work for a forked backend: heaptrack deliberately
+ * disables itself in forked children to avoid two processes writing one data
+ * file.
+ *
+ * This module bypasses that by enabling heaptrack from inside an already
+ * running backend, after the fork, where heaptrack's fork guard never tripped.
+ * On load it dlopen()s heaptrack's injection library and calls its public
+ * heaptrack_inject() entry point, which starts recording and rewrites the
+ * GOT entries for malloc/free/realloc (and friends) across all loaded objects
+ * --- giving block-level profiling of this backend from LOAD onward, exactly
+ * as "heaptrack -p <pid>" would.
+ *
+ * With pg_heaptrack.track_chunks enabled, it additionally rewrites this
+ * backend's own GOT slots for the three heaptrack_* API symbols so they point
+ * at heaptrack's implementations, waking up the -DUSE_HEAPTRACK chunk-level
+ * instrumentation (palloc/pfree attribution and the context-reset walkers).
+ *
+ * Usage:
+ *		LOAD 'pg_heaptrack';						-- this session only
+ *		-- or session_preload_libraries = 'pg_heaptrack' for every backend
+ *
+ * Profiling can only happen on platforms heaptrack supports (Linux, FreeBSD);
+ * elsewhere loading the module raises an error.
+ *
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ *
+ * IDENTIFICATION
+ *		contrib/pg_heaptrack/pg_heaptrack.c
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "fmgr.h"
+#include "miscadmin.h"
+#include "utils/builtins.h"
+#include "utils/guc.h"
+
+PG_MODULE_MAGIC;
+
+void		_PG_init(void);
+
+/* GUCs */
+static char *pg_heaptrack_inject_library = NULL;
+static char *pg_heaptrack_output_prefix = NULL;
+static bool pg_heaptrack_track_chunks = false;
+
+PG_FUNCTION_INFO_V1(pg_heaptrack_stop);
+PG_FUNCTION_INFO_V1(pg_heaptrack_is_active);
+
+/*
+ * The real machinery only exists where heaptrack does.  On other platforms the
+ * module still builds (so the tree compiles everywhere), but loading it fails.
+ */
+#if defined(__linux__) || defined(__FreeBSD__)
+#define PG_HEAPTRACK_SUPPORTED
+#endif
+
+#ifdef PG_HEAPTRACK_SUPPORTED
+
+#include <dlfcn.h>
+#include <link.h>
+#include <sys/mman.h>
+#include <unistd.h>			/* sysconf */
+
+/* heaptrack's runtime-injection entry point and stop hook */
+typedef void (*heaptrack_inject_fn) (const char *outputFileName);
+typedef void (*heaptrack_stop_fn) (void);
+
+static void *pg_heaptrack_handle = NULL;
+static heaptrack_stop_fn pg_heaptrack_stop_hook = NULL;
+
+/* Is heaptrack currently recording in this backend? */
+static bool pg_heaptrack_active = false;
+
+#if __ELF_NATIVE_CLASS == 64
+#define PGHT_R_SYM(info)	ELF64_R_SYM(info)
+#else
+#define PGHT_R_SYM(info)	ELF32_R_SYM(info)
+#endif
+
+/*
+ * One symbol we want to repoint, and the address to repoint it at.  We patch
+ * exactly the three heaptrack API functions the backend references weakly.
+ */
+typedef struct PgHtApiSymbol
+{
+	const char *name;
+	void	   *target;
+} PgHtApiSymbol;
+
+typedef struct PgHtPatchState
+{
+	PgHtApiSymbol *symbols;
+	int			nsymbols;
+	int			npatched;
+} PgHtPatchState;
+
+/*
+ * Overwrite one GOT slot, after making its page writable.
+ *
+ * The slot may live in a RELRO-protected, read-only page, so we mprotect it
+ * first; heaptrack's own injector does the same.  We never restore the
+ * original protection, matching heaptrack --- the cost is one page left
+ * writable, which is acceptable for a profiling-only build.
+ */
+static void
+pg_heaptrack_write_slot(ElfW(Addr) slot, void *target)
+{
+	long		pagesize = sysconf(_SC_PAGESIZE);
+	void	   *page;
+
+	if (pagesize <= 0)
+		pagesize = 4096;
+
+	page = (void *) (slot & ~((ElfW(Addr)) pagesize - 1));
+	if (mprotect(page, pagesize, PROT_READ | PROT_WRITE) != 0)
+		return;					/* leave the slot alone if we cannot unprotect */
+
+	*(void **) slot = target;
+}
+
+/*
+ * Walk one object's relocation table, repointing any slot that names one of
+ * the symbols we are after.  Modelled on heaptrack's try_overwrite_elftable.
+ *
+ * symtab_cap bounds the symbol index defensively: if the string table follows
+ * the symbol table in memory (the common layout) it is the exact entry count,
+ * otherwise 0 meaning "unknown" and we fall back to bounding the name offset
+ * against the string-table size.
+ */
+static void
+pg_heaptrack_scan_rela(PgHtPatchState *state,
+					   const ElfW(Rela) *rela, size_t relasz,
+					   const ElfW(Sym) *symtab, uintptr_t symtab_cap,
+					   const char *strtab, size_t strsz,
+					   ElfW(Addr) base)
+{
+	const ElfW(Rela) *end = (const ElfW(Rela) *) ((const char *) rela + relasz);
+
+	for (; rela < end; rela++)
+	{
+		uintptr_t	symidx = PGHT_R_SYM(rela->r_info);
+		const ElfW(Sym) *sym;
+		const char *symname;
+
+		if (symtab_cap != 0 && symidx >= symtab_cap)
+			continue;
+
+		sym = &symtab[symidx];
+		if (sym->st_name >= strsz)
+			continue;
+
+		symname = strtab + sym->st_name;
+
+		for (int i = 0; i < state->nsymbols; i++)
+		{
+			if (strcmp(symname, state->symbols[i].name) == 0)
+			{
+				pg_heaptrack_write_slot(rela->r_offset + base,
+										state->symbols[i].target);
+				state->npatched++;
+				break;
+			}
+		}
+	}
+}
+
+/*
+ * dl_iterate_phdr callback: patch the API symbols in the main executable.
+ *
+ * Only the backend executable references the heaptrack_* weak symbols, so we
+ * skip shared objects (empty dlpi_name is the main program) and, defensively,
+ * heaptrack's own library and the dynamic loader.
+ */
+static int
+pg_heaptrack_iter_phdr(struct dl_phdr_info *info, size_t size, void *data)
+{
+	PgHtPatchState *state = (PgHtPatchState *) data;
+	const ElfW(Dyn) *dyn = NULL;
+	ElfW(Addr)	base = info->dlpi_addr;
+
+	const ElfW(Sym) *symtab = NULL;
+	const char *strtab = NULL;
+	size_t		strsz = 0;
+	const ElfW(Rela) *rela = NULL;
+	size_t		relasz = 0;
+	const ElfW(Rela) *jmprela = NULL;
+	size_t		jmprelsz = 0;
+	ElfW(Sxword) pltrel = 0;
+	uintptr_t	symtab_cap = 0;
+
+	/* Only the main executable carries the weak heaptrack references. */
+	if (info->dlpi_name != NULL && info->dlpi_name[0] != '\0')
+		return 0;
+
+	/* Locate the PT_DYNAMIC segment. */
+	for (int i = 0; i < info->dlpi_phnum; i++)
+	{
+		if (info->dlpi_phdr[i].p_type == PT_DYNAMIC)
+		{
+			dyn = (const ElfW(Dyn) *) (info->dlpi_phdr[i].p_vaddr + base);
+			break;
+		}
+	}
+	if (dyn == NULL)
+		return 0;
+
+	for (; dyn->d_tag != DT_NULL; dyn++)
+	{
+		switch (dyn->d_tag)
+		{
+			case DT_SYMTAB:
+				symtab = (const ElfW(Sym) *) dyn->d_un.d_ptr;
+				break;
+			case DT_STRTAB:
+				strtab = (const char *) dyn->d_un.d_ptr;
+				break;
+			case DT_STRSZ:
+				strsz = dyn->d_un.d_val;
+				break;
+			case DT_RELA:
+				rela = (const ElfW(Rela) *) dyn->d_un.d_ptr;
+				break;
+			case DT_RELASZ:
+				relasz = dyn->d_un.d_val;
+				break;
+			case DT_JMPREL:
+				jmprela = (const ElfW(Rela) *) dyn->d_un.d_ptr;
+				break;
+			case DT_PLTRELSZ:
+				jmprelsz = dyn->d_un.d_val;
+				break;
+			case DT_PLTREL:
+				pltrel = dyn->d_un.d_val;
+				break;
+			default:
+				break;
+		}
+	}
+
+	if (symtab == NULL || strtab == NULL || strsz == 0)
+		return 0;
+
+	/*
+	 * If the string table immediately follows the symbol table (the usual
+	 * layout), the gap gives the exact symbol count; use it to bound indexing.
+	 */
+	if ((const char *) strtab > (const char *) symtab)
+		symtab_cap = ((const char *) strtab - (const char *) symtab) /
+			sizeof(ElfW(Sym));
+
+	/* GLOB_DAT relocations (the address-of test) live in .rela.dyn. */
+	if (rela != NULL && relasz > 0)
+		pg_heaptrack_scan_rela(state, rela, relasz, symtab, symtab_cap,
+							   strtab, strsz, base);
+
+	/* JUMP_SLOT relocations (the call) live in .rela.plt, when it is RELA. */
+	if (jmprela != NULL && jmprelsz > 0 && pltrel == DT_RELA)
+		pg_heaptrack_scan_rela(state, jmprela, jmprelsz, symtab, symtab_cap,
+							   strtab, strsz, base);
+
+	return 0;
+}
+
+/*
+ * Point this backend's weak heaptrack_* references at the implementations in
+ * the injection library.  Returns the number of GOT slots rewritten.
+ */
+static int
+pg_heaptrack_patch_api(void *handle)
+{
+	PgHtApiSymbol syms[3];
+	PgHtPatchState state;
+
+	syms[0].name = "heaptrack_malloc";
+	syms[0].target = dlsym(handle, "heaptrack_malloc");
+	syms[1].name = "heaptrack_free";
+	syms[1].target = dlsym(handle, "heaptrack_free");
+	syms[2].name = "heaptrack_realloc";
+	syms[2].target = dlsym(handle, "heaptrack_realloc");
+
+	for (int i = 0; i < 3; i++)
+	{
+		if (syms[i].target == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("could not resolve heaptrack API symbol \"%s\"",
+							syms[i].name),
+					 errdetail("The injection library does not export the heaptrack reporting API."),
+					 errhint("Chunk-level tracking is unavailable; load with pg_heaptrack.track_chunks = off.")));
+	}
+
+	state.symbols = syms;
+	state.nsymbols = 3;
+	state.npatched = 0;
+	dl_iterate_phdr(pg_heaptrack_iter_phdr, &state);
+
+	return state.npatched;
+}
+
+/*
+ * Enable heaptrack for this backend.  Raises ERROR on any failure, so a failed
+ * LOAD leaves the backend in its normal, untracked state.
+ */
+static void
+pg_heaptrack_enable(void)
+{
+	char		path[MAXPGPATH];
+	const char *prefix;
+	heaptrack_inject_fn inject;
+
+	if (pg_heaptrack_active)
+		return;
+
+	pg_heaptrack_handle = dlopen(pg_heaptrack_inject_library,
+								 RTLD_NOW | RTLD_GLOBAL);
+	if (pg_heaptrack_handle == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("could not load heaptrack injection library \"%s\"",
+						pg_heaptrack_inject_library),
+				 errdetail("%s", dlerror())));
+
+	inject = (heaptrack_inject_fn) dlsym(pg_heaptrack_handle, "heaptrack_inject");
+	if (inject == NULL)
+	{
+		dlclose(pg_heaptrack_handle);
+		pg_heaptrack_handle = NULL;
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("could not find heaptrack_inject in \"%s\"",
+						pg_heaptrack_inject_library)));
+	}
+
+	/* Resolve the stop hook now; it is optional, so a NULL is fine. */
+	pg_heaptrack_stop_hook = (heaptrack_stop_fn)
+		dlsym(pg_heaptrack_handle, "heaptrack_stop");
+
+	/* One data file per backend, distinguished by PID. */
+	prefix = (pg_heaptrack_output_prefix && pg_heaptrack_output_prefix[0])
+		? pg_heaptrack_output_prefix : "/tmp/heaptrack.postgres";
+	snprintf(path, sizeof(path), "%s.%d", prefix, (int) MyProcPid);
+
+	/* Block-level tracking: start recording and hook malloc/free/realloc. */
+	inject(path);
+
+	/* Chunk-level tracking: wake up the -DUSE_HEAPTRACK instrumentation. */
+	if (pg_heaptrack_track_chunks)
+	{
+		int			npatched = pg_heaptrack_patch_api(pg_heaptrack_handle);
+
+		if (npatched == 0)
+			ereport(WARNING,
+					(errmsg("pg_heaptrack found no heaptrack API references to patch"),
+					 errdetail("The backend may not have been built with -DUSE_HEAPTRACK.")));
+	}
+
+	pg_heaptrack_active = true;
+
+	ereport(LOG,
+			(errmsg("pg_heaptrack: recording heap profile to \"%s\"%s",
+					path,
+					pg_heaptrack_track_chunks ? " (chunk-level)" : " (block-level)")));
+}
+
+Datum
+pg_heaptrack_stop(PG_FUNCTION_ARGS)
+{
+	if (!pg_heaptrack_active)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pg_heaptrack is not active in this backend")));
+
+	if (pg_heaptrack_stop_hook != NULL)
+		pg_heaptrack_stop_hook();
+
+	pg_heaptrack_active = false;
+
+	PG_RETURN_VOID();
+}
+
+#else							/* !PG_HEAPTRACK_SUPPORTED */
+
+static void
+pg_heaptrack_enable(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("pg_heaptrack is only supported on Linux and FreeBSD")));
+}
+
+Datum
+pg_heaptrack_stop(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("pg_heaptrack is only supported on Linux and FreeBSD")));
+	PG_RETURN_VOID();
+}
+
+#endif							/* PG_HEAPTRACK_SUPPORTED */
+
+Datum
+pg_heaptrack_is_active(PG_FUNCTION_ARGS)
+{
+#ifdef PG_HEAPTRACK_SUPPORTED
+	PG_RETURN_BOOL(pg_heaptrack_active);
+#else
+	PG_RETURN_BOOL(false);
+#endif
+}
+
+void
+_PG_init(void)
+{
+	/*
+	 * Loading in the postmaster (shared_preload_libraries) would register
+	 * heaptrack's fork guard before any backend forks, which disables tracking
+	 * in every child --- the exact failure mode this module exists to avoid.
+	 * Refuse it.  Use LOAD or session_preload_libraries instead, so that we
+	 * run in an already-forked backend.
+	 */
+	if (process_shared_preload_libraries_in_progress)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pg_heaptrack cannot be loaded via shared_preload_libraries"),
+				 errhint("Use LOAD or session_preload_libraries so the module loads after fork.")));
+
+	DefineCustomStringVariable("pg_heaptrack.inject_library",
+							   "Path or name of heaptrack's injection library.",
+							   NULL,
+							   &pg_heaptrack_inject_library,
+							   "libheaptrack_inject.so",
+							   PGC_SUSET,
+							   0,
+							   NULL, NULL, NULL);
+
+	DefineCustomStringVariable("pg_heaptrack.output_prefix",
+							   "Prefix for this backend's heaptrack data file.",
+							   "The backend PID is appended to form the file name.",
+							   &pg_heaptrack_output_prefix,
+							   "/tmp/heaptrack.postgres",
+							   PGC_SUSET,
+							   0,
+							   NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_heaptrack.track_chunks",
+							 "Also report palloc/pfree (chunk-level) allocations.",
+							 "Requires a server built with -DUSE_HEAPTRACK.",
+							 &pg_heaptrack_track_chunks,
+							 false,
+							 PGC_SUSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	MarkGUCPrefixReserved("pg_heaptrack");
+
+	/* Start profiling as soon as we are loaded. */
+	pg_heaptrack_enable();
+}

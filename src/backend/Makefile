@@ -77,6 +77,33 @@ ifeq ($(with_systemd),yes)
 LIBS += -lsystemd
 endif
 
+# heaptrack chunk profiling (-DUSE_HEAPTRACK): compile heaptrack's recording
+# engine directly into the backend, resolving the heaptrack_malloc()/free()/
+# realloc() and heaptrack_init()/stop()/pause()/resume() references in mcxt.c,
+# alignedalloc.c and the allocators.  We build only the engine -- libheaptrack.cpp
+# plus the unwind-tables trace backend -- and none of heaptrack's malloc
+# interposers, so there is no double counting.  HEAPTRACK_SRC must point at
+# heaptrack's src/ directory; the two headers heaptrack normally generates with
+# CMake are substituted from contrib/pg_heaptrack/engine/include.  The engine is
+# C++, so it pulls in libstdc++; -Wl,--export-dynamic (already in LDFLAGS_EX_BE)
+# exports the engine symbols so the pg_heaptrack module can resolve them at LOAD.
+ifneq (,$(findstring -DUSE_HEAPTRACK,$(CPPFLAGS)))
+HEAPTRACK_SRC ?= $(top_srcdir)/contrib/heaptrack/src
+HEAPTRACK_ENGINE_CPPFLAGS = -D_GNU_SOURCE \
+	-I$(top_srcdir)/contrib/pg_heaptrack/engine/include \
+	-I$(HEAPTRACK_SRC) -I$(HEAPTRACK_SRC)/track \
+	-I$(HEAPTRACK_SRC)/../3rdparty/robin-map/include
+HEAPTRACK_ENGINE_CXXFLAGS = -O2 -g -fPIC -std=c++17
+
+OBJS += heaptrack_engine.o heaptrack_trace.o
+LIBS += -lstdc++ -lpthread -lrt -ldl
+
+heaptrack_engine.o: $(HEAPTRACK_SRC)/track/libheaptrack.cpp
+	$(CXX) $(HEAPTRACK_ENGINE_CXXFLAGS) $(HEAPTRACK_ENGINE_CPPFLAGS) -c -o $@ $<
+heaptrack_trace.o: $(HEAPTRACK_SRC)/track/trace_unwind_tables.cpp
+	$(CXX) $(HEAPTRACK_ENGINE_CXXFLAGS) $(HEAPTRACK_ENGINE_CPPFLAGS) -c -o $@ $<
+endif
+
 override LDFLAGS := $(LDFLAGS) $(LDFLAGS_EX) $(LDFLAGS_EX_BE)
 
 ##########################################################################

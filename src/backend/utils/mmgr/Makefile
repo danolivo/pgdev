@@ -20,6 +20,7 @@ OBJS = \
 	freepage.o \
 	generation.o \
 	mcxt.o \
+	mcxt_instrument.o \
 	memdebug.o \
 	portalmem.o \
 	slab.o

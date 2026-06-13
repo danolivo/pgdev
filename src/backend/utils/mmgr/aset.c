@@ -601,14 +601,14 @@ AllocBlockReportChunksFreed(AllocBlock block)
 }
 
 /*
- * Skip the walk entirely when the heaptrack preload library is not loaded:
- * the weak heaptrack_free symbol is NULL then and every report would be a
- * no-op.  Context resets run in hot paths (per-tuple contexts), so don't
- * touch the chunk headers unless someone is listening.
+ * Skip the walk entirely while no one is profiling: pg_heaptrack_active is
+ * false then and every report would be a no-op.  Context resets run in hot
+ * paths (per-tuple contexts), so don't touch the chunk headers unless the
+ * engine is actually recording.
  */
 #define HEAPTRACK_MEMPOOL_FREE(set, block) \
 	do { \
-		if (heaptrack_free) \
+		if (pg_heaptrack_active) \
 			AllocBlockReportChunksFreed(block); \
 	} while (0)
 #else

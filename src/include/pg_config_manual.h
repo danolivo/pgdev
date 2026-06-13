@@ -262,32 +262,42 @@
 
 /*
  * Report memory context chunk allocations to heaptrack, by mapping the
- * Valgrind mempool client requests onto heaptrack's API (see
+ * Valgrind mempool client requests onto heaptrack's recording engine (see
  * src/include/utils/memdebug.h).  This lets heaptrack profile palloc/pfree
- * traffic instead of only the underlying malloc'd blocks.  Requires
- * heaptrack_api.h on the include path and is mutually exclusive with
- * USE_VALGRIND, e.g.
+ * traffic instead of only the underlying malloc'd blocks.  Mutually exclusive
+ * with USE_VALGRIND.
  *
- *   CPPFLAGS='-DUSE_HEAPTRACK -I$(top_srcdir)/contrib/heaptrack/src/track'
+ * Unlike USE_VALGRIND, which only emits inert client-request instructions,
+ * heaptrack needs its recording engine present in the process.  So when
+ * -DUSE_HEAPTRACK is set, src/backend/Makefile compiles heaptrack's engine
+ * sources directly into the backend and links -lstdc++ -lpthread -lrt -ldl.
+ * Point it at a heaptrack source tree, e.g.
  *
- * heaptrack's API is declared with weak symbols that stay NULL unless the
- * heaptrack preload library is loaded.  On macOS the linker rejects such
- * unresolved references by default, so also pass
- * LDFLAGS='-Wl,-undefined,dynamic_lookup' there.  Note that macOS support
- * is build-only: heaptrack's tracker runs on Linux and FreeBSD, so actual
- * profiling requires one of those.
+ *   CPPFLAGS='-DUSE_HEAPTRACK'
+ *   make HEAPTRACK_SRC=/path/to/heaptrack/src
  *
- * When built with this but run without the heaptrack preload library, each
- * palloc/pfree/repalloc and each memory context reset pays only a
- * weak-symbol NULL test; this is cheap but not free, so do not enable this
- * in production builds.  When profiling is active, expect a substantial
- * slowdown and large data files: every palloc-level event takes heaptrack's
- * global lock and records a stack trace, and palloc traffic far exceeds
- * malloc traffic.
+ * (The two headers heaptrack normally generates with CMake are substituted from
+ * contrib/pg_heaptrack/engine/include.  configure already puts
+ * -Wl,--export-dynamic in LDFLAGS_EX_BE, which exports the engine symbols so the
+ * pg_heaptrack module can resolve them at LOAD.)  No heaptrack header is needed
+ * on the core include path.  heaptrack's engine compiles only on Linux
+ * and FreeBSD, so USE_HEAPTRACK is usable only there; on other platforms the
+ * backend will fail to link against the engine, which is the intended signal.
  *
- * heaptrack still tracks the underlying malloc'd blocks as well, so its
- * headline consumption totals count block-level and chunk-level records
- * on top of each other; filter by call site to separate the two layers.
+ * The engine stays dormant until the pg_heaptrack extension
+ * (contrib/pg_heaptrack) calls heaptrack_init(), and every report is gated on
+ * the core switch pg_heaptrack_active, which that extension flips.  A backend
+ * that never starts the profiler therefore pays only a single predicted-false
+ * branch per palloc/pfree/repalloc -- and no chunk-header walk on context
+ * reset -- but this is not free, so do not enable USE_HEAPTRACK in production
+ * builds.  When profiling is active, expect a substantial slowdown and large
+ * data files: every palloc-level event takes heaptrack's global lock and
+ * records a stack trace, and palloc traffic far exceeds malloc traffic.
+ *
+ * Because activation uses heaptrack_init() rather than heaptrack's preload or
+ * inject malloc interposers, only the chunk allocations reported here are
+ * recorded; the underlying malloc'd blocks are not, so there is no double
+ * counting between block-level and chunk-level records.
  *
  * Bump contexts grow per-chunk headers under USE_HEAPTRACK, since those
  * are the only way to recover chunk pointers when a bump context is reset

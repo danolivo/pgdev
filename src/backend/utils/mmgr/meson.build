@@ -8,6 +8,7 @@ backend_sources += files(
   'freepage.c',
   'generation.c',
   'mcxt.c',
+  'mcxt_instrument.c',
   'memdebug.c',
   'portalmem.c',
   'slab.c',

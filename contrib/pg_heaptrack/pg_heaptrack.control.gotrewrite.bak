@@ -1,0 +1,5 @@
+# pg_heaptrack extension
+comment = 'enable heaptrack heap profiling at run time'
+default_version = '1.0'
+module_pathname = '$libdir/pg_heaptrack'
+relocatable = true
