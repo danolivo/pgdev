@@ -675,84 +675,28 @@ clause_selectivity(PlannerInfo *root,
 }
 
 /*
- * clause_selectivity_ext -
- *	  Extended version of clause_selectivity().  If "use_extended_stats" is
- *	  false, all extended statistics will be ignored, and only per-column
- *	  statistics will be used.
+ * clause_selectivity_compute
+ *		Workhorse for clause_selectivity_ext(): dispatch on the clause type and
+ *		return its selectivity, caching the result on the RestrictInfo when
+ *		permitted.
+ *
+ *		Runs with CurrentMemoryContext already set to the planner's scratch
+ *		context (planner_tmp_cxt); the caller switches into it and resets it.
+ *		"clause" has had any enclosing RestrictInfo stripped off; "rinfo" is
+ *		that RestrictInfo (or NULL) and "cacheable" says whether the result may
+ *		be cached on it.
  */
-Selectivity
-clause_selectivity_ext(PlannerInfo *root,
-					   Node *clause,
-					   int varRelid,
-					   JoinType jointype,
-					   SpecialJoinInfo *sjinfo,
-					   bool use_extended_stats)
+static Selectivity
+clause_selectivity_compute(PlannerInfo *root,
+						   Node *clause,
+						   int varRelid,
+						   JoinType jointype,
+						   SpecialJoinInfo *sjinfo,
+						   bool use_extended_stats,
+						   RestrictInfo *rinfo,
+						   bool cacheable)
 {
 	Selectivity s1 = 0.5;		/* default for any unhandled clause type */
-	RestrictInfo *rinfo = NULL;
-	bool		cacheable = false;
-
-	if (clause == NULL)			/* can this still happen? */
-		return s1;
-
-	if (IsA(clause, RestrictInfo))
-	{
-		rinfo = (RestrictInfo *) clause;
-
-		/*
-		 * If the clause is marked pseudoconstant, then it will be used as a
-		 * gating qual and should not affect selectivity estimates; hence
-		 * return 1.0.  The only exception is that a constant FALSE may be
-		 * taken as having selectivity 0.0, since it will surely mean no rows
-		 * out of the plan.  This case is simple enough that we need not
-		 * bother caching the result.
-		 */
-		if (rinfo->pseudoconstant)
-		{
-			if (!IsA(rinfo->clause, Const))
-				return (Selectivity) 1.0;
-		}
-
-		/*
-		 * If possible, cache the result of the selectivity calculation for
-		 * the clause.  We can cache if varRelid is zero or the clause
-		 * contains only vars of that relid --- otherwise varRelid will affect
-		 * the result, so mustn't cache.  Outer join quals might be examined
-		 * with either their join's actual jointype or JOIN_INNER, so we need
-		 * two cache variables to remember both cases.  Note: we assume the
-		 * result won't change if we are switching the input relations or
-		 * considering a unique-ified case, so we only need one cache variable
-		 * for all non-JOIN_INNER cases.
-		 */
-		if (varRelid == 0 ||
-			rinfo->num_base_rels == 0 ||
-			(rinfo->num_base_rels == 1 &&
-			 bms_is_member(varRelid, rinfo->clause_relids)))
-		{
-			/* Cacheable --- do we already have the result? */
-			if (jointype == JOIN_INNER)
-			{
-				if (rinfo->norm_selec >= 0)
-					return rinfo->norm_selec;
-			}
-			else
-			{
-				if (rinfo->outer_selec >= 0)
-					return rinfo->outer_selec;
-			}
-			cacheable = true;
-		}
-
-		/*
-		 * Proceed with examination of contained clause.  If the clause is an
-		 * OR-clause, we want to look at the variant with sub-RestrictInfos,
-		 * so that per-subclause selectivities can be cached.
-		 */
-		if (rinfo->orclause)
-			clause = (Node *) rinfo->orclause;
-		else
-			clause = (Node *) rinfo->clause;
-	}
 
 	if (IsA(clause, Var))
 	{
@@ -968,6 +912,92 @@ clause_selectivity_ext(PlannerInfo *root,
 		else
 			rinfo->outer_selec = s1;
 	}
+
+	return s1;
+}
+
+/*
+ * clause_selectivity_ext -
+ *	  Extended version of clause_selectivity().  If "use_extended_stats" is
+ *	  false, all extended statistics will be ignored, and only per-column
+ *	  statistics will be used.
+ */
+Selectivity
+clause_selectivity_ext(PlannerInfo *root,
+					   Node *clause,
+					   int varRelid,
+					   JoinType jointype,
+					   SpecialJoinInfo *sjinfo,
+					   bool use_extended_stats)
+{
+	Selectivity s1 = 0.5;		/* default for any unhandled clause type */
+	RestrictInfo *rinfo = NULL;
+	bool		cacheable = false;
+
+	if (clause == NULL)			/* can this still happen? */
+		return s1;
+
+	if (IsA(clause, RestrictInfo))
+	{
+		rinfo = (RestrictInfo *) clause;
+
+		/*
+		 * If the clause is marked pseudoconstant, then it will be used as a
+		 * gating qual and should not affect selectivity estimates; hence
+		 * return 1.0.  The only exception is that a constant FALSE may be
+		 * taken as having selectivity 0.0, since it will surely mean no rows
+		 * out of the plan.  This case is simple enough that we need not
+		 * bother caching the result.
+		 */
+		if (rinfo->pseudoconstant)
+		{
+			if (!IsA(rinfo->clause, Const))
+				return (Selectivity) 1.0;
+		}
+
+		/*
+		 * If possible, cache the result of the selectivity calculation for
+		 * the clause.  We can cache if varRelid is zero or the clause
+		 * contains only vars of that relid --- otherwise varRelid will affect
+		 * the result, so mustn't cache.  Outer join quals might be examined
+		 * with either their join's actual jointype or JOIN_INNER, so we need
+		 * two cache variables to remember both cases.  Note: we assume the
+		 * result won't change if we are switching the input relations or
+		 * considering a unique-ified case, so we only need one cache variable
+		 * for all non-JOIN_INNER cases.
+		 */
+		if (varRelid == 0 ||
+			rinfo->num_base_rels == 0 ||
+			(rinfo->num_base_rels == 1 &&
+			 bms_is_member(varRelid, rinfo->clause_relids)))
+		{
+			/* Cacheable --- do we already have the result? */
+			if (jointype == JOIN_INNER)
+			{
+				if (rinfo->norm_selec >= 0)
+					return rinfo->norm_selec;
+			}
+			else
+			{
+				if (rinfo->outer_selec >= 0)
+					return rinfo->outer_selec;
+			}
+			cacheable = true;
+		}
+
+		/*
+		 * Proceed with examination of contained clause.  If the clause is an
+		 * OR-clause, we want to look at the variant with sub-RestrictInfos,
+		 * so that per-subclause selectivities can be cached.
+		 */
+		if (rinfo->orclause)
+			clause = (Node *) rinfo->orclause;
+		else
+			clause = (Node *) rinfo->clause;
+	}
+
+	s1 = clause_selectivity_compute(root, clause, varRelid, jointype,
+									sjinfo, use_extended_stats, rinfo, cacheable);
 
 #ifdef SELECTIVITY_DEBUG
 	elog(DEBUG4, "clause_selectivity: s1 %f", s1);
