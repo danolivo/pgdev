@@ -330,8 +330,13 @@ pull_ands(List *andlist)
 		Node	   *subexpr = (Node *) lfirst(arg);
 
 		if (is_andclause(subexpr))
-			out_list = list_concat(out_list,
-								   pull_ands(((BoolExpr *) subexpr)->args));
+		{
+			List	   *sublist = pull_ands(((BoolExpr *) subexpr)->args);
+
+			out_list = list_concat(out_list, sublist);
+			/* sublist's cells are now in out_list; free the dead header. */
+			list_free(sublist);
+		}
 		else
 			out_list = lappend(out_list, subexpr);
 	}
@@ -356,8 +361,13 @@ pull_ors(List *orlist)
 		Node	   *subexpr = (Node *) lfirst(arg);
 
 		if (is_orclause(subexpr))
-			out_list = list_concat(out_list,
-								   pull_ors(((BoolExpr *) subexpr)->args));
+		{
+			List	   *sublist = pull_ors(((BoolExpr *) subexpr)->args);
+
+			out_list = list_concat(out_list, sublist);
+			/* sublist's cells are now in out_list; free the dead header. */
+			list_free(sublist);
+		}
 		else
 			out_list = lappend(out_list, subexpr);
 	}

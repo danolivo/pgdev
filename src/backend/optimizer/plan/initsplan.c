@@ -1670,7 +1670,16 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode,
 			remaining--;
 			if (sub_members <= 1 ||
 				list_length(joinlist) + sub_members + remaining <= from_collapse_limit)
+			{
 				joinlist = list_concat(joinlist, sub_joinlist);
+
+				/*
+				 * sub_joinlist's cells were copied into joinlist; free the
+				 * now-dead header.  (In the lappend branch below, sub_joinlist
+				 * is retained as a sublist and must NOT be freed.)
+				 */
+				list_free(sub_joinlist);
+			}
 			else
 				joinlist = lappend(joinlist, sub_joinlist);
 		}
@@ -1859,6 +1868,13 @@ deconstruct_recurse(PlannerInfo *root, Node *jtnode,
 		{
 			/* OK to combine subproblems */
 			joinlist = list_concat(leftjoinlist, rightjoinlist);
+
+			/*
+			 * rightjoinlist's cells were copied into joinlist (== the extended
+			 * leftjoinlist); free the now-dead header.  The other branches
+			 * retain both sublists, so the free must stay local to this one.
+			 */
+			list_free(rightjoinlist);
 		}
 		else
 		{

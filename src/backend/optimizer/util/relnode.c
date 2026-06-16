@@ -1448,6 +1448,7 @@ build_joinrel_restrictlist(PlannerInfo *root,
 						   SpecialJoinInfo *sjinfo)
 {
 	List	   *result;
+	List	   *eclauses;
 	Relids		both_input_relids;
 
 	both_input_relids = bms_union(outer_rel->relids, inner_rel->relids);
@@ -1467,12 +1468,18 @@ build_joinrel_restrictlist(PlannerInfo *root,
 	 * redundant with the clauses in the joininfo lists, so don't bother
 	 * checking.
 	 */
-	result = list_concat(result,
-						 generate_join_implied_equalities(root,
-														  joinrel->relids,
-														  outer_rel->relids,
-														  inner_rel,
-														  sjinfo));
+	eclauses = generate_join_implied_equalities(root,
+												joinrel->relids,
+												outer_rel->relids,
+												inner_rel,
+												sjinfo);
+	result = list_concat(result, eclauses);
+
+	/*
+	 * list_concat() copied eclauses' cells into result; the eclauses header
+	 * and cell array are now dead (its elements stay shared with result).
+	 */
+	list_free(eclauses);
 
 	return result;
 }
@@ -1762,6 +1769,9 @@ get_baserel_parampathinfo(PlannerInfo *root, RelOptInfo *baserel,
 	}
 #endif
 	pclauses = list_concat(pclauses, eqclauses);
+
+	/* eqclauses' cells are now copied into pclauses; free the dead header. */
+	list_free(eqclauses);
 
 	/* Compute set of serial numbers of the enforced clauses */
 	pserials = NULL;
