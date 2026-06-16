@@ -103,6 +103,14 @@ typedef struct PlannerGlobal
 	/* Param values provided to planner() */
 	ParamListInfo boundParams pg_node_attr(read_write_ignore);
 
+	/* context holding PlannerGlobal */
+	MemoryContext planner_cxt pg_node_attr(read_write_ignore);
+
+	/* short-lived context for purposes such as calling selectivity functions */
+	MemoryContext planner_tmp_cxt pg_node_attr(read_write_ignore);
+	/* nesting depth of uses of planner_tmp_cxt; reset it only at level 0 */
+	int			planner_tmp_cxt_depth;
+
 	/* Plans for SubPlan nodes */
 	List	   *subplans;
 
@@ -500,7 +508,7 @@ struct PlannerInfo
 	/* List of MinMaxAggInfos */
 	List	   *minmax_aggs;
 
-	/* context holding PlannerInfo */
+	/* context holding PlannerInfo (copied from PlannerGlobal) */
 	MemoryContext planner_cxt pg_node_attr(read_write_ignore);
 
 	/* # of pages in all non-dummy tables of query */
