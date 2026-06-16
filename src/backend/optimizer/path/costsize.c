@@ -617,12 +617,21 @@ cost_index(IndexPath *path, PlannerInfo *root, double loop_count,
 	 */
 	if (path->path.param_info)
 	{
+		List	   *ppi_nonindex;
+
 		path->path.rows = path->path.param_info->ppi_rows;
 		/* qpquals come from the rel's restriction clauses and ppi_clauses */
+		ppi_nonindex = extract_nonindex_conditions(path->path.param_info->ppi_clauses,
+												   path->indexclauses);
 		qpquals = list_concat(extract_nonindex_conditions(path->indexinfo->indrestrictinfo,
 														  path->indexclauses),
-							  extract_nonindex_conditions(path->path.param_info->ppi_clauses,
-														  path->indexclauses));
+							  ppi_nonindex);
+
+		/*
+		 * list_concat() copied ppi_nonindex's cells into qpquals; free the
+		 * now-dead header (the contained clauses remain shared).
+		 */
+		list_free(ppi_nonindex);
 	}
 	else
 	{
