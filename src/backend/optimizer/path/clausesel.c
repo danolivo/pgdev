@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
@@ -22,6 +23,7 @@
 #include "statistics/statistics.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/selfuncs.h"
 
 /*
@@ -933,6 +935,7 @@ clause_selectivity_ext(PlannerInfo *root,
 	Selectivity s1 = 0.5;		/* default for any unhandled clause type */
 	RestrictInfo *rinfo = NULL;
 	bool		cacheable = false;
+	MemoryContext saved_cxt;
 
 	if (clause == NULL)			/* can this still happen? */
 		return s1;
@@ -996,8 +999,56 @@ clause_selectivity_ext(PlannerInfo *root,
 			clause = (Node *) rinfo->clause;
 	}
 
-	s1 = clause_selectivity_compute(root, clause, varRelid, jointype,
-									sjinfo, use_extended_stats, rinfo, cacheable);
+	/*
+	 * Run the remaining work in the short-lived planner_tmp_cxt so the
+	 * selectivity code need not worry about leaking memory.  This function can
+	 * recurse (through clauselist_selectivity() and friends), so only the
+	 * topmost level resets the context.  The topmost level also guards the
+	 * computation with PG_TRY(): selectivity estimation calls into user-defined
+	 * operators, type input functions and syscache lookups, any of which may
+	 * throw; if that happens we must not leave CurrentMemoryContext pointing at
+	 * planner_tmp_cxt or the depth counter elevated.  Nested levels need no
+	 * guard of their own --- an error there unwinds through the topmost
+	 * PG_FINALLY().
+	 */
+	saved_cxt = MemoryContextSwitchTo(root->glob->planner_tmp_cxt);
+
+	if (root->glob->planner_tmp_cxt_depth++ == 0)
+	{
+		PG_TRY();
+		{
+			s1 = clause_selectivity_compute(root, clause, varRelid, jointype,
+											sjinfo, use_extended_stats,
+											rinfo, cacheable);
+		}
+		PG_FINALLY();
+		{
+			MemoryContextSwitchTo(saved_cxt);
+			root->glob->planner_tmp_cxt_depth = 0;
+
+			/*
+			 * Reclaim the scratch space, but only once it has accumulated more
+			 * than work_mem of blocks.  That bounds the scratch memory a
+			 * selectivity-heavy plan can hold at once, while letting the common
+			 * case (a few cheap estimations) reuse the same allocations rather
+			 * than resetting after every top-level call.  Recurse into child
+			 * contexts so the figure matches what the reset actually reclaims.
+			 */
+			if (MemoryContextMemAllocated(root->glob->planner_tmp_cxt, true) >
+				work_mem * (Size) 1024)
+				MemoryContextReset(root->glob->planner_tmp_cxt);
+		}
+		PG_END_TRY();
+	}
+	else
+	{
+		/* Nested call: errors unwind through the topmost PG_FINALLY(). */
+		s1 = clause_selectivity_compute(root, clause, varRelid, jointype,
+										sjinfo, use_extended_stats,
+										rinfo, cacheable);
+		root->glob->planner_tmp_cxt_depth--;
+		MemoryContextSwitchTo(saved_cxt);
+	}
 
 #ifdef SELECTIVITY_DEBUG
 	elog(DEBUG4, "clause_selectivity: s1 %f", s1);
