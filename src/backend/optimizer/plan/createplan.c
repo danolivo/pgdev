@@ -4358,6 +4358,7 @@ create_nestloop_plan(PlannerInfo *root,
 	List	   *tlist = build_path_tlist(root, &best_path->jpath.path);
 	List	   *joinrestrictclauses = best_path->jpath.joinrestrictinfo;
 	List	   *gating_clauses = NIL;
+	bool		keep_inner_rewind = false;
 	List	   *joinclauses;
 	List	   *otherclauses;
 	List	   *nestParams;
@@ -4461,6 +4462,17 @@ create_nestloop_plan(PlannerInfo *root,
 		Relids		tmpOuterRels = root->curOuterRels;
 		Plan	   *subplan = inner_plan;
 		ParallelSafe	gate_parallel_safe;
+
+		/*
+		 * Keep the inner rewindable across rescans, but only when this gate is
+		 * the sole source of nestloop parameters.  If the inner is itself
+		 * parameterized by the outer (a join key pushed into the inner scan),
+		 * the plan below the gate is parameter-dependent and gains nothing from
+		 * REWIND, so don't request it.  See ExecInitNestLoop.
+		 */
+		keep_inner_rewind =
+			!bms_overlap(PATH_REQ_OUTER(best_path->jpath.innerjoinpath),
+						 outerrelids);
 
 		Assert(bms_is_subset(pull_varnos(root, (Node *) gating_clauses),
 							  outerrelids));
@@ -4587,6 +4599,8 @@ create_nestloop_plan(PlannerInfo *root,
 							  inner_plan,
 							  best_path->jpath.jointype,
 							  best_path->jpath.inner_unique);
+
+	join_plan->keep_inner_rewind = keep_inner_rewind;
 
 	copy_generic_path_info(&join_plan->join.plan, &best_path->jpath.path);
 
