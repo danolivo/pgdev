@@ -3393,3 +3393,41 @@ select make_timestamptz(1999, 12, 31, 24, 0, 0);
  Sat Jan 01 00:00:00 2000 PST
 (1 row)
 
+--
+-- date_trunc_eq_support: cross-type rewrite on the timestamptz path.
+--
+CREATE INDEX timestamptz_tbl_d1_idx ON timestamptz_tbl (d1);
+SET enable_seqscan = off;
+-- Const date RHS -> rewrite; upper bound folded.
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamptz_tbl WHERE date_trunc('day', d1) = DATE '2000-03-15';
+                                                  QUERY PLAN                                                   
+---------------------------------------------------------------------------------------------------------------
+ Index Only Scan using timestamptz_tbl_d1_idx on timestamptz_tbl
+   Index Cond: ((d1 >= '03-15-2000'::date) AND (d1 < 'Thu Mar 16 00:00:00 2000'::timestamp without time zone))
+(2 rows)
+
+-- Var date RHS (self-join) -> rewrite; upper bound is a date + interval OpExpr.
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamptz_tbl t1, timestamptz_tbl t2
+WHERE date_trunc('day', t1.d1) = t2.d1::date;
+                                          QUERY PLAN                                          
+----------------------------------------------------------------------------------------------
+ Nested Loop
+   ->  Index Only Scan using timestamptz_tbl_d1_idx on timestamptz_tbl t2
+   ->  Index Only Scan using timestamptz_tbl_d1_idx on timestamptz_tbl t1
+         Index Cond: ((d1 >= (t2.d1)::date) AND (d1 < ((t2.d1)::date + '@ 1 day'::interval)))
+(4 rows)
+
+DROP INDEX timestamptz_tbl_d1_idx;
+RESET enable_seqscan;
+-- Result equivalence on finite data.
+SELECT (SELECT count(*) FROM timestamptz_tbl WHERE date_trunc('day', d1) = DATE '2000-03-15')
+     = (SELECT count(*) FROM timestamptz_tbl
+        WHERE d1 >= DATE '2000-03-15' AND d1 < DATE '2000-03-15' + interval '1 day')
+       AS rewrite_results_match;
+ rewrite_results_match 
+-----------------------
+ t
+(1 row)
+

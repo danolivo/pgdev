@@ -432,3 +432,64 @@ select age(timestamp '-infinity', timestamp '-infinity');
 -- test timestamp near POSTGRES_EPOCH_JDATE
 select timestamp '1999-12-31 24:00:00';
 select make_timestamp(1999, 12, 31, 24, 0, 0);
+
+--
+-- date_trunc_eq_support: rewrite date_trunc('day', x) = d to a half-open
+-- range so a btree index on x can serve the predicate.  Stage 1 handles the
+-- cross-type =(timestamp[tz], date) operators (both argument orders).
+--
+CREATE INDEX timestamp_tbl_d1_idx ON timestamp_tbl (d1);
+SET enable_seqscan = off;
+
+-- Const date RHS -> rewrite; upper bound folded to a Const at plan time.
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('day', d1) = DATE '2000-03-15';
+-- Reverse argument order, =(date, timestamp) -> same rewrite.
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE DATE '2000-03-15' = date_trunc('day', d1);
+-- Var date RHS (self-join) -> rewrite; upper bound is a date + interval OpExpr,
+-- composed with the unrelated range predicate.
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl t1, timestamp_tbl t2
+WHERE t1.d1 < '2000-03-15' AND date_trunc('day', t1.d1) = t2.d1::date;
+
+DROP INDEX timestamp_tbl_d1_idx;
+
+-- XXX: documented incorrect behaviour under infinity.  The rewrite maps
+-- date_trunc('day', x) = d to x >= d AND x < d + interval '1 day'; for
+-- d = '+infinity' that range is empty (infinity + interval = infinity), so a
+-- matching infinity row would be dropped.  Safe only if the deployment
+-- excludes infinity dates by a constraint.
+-- The repro trick is based on the assumption that 'ts var' = 'ts var' can't be
+-- transformed
+CREATE TABLE date_trunc_infinity (x timestamp, y date);
+INSERT INTO date_trunc_infinity VALUES ('+infinity', '+infinity');
+CREATE INDEX date_trunc_infinity_idx ON date_trunc_infinity (x);
+
+-- one row returned without transformation
+SELECT count(*) FROM date_trunc_infinity a, date_trunc_infinity b
+  WHERE date_trunc('day', a.x) = b.x;
+
+-- Guard transformation against 'infinity' constants.
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM date_trunc_infinity
+  WHERE date_trunc('day', x) = DATE '+infinity';
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM date_trunc_infinity a, date_trunc_infinity b
+  WHERE date_trunc('day', a.x) = b.y;
+-- error: zero result when transformation has been applied
+SELECT count(*) FROM date_trunc_infinity a, date_trunc_infinity b
+  WHERE date_trunc('day', a.x) = b.y;
+DROP INDEX date_trunc_infinity_idx;
+DROP TABLE date_trunc_infinity;
+
+RESET enable_seqscan;
+
+-- Result equivalence on finite data (deployment assumption excludes infinity).
+SELECT (SELECT count(*) FROM timestamp_tbl WHERE date_trunc('day', d1) = DATE '2000-03-15')
+     = (SELECT count(*) FROM timestamp_tbl
+        WHERE d1 >= DATE '2000-03-15' AND d1 < DATE '2000-03-15' + interval '1 day')
+       AS rewrite_results_match;
+-- NULL RHS preserves NULL semantics (no row selected).
+SELECT count(*) FROM timestamp_tbl WHERE date_trunc('day', d1) = NULL::date;
