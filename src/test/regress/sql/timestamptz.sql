@@ -766,3 +766,20 @@ DEALLOCATE tstz_neg_p;
 RESET plan_cache_mode;
 RESET TIME ZONE;
 DROP TABLE tstz_neg;
+
+--
+-- date_trunc_eq_support, Stage 4: coarser units on the timestamptz path
+-- (cross-type date Const only; timezone-independent and thus safe).
+--
+CREATE INDEX timestamptz_tbl_d1_idx ON timestamptz_tbl (d1);
+SET enable_seqscan = off;
+
+-- Year-aligned Const (Jan 1) -> rewrite (step 1 year).
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamptz_tbl WHERE date_trunc('year', d1) = DATE '2000-01-01';
+-- Not year-aligned (Mar 15) -> no rewrite.
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamptz_tbl WHERE date_trunc('year', d1) = DATE '2000-03-15';
+
+DROP INDEX timestamptz_tbl_d1_idx;
+RESET enable_seqscan;

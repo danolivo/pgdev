@@ -2413,3 +2413,118 @@ DEALLOCATE dtpc;
 RESET plan_cache_mode;
 RESET TIME ZONE;
 DROP TABLE date_trunc_pc;
+--
+-- date_trunc_eq_support, Stage 4: coarser fixed-boundary units.  week /
+-- month / quarter / year rewrite only when the RHS Const sits exactly on a
+-- unit boundary; the step is 7 days / 1 month / 3 months / 1 year.
+--
+CREATE INDEX timestamp_tbl_d1_idx ON timestamp_tbl (d1);
+SET enable_seqscan = off;
+-- Aligned Const -> rewrite.  Feb 10 1997 is a Monday (a valid week boundary).
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('week', d1)    = DATE '1997-02-10';
+                                                  QUERY PLAN                                                   
+---------------------------------------------------------------------------------------------------------------
+ Index Only Scan using timestamp_tbl_d1_idx on timestamp_tbl
+   Index Cond: ((d1 >= '02-10-1997'::date) AND (d1 < 'Mon Feb 17 00:00:00 1997'::timestamp without time zone))
+(2 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('month', d1)   = DATE '1997-02-01';
+                                                  QUERY PLAN                                                   
+---------------------------------------------------------------------------------------------------------------
+ Index Only Scan using timestamp_tbl_d1_idx on timestamp_tbl
+   Index Cond: ((d1 >= '02-01-1997'::date) AND (d1 < 'Sat Mar 01 00:00:00 1997'::timestamp without time zone))
+(2 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('quarter', d1) = DATE '1997-04-01';
+                                                  QUERY PLAN                                                   
+---------------------------------------------------------------------------------------------------------------
+ Index Only Scan using timestamp_tbl_d1_idx on timestamp_tbl
+   Index Cond: ((d1 >= '04-01-1997'::date) AND (d1 < 'Tue Jul 01 00:00:00 1997'::timestamp without time zone))
+(2 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('year', d1)    = DATE '1997-01-01';
+                                                  QUERY PLAN                                                   
+---------------------------------------------------------------------------------------------------------------
+ Index Only Scan using timestamp_tbl_d1_idx on timestamp_tbl
+   Index Cond: ((d1 >= '01-01-1997'::date) AND (d1 < 'Thu Jan 01 00:00:00 1998'::timestamp without time zone))
+(2 rows)
+
+-- Misaligned Const -> no rewrite (the predicate is always false; a range
+-- rewrite would wrongly return rows).
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('month', d1) = DATE '1997-02-10';
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Index Only Scan using timestamp_tbl_d1_idx on timestamp_tbl
+   Filter: (date_trunc('month'::text, d1) = '02-10-1997'::date)
+(2 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('week', d1)  = DATE '1997-02-12'; -- a Wednesday
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Index Only Scan using timestamp_tbl_d1_idx on timestamp_tbl
+   Filter: (date_trunc('week'::text, d1) = '02-12-1997'::date)
+(2 rows)
+
+-- Coarser unit, Var RHS -> no rewrite (alignment unprovable at plan time).
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl t1, timestamp_tbl t2
+WHERE date_trunc('month', t1.d1) = t2.d1::date;
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Merge Join
+   Merge Cond: ((date_trunc('month'::text, t1.d1)) = ((t2.d1)::date))
+   ->  Sort
+         Sort Key: (date_trunc('month'::text, t1.d1))
+         ->  Index Only Scan using timestamp_tbl_d1_idx on timestamp_tbl t1
+   ->  Sort
+         Sort Key: ((t2.d1)::date)
+         ->  Index Only Scan using timestamp_tbl_d1_idx on timestamp_tbl t2
+(8 rows)
+
+-- Coarser unit, same-type aligned Const -> rewrite.
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('month', d1) = TIMESTAMP '1997-02-01';
+                                                                     QUERY PLAN                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------
+ Index Only Scan using timestamp_tbl_d1_idx on timestamp_tbl
+   Index Cond: ((d1 >= 'Sat Feb 01 00:00:00 1997'::timestamp without time zone) AND (d1 < 'Sat Mar 01 00:00:00 1997'::timestamp without time zone))
+(2 rows)
+
+-- Unsupported unit ('century' is not a fixed-boundary unit we handle) -> no
+-- rewrite.
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('century', d1) = DATE '2001-01-01';
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Index Only Scan using timestamp_tbl_d1_idx on timestamp_tbl
+   Filter: (date_trunc('century'::text, d1) = '01-01-2001'::date)
+(2 rows)
+
+DROP INDEX timestamp_tbl_d1_idx;
+RESET enable_seqscan;
+-- Result equivalence for the coarser units: rewritten predicate must return
+-- the same rows as the hand-applied half-open range.
+SELECT
+  (SELECT count(*) FROM timestamp_tbl WHERE date_trunc('week', d1) = DATE '1997-02-10')
+  = (SELECT count(*) FROM timestamp_tbl
+     WHERE d1 >= DATE '1997-02-10' AND d1 < DATE '1997-02-10' + interval '7 days')   AS week_match,
+  (SELECT count(*) FROM timestamp_tbl WHERE date_trunc('month', d1) = DATE '1997-02-01')
+  = (SELECT count(*) FROM timestamp_tbl
+     WHERE d1 >= DATE '1997-02-01' AND d1 < DATE '1997-02-01' + interval '1 month')  AS month_match,
+  (SELECT count(*) FROM timestamp_tbl WHERE date_trunc('quarter', d1) = DATE '1997-04-01')
+  = (SELECT count(*) FROM timestamp_tbl
+     WHERE d1 >= DATE '1997-04-01' AND d1 < DATE '1997-04-01' + interval '3 months') AS quarter_match,
+  (SELECT count(*) FROM timestamp_tbl WHERE date_trunc('year', d1) = DATE '1997-01-01')
+  = (SELECT count(*) FROM timestamp_tbl
+     WHERE d1 >= DATE '1997-01-01' AND d1 < DATE '1997-01-01' + interval '1 year')   AS year_match;
+ week_match | month_match | quarter_match | year_match 
+------------+-------------+---------------+------------
+ t          | t           | t             | t
+(1 row)
+

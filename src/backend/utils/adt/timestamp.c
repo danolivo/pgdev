@@ -1335,74 +1335,98 @@ interval_support(PG_FUNCTION_ARGS)
 			 ((FuncExpr *) (node))->funcid == F_DATE_TRUNC_TEXT_TIMESTAMPTZ))
 
 /*
- * Is c a non-null Const of type timestamp (without time zone) whose value is
- * midnight?
+ * Is Const c aligned to the date_trunc unit named by unit_datum?
  *
- * Deliberately timestamp-only.  The analogous same-type timestamptz rewrite is
- * NOT supported, because "midnight" for timestamptz is defined in the session
- * timezone: date_trunc(text, timestamptz) is STABLE and the folded bound would
- * bake a specific instant at plan time.  Under a cached generic plan reused
- * across a SET TIME ZONE that diverges from the original predicate, whose LHS
- * re-truncates under the execute-time zone - and no plan-time rewrite can be
- * equivalent, since whether the constant is an execute-zone midnight is not
- * knowable when the plan is built.  timestamp (no time zone) has no such
- * dependency: date_trunc(text, timestamp) is IMMUTABLE and this check is
- * timezone-independent.  Callers must not pass a timestamptz Const.  See
- * date-trunc-rewrite-spec.md.  Infinity is never midnight, and is rejected.
+ * "Aligned" means date_trunc(unit, c) == c, i.e. c already sits on a unit
+ * boundary (midnight for 'day', a Monday for 'week', the first of the month
+ * for 'month', and so on).  We answer by running the very same *_trunc routine
+ * the executor would and comparing, so the proof cannot drift from date_trunc's
+ * actual calendar semantics (this matters most for ISO 'week' and 'quarter').
+ *
+ * Handles date and timestamp only, both timezone-independent
+ * (date_trunc(text, timestamp) is IMMUTABLE).  timestamptz is deliberately
+ * absent: its boundaries are session-timezone dependent, so a same-type
+ * timestamptz rewrite cannot be folded soundly at plan time (see
+ * date_trunc_eq_support and date-trunc-rewrite-spec.md).  The cross-type path
+ * always presents a date here, so a timestamptz Const never reaches this
+ * function.
+ *
+ * Infinity is never aligned: date_trunc(unit, infinity) = infinity would make
+ * the caller's half-open range empty and drop the infinity row the original
+ * predicate matches, so it is rejected here.
  */
 static bool
-is_midnight_timestamp_const(Const *c)
+is_unit_aligned_const(Const *c, Datum unit_datum)
 {
-	Timestamp		value;
-	struct pg_tm	tm;
-	fsec_t			fsec;
-
-	Assert(c->consttype == TIMESTAMPOID);
-
 	if (c->constisnull)
 		return false;
 
-	value = DatumGetTimestamp(c->constvalue);
-	if (TIMESTAMP_NOT_FINITE(value))
-		return false;
+	switch (c->consttype)
+	{
+		case TIMESTAMPOID:
+			{
+				Timestamp	v = DatumGetTimestamp(c->constvalue);
 
-	if (timestamp2tm(value, NULL, &tm, &fsec, NULL, NULL) != 0)
-		return false;
+				if (TIMESTAMP_NOT_FINITE(v))
+					return false;
+				return DatumGetTimestamp(DirectFunctionCall2(timestamp_trunc,
+															 unit_datum,
+															 c->constvalue)) == v;
+			}
+		case DATEOID:
+			{
+				DateADT		v = DatumGetDateADT(c->constvalue);
+				Datum		vts;
 
-	return tm.tm_hour == 0 && tm.tm_min == 0 && tm.tm_sec == 0 && fsec == 0;
+				if (DATE_NOT_FINITE(v))
+					return false;
+				/* date has no sub-day part; align-check via timestamp trunc */
+				vts = DirectFunctionCall1(date_timestamp, c->constvalue);
+				return DatumGetTimestamp(DirectFunctionCall2(timestamp_trunc,
+															 unit_datum, vts))
+					== DatumGetTimestamp(vts);
+			}
+		default:
+			return false;
+	}
 }
 
 /*
  * date_trunc_eq_support
  *
  * Planner support for the equality functions that can carry a
- * date_trunc('day', x) = d predicate: the four cross-type =(timestamp[tz],
+ * date_trunc(unit, x) = d predicate: the four cross-type =(timestamp[tz],
  * date) variants (both argument orders) and the same-type
- * =(timestamp, timestamp) variant.  Rewrites
- *		date_trunc('day', x) = d
+ * =(timestamp, timestamp) variant.  Handles the fixed-boundary units 'day',
+ * 'week', 'month', 'quarter' and 'year'.  Rewrites
+ *		date_trunc(unit, x) = d
  * as
- *		x >= d  AND  x < d + interval '1 day'
- * so a btree index on x can serve the predicate; the original form buries the
+ *		x >= d  AND  x < d + step(unit)
+ * where step is '1 day', '7 days', '1 month', '3 months' or '1 year', so a
+ * btree index on x can serve the predicate; the original form buries the
  * indexable column under date_trunc().  It also unlocks BRIN summary skipping
  * and range-partition pruning on x.
  *
- * Soundness rests on d being midnight-aligned.  For the cross-type variants
- * this is automatic (d has type date).  For the same-type timestamp variant d
- * must be a non-null Const whose value is midnight (is_midnight_timestamp_const).
+ * Soundness rests on d sitting exactly on a unit boundary.  For 'day' every
+ * date value qualifies, so a date-typed RHS - Const or Var - is accepted with
+ * no value check.  For coarser units alignment is a value property
+ * (first-of-month, a Monday, ...) provable only for a Const, so a coarser-unit
+ * Var RHS is left alone.  The same-type timestamp variant always requires a
+ * Const RHS proven aligned by is_unit_aligned_const().
  *
  * The same-type =(timestamptz, timestamptz) variant is deliberately NOT
- * handled: "midnight" for timestamptz is session-timezone-dependent, so no
+ * handled: timestamptz boundaries are session-timezone-dependent, so no
  * plan-time rewrite can stay equivalent to the STABLE original across a zone
- * change under a cached generic plan - see is_midnight_timestamp_const() and
+ * change under a cached generic plan - see is_unit_aligned_const() and
  * date-trunc-rewrite-spec.md.  The common natural form
  * date_trunc('day', tstz) = '2020-01-01' resolves the bare literal to
  * timestamptz and so is left alone here; write = DATE '2020-01-01' to get the
  * (timezone-safe) cross-type rewrite instead.
  *
- * Infinity is not defended for the cross-type date Var path (a date Var may
- * be infinite): that path assumes schemas exclude infinity dates by
- * constraint - see the XXX block in timestamp.sql.  A Const date is checked
- * for finiteness, and the same-type path is finite by is_midnight_timestamp_const().
+ * Infinity is not defended for the 'day' + date Var path (a date Var may be
+ * infinite): that path assumes schemas exclude infinity dates by constraint -
+ * see the XXX block in timestamp.sql.  A Const date is checked for finiteness,
+ * and every path through is_unit_aligned_const() rejects infinity.
  */
 Datum
 date_trunc_eq_support(PG_FUNCTION_ARGS)
@@ -1416,6 +1440,9 @@ date_trunc_eq_support(PG_FUNCTION_ARGS)
 	FuncExpr			   *func_node = NULL;
 	Node				   *ret = NULL;
 	Oid						typoid;
+	Datum					unit_datum = (Datum) 0;
+	int						val = 0;
+	Interval				step = {0};
 
 	if (unlikely(!IsA(rawreq, SupportRequestSimplify)))
 		PG_RETURN_POINTER(NULL);
@@ -1456,13 +1483,17 @@ date_trunc_eq_support(PG_FUNCTION_ARGS)
 	else
 		PG_RETURN_POINTER(NULL);
 
-	/* is_date_trunc accepts any overload; gate on the unit text here. */
+	/*
+	 * is_date_trunc accepts any overload; decode the unit here and set the
+	 * corresponding half-open step.  Only fixed-boundary units are handled;
+	 * units whose length is not a constant interval (e.g. 'century', or sub-day
+	 * units needing a different alignment proof) fall through to no rewrite.
+	 */
 	{
 		Node	   *unit_node;
 		Const	   *unit;
 		char	   *lowunits;
 		int			dtype;
-		int			val;
 
 		Assert(list_length(func_node->args) == 2);
 		unit_node = (Node *) linitial(func_node->args);
@@ -1472,36 +1503,69 @@ date_trunc_eq_support(PG_FUNCTION_ARGS)
 		unit = (Const *) unit_node;
 		if (unit->constisnull || unit->consttype != TEXTOID)
 			PG_RETURN_POINTER(NULL);
+		unit_datum = unit->constvalue;
 
 		lowunits = downcase_truncate_identifier(
-						VARDATA_ANY(DatumGetPointer(unit->constvalue)),
-						VARSIZE_ANY_EXHDR(DatumGetPointer(unit->constvalue)),
+						VARDATA_ANY(DatumGetPointer(unit_datum)),
+						VARSIZE_ANY_EXHDR(DatumGetPointer(unit_datum)),
 								false);
 		dtype = DecodeUnits(0, lowunits, &val);
-		if (dtype != UNITS || val != DTK_DAY)
+		if (dtype != UNITS)
 			PG_RETURN_POINTER(NULL);
+
+		switch (val)
+		{
+			case DTK_DAY:
+				step.day = 1;
+				break;
+			case DTK_WEEK:
+				step.day = 7;
+				break;
+			case DTK_MONTH:
+				step.month = 1;
+				break;
+			case DTK_QUARTER:
+				step.month = 3;
+				break;
+			case DTK_YEAR:
+				step.month = 12;
+				break;
+			default:
+				PG_RETURN_POINTER(NULL);
+		}
 	}
 
 	typoid = func_node->funcresulttype;
 	Assert(typoid == TIMESTAMPOID || typoid == TIMESTAMPTZOID);
 
 	/*
-	 * Discriminate the RHS shape: a date (cross-type; every date is
-	 * day-aligned) or a midnight timestamp Const (same-type).  Same-type is
-	 * restricted to typoid == TIMESTAMPOID; a timestamptz column reaching here
-	 * with a timestamptz RHS is intentionally left alone (see the header
-	 * comment and is_midnight_timestamp_const() for the timezone reason).
-	 * Anything else bails.
+	 * Discriminate the RHS shape:
+	 *
+	 *   (a) date (cross-type).  For 'day' every date is aligned, so any date
+	 *       (Const or Var) is accepted.  For a coarser unit alignment must be
+	 *       proven, so we require a Const that is_unit_aligned_const() confirms;
+	 *       a Var date cannot be shown aligned and is left alone.
+	 *   (b) a Const of type timestamp, proven aligned to the unit (same-type).
+	 *
+	 * Same-type is restricted to typoid == TIMESTAMPOID; a timestamptz column
+	 * with a timestamptz RHS is intentionally left alone (see the header comment
+	 * and is_unit_aligned_const() for the timezone reason).  Anything else bails.
 	 */
 	{
 		Oid		rhs_type = exprType(date_node);
 		bool	rhs_is_sametype;
 
 		if (rhs_type == DATEOID)
+		{
 			rhs_is_sametype = false;
+			if (val != DTK_DAY &&
+				(!IsA(date_node, Const) ||
+				 !is_unit_aligned_const((Const *) date_node, unit_datum)))
+				PG_RETURN_POINTER(NULL);
+		}
 		else if (typoid == TIMESTAMPOID && rhs_type == TIMESTAMPOID &&
 				 IsA(date_node, Const) &&
-				 is_midnight_timestamp_const((Const *) date_node))
+				 is_unit_aligned_const((Const *) date_node, unit_datum))
 			rhs_is_sametype = true;
 		else
 			PG_RETURN_POINTER(NULL);
@@ -1556,54 +1620,53 @@ date_trunc_eq_support(PG_FUNCTION_ARGS)
 				PG_RETURN_POINTER(NULL);
 
 			/*
-			 * upper := d + interval '1 day'.  Fold when d is a Const so a
-			 * Const+Const OpExpr does not reach the executor unfolded
-			 * (eval_const_expressions does not re-walk what we return).  The
-			 * pl_interval picked depends on d's type: timestamp[tz]_pl_interval
-			 * for same-type (returns typoid), date_pl_interval for cross-type
-			 * (returns timestamp).  A cross-type date Var keeps the OpExpr,
-			 * looking up + schema-qualified to pg_catalog so a user-defined
-			 * +(date, interval) cannot hijack the rewrite.
+			 * upper := d + step.  Fold when d is a Const so a Const+Const
+			 * OpExpr does not reach the executor unfolded (eval_const_expressions
+			 * does not re-walk what we return).  The pl_interval picked depends
+			 * on d's type: timestamp_pl_interval for same-type (returns
+			 * timestamp), date_pl_interval for cross-type (returns timestamp).
+			 * The non-Const branch is reached only for the 'day' + date Var case
+			 * (coarser units and same-type both require a Const); it keeps the
+			 * OpExpr, looking up + schema-qualified to pg_catalog so a
+			 * user-defined +(date, interval) cannot hijack the rewrite.
 			 */
 			if (rhs_is_sametype)
 			{
-				Interval	iv = {0};
 				Datum		tstamp;
 
 				/*
 				 * Same-type is timestamp-only (typoid == TIMESTAMPOID), and
-				 * is_midnight_timestamp_const() already rejected infinity and
-				 * null.  timestamp + interval is IMMUTABLE, so the folded upper
-				 * bound is timezone-independent.
+				 * is_unit_aligned_const() already rejected infinity and null.
+				 * timestamp + interval is IMMUTABLE, so the folded upper bound
+				 * is timezone-independent.
 				 */
 				Assert(typoid == TIMESTAMPOID);
-				iv.day = 1;
 				tstamp = DirectFunctionCall2(timestamp_pl_interval,
 											 ((Const *) date_node)->constvalue,
-											 IntervalPGetDatum(&iv));
+											 IntervalPGetDatum(&step));
 				upper = (Expr *) makeConst(typoid, -1, InvalidOid,
 										   sizeof(Timestamp), tstamp,
 										   false, FLOAT8PASSBYVAL);
 			}
 			else if (IsA(date_node, Const))
 			{
-				Interval	iv = {0};
 				Datum		tstamp;
 				Const	   *d = (Const *) date_node;
 
 				/*
 				 * An infinite (or null) Const d cannot be rewritten: the range
-				 * [d, d + '1 day') is empty because infinity + interval =
-				 * infinity, which would drop the rows date_trunc('day', x) = d
-				 * actually matches.  Decline and keep the original predicate.
+				 * [d, d + step) is empty because infinity + interval = infinity,
+				 * which would drop the rows date_trunc(unit, x) = d actually
+				 * matches.  Decline and keep the original predicate.  (For
+				 * coarser units is_unit_aligned_const() already rejected
+				 * infinity; this also covers the unchecked 'day' path.)
 				 */
 				if (d->constisnull ||
 					DATE_NOT_FINITE(DatumGetDateADT(d->constvalue)))
 					PG_RETURN_POINTER(NULL);
 
-				iv.day = 1;
 				tstamp = DirectFunctionCall2(date_pl_interval, d->constvalue,
-											 IntervalPGetDatum(&iv));
+											 IntervalPGetDatum(&step));
 				upper = (Expr *) makeConst(TIMESTAMPOID, -1, InvalidOid,
 										   sizeof(Timestamp), tstamp,
 										   false, FLOAT8PASSBYVAL);
@@ -1611,7 +1674,7 @@ date_trunc_eq_support(PG_FUNCTION_ARGS)
 			else
 			{
 				Interval   *iv;
-				Const	   *one_day;
+				Const	   *step_const;
 				Oid			pl_opno;
 
 				pl_opno = OpernameGetOprid(list_make2(makeString("pg_catalog"),
@@ -1620,14 +1683,15 @@ date_trunc_eq_support(PG_FUNCTION_ARGS)
 				if (!OidIsValid(pl_opno))
 					PG_RETURN_POINTER(NULL);
 
-				/* one_day's Datum is by-reference; iv must outlive the Const. */
-				iv = palloc0_object(Interval);
-				iv->day = 1;
-				one_day = makeConst(INTERVALOID, -1, InvalidOid, sizeof(Interval),
-									IntervalPGetDatum(iv), false, false);
+				/* step_const's Datum is by-reference; iv must outlive it. */
+				iv = palloc_object(Interval);
+				*iv = step;
+				step_const = makeConst(INTERVALOID, -1, InvalidOid,
+									   sizeof(Interval),
+									   IntervalPGetDatum(iv), false, false);
 				upper = make_opclause(pl_opno, TIMESTAMPOID, false,
 									  (Expr *) date_node,
-									  (Expr *) one_day,
+									  (Expr *) step_const,
 									  InvalidOid, InvalidOid);
 			}
 

@@ -538,3 +538,61 @@ DEALLOCATE dtpc;
 RESET plan_cache_mode;
 RESET TIME ZONE;
 DROP TABLE date_trunc_pc;
+
+--
+-- date_trunc_eq_support, Stage 4: coarser fixed-boundary units.  week /
+-- month / quarter / year rewrite only when the RHS Const sits exactly on a
+-- unit boundary; the step is 7 days / 1 month / 3 months / 1 year.
+--
+CREATE INDEX timestamp_tbl_d1_idx ON timestamp_tbl (d1);
+SET enable_seqscan = off;
+
+-- Aligned Const -> rewrite.  Feb 10 1997 is a Monday (a valid week boundary).
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('week', d1)    = DATE '1997-02-10';
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('month', d1)   = DATE '1997-02-01';
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('quarter', d1) = DATE '1997-04-01';
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('year', d1)    = DATE '1997-01-01';
+
+-- Misaligned Const -> no rewrite (the predicate is always false; a range
+-- rewrite would wrongly return rows).
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('month', d1) = DATE '1997-02-10';
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('week', d1)  = DATE '1997-02-12'; -- a Wednesday
+
+-- Coarser unit, Var RHS -> no rewrite (alignment unprovable at plan time).
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl t1, timestamp_tbl t2
+WHERE date_trunc('month', t1.d1) = t2.d1::date;
+
+-- Coarser unit, same-type aligned Const -> rewrite.
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('month', d1) = TIMESTAMP '1997-02-01';
+
+-- Unsupported unit ('century' is not a fixed-boundary unit we handle) -> no
+-- rewrite.
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('century', d1) = DATE '2001-01-01';
+
+DROP INDEX timestamp_tbl_d1_idx;
+RESET enable_seqscan;
+
+-- Result equivalence for the coarser units: rewritten predicate must return
+-- the same rows as the hand-applied half-open range.
+SELECT
+  (SELECT count(*) FROM timestamp_tbl WHERE date_trunc('week', d1) = DATE '1997-02-10')
+  = (SELECT count(*) FROM timestamp_tbl
+     WHERE d1 >= DATE '1997-02-10' AND d1 < DATE '1997-02-10' + interval '7 days')   AS week_match,
+  (SELECT count(*) FROM timestamp_tbl WHERE date_trunc('month', d1) = DATE '1997-02-01')
+  = (SELECT count(*) FROM timestamp_tbl
+     WHERE d1 >= DATE '1997-02-01' AND d1 < DATE '1997-02-01' + interval '1 month')  AS month_match,
+  (SELECT count(*) FROM timestamp_tbl WHERE date_trunc('quarter', d1) = DATE '1997-04-01')
+  = (SELECT count(*) FROM timestamp_tbl
+     WHERE d1 >= DATE '1997-04-01' AND d1 < DATE '1997-04-01' + interval '3 months') AS quarter_match,
+  (SELECT count(*) FROM timestamp_tbl WHERE date_trunc('year', d1) = DATE '1997-01-01')
+  = (SELECT count(*) FROM timestamp_tbl
+     WHERE d1 >= DATE '1997-01-01' AND d1 < DATE '1997-01-01' + interval '1 year')   AS year_match;
