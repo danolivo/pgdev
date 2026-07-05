@@ -3431,3 +3431,78 @@ SELECT (SELECT count(*) FROM timestamptz_tbl WHERE date_trunc('day', d1) = DATE 
  t
 (1 row)
 
+--
+-- date_trunc_eq_support: the same-type =(timestamptz, timestamptz) case is
+-- deliberately NOT rewritten.  "midnight" for timestamptz is session-timezone
+-- dependent, so a plan-time-folded range cannot stay equivalent to the STABLE
+-- original across a SET TIME ZONE under a cached generic plan.  Both an
+-- explicit TIMESTAMPTZ literal and a bare literal (which coerces to timestamptz
+-- against a timestamptz column) must keep date_trunc() - no range rewrite.
+-- Use = DATE '...' for the timezone-safe cross-type rewrite instead.
+--
+CREATE INDEX timestamptz_tbl_d1_idx ON timestamptz_tbl (d1);
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamptz_tbl WHERE date_trunc('day', d1) = TIMESTAMPTZ '2000-03-15';
+                                             QUERY PLAN                                             
+----------------------------------------------------------------------------------------------------
+ Index Only Scan using timestamptz_tbl_d1_idx on timestamptz_tbl
+   Filter: (date_trunc('day'::text, d1) = 'Wed Mar 15 00:00:00 2000 PST'::timestamp with time zone)
+(2 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamptz_tbl WHERE date_trunc('day', d1) = '2000-03-15';
+                                             QUERY PLAN                                             
+----------------------------------------------------------------------------------------------------
+ Index Only Scan using timestamptz_tbl_d1_idx on timestamptz_tbl
+   Filter: (date_trunc('day'::text, d1) = 'Wed Mar 15 00:00:00 2000 PST'::timestamp with time zone)
+(2 rows)
+
+DROP INDEX timestamptz_tbl_d1_idx;
+RESET enable_seqscan;
+-- Functional guard against a re-introduced timestamptz rewrite.  Because the
+-- predicate keeps its STABLE date_trunc(), a cached generic plan re-truncates
+-- under the execute-time zone: the same plan returns 1 under UTC and 0 under
+-- +14, and the cached +14 result agrees with a freshly planned query.  A
+-- plan-time-folded range would instead freeze at UTC and return 1 under +14,
+-- diverging from the re-plan - so this test would fail if the rewrite ever
+-- fired for timestamptz.
+CREATE TABLE tstz_neg (d1 timestamptz);
+INSERT INTO tstz_neg VALUES ('2000-03-15 12:00:00+00');  -- noon UTC on the 15th
+SET plan_cache_mode = force_generic_plan;
+SET TIME ZONE INTERVAL '0' HOUR TO MINUTE;
+PREPARE tstz_neg_p AS
+  SELECT count(*) FROM tstz_neg WHERE date_trunc('day', d1) = TIMESTAMPTZ '2000-03-15';
+-- the generic plan must keep date_trunc(), not a folded range
+EXPLAIN (COSTS OFF) EXECUTE tstz_neg_p;
+                                                QUERY PLAN                                                
+----------------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Seq Scan on tstz_neg
+         Filter: (date_trunc('day'::text, d1) = 'Wed Mar 15 00:00:00 2000 +00'::timestamp with time zone)
+(3 rows)
+
+EXECUTE tstz_neg_p;                        -- UTC: 1
+ count 
+-------
+     1
+(1 row)
+
+SET TIME ZONE INTERVAL '+14:00' HOUR TO MINUTE;
+EXECUTE tstz_neg_p;                        -- cached plan re-truncates under +14: 0
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM tstz_neg              -- honest re-plan under +14: also 0
+  WHERE date_trunc('day', d1) = TIMESTAMPTZ '2000-03-15';
+ count 
+-------
+     0
+(1 row)
+
+DEALLOCATE tstz_neg_p;
+RESET plan_cache_mode;
+RESET TIME ZONE;
+DROP TABLE tstz_neg;

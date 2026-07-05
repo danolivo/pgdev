@@ -1335,21 +1335,74 @@ interval_support(PG_FUNCTION_ARGS)
 			 ((FuncExpr *) (node))->funcid == F_DATE_TRUNC_TEXT_TIMESTAMPTZ))
 
 /*
+ * Is c a non-null Const of type timestamp (without time zone) whose value is
+ * midnight?
+ *
+ * Deliberately timestamp-only.  The analogous same-type timestamptz rewrite is
+ * NOT supported, because "midnight" for timestamptz is defined in the session
+ * timezone: date_trunc(text, timestamptz) is STABLE and the folded bound would
+ * bake a specific instant at plan time.  Under a cached generic plan reused
+ * across a SET TIME ZONE that diverges from the original predicate, whose LHS
+ * re-truncates under the execute-time zone - and no plan-time rewrite can be
+ * equivalent, since whether the constant is an execute-zone midnight is not
+ * knowable when the plan is built.  timestamp (no time zone) has no such
+ * dependency: date_trunc(text, timestamp) is IMMUTABLE and this check is
+ * timezone-independent.  Callers must not pass a timestamptz Const.  See
+ * date-trunc-rewrite-spec.md.  Infinity is never midnight, and is rejected.
+ */
+static bool
+is_midnight_timestamp_const(Const *c)
+{
+	Timestamp		value;
+	struct pg_tm	tm;
+	fsec_t			fsec;
+
+	Assert(c->consttype == TIMESTAMPOID);
+
+	if (c->constisnull)
+		return false;
+
+	value = DatumGetTimestamp(c->constvalue);
+	if (TIMESTAMP_NOT_FINITE(value))
+		return false;
+
+	if (timestamp2tm(value, NULL, &tm, &fsec, NULL, NULL) != 0)
+		return false;
+
+	return tm.tm_hour == 0 && tm.tm_min == 0 && tm.tm_sec == 0 && fsec == 0;
+}
+
+/*
  * date_trunc_eq_support
  *
- * Planner support for the four cross-type =(timestamp[tz], date) equality
- * functions (both argument orders).  Rewrites
- *		date_trunc('day', x) = d		(d of type date)
+ * Planner support for the equality functions that can carry a
+ * date_trunc('day', x) = d predicate: the four cross-type =(timestamp[tz],
+ * date) variants (both argument orders) and the same-type
+ * =(timestamp, timestamp) variant.  Rewrites
+ *		date_trunc('day', x) = d
  * as
  *		x >= d  AND  x < d + interval '1 day'
  * so a btree index on x can serve the predicate; the original form buries the
  * indexable column under date_trunc().  It also unlocks BRIN summary skipping
  * and range-partition pruning on x.
  *
- * A date value is always day-aligned, so a date-typed RHS - Const or Var -
- * needs no value check.  Infinity is not defended at run time (a date Var may
- * be infinite): this assumes schemas exclude infinity dates by constraint -
- * see the XXX block in timestamp.sql.
+ * Soundness rests on d being midnight-aligned.  For the cross-type variants
+ * this is automatic (d has type date).  For the same-type timestamp variant d
+ * must be a non-null Const whose value is midnight (is_midnight_timestamp_const).
+ *
+ * The same-type =(timestamptz, timestamptz) variant is deliberately NOT
+ * handled: "midnight" for timestamptz is session-timezone-dependent, so no
+ * plan-time rewrite can stay equivalent to the STABLE original across a zone
+ * change under a cached generic plan - see is_midnight_timestamp_const() and
+ * date-trunc-rewrite-spec.md.  The common natural form
+ * date_trunc('day', tstz) = '2020-01-01' resolves the bare literal to
+ * timestamptz and so is left alone here; write = DATE '2020-01-01' to get the
+ * (timezone-safe) cross-type rewrite instead.
+ *
+ * Infinity is not defended for the cross-type date Var path (a date Var may
+ * be infinite): that path assumes schemas exclude infinity dates by
+ * constraint - see the XXX block in timestamp.sql.  A Const date is checked
+ * for finiteness, and the same-type path is finite by is_midnight_timestamp_const().
  */
 Datum
 date_trunc_eq_support(PG_FUNCTION_ARGS)
@@ -1378,7 +1431,10 @@ date_trunc_eq_support(PG_FUNCTION_ARGS)
 		case F_TIMESTAMPTZ_EQ_DATE:
 		case F_DATE_EQ_TIMESTAMP:
 		case F_DATE_EQ_TIMESTAMPTZ:
-			/* One side is date by signature. */
+			/* Cross-type: one side is date by signature. */
+		case F_TIMESTAMP_EQ:
+		case F_TIMESTAMPTZ_EQ:
+			/* Same-type: alignment gated at the RHS check below. */
 			break;
 		default:
 			PG_RETURN_POINTER(NULL);
@@ -1426,116 +1482,167 @@ date_trunc_eq_support(PG_FUNCTION_ARGS)
 			PG_RETURN_POINTER(NULL);
 	}
 
-	/* Cross-type only: the RHS must be date-typed. */
-	if (exprType(date_node) != DATEOID)
-		PG_RETURN_POINTER(NULL);
-
 	typoid = func_node->funcresulttype;
 	Assert(typoid == TIMESTAMPOID || typoid == TIMESTAMPTZOID);
+
+	/*
+	 * Discriminate the RHS shape: a date (cross-type; every date is
+	 * day-aligned) or a midnight timestamp Const (same-type).  Same-type is
+	 * restricted to typoid == TIMESTAMPOID; a timestamptz column reaching here
+	 * with a timestamptz RHS is intentionally left alone (see the header
+	 * comment and is_midnight_timestamp_const() for the timezone reason).
+	 * Anything else bails.
+	 */
 	{
-		TypeCacheEntry *tce;
-		Oid			ge_opno;
-		Oid			lt_opno;
-		Node	   *col_expr;
-		Expr	   *upper;
-		Expr	   *ge_cl;
-		Expr	   *lt_cl;
-		QualCost	eval_cost;
+		Oid		rhs_type = exprType(date_node);
+		bool	rhs_is_sametype;
 
-		col_expr = (Node *) lsecond(func_node->args);
-		Assert(exprType(col_expr) == typoid);
-
-		/*
-		 * XXX: Quite rare case. Just remove if your system doesn't need it:
-		 *
-		 * The rewrite mentions x (the date_trunc argument) at least twice, so
-		 * refuse it when duplicating x would be unsafe or costly: a volatile x
-		 * could yield different values across the copies (a wrong answer), and
-		 * an expensive x would have its per-row cost multiplied.  Same guard,
-		 * and same "> 10 * cpu_operator_cost" notion of expensive, as
-		 * rangetypes.c's find_simplified_clause().
-		 */
-		if (contain_volatile_functions(col_expr) || contain_subplans(col_expr))
-			PG_RETURN_POINTER(NULL);
-		cost_qual_eval_node(&eval_cost, col_expr, req->root);
-		if (eval_cost.startup + eval_cost.per_tuple > 10 * cpu_operator_cost)
-			PG_RETURN_POINTER(NULL);
-
-		/*
-		 * Comparison operators from typoid's default btree opfamily.  >= pairs
-		 * (typoid, date); < pairs (typoid, timestamp) because date + interval
-		 * returns timestamp.
-		 */
-		tce = lookup_type_cache(typoid, TYPECACHE_BTREE_OPFAMILY);
-		if (!OidIsValid(tce->btree_opf))
-			PG_RETURN_POINTER(NULL);
-		ge_opno = get_opfamily_member_for_cmptype(tce->btree_opf, typoid,
-												  DATEOID, COMPARE_GE);
-		lt_opno = get_opfamily_member_for_cmptype(tce->btree_opf, typoid,
-												  TIMESTAMPOID, COMPARE_LT);
-		if (!OidIsValid(ge_opno) || !OidIsValid(lt_opno))
-			PG_RETURN_POINTER(NULL);
-
-		/*
-		 * upper := d + interval '1 day'.  Fold at plan time when d is a
-		 * non-null Const so a Const+Const OpExpr does not reach the executor
-		 * unfolded (eval_const_expressions does not re-walk what we return).
-		 * The non-Const (date Var) case keeps the OpExpr, looking up + by name
-		 * schema-qualified to pg_catalog so a user-defined +(date, interval)
-		 * cannot hijack the rewrite.
-		 */
-		if (IsA(date_node, Const))
-		{
-			Interval	iv = {0};
-			Datum		tstamp;
-			Const	   *d = (Const *) date_node;
-
-			if (d->constisnull ||
-				DATE_NOT_FINITE(DatumGetDateADT(d->constvalue)))
-				PG_RETURN_POINTER(NULL);
-
-			iv.day = 1;
-			tstamp = DirectFunctionCall2(date_pl_interval,
-										 d->constvalue,
-										 IntervalPGetDatum(&iv));
-			upper = (Expr *) makeConst(TIMESTAMPOID, -1, InvalidOid,
-									   sizeof(Timestamp), tstamp,
-									   false, FLOAT8PASSBYVAL);
-		}
+		if (rhs_type == DATEOID)
+			rhs_is_sametype = false;
+		else if (typoid == TIMESTAMPOID && rhs_type == TIMESTAMPOID &&
+				 IsA(date_node, Const) &&
+				 is_midnight_timestamp_const((Const *) date_node))
+			rhs_is_sametype = true;
 		else
-		{
-			Interval   *iv;
-			Const	   *one_day;
-			Oid			pl_opno;
+			PG_RETURN_POINTER(NULL);
 
-			pl_opno = OpernameGetOprid(list_make2(makeString("pg_catalog"),
-												  makeString("+")),
-									   DATEOID, INTERVALOID);
-			if (!OidIsValid(pl_opno))
+		{
+			TypeCacheEntry *tce;
+			Oid			ge_opno;
+			Oid			lt_opno;
+			Node	   *col_expr;
+			Expr	   *upper;
+			Expr	   *ge_cl;
+			Expr	   *lt_cl;
+			QualCost	eval_cost;
+
+			col_expr = (Node *) lsecond(func_node->args);
+			Assert(exprType(col_expr) == typoid);
+
+			/*
+			 * XXX: Quite rare case. Just remove if your system doesn't need it:
+			 *
+			 * The rewrite mentions x (the date_trunc argument) at least twice, so
+			 * refuse it when duplicating x would be unsafe or costly: a volatile x
+			 * could yield different values across the copies (a wrong answer), and
+			 * an expensive x would have its per-row cost multiplied.  Same guard,
+			 * and same "> 10 * cpu_operator_cost" notion of expensive, as
+			 * rangetypes.c's find_simplified_clause().
+			 */
+			if (contain_volatile_functions(col_expr) || contain_subplans(col_expr))
+				PG_RETURN_POINTER(NULL);
+			cost_qual_eval_node(&eval_cost, col_expr, req->root);
+			if (eval_cost.startup + eval_cost.per_tuple > 10 * cpu_operator_cost)
 				PG_RETURN_POINTER(NULL);
 
-			/* one_day's Datum is by-reference; iv must outlive the Const. */
-			iv = palloc0_object(Interval);
-			iv->day = 1;
-			one_day = makeConst(INTERVALOID, -1, InvalidOid, sizeof(Interval),
-								IntervalPGetDatum(iv), false, false);
-			upper = make_opclause(pl_opno, TIMESTAMPOID, false,
-								  (Expr *) date_node,
-								  (Expr *) one_day,
+			/*
+			 * Comparison operators from typoid's default btree opfamily.
+			 * Cross-type pairs (typoid, date) for >= and (typoid, timestamp)
+			 * for < (date + interval returns timestamp); same-type pairs
+			 * (typoid, typoid) on both sides.
+			 */
+			tce = lookup_type_cache(typoid, TYPECACHE_BTREE_OPFAMILY);
+			if (!OidIsValid(tce->btree_opf))
+				PG_RETURN_POINTER(NULL);
+			ge_opno = get_opfamily_member_for_cmptype(tce->btree_opf, typoid,
+													  rhs_is_sametype
+													  ? typoid : DATEOID,
+													  COMPARE_GE);
+			lt_opno = get_opfamily_member_for_cmptype(tce->btree_opf, typoid,
+													  rhs_is_sametype
+													  ? typoid : TIMESTAMPOID,
+													  COMPARE_LT);
+			if (!OidIsValid(ge_opno) || !OidIsValid(lt_opno))
+				PG_RETURN_POINTER(NULL);
+
+			/*
+			 * upper := d + interval '1 day'.  Fold when d is a Const so a
+			 * Const+Const OpExpr does not reach the executor unfolded
+			 * (eval_const_expressions does not re-walk what we return).  The
+			 * pl_interval picked depends on d's type: timestamp[tz]_pl_interval
+			 * for same-type (returns typoid), date_pl_interval for cross-type
+			 * (returns timestamp).  A cross-type date Var keeps the OpExpr,
+			 * looking up + schema-qualified to pg_catalog so a user-defined
+			 * +(date, interval) cannot hijack the rewrite.
+			 */
+			if (rhs_is_sametype)
+			{
+				Interval	iv = {0};
+				Datum		tstamp;
+
+				/*
+				 * Same-type is timestamp-only (typoid == TIMESTAMPOID), and
+				 * is_midnight_timestamp_const() already rejected infinity and
+				 * null.  timestamp + interval is IMMUTABLE, so the folded upper
+				 * bound is timezone-independent.
+				 */
+				Assert(typoid == TIMESTAMPOID);
+				iv.day = 1;
+				tstamp = DirectFunctionCall2(timestamp_pl_interval,
+											 ((Const *) date_node)->constvalue,
+											 IntervalPGetDatum(&iv));
+				upper = (Expr *) makeConst(typoid, -1, InvalidOid,
+										   sizeof(Timestamp), tstamp,
+										   false, FLOAT8PASSBYVAL);
+			}
+			else if (IsA(date_node, Const))
+			{
+				Interval	iv = {0};
+				Datum		tstamp;
+				Const	   *d = (Const *) date_node;
+
+				/*
+				 * An infinite (or null) Const d cannot be rewritten: the range
+				 * [d, d + '1 day') is empty because infinity + interval =
+				 * infinity, which would drop the rows date_trunc('day', x) = d
+				 * actually matches.  Decline and keep the original predicate.
+				 */
+				if (d->constisnull ||
+					DATE_NOT_FINITE(DatumGetDateADT(d->constvalue)))
+					PG_RETURN_POINTER(NULL);
+
+				iv.day = 1;
+				tstamp = DirectFunctionCall2(date_pl_interval, d->constvalue,
+											 IntervalPGetDatum(&iv));
+				upper = (Expr *) makeConst(TIMESTAMPOID, -1, InvalidOid,
+										   sizeof(Timestamp), tstamp,
+										   false, FLOAT8PASSBYVAL);
+			}
+			else
+			{
+				Interval   *iv;
+				Const	   *one_day;
+				Oid			pl_opno;
+
+				pl_opno = OpernameGetOprid(list_make2(makeString("pg_catalog"),
+													  makeString("+")),
+										   DATEOID, INTERVALOID);
+				if (!OidIsValid(pl_opno))
+					PG_RETURN_POINTER(NULL);
+
+				/* one_day's Datum is by-reference; iv must outlive the Const. */
+				iv = palloc0_object(Interval);
+				iv->day = 1;
+				one_day = makeConst(INTERVALOID, -1, InvalidOid, sizeof(Interval),
+									IntervalPGetDatum(iv), false, false);
+				upper = make_opclause(pl_opno, TIMESTAMPOID, false,
+									  (Expr *) date_node,
+									  (Expr *) one_day,
+									  InvalidOid, InvalidOid);
+			}
+
+			/* date_node may be embedded in upper; copy for the ge clause. */
+			ge_cl = make_opclause(ge_opno, BOOLOID, false,
+								  (Expr *) col_expr,
+								  (Expr *) copyObject(date_node),
 								  InvalidOid, InvalidOid);
+			lt_cl = make_opclause(lt_opno, BOOLOID, false,
+								  (Expr *) copyObject(col_expr),
+								  upper,
+								  InvalidOid, InvalidOid);
+
+			ret = (Node *) make_andclause(list_make2(ge_cl, lt_cl));
 		}
-
-		/* date_node may be embedded in upper; copy for the ge clause. */
-		ge_cl = make_opclause(ge_opno, BOOLOID, false,
-							  (Expr *) col_expr,
-							  (Expr *) copyObject(date_node),
-							  InvalidOid, InvalidOid);
-		lt_cl = make_opclause(lt_opno, BOOLOID, false,
-							  (Expr *) copyObject(col_expr),
-							  upper,
-							  InvalidOid, InvalidOid);
-
-		ret = (Node *) make_andclause(list_make2(ge_cl, lt_cl));
 	}
 
 	PG_RETURN_POINTER(ret);

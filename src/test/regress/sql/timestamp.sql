@@ -493,3 +493,48 @@ SELECT (SELECT count(*) FROM timestamp_tbl WHERE date_trunc('day', d1) = DATE '2
        AS rewrite_results_match;
 -- NULL RHS preserves NULL semantics (no row selected).
 SELECT count(*) FROM timestamp_tbl WHERE date_trunc('day', d1) = NULL::date;
+
+--
+-- date_trunc_eq_support, Stage 2: same-type equality with a midnight Const.
+--
+CREATE INDEX timestamp_tbl_d1_idx ON timestamp_tbl (d1);
+SET enable_seqscan = off;
+
+-- Same-type Const at midnight -> rewrite ('2000-03-15' coerces to a Const
+-- timestamp; the midnight check succeeds).
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('day', d1) = TIMESTAMP '2000-03-15';
+-- Same-type Const not at midnight -> no rewrite (is_midnight_typoid_const bail).
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('day', d1) = TIMESTAMP '2000-03-15 06:00:00';
+-- Same-type infinity Const -> no rewrite (rewriting infinity is unsound).
+EXPLAIN (COSTS OFF)
+SELECT * FROM timestamp_tbl WHERE date_trunc('day', d1) = TIMESTAMP 'infinity';
+
+DROP INDEX timestamp_tbl_d1_idx;
+RESET enable_seqscan;
+
+-- Result equivalence for the same-type path.
+SELECT (SELECT count(*) FROM timestamp_tbl WHERE date_trunc('day', d1) = TIMESTAMP '2000-03-15')
+     = (SELECT count(*) FROM timestamp_tbl
+        WHERE d1 >= TIMESTAMP '2000-03-15' AND d1 < TIMESTAMP '2000-03-15' + interval '1 day')
+       AS rewrite_results_match;
+
+-- timestamp (no time zone) is timezone-independent, which is why the same-type
+-- rewrite is supported for it (but not for timestamptz): a cached generic plan
+-- stays correct across a SET TIME ZONE between plan and execution.
+CREATE TABLE date_trunc_pc (d1 timestamp);
+INSERT INTO date_trunc_pc VALUES ('2000-03-15 12:00:00');
+SET plan_cache_mode = force_generic_plan;
+SET TIME ZONE INTERVAL '0' HOUR TO MINUTE;
+PREPARE dtpc AS
+  SELECT count(*) FROM date_trunc_pc WHERE date_trunc('day', d1) = TIMESTAMP '2000-03-15';
+EXECUTE dtpc;                            -- generic plan built here (UTC)
+SET TIME ZONE INTERVAL '+14:00' HOUR TO MINUTE;
+EXECUTE dtpc;                            -- same cached plan, different zone: unchanged
+SELECT count(*) FROM date_trunc_pc       -- honest re-planned answer: also unchanged
+  WHERE date_trunc('day', d1) = TIMESTAMP '2000-03-15';
+DEALLOCATE dtpc;
+RESET plan_cache_mode;
+RESET TIME ZONE;
+DROP TABLE date_trunc_pc;

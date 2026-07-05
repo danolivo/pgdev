@@ -6441,7 +6441,7 @@
   proname => 'to_char', provolatile => 's', prorettype => 'text',
   proargtypes => 'timestamp text', prosrc => 'timestamp_to_char' },
 { oid => '2052',
-  proname => 'timestamp_eq',
+  proname => 'timestamp_eq', prosupport => 'date_trunc_eq_support',
   proleakproof => 't', prorettype => 'bool',
   proargtypes => 'timestamp timestamp', prosrc => 'timestamp_eq' },
 { oid => '2053',
