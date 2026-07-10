@@ -6150,8 +6150,8 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
        <para>
         Enables or disables the query planner's optimization which analyses
         the query tree and replaces self joins with semantically equivalent
-        single scans.  Takes into consideration only plain tables.
-        The default is <literal>on</literal>.
+        single scans.  Takes into consideration plain tables and partitioned
+        tables.  The default is <literal>on</literal>.
        </para>
       </listitem>
      </varlistentry>

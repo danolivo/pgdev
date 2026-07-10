@@ -2476,15 +2476,25 @@ remove_self_joins_recurse(PlannerInfo *root, List *joinlist, Relids toRemove)
 			RangeTblEntry *rte = root->simple_rte_array[varno];
 
 			/*
-			 * We only consider ordinary relations as candidates to be
-			 * removed, and these relations should not have TABLESAMPLE
-			 * clauses specified.  Removing a relation with TABLESAMPLE clause
-			 * could potentially change the syntax of the query. Because of
-			 * UPDATE/DELETE EPQ mechanism, currently Query->resultRelation or
-			 * Query->mergeTargetRelation associated rel cannot be eliminated.
+			 * We consider ordinary relations and partitioned tables as
+			 * candidates to be removed.  For a partitioned table, uniqueness
+			 * can be proven from a unique index that includes the partition
+			 * key, which is enforced globally across all partitions; the
+			 * planner records such indexes for partitioned tables precisely so
+			 * this optimization can use them (see get_relation_info()).  Other
+			 * inheritance parents are naturally excluded because we don't
+			 * populate their indexlist and thus can't prove uniqueness.
+			 *
+			 * Candidate relations should not have TABLESAMPLE clauses
+			 * specified.  Removing a relation with a TABLESAMPLE clause could
+			 * potentially change the syntax of the query.  Because of the
+			 * UPDATE/DELETE EPQ mechanism, currently the rel associated with
+			 * Query->resultRelation or Query->mergeTargetRelation cannot be
+			 * eliminated.
 			 */
 			if (rte->rtekind == RTE_RELATION &&
-				rte->relkind == RELKIND_RELATION &&
+				(rte->relkind == RELKIND_RELATION ||
+				 rte->relkind == RELKIND_PARTITIONED_TABLE) &&
 				rte->tablesample == NULL &&
 				varno != root->parse->resultRelation &&
 				varno != root->parse->mergeTargetRelation)
