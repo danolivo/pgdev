@@ -1,0 +1,5 @@
+# shared_numeric_agg extension
+comment = 'flat in-place numeric sum/avg aggregates for parallel shared hash aggregation'
+default_version = '1.0'
+module_pathname = '$libdir/shared_numeric_agg'
+relocatable = true
