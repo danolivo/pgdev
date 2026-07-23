@@ -1434,19 +1434,17 @@ create index on t (a);
 analyze t;
 set enable_incremental_sort = off;
 explain (costs off) select a,b,sum(c) from t group by 1,2 order by 1,2,3 limit 1;
-                      QUERY PLAN                      
-------------------------------------------------------
+                   QUERY PLAN                   
+------------------------------------------------
  Limit
    ->  Sort
          Sort Key: a, b, (sum(c))
-         ->  Finalize HashAggregate
-               Group Key: a, b
-               ->  Gather
-                     Workers Planned: 2
-                     ->  Partial HashAggregate
-                           Group Key: a, b
-                           ->  Parallel Seq Scan on t
-(10 rows)
+         ->  Gather
+               Workers Planned: 2
+               ->  Parallel HashAggregate
+                     Group Key: a, b
+                     ->  Parallel Seq Scan on t
+(8 rows)
 
 set enable_incremental_sort = on;
 explain (costs off) select a,b,sum(c) from t group by 1,2 order by 1,2,3 limit 1;

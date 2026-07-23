@@ -231,16 +231,14 @@ select sp_parallel_restricted(unique1) from tenk1
 -- test parallel plan when group by expression is in target list.
 explain (costs off)
 	select length(stringu1) from tenk1 group by length(stringu1);
-                    QUERY PLAN                     
----------------------------------------------------
- Finalize HashAggregate
-   Group Key: (length((stringu1)::text))
-   ->  Gather
-         Workers Planned: 4
-         ->  Partial HashAggregate
-               Group Key: length((stringu1)::text)
-               ->  Parallel Seq Scan on tenk1
-(7 rows)
+                 QUERY PLAN                  
+---------------------------------------------
+ Gather
+   Workers Planned: 4
+   ->  Parallel HashAggregate
+         Group Key: length((stringu1)::text)
+         ->  Parallel Seq Scan on tenk1
+(5 rows)
 
 select length(stringu1) from tenk1 group by length(stringu1);
  length 
@@ -250,18 +248,16 @@ select length(stringu1) from tenk1 group by length(stringu1);
 
 explain (costs off)
 	select stringu1, count(*) from tenk1 group by stringu1 order by stringu1;
-                     QUERY PLAN                     
-----------------------------------------------------
- Sort
-   Sort Key: stringu1
-   ->  Finalize HashAggregate
-         Group Key: stringu1
-         ->  Gather
-               Workers Planned: 4
-               ->  Partial HashAggregate
-                     Group Key: stringu1
-                     ->  Parallel Seq Scan on tenk1
-(9 rows)
+                  QUERY PLAN                  
+----------------------------------------------
+ Gather Merge
+   Workers Planned: 4
+   ->  Sort
+         Sort Key: stringu1
+         ->  Parallel HashAggregate
+               Group Key: stringu1
+               ->  Parallel Seq Scan on tenk1
+(7 rows)
 
 -- test that parallel plan for aggregates is not selected when
 -- target list contains parallel restricted clause.
@@ -1049,18 +1045,14 @@ reset enable_seqscan;
 explain (costs off)
 select count(*) from tenk1
 group by twenty, parallel_safe_volatile(two);
-                             QUERY PLAN                             
---------------------------------------------------------------------
- Finalize GroupAggregate
-   Group Key: twenty, (parallel_safe_volatile(two))
-   ->  Gather Merge
-         Workers Planned: 4
-         ->  Sort
-               Sort Key: twenty, (parallel_safe_volatile(two))
-               ->  Partial HashAggregate
-                     Group Key: twenty, parallel_safe_volatile(two)
-                     ->  Parallel Seq Scan on tenk1
-(9 rows)
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Gather
+   Workers Planned: 4
+   ->  Parallel HashAggregate
+         Group Key: twenty, parallel_safe_volatile(two)
+         ->  Parallel Seq Scan on tenk1
+(5 rows)
 
 drop function parallel_safe_volatile(int);
 SAVEPOINT settings;

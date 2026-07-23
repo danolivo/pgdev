@@ -1322,26 +1322,26 @@ SELECT a, sum(b), count(*) FROM pagg_tab_ml GROUP BY a, b, c HAVING avg(b) > 7 O
    ->  Sort
          Sort Key: pagg_tab_ml.a, (sum(pagg_tab_ml.b)), (count(*))
          ->  Parallel Append
-               ->  HashAggregate
+               ->  Parallel HashAggregate
                      Group Key: pagg_tab_ml.a, pagg_tab_ml.b, pagg_tab_ml.c
                      Filter: (avg(pagg_tab_ml.b) > '7'::numeric)
-                     ->  Seq Scan on pagg_tab_ml_p1 pagg_tab_ml
-               ->  HashAggregate
+                     ->  Parallel Seq Scan on pagg_tab_ml_p1 pagg_tab_ml
+               ->  Parallel HashAggregate
                      Group Key: pagg_tab_ml_3.a, pagg_tab_ml_3.b, pagg_tab_ml_3.c
                      Filter: (avg(pagg_tab_ml_3.b) > '7'::numeric)
-                     ->  Seq Scan on pagg_tab_ml_p3_s1 pagg_tab_ml_3
-               ->  HashAggregate
+                     ->  Parallel Seq Scan on pagg_tab_ml_p3_s1 pagg_tab_ml_3
+               ->  Parallel HashAggregate
                      Group Key: pagg_tab_ml_1.a, pagg_tab_ml_1.b, pagg_tab_ml_1.c
                      Filter: (avg(pagg_tab_ml_1.b) > '7'::numeric)
-                     ->  Seq Scan on pagg_tab_ml_p2_s1 pagg_tab_ml_1
-               ->  HashAggregate
+                     ->  Parallel Seq Scan on pagg_tab_ml_p2_s1 pagg_tab_ml_1
+               ->  Parallel HashAggregate
                      Group Key: pagg_tab_ml_4.a, pagg_tab_ml_4.b, pagg_tab_ml_4.c
                      Filter: (avg(pagg_tab_ml_4.b) > '7'::numeric)
-                     ->  Seq Scan on pagg_tab_ml_p3_s2 pagg_tab_ml_4
-               ->  HashAggregate
+                     ->  Parallel Seq Scan on pagg_tab_ml_p3_s2 pagg_tab_ml_4
+               ->  Parallel HashAggregate
                      Group Key: pagg_tab_ml_2.a, pagg_tab_ml_2.b, pagg_tab_ml_2.c
                      Filter: (avg(pagg_tab_ml_2.b) > '7'::numeric)
-                     ->  Seq Scan on pagg_tab_ml_p2_s2 pagg_tab_ml_2
+                     ->  Parallel Seq Scan on pagg_tab_ml_p2_s2 pagg_tab_ml_2
 (25 rows)
 
 SELECT a, sum(b), count(*) FROM pagg_tab_ml GROUP BY a, b, c HAVING avg(b) > 7 ORDER BY 1, 2, 3;
