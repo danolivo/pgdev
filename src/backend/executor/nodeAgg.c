@@ -266,15 +266,21 @@
 #include "parser/parse_agg.h"
 #include "parser/parse_coerce.h"
 #include "port/pg_bitutils.h"
+#include "storage/barrier.h"
+#include "storage/lwlock.h"
+#include "storage/sharedfileset.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/dsa.h"
+#include "utils/wait_event.h"
 #include "utils/expandeddatum.h"
 #include "utils/injection_point.h"
 #include "utils/logtape.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/memutils_memorychunk.h"
+#include "utils/sharedtuplestore.h"
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
 
@@ -366,6 +372,234 @@ typedef struct FindColsContext
 	Bitmapset  *unaggregated;	/* other column references */
 } FindColsContext;
 
+/*
+ * Parallel shared hash aggregation (Parallel Hash Aggregate, v0 prototype).
+ *
+ * All participants (workers plus possibly the leader) cooperatively build a
+ * single hash table in dynamic shared memory, then cooperatively emit the
+ * finalized groups.  This removes the serial Finalize HashAggregate stage of
+ * the conventional Partial -> Gather -> Finalize plan shape: no partial
+ * states ever need to be merged, because every input row's transition call
+ * mutates the one shared per-group state, under a per-bucket-stripe LWLock
+ * (strategy 1 of the accompanying specification).
+ *
+ * v0 restrictions (documented, checked by the planner):
+ *	- every aggregate's transition type must be pass-by-value (a by-ref
+ *	  transition state allocated in one process's memory cannot be
+ *	  dereferenced in another process);
+ *	- no grouping sets, no DISTINCT/ORDER BY aggregates;
+ *	- the table is sized once from the planner estimate and never grows;
+ *	  underestimates only lengthen chains, they do not affect correctness;
+ *	- no disk spilling: hash_mem is not enforced for the shared table;
+ *	- rescan is not supported.
+ *
+ * The shared bucket array holds dsa_pointers to chains of SharedAggEntry.
+ * All chain reads and mutations during the build phase happen under the
+ * stripe LWLock covering the entry's bucket, so no atomics are required.
+ * The emission phase begins only after every participant has arrived at the
+ * build barrier, at which point the table is immutable and may be read
+ * without locks.
+ */
+
+/* Offset added to plan_node_id for the shared-build shm_toc entry */
+#define PARALLEL_KEY_AGG_SHARED_OFFSET	UINT64CONST(0xB000000000000000)
+
+/*
+ * Number of LWLock stripes protecting the bucket array during build, and
+ * buckets claimed at a time by one participant during emission.  Both are
+ * unbenchmarked initial guesses: 256 stripes keeps the probability of false
+ * stripe sharing below ~4% for 8 concurrent participants, and 64-bucket
+ * scan chunks amortize the atomic fetch-add without starving participants
+ * at the tail.  Revisit with contention benchmarks.
+ */
+#define SHARED_AGG_NUM_STRIPES		256
+#define SHARED_AGG_SCAN_CHUNK		64
+
+/* Cap on the shared bucket array (16M buckets = 128MB of pointers) */
+#define SHARED_AGG_MAX_BUCKETS		(UINT64CONST(1) << 24)
+
+/*
+ * Number of spill partitions (single level, no recursive repartitioning).
+ * Partition selection uses the top hash bits, disjoint from the bucket
+ * number's low bits.  Also an unbenchmarked initial guess.
+ */
+#define SHARED_AGG_SPILL_BITS		5
+#define SHARED_AGG_SPILL_PARTITIONS (1 << SHARED_AGG_SPILL_BITS)
+#define SharedAggSpillPartition(hash) \
+	((hash) >> (32 - SHARED_AGG_SPILL_BITS))
+
+/* Build-barrier phases */
+#define PHA_BUILD_ELECT				0
+#define PHA_BUILD_ALLOCATE			1
+#define PHA_BUILD_RUN				2
+#define PHA_BUILD_DONE				3
+
+/* Sentinel for SharedAggBuildState.cur_batch: all batches processed */
+#define PHA_BATCHES_DONE			PG_UINT32_MAX
+
+/*
+ * How transition states are maintained in the shared table.
+ *
+ * Pass-by-value states are ordinary AggStatePerGroupData whose transValue
+ * is the value itself, mutated in place by advance_transition_function().
+ *
+ * Plain pass-by-reference states (varlena such as bytea/text/numeric, or
+ * fixed-length by-ref such as interval) are stored as self-contained blobs
+ * in the DSA area: the slot's transValue then holds a dsa_pointer rather
+ * than a local pointer.  shared_agg_advance_byref() translates it to a
+ * local address around each transition call and copies the result back
+ * into DSA only when the transition function returns a different pointer;
+ * a function that modifies its state in place (the common pattern for
+ * custom bytea-state aggregates, sanctioned by AggCheckCallContext) is
+ * thereby mutating the shared blob directly, under the stripe lock, with
+ * no copy at all.  Values are detoasted and expanded datums flattened
+ * before storing, so a blob is always plain contiguous bytes that any
+ * participant may map.
+ *
+ * The 'internal' pseudo-type is deliberately unsupported: it is a
+ * by-value pointer to an opaque struct with interior process-local
+ * pointers, which no byte-copy can make shareable.  (A variant that kept
+ * such states in serialized form, converting around every transition
+ * call, was prototyped and removed: per-row serialize/deserialize under
+ * the stripe lock costs more than it saves.  Aggregates wanting the
+ * shared table should provide a flat transition representation instead —
+ * see contrib/shared_numeric_agg.)  The planner never admits them; the
+ * check in shared_agg_init_support() is a cross-check.
+ */
+
+/*
+ * Executor-local per-transition support for the shared path: argument and
+ * filter expressions (the shared path cannot use the compiled evaltrans
+ * program, whose by-ref handling would store process-local pointers into
+ * the shared table).
+ */
+typedef struct SharedAggTransInfo
+{
+	bool		blob_stored;	/* transValue holds a dsa_pointer */
+	ExprState **argstates;		/* transition argument expressions */
+	ExprState **argstates_spill;	/* ditto, compiled for minimal-tuple
+									 * slots (spill batch reads) */
+	int			numargs;
+	ExprState  *filterstate;	/* FILTER clause, or NULL */
+	ExprState  *filterstate_spill;	/* ditto, for spill batch reads */
+
+	/*
+	 * Per-row staging area, filled by shared_agg_prepare_inputs() BEFORE
+	 * the stripe lock is taken, consumed by shared_agg_apply() under the
+	 * lock.  Keeping expression evaluation and detoasting outside the lock
+	 * is essential: the lock serializes 1/256th of the bucket space, and
+	 * must protect only the state mutation.
+	 */
+	bool		pending_skip;	/* row filtered out */
+	Datum	   *pending_args;	/* evaluated argument values */
+	bool	   *pending_nulls;
+} SharedAggTransInfo;
+
+/*
+ * One entry of the shared hash table.  Immediately followed (MAXALIGNed) by
+ * an AggStatePerGroupData[numtrans] array and then by the group-key
+ * MinimalTuple bytes.  For by-ref transition types the pergroup transValue
+ * holds a dsa_pointer to the state blob, not a local pointer.
+ */
+typedef struct SharedAggEntry
+{
+	dsa_pointer next;			/* next entry in bucket chain */
+	uint32		hash;			/* group key hash, same IV in all workers */
+	uint32		tuplen;			/* length of key MinimalTuple */
+} SharedAggEntry;
+
+#define SharedAggEntryStates(entry) \
+	((AggStatePerGroup) ((char *) (entry) + MAXALIGN(sizeof(SharedAggEntry))))
+#define SharedAggEntryTuple(entry, numtrans) \
+	((MinimalTuple) ((char *) (entry) + MAXALIGN(sizeof(SharedAggEntry)) + \
+					 MAXALIGN((numtrans) * sizeof(AggStatePerGroupData))))
+
+/*
+ * Shared-memory coordination state, allocated in the fixed DSM segment
+ * (shm_toc) by the leader; the variable-size table itself lives in the
+ * per-query dsa_area.
+ */
+typedef struct SharedAggBuildState
+{
+	Barrier		build_barrier;	/* synchronizes build vs. emission */
+	Barrier		scan_barrier;	/* synchronizes spill-batch cycles */
+	int			nparticipants;	/* leader + planned workers */
+	uint64		nbuckets;		/* size of shared bucket array (power of 2) */
+	dsa_pointer buckets;		/* -> dsa_pointer[nbuckets], zero-initialized */
+	pg_atomic_uint64 nentries;	/* number of groups created */
+	pg_atomic_uint64 scan_cursor;	/* next bucket to claim for emission */
+
+	/* spill support */
+	uint64		mem_limit;		/* combined budget for the shared table */
+	pg_atomic_uint64 mem_used;	/* DSA bytes allocated for the table */
+	pg_atomic_uint32 spill_mode;	/* nonzero: stop creating new groups */
+	pg_atomic_uint64 nspilled;	/* total tuples written to spill files */
+	pg_atomic_uint64 npart_spilled[SHARED_AGG_SPILL_PARTITIONS];	/* per partition */
+
+	/*
+	 * cur_batch: 0 = in-memory phase, 1..NPARTITIONS = spill batches,
+	 * PHA_BATCHES_DONE = all done.  Advanced under batch_lock by whichever
+	 * participant gets there first after the emit-done barrier wait.  Do
+	 * NOT derive that responsibility from BarrierArriveAndWait()'s return
+	 * value: a detaching participant (the leader bowing out of batch
+	 * processing) advances the barrier phase without any waiter being told
+	 * it arrived last, so a barrier-return "election" can be lost entirely,
+	 * leaving cur_batch stuck.
+	 */
+	uint32		cur_batch;
+	LWLock		batch_lock;		/* protects cur_batch transitions and the
+								 * entry chunk list */
+	dsa_pointer chunk_head;		/* list of entry chunks, for wholesale free */
+
+	SharedFileSet fileset;		/* backing files for spill partitions */
+
+	/*
+	 * Padded to a cache line each: adjacent unpadded LWLocks share lines,
+	 * so participants contending on DIFFERENT stripes would still bounce
+	 * the same cache line between cores (false sharing).
+	 */
+	LWLockPadded stripe_locks[SHARED_AGG_NUM_STRIPES];
+
+	/*
+	 * Followed in the same shm_toc chunk by SHARED_AGG_SPILL_PARTITIONS
+	 * SharedTuplestores, each of size sts_estimate(nparticipants).
+	 */
+} SharedAggBuildState;
+
+/*
+ * A group's key hashes to exactly one bucket, and a bucket maps to exactly
+ * one stripe: this is the entire duplicate-prevention argument.  Two
+ * participants inserting the same new group necessarily contend on the same
+ * stripe lock, so the second finds the first's entry.
+ */
+#define SharedAggStripeLock(shstate, bucketno) \
+	(&(shstate)->stripe_locks[(bucketno) % SHARED_AGG_NUM_STRIPES].lock)
+
+/*
+ * Entries are carved out of per-participant chunks rather than allocated
+ * individually: dsa_allocate takes area-global locks, and per-entry
+ * allocation was measured as a contention point (the same reason Parallel
+ * Hash Join uses HASH_CHUNK-based allocation).  A participant owns its
+ * current chunk exclusively, so carving needs no locks; each new chunk is
+ * pushed onto a shared list (under batch_lock, once per chunk) so that a
+ * batch reset can free entry memory wholesale instead of per entry.
+ * dsa_pointer arithmetic within one allocation is valid — nodeHash.c's
+ * "chunk_shared + offset" pattern is the precedent.
+ */
+#define SHARED_AGG_CHUNK_SIZE	(32 * 1024)
+
+typedef struct SharedAggChunk
+{
+	dsa_pointer next;			/* next chunk in shared list */
+} SharedAggChunk;
+
+#define SharedAggChunkHeaderSize	MAXALIGN(sizeof(SharedAggChunk))
+
+#define SharedAggPartitionSts(shstate, i) \
+	((SharedTuplestore *) ((char *) (shstate) + \
+						   MAXALIGN(sizeof(SharedAggBuildState)) + \
+						   (i) * MAXALIGN(sts_estimate((shstate)->nparticipants))))
+
 static void select_current_set(AggState *aggstate, int setno, bool is_hash);
 static void initialize_phase(AggState *aggstate, int newphase);
 static TupleTableSlot *fetch_input_tuple(AggState *aggstate);
@@ -440,6 +674,25 @@ static Size hashagg_spill_tuple(AggState *aggstate, HashAggSpill *spill,
 								TupleTableSlot *inputslot, uint32 hash);
 static void hashagg_spill_finish(AggState *aggstate, HashAggSpill *spill,
 								 int setno);
+static void shared_agg_init_support(AggState *aggstate);
+static void shared_agg_prepare_inputs(AggState *aggstate, bool from_spill);
+static dsa_pointer shared_agg_store_varlena(AggState *aggstate, dsa_area *area,
+											struct varlena *val);
+static dsa_pointer shared_agg_store_datum(AggState *aggstate, dsa_area *area,
+										  AggStatePerTrans pertrans, Datum value);
+static void shared_agg_advance_byref(AggState *aggstate, dsa_area *area,
+									 AggStatePerTrans pertrans,
+									 SharedAggTransInfo *info,
+									 AggStatePerGroup pergroupstate);
+static void shared_agg_apply(AggState *aggstate, dsa_area *area,
+							 AggStatePerGroup states);
+static void shared_agg_insert(AggState *aggstate, dsa_area *area,
+							  TupleTableSlot *hashslot, uint32 hash,
+							  bool allow_spill);
+static void shared_agg_reset_table(AggState *aggstate, dsa_area *area);
+static void shared_agg_refill(AggState *aggstate, dsa_area *area, int batchno);
+static void agg_fill_shared_hash_table(AggState *aggstate);
+static TupleTableSlot *agg_retrieve_shared_hash_table(AggState *aggstate);
 static Datum GetAggInitVal(Datum textInitVal, Oid transtype);
 static void build_pertrans_for_aggref(AggStatePerTrans pertrans,
 									  AggState *aggstate, EState *estate,
@@ -2257,6 +2510,13 @@ ExecAgg(PlanState *pstate)
 		switch (node->phase->aggstrategy)
 		{
 			case AGG_HASHED:
+				if (node->shared_mode)
+				{
+					if (!node->table_filled)
+						agg_fill_shared_hash_table(node);
+					result = agg_retrieve_shared_hash_table(node);
+					break;
+				}
 				if (!node->table_filled)
 					agg_fill_hash_table(node);
 				pg_fallthrough;
@@ -2974,6 +3234,1158 @@ agg_retrieve_hash_table_in_memory(AggState *aggstate)
 
 	/* No more groups */
 	return NULL;
+}
+
+/*
+ * Set up executor-local support for parallel shared hash aggregation:
+ * a deterministic hash expression (zero IV, so every participant computes
+ * identical hashes), a group-key equality expression comparing the condensed
+ * input key against a stored MinimalTuple, a slot to read stored keys, a
+ * private ExprContext so hash/equality evaluation cannot clobber the slots
+ * the transition arguments read from tmpcontext, and per-transition advance
+ * support (the shared path does not use the compiled evaltrans program).
+ */
+static void
+shared_agg_init_support(AggState *aggstate)
+{
+	AggStatePerHash perhash = &aggstate->perhash[0];
+	EState	   *estate = aggstate->ss.ps.state;
+	TupleDesc	keyDesc = perhash->hashslot->tts_tupleDescriptor;
+	int			transno;
+
+	/* planner only generates this for plain GROUP BY */
+	Assert(aggstate->num_hashes == 1);
+
+	aggstate->shared_keyslot =
+		ExecInitExtraTupleSlot(estate, CreateTupleDescCopy(keyDesc),
+							   &TTSOpsMinimalTuple);
+	aggstate->shared_exprcontext = CreateExprContext(estate);
+
+	aggstate->shared_hashexpr =
+		ExecBuildHash32FromAttrs(keyDesc,
+								 perhash->hashslot->tts_ops,
+								 perhash->hashfunctions,
+								 perhash->aggnode->grpCollations,
+								 perhash->numCols,
+								 perhash->hashGrpColIdxHash,
+								 &aggstate->ss.ps,
+								 0);
+
+	/* INNER = condensed input key (hashslot), OUTER = stored key tuple */
+	aggstate->shared_eqexpr =
+		ExecBuildGroupingEqual(keyDesc, keyDesc,
+							   perhash->hashslot->tts_ops,
+							   &TTSOpsMinimalTuple,
+							   perhash->numCols,
+							   perhash->hashGrpColIdxHash,
+							   perhash->eqfuncoids,
+							   perhash->aggnode->grpCollations,
+							   &aggstate->ss.ps);
+
+	aggstate->shared_scan_entry = InvalidDsaPointer;
+
+	/*
+	 * Classify every transition and build its argument/filter expressions.
+	 * The planner has already vetted eligibility; anything neither by-value
+	 * nor whitelisted here is a planner/executor disagreement.
+	 */
+	aggstate->shared_transinfo =
+		palloc0(aggstate->numtrans * sizeof(SharedAggTransInfo));
+	aggstate->shared_scratch_pergroup =
+		palloc0(aggstate->numtrans * sizeof(AggStatePerGroupData));
+
+	for (transno = 0; transno < aggstate->numtrans; transno++)
+	{
+		AggStatePerTrans pertrans = &aggstate->pertrans[transno];
+		Aggref	   *aggref = pertrans->aggref;
+		SharedAggTransInfo *info = &aggstate->shared_transinfo[transno];
+		const TupleTableSlotOps *save_outerops;
+		bool		save_outeropsfixed;
+		ListCell   *arg;
+		int			i;
+
+		/*
+		 * Cross-check the planner's eligibility decision.  Note that
+		 * testing transtypeByVal alone would NOT suffice: the 'internal'
+		 * pseudo-type is itself pass-by-value (a pointer-sized Datum),
+		 * while the pointed-to struct is process-local and must never be
+		 * stored in the shared table.
+		 */
+		if (pertrans->aggtranstype == INTERNALOID)
+			elog(ERROR, "aggregate %u is not supported by shared hash aggregation",
+				 aggref->aggfnoid);
+
+		info->blob_stored = !pertrans->transtypeByVal;
+
+		info->numargs = list_length(aggref->args);
+		info->argstates = palloc0(info->numargs * sizeof(ExprState *));
+		info->argstates_spill = palloc0(info->numargs * sizeof(ExprState *));
+		info->pending_args = palloc0(info->numargs * sizeof(Datum));
+		info->pending_nulls = palloc0(info->numargs * sizeof(bool));
+		i = 0;
+		foreach(arg, aggref->args)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(arg);
+
+			info->argstates[i++] = ExecInitExpr(tle->expr, &aggstate->ss.ps);
+		}
+
+		if (aggref->aggfilter)
+			info->filterstate = ExecInitExpr(aggref->aggfilter,
+											 &aggstate->ss.ps);
+
+		/*
+		 * Build second variants compiled for minimal-tuple outer slots, for
+		 * reading spilled batches — the same trick as
+		 * hashagg_recompile_expressions().
+		 */
+		save_outerops = aggstate->ss.ps.outerops;
+		save_outeropsfixed = aggstate->ss.ps.outeropsfixed;
+		aggstate->ss.ps.outerops = &TTSOpsMinimalTuple;
+		aggstate->ss.ps.outeropsfixed = true;
+
+		i = 0;
+		foreach(arg, aggref->args)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(arg);
+
+			info->argstates_spill[i++] = ExecInitExpr(tle->expr,
+													  &aggstate->ss.ps);
+		}
+		if (aggref->aggfilter)
+			info->filterstate_spill = ExecInitExpr(aggref->aggfilter,
+												   &aggstate->ss.ps);
+
+		aggstate->ss.ps.outerops = save_outerops;
+		aggstate->ss.ps.outeropsfixed = save_outeropsfixed;
+	}
+}
+
+/*
+ * Evaluate FILTER clauses, transition arguments, and (for the numeric fast
+ * path) the rescaling of the input into each transition's pending staging
+ * area.  This runs with NO lock held: everything here is a pure function of
+ * the input tuple (tmpcontext->ecxt_outertuple), and can involve arbitrary
+ * expression evaluation, detoasting and numeric arithmetic that must not
+ * serialize other participants.
+ *
+ * from_spill selects the expression variants compiled for minimal-tuple
+ * outer slots (spill batch reads).
+ */
+static void
+shared_agg_prepare_inputs(AggState *aggstate, bool from_spill)
+{
+	ExprContext *tmpcontext = aggstate->tmpcontext;
+	int			transno;
+
+	for (transno = 0; transno < aggstate->numtrans; transno++)
+	{
+		SharedAggTransInfo *info = &aggstate->shared_transinfo[transno];
+		ExprState **argstates = from_spill ? info->argstates_spill :
+			info->argstates;
+		ExprState  *filterstate = from_spill ? info->filterstate_spill :
+			info->filterstate;
+		int			i;
+
+		info->pending_skip = false;
+
+		if (filterstate)
+		{
+			Datum		res;
+			bool		resnull;
+
+			res = ExecEvalExprSwitchContext(filterstate, tmpcontext,
+											&resnull);
+			if (resnull || !DatumGetBool(res))
+			{
+				info->pending_skip = true;
+				continue;
+			}
+		}
+
+		for (i = 0; i < info->numargs; i++)
+			info->pending_args[i] =
+				ExecEvalExprSwitchContext(argstates[i], tmpcontext,
+										  &info->pending_nulls[i]);
+	}
+}
+
+/*
+ * Allocate space for one hash table entry, carving it from the
+ * participant's current chunk (allocating and publishing a fresh chunk
+ * when needed).  Oversized entries get a dedicated chunk.  Returns the
+ * local address and sets *entryp_out to the corresponding dsa_pointer.
+ */
+static SharedAggEntry *
+shared_agg_alloc_entry(AggState *aggstate, dsa_area *area, Size len,
+					   dsa_pointer *entryp_out)
+{
+	SharedAggBuildState *shstate = aggstate->shared_build;
+	dsa_pointer entryp;
+
+	Assert(len >= sizeof(SharedAggEntry));
+
+	len = MAXALIGN(len);
+
+	/*
+	 * Note: this runs with the caller's bucket stripe lock held, so a
+	 * chunk refill (dsa_allocate + a brief batch_lock acquisition, once
+	 * per ~32KB of entries) briefly extends that lock's hold time.
+	 * Releasing and re-acquiring around the refill would require
+	 * re-walking the bucket chain (the group might appear concurrently);
+	 * not worth it for an amortized-rare event.
+	 */
+
+	if (!DsaPointerIsValid((dsa_pointer) aggstate->shared_alloc_chunk) ||
+		aggstate->shared_alloc_used + len > aggstate->shared_alloc_size)
+	{
+		Size		chunksz;
+		dsa_pointer chunkp;
+		SharedAggChunk *chunk;
+
+		chunksz = Max((Size) SHARED_AGG_CHUNK_SIZE,
+					  SharedAggChunkHeaderSize + len);
+		chunkp = dsa_allocate(area, chunksz);
+		chunk = (SharedAggChunk *) dsa_get_address(area, chunkp);
+
+		/* publish for wholesale freeing at batch reset */
+		LWLockAcquire(&shstate->batch_lock, LW_EXCLUSIVE);
+		chunk->next = shstate->chunk_head;
+		shstate->chunk_head = chunkp;
+		LWLockRelease(&shstate->batch_lock);
+
+		pg_atomic_add_fetch_u64(&shstate->mem_used, chunksz);
+
+		aggstate->shared_alloc_chunk = chunkp;
+		aggstate->shared_alloc_used = SharedAggChunkHeaderSize;
+		aggstate->shared_alloc_size = chunksz;
+	}
+
+	entryp = (dsa_pointer) aggstate->shared_alloc_chunk +
+		aggstate->shared_alloc_used;
+	aggstate->shared_alloc_used += len;
+
+	*entryp_out = entryp;
+	return (SharedAggEntry *) dsa_get_address(area, entryp);
+}
+
+/*
+ * Store a plain varlena into the DSA area and return its dsa_pointer.
+ * Memory accounting only ever adds: blobs replaced during aggregation are
+ * freed but not subtracted, which can only make spilling kick in earlier —
+ * the safe direction.
+ */
+static dsa_pointer
+shared_agg_store_varlena(AggState *aggstate, dsa_area *area,
+						 struct varlena *val)
+{
+	SharedAggBuildState *shstate = aggstate->shared_build;
+	Size		sz = VARSIZE_ANY(val);
+	dsa_pointer sp;
+
+	sp = dsa_allocate(area, sz);
+	memcpy(dsa_get_address(area, sp), val, sz);
+	pg_atomic_add_fetch_u64(&shstate->mem_used, sz);
+	return sp;
+}
+
+/*
+ * Try to replace the state blob at *state_dp with the new (flat, local)
+ * representation IN PLACE.  Steady-state aggregation tends to produce
+ * same-sized states row after row (serialized numeric accumulators,
+ * fixed-scale sums, all fixed-length types), and overwriting in place
+ * avoids a dsa_allocate + dsa_free round trip per row — dsa_allocate takes
+ * area-global locks, so this matters under concurrency.  Returns true if
+ * the blob was overwritten; false if the caller must allocate anew.
+ */
+static bool
+shared_agg_overwrite_blob(dsa_area *area, dsa_pointer state_dp,
+						  const void *newdata, Size newsz)
+{
+	void	   *old = dsa_get_address(area, state_dp);
+
+	if (VARSIZE_ANY(old) != newsz)
+		return false;
+	memcpy(old, newdata, newsz);
+	return true;
+}
+
+/*
+ * Copy a transition value into the DSA area as a self-contained blob,
+ * detoasting varlenas and flattening expanded datums, and return its
+ * dsa_pointer.
+ */
+static dsa_pointer
+shared_agg_store_datum(AggState *aggstate, dsa_area *area,
+					   AggStatePerTrans pertrans, Datum value)
+{
+	SharedAggBuildState *shstate = aggstate->shared_build;
+	dsa_pointer sp;
+	Size		sz;
+
+	if (pertrans->transtypeLen > 0)
+	{
+		/* fixed-length by-reference type (e.g. interval) */
+		sz = (Size) pertrans->transtypeLen;
+		sp = dsa_allocate(area, sz);
+		memcpy(dsa_get_address(area, sp), DatumGetPointer(value), sz);
+	}
+	else if (pertrans->transtypeLen == -2)
+	{
+		/* cstring */
+		sz = strlen(DatumGetCString(value)) + 1;
+		sp = dsa_allocate(area, sz);
+		memcpy(dsa_get_address(area, sp), DatumGetPointer(value), sz);
+	}
+	else if (VARATT_IS_EXTERNAL_EXPANDED(DatumGetPointer(value)))
+	{
+		/* expanded datum: flatten directly into the shared blob */
+		ExpandedObjectHeader *eoh = DatumGetEOHP(value);
+
+		sz = EOH_get_flat_size(eoh);
+		sp = dsa_allocate(area, sz);
+		EOH_flatten_into(eoh, dsa_get_address(area, sp), sz);
+	}
+	else
+	{
+		/* varlena: detoast (into per-tuple memory) and copy flat bytes */
+		return shared_agg_store_varlena(aggstate, area,
+										pg_detoast_datum((struct varlena *) DatumGetPointer(value)));
+	}
+
+	pg_atomic_add_fetch_u64(&shstate->mem_used, sz);
+	return sp;
+}
+
+/*
+ * Advance one by-ref transition state stored in the DSA area.  Caller holds
+ * the stripe LWLock and has staged the argument values.
+ *
+ * This mirrors advance_transition_function(), with the copy semantics
+ * replaced: the state Datum in the shared slot is a dsa_pointer, mapped to
+ * a local address around the call; a new result is copied into DSA and the
+ * old blob freed.  A transition function that returns its own input
+ * unchanged (min/max) or scribbles on it in place (custom bytea states,
+ * sanctioned via AggCheckCallContext) touches the shared blob directly and
+ * requires no copy.
+ *
+ * Note: transition functions that allocate their result in the aggcontext
+ * (as AggCheckCallContext invites) leak that local copy until end of query
+ * in shared mode, since we immediately copy it into DSA; the aggcontext is
+ * not reset between groups here.  Bounded by input size per row, but worth
+ * remembering when profiling memory.
+ */
+static void
+shared_agg_advance_byref(AggState *aggstate, dsa_area *area,
+						 AggStatePerTrans pertrans,
+						 SharedAggTransInfo *info,
+						 AggStatePerGroup pergroupstate)
+{
+	FunctionCallInfo fcinfo = pertrans->transfn_fcinfo;
+	MemoryContext oldContext;
+	Datum		newVal;
+	void	   *oldstate = NULL;
+	int			i;
+
+	for (i = 0; i < info->numargs; i++)
+	{
+		fcinfo->args[i + 1].value = info->pending_args[i];
+		fcinfo->args[i + 1].isnull = info->pending_nulls[i];
+	}
+
+	if (pertrans->transfn.fn_strict)
+	{
+		for (i = 1; i <= pertrans->numTransInputs; i++)
+		{
+			if (fcinfo->args[i].isnull)
+				return;
+		}
+		if (pergroupstate->noTransValue)
+		{
+			/*
+			 * First non-NULL input becomes the state (the agg's input type
+			 * is binary-compatible with its transtype, as for the regular
+			 * path).
+			 */
+			pergroupstate->transValue =
+				(Datum) shared_agg_store_datum(aggstate, area, pertrans,
+											   fcinfo->args[1].value);
+			pergroupstate->transValueIsNull = false;
+			pergroupstate->noTransValue = false;
+			return;
+		}
+		if (pergroupstate->transValueIsNull)
+			return;
+	}
+
+	oldContext = MemoryContextSwitchTo(aggstate->tmpcontext->ecxt_per_tuple_memory);
+
+	/* set up aggstate->curpertrans for AggGetAggref() */
+	aggstate->curpertrans = pertrans;
+
+	if (!pergroupstate->transValueIsNull)
+	{
+		oldstate = dsa_get_address(area, (dsa_pointer) pergroupstate->transValue);
+		fcinfo->args[0].value = PointerGetDatum(oldstate);
+		fcinfo->args[0].isnull = false;
+	}
+	else
+	{
+		fcinfo->args[0].value = (Datum) 0;
+		fcinfo->args[0].isnull = true;
+	}
+	fcinfo->isnull = false;
+
+	newVal = FunctionCallInvoke(fcinfo);
+
+	aggstate->curpertrans = NULL;
+
+	if (fcinfo->isnull)
+	{
+		if (!pergroupstate->transValueIsNull)
+			dsa_free(area, (dsa_pointer) pergroupstate->transValue);
+		pergroupstate->transValue = (Datum) 0;
+		pergroupstate->transValueIsNull = true;
+	}
+	else if (DatumGetPointer(newVal) != oldstate)
+	{
+		/*
+		 * Prefer overwriting the existing blob in place: fixed-length
+		 * states are always the same size, and varlena states usually
+		 * stabilize (fixed-scale sums, extrema of similar length),
+		 * avoiding per-row dsa_allocate/dsa_free traffic.
+		 */
+		if (!pergroupstate->transValueIsNull && pertrans->transtypeLen > 0)
+		{
+			memcpy(dsa_get_address(area, (dsa_pointer) pergroupstate->transValue),
+				   DatumGetPointer(newVal), (Size) pertrans->transtypeLen);
+		}
+		else
+		{
+			struct varlena *flat = NULL;
+
+			if (!pergroupstate->transValueIsNull &&
+				pertrans->transtypeLen == -1 &&
+				!VARATT_IS_EXTERNAL_EXPANDED(DatumGetPointer(newVal)))
+				flat = pg_detoast_datum((struct varlena *) DatumGetPointer(newVal));
+
+			if (flat != NULL &&
+				shared_agg_overwrite_blob(area,
+										  (dsa_pointer) pergroupstate->transValue,
+										  flat, VARSIZE_ANY(flat)))
+			{
+				/* overwritten in place */
+			}
+			else
+			{
+				dsa_pointer newsp;
+
+				newsp = shared_agg_store_datum(aggstate, area, pertrans,
+											   newVal);
+				if (!pergroupstate->transValueIsNull)
+					dsa_free(area, (dsa_pointer) pergroupstate->transValue);
+				pergroupstate->transValue = (Datum) newsp;
+				pergroupstate->transValueIsNull = false;
+			}
+		}
+	}
+	/* else: state was modified (or kept) in place in shared memory */
+
+	MemoryContextSwitchTo(oldContext);
+}
+
+/*
+ * Apply the staged inputs to one shared entry's transition states.  Caller
+ * holds the entry's stripe LWLock; keep this minimal — no expression
+ * evaluation and no detoasting of inputs (both happened pre-lock), though
+ * by-ref transition functions do run here by design.
+ */
+static void
+shared_agg_apply(AggState *aggstate, dsa_area *area, AggStatePerGroup states)
+{
+	int			transno;
+
+	for (transno = 0; transno < aggstate->numtrans; transno++)
+	{
+		AggStatePerTrans pertrans = &aggstate->pertrans[transno];
+		SharedAggTransInfo *info = &aggstate->shared_transinfo[transno];
+		AggStatePerGroup pergroupstate = &states[transno];
+
+		if (info->pending_skip)
+			continue;
+
+		if (pertrans->transtypeByVal)
+		{
+			FunctionCallInfo fcinfo = pertrans->transfn_fcinfo;
+			int			i;
+
+			for (i = 0; i < info->numargs; i++)
+			{
+				fcinfo->args[i + 1].value = info->pending_args[i];
+				fcinfo->args[i + 1].isnull = info->pending_nulls[i];
+			}
+			advance_transition_function(aggstate, pertrans, pergroupstate);
+		}
+		else
+			shared_agg_advance_byref(aggstate, area, pertrans, info,
+									 pergroupstate);
+	}
+}
+
+/*
+ * Find-or-create the group for the key currently in hashslot, and apply the
+ * staged transition inputs to it.  If the group is absent, memory is over
+ * budget, and allow_spill is true, the full input tuple is written to the
+ * appropriate spill partition instead.
+ *
+ * Caller must already have run shared_agg_prepare_inputs().
+ */
+static void
+shared_agg_insert(AggState *aggstate, dsa_area *area,
+				  TupleTableSlot *hashslot, uint32 hash, bool allow_spill)
+{
+	SharedAggBuildState *shstate = aggstate->shared_build;
+	ExprContext *tmpcontext = aggstate->tmpcontext;
+	ExprContext *hashcxt = aggstate->shared_exprcontext;
+	TupleTableSlot *keyslot = aggstate->shared_keyslot;
+	dsa_pointer *buckets = (dsa_pointer *)
+		dsa_get_address(area, shstate->buckets);
+	uint64		mask = shstate->nbuckets - 1;
+	uint64		bucketno = hash & mask;
+	LWLock	   *lock = SharedAggStripeLock(shstate, bucketno);
+	dsa_pointer entryp;
+	SharedAggEntry *entry = NULL;
+
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+
+	/* walk the chain looking for our group */
+	entryp = buckets[bucketno];
+	while (DsaPointerIsValid(entryp))
+	{
+		SharedAggEntry *cand = (SharedAggEntry *)
+			dsa_get_address(area, entryp);
+
+		if (cand->hash == hash)
+		{
+			ExecStoreMinimalTuple(SharedAggEntryTuple(cand, aggstate->numtrans),
+								  keyslot, false);
+			hashcxt->ecxt_innertuple = hashslot;
+			hashcxt->ecxt_outertuple = keyslot;
+			if (ExecQualAndReset(aggstate->shared_eqexpr, hashcxt))
+			{
+				entry = cand;
+				break;
+			}
+		}
+		entryp = cand->next;
+	}
+
+	if (entry == NULL)
+	{
+		MinimalTuple mt;
+		Size		alloclen;
+		dsa_pointer newp;
+		SharedAggEntry *newentry;
+		AggStatePerGroup states;
+		MemoryContext oldcxt;
+		int			transno;
+		uint64		used;
+
+		/*
+		 * Over budget?  Route the whole input tuple to its spill partition
+		 * instead of growing the table.  Existing groups keep advancing in
+		 * place above, so memory use is stable in spill mode — the same
+		 * semantics as the private hashagg's hash_spill_mode.
+		 */
+		if (allow_spill &&
+			pg_atomic_read_u32(&shstate->spill_mode) != 0)
+		{
+			uint32		partno = SharedAggSpillPartition(hash);
+
+			LWLockRelease(lock);
+
+			/*
+			 * Note that shared_agg_prepare_inputs() already ran for this
+			 * row and its work is discarded here, to be redone when the
+			 * batch is reloaded.  Preparing after the probe would avoid
+			 * that, but would put expression evaluation back under the
+			 * stripe lock; spilled rows are the rarer case, so we accept
+			 * the double evaluation.
+			 */
+			oldcxt = MemoryContextSwitchTo(tmpcontext->ecxt_per_tuple_memory);
+			mt = ExecCopySlotMinimalTuple(tmpcontext->ecxt_outertuple);
+			MemoryContextSwitchTo(oldcxt);
+
+			sts_puttuple(aggstate->shared_spill_acc[partno], &hash, mt);
+			pg_atomic_fetch_add_u64(&shstate->nspilled, 1);
+			pg_atomic_fetch_add_u64(&shstate->npart_spilled[partno], 1);
+			return;
+		}
+
+		oldcxt = MemoryContextSwitchTo(tmpcontext->ecxt_per_tuple_memory);
+		mt = ExecCopySlotMinimalTuple(hashslot);
+		MemoryContextSwitchTo(oldcxt);
+
+		alloclen = MAXALIGN(sizeof(SharedAggEntry)) +
+			MAXALIGN(aggstate->numtrans * sizeof(AggStatePerGroupData)) +
+			mt->t_len;
+		newentry = shared_agg_alloc_entry(aggstate, area, alloclen, &newp);
+		newentry->hash = hash;
+		newentry->tuplen = mt->t_len;
+		memcpy(SharedAggEntryTuple(newentry, aggstate->numtrans),
+			   mt, mt->t_len);
+
+		states = SharedAggEntryStates(newentry);
+		memset(states, 0,
+			   aggstate->numtrans * sizeof(AggStatePerGroupData));
+		for (transno = 0; transno < aggstate->numtrans; transno++)
+		{
+			AggStatePerTrans pertrans = &aggstate->pertrans[transno];
+			AggStatePerGroup pergroupstate = &states[transno];
+
+			if (pertrans->transtypeByVal || pertrans->initValueIsNull)
+				initialize_aggregate(aggstate, pertrans, pergroupstate);
+			else
+			{
+				/* non-NULL by-ref initcond: copy the blob into DSA */
+				pergroupstate->transValue =
+					(Datum) shared_agg_store_datum(aggstate, area, pertrans,
+												   pertrans->initValue);
+				pergroupstate->transValueIsNull = false;
+				pergroupstate->noTransValue = false;
+			}
+		}
+
+		/* link at chain head; all mutators hold the stripe lock */
+		newentry->next = buckets[bucketno];
+		buckets[bucketno] = newp;
+		pg_atomic_fetch_add_u64(&shstate->nentries, 1);
+
+		/*
+		 * Entry memory is accounted at chunk granularity inside
+		 * shared_agg_alloc_entry(); here just check the budget and flip
+		 * into spill mode when exceeded.
+		 */
+		used = pg_atomic_read_u64(&shstate->mem_used);
+		if (allow_spill && used > shstate->mem_limit)
+			pg_atomic_write_u32(&shstate->spill_mode, 1);
+
+		entry = newentry;
+	}
+
+	/*
+	 * Apply the staged inputs, still under the stripe lock.  This is why
+	 * only LWLocks are acceptable here: a transition function can
+	 * ereport(ERROR), and LWLocks are released by transaction abort,
+	 * whereas a spinlock would stay wedged.
+	 */
+	shared_agg_apply(aggstate, area, SharedAggEntryStates(entry));
+
+	LWLockRelease(lock);
+}
+
+/*
+ * Free the table's contents and zero the bucket array, preparing the
+ * shared table for the next spill batch.  Runs in the one participant
+ * that claimed the batch transition; nobody else touches the table
+ * concurrently (they are waiting at the scan barrier).
+ *
+ * Entry memory is freed wholesale by walking the chunk list.  A per-entry
+ * bucket-chain walk is needed only when some transition keeps its state
+ * in a separately allocated blob.
+ */
+static void
+shared_agg_reset_table(AggState *aggstate, dsa_area *area)
+{
+	SharedAggBuildState *shstate = aggstate->shared_build;
+	dsa_pointer *buckets = (dsa_pointer *)
+		dsa_get_address(area, shstate->buckets);
+	dsa_pointer chunkp;
+	bool		have_blobs = false;
+	int			transno;
+	uint64		i;
+
+	for (transno = 0; transno < aggstate->numtrans; transno++)
+		have_blobs |= aggstate->shared_transinfo[transno].blob_stored;
+
+	if (have_blobs)
+	{
+		for (i = 0; i < shstate->nbuckets; i++)
+		{
+			dsa_pointer entryp = buckets[i];
+
+			while (DsaPointerIsValid(entryp))
+			{
+				SharedAggEntry *entry = (SharedAggEntry *)
+					dsa_get_address(area, entryp);
+				AggStatePerGroup states = SharedAggEntryStates(entry);
+
+				for (transno = 0; transno < aggstate->numtrans; transno++)
+				{
+					if (aggstate->shared_transinfo[transno].blob_stored &&
+						!states[transno].transValueIsNull)
+						dsa_free(area,
+								 (dsa_pointer) states[transno].transValue);
+				}
+				entryp = entry->next;
+			}
+		}
+	}
+
+	/* free all entry chunks wholesale */
+	chunkp = shstate->chunk_head;
+	while (DsaPointerIsValid(chunkp))
+	{
+		SharedAggChunk *chunk = (SharedAggChunk *)
+			dsa_get_address(area, chunkp);
+		dsa_pointer next = chunk->next;
+
+		dsa_free(area, chunkp);
+		chunkp = next;
+	}
+	shstate->chunk_head = InvalidDsaPointer;
+
+	memset(buckets, 0, shstate->nbuckets * sizeof(dsa_pointer));
+
+	pg_atomic_write_u64(&shstate->nentries, 0);
+	pg_atomic_write_u64(&shstate->scan_cursor, 0);
+	pg_atomic_write_u64(&shstate->mem_used,
+						shstate->nbuckets * sizeof(dsa_pointer));
+}
+
+/*
+ * Re-aggregate one spill partition into the (empty) shared table.  All
+ * remaining participants call this concurrently; sts_parallel_scan_next
+ * hands out disjoint tuples.
+ *
+ * Note: batches do not re-spill.  If a single partition's groups exceed the
+ * budget, the table simply grows past it (single-level partitioning, no
+ * recursion) — documented prototype limitation.
+ */
+static void
+shared_agg_refill(AggState *aggstate, dsa_area *area, int batchno)
+{
+	SharedTuplestoreAccessor *acc = aggstate->shared_spill_acc[batchno];
+	AggStatePerHash perhash = &aggstate->perhash[0];
+	ExprContext *tmpcontext = aggstate->tmpcontext;
+	TupleTableSlot *spillslot = aggstate->hash_spill_rslot;
+	TupleTableSlot *hashslot = perhash->hashslot;
+
+	/* curaggcontext must point at the hash context, as during the build */
+	select_current_set(aggstate, 0, true);
+
+	sts_begin_parallel_scan(acc);
+	for (;;)
+	{
+		MinimalTuple mt;
+		uint32		hash;
+
+		CHECK_FOR_INTERRUPTS();
+
+		mt = sts_parallel_scan_next(acc, &hash);
+		if (mt == NULL)
+			break;
+
+		ExecStoreMinimalTuple(mt, spillslot, false);
+		tmpcontext->ecxt_outertuple = spillslot;
+
+		prepare_hash_slot(perhash, spillslot, hashslot);
+		shared_agg_prepare_inputs(aggstate, true);
+		shared_agg_insert(aggstate, area, hashslot, hash, false);
+
+		ResetExprContext(aggstate->shared_exprcontext);
+		ResetExprContext(tmpcontext);
+	}
+	sts_end_parallel_scan(acc);
+}
+
+/*
+ * Cooperatively build the shared hash table.
+ *
+ * Every participant attaches to the build barrier, one of them is elected to
+ * allocate the bucket array, then all of them consume their share of the
+ * (parallel-aware) outer plan, doing find-or-create-then-advance on shared
+ * entries under per-stripe LWLocks.  Nobody proceeds to emission until every
+ * attached participant has exhausted its input, so the table is complete and
+ * immutable once this function returns.
+ */
+static void
+agg_fill_shared_hash_table(AggState *aggstate)
+{
+	SharedAggBuildState *shstate = aggstate->shared_build;
+	dsa_area   *area = aggstate->ss.ps.state->es_query_dsa;
+	Barrier    *build_barrier;
+	int			phase;
+	AggStatePerHash perhash = &aggstate->perhash[0];
+	ExprContext *tmpcontext = aggstate->tmpcontext;
+	ExprContext *hashcxt;
+
+	if (shstate == NULL || area == NULL)
+		elog(ERROR, "parallel shared hash aggregation is not initialized");
+
+	hashcxt = aggstate->shared_exprcontext;
+	build_barrier = &shstate->build_barrier;
+	phase = BarrierAttach(build_barrier);
+	aggstate->shared_attached = true;
+
+	/*
+	 * Elect one participant to size and allocate the bucket array.  The
+	 * table is sized once from the planner's group estimate; in this
+	 * prototype it never grows, so an underestimate merely lengthens
+	 * chains.  We reuse two Parallel Hash Join wait events for the
+	 * allocation handshake rather than defining near-duplicates.
+	 *
+	 * This barrier-return election is safe only because NOTHING detaches
+	 * from the build barrier before the run phase completes (late
+	 * attachers bail out below without ever arriving).  A detach-driven
+	 * phase advance releases waiters with no one told they arrived last,
+	 * losing the election — see the batch_lock protocol in
+	 * agg_retrieve_shared_hash_table() for the detach-tolerant pattern.
+	 */
+	if (phase == PHA_BUILD_ELECT)
+	{
+		if (BarrierArriveAndWait(build_barrier, WAIT_EVENT_HASH_BUILD_ELECT))
+		{
+			uint64		nbuckets;
+			double		dgroups = perhash->aggnode->numGroups;
+
+			nbuckets = pg_nextpower2_64((uint64) Max(dgroups / 0.75, 1024));
+			nbuckets = Min(nbuckets, SHARED_AGG_MAX_BUCKETS);
+			shstate->nbuckets = nbuckets;
+			shstate->buckets =
+				dsa_allocate_extended(area,
+									  nbuckets * sizeof(dsa_pointer),
+									  DSA_ALLOC_ZERO | DSA_ALLOC_HUGE);
+			pg_atomic_add_fetch_u64(&shstate->mem_used,
+									nbuckets * sizeof(dsa_pointer));
+		}
+		BarrierArriveAndWait(build_barrier, WAIT_EVENT_HASH_BUILD_ALLOCATE);
+		phase = PHA_BUILD_RUN;
+	}
+	else if (phase == PHA_BUILD_ALLOCATE)
+	{
+		BarrierArriveAndWait(build_barrier, WAIT_EVENT_HASH_BUILD_ALLOCATE);
+		phase = PHA_BUILD_RUN;
+	}
+
+	if (phase == PHA_BUILD_RUN)
+	{
+		TupleTableSlot *hashslot = perhash->hashslot;
+
+		select_current_set(aggstate, 0, true);
+
+		for (;;)
+		{
+			TupleTableSlot *outerslot;
+			uint32		hash;
+			bool		isnull;
+
+			outerslot = fetch_input_tuple(aggstate);
+			if (TupIsNull(outerslot))
+				break;
+			tmpcontext->ecxt_outertuple = outerslot;
+
+			/* condense the grouping columns into hashslot */
+			prepare_hash_slot(perhash, outerslot, hashslot);
+
+			/* deterministic hash of the condensed key */
+			hashcxt->ecxt_innertuple = hashslot;
+			hash = DatumGetUInt32(ExecEvalExprSwitchContext(aggstate->shared_hashexpr,
+															hashcxt,
+															&isnull));
+
+			/*
+			 * Evaluate filters, arguments and fast-path rescaling BEFORE
+			 * taking any lock, then do the locked find-or-create-and-apply
+			 * (or spill).
+			 */
+			shared_agg_prepare_inputs(aggstate, false);
+			shared_agg_insert(aggstate, area, hashslot, hash, true);
+
+			ResetExprContext(hashcxt);
+			ResetExprContext(tmpcontext);
+		}
+
+		/*
+		 * Flush our spill writes (harmless if we never wrote), and attach
+		 * to the scan barrier while every feeding participant is still
+		 * co-present.  This ordering is load-bearing: scan-barrier
+		 * membership is thereby fixed for all feeders before any emission
+		 * begins and can only shrink afterwards (leader bow-out, batch
+		 * completion), never grow — the batch-cycle waits rely on that.
+		 */
+		{
+			int			partno;
+
+			for (partno = 0; partno < SHARED_AGG_SPILL_PARTITIONS; partno++)
+				sts_end_write(aggstate->shared_spill_acc[partno]);
+		}
+		BarrierAttach(&shstate->scan_barrier);
+		aggstate->shared_scan_attached = true;
+
+		/* wait for all attached participants to finish feeding the table */
+		BarrierArriveAndWait(build_barrier, WAIT_EVENT_PARALLEL_HASH_AGG_BUILD);
+
+		BarrierDetach(build_barrier);
+		aggstate->shared_attached = false;
+
+		aggstate->table_filled = true;
+		aggstate->shared_scan_bucket = 0;
+		aggstate->shared_scan_chunk_end = 0;
+		aggstate->shared_scan_entry = InvalidDsaPointer;
+		return;
+	}
+
+	/*
+	 * Late attacher (phase >= PHA_BUILD_DONE): the build is already over
+	 * and other participants may be arbitrarily deep into emission or
+	 * batch cycles, whose barrier phases we cannot join coherently.
+	 * Contribute nothing; the other participants cover all groups.
+	 */
+	BarrierDetach(build_barrier);
+	aggstate->shared_attached = false;
+	aggstate->shared_scan_attached = false;
+
+	aggstate->table_filled = true;
+	aggstate->agg_done = true;
+}
+
+/*
+ * Cooperatively emit finalized groups from the completed shared hash table.
+ *
+ * Participants claim disjoint chunks of the bucket array via an atomic
+ * fetch-add cursor, so each group is finalized and emitted by exactly one
+ * participant and no leader-side merge exists at all.  The table is
+ * immutable by now, so no locks are taken.
+ */
+static TupleTableSlot *
+agg_retrieve_shared_hash_table(AggState *aggstate)
+{
+	ExprContext *econtext = aggstate->ss.ps.ps_ExprContext;
+	AggStatePerAgg peragg = aggstate->peragg;
+	TupleTableSlot *firstSlot = aggstate->ss.ss_ScanTupleSlot;
+	AggStatePerHash perhash = &aggstate->perhash[0];
+	SharedAggBuildState *shstate = aggstate->shared_build;
+	dsa_area   *area = aggstate->ss.ps.state->es_query_dsa;
+	dsa_pointer *buckets;
+
+	if (aggstate->agg_done)
+		return NULL;
+
+	buckets = (dsa_pointer *) dsa_get_address(area, shstate->buckets);
+
+	for (;;)
+	{
+		SharedAggEntry *entry;
+		AggStatePerGroup states;
+		TupleTableSlot *hashslot = perhash->hashslot;
+		TupleTableSlot *result;
+		AggStatePerGroup scratch = aggstate->shared_scratch_pergroup;
+		int			i;
+		int			transno;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/* advance: current chain, then next bucket, then claim a new chunk */
+		while (!DsaPointerIsValid(aggstate->shared_scan_entry))
+		{
+			if (aggstate->shared_scan_bucket >= aggstate->shared_scan_chunk_end)
+			{
+				uint64		claim;
+				uint32		mybatch;
+				uint32		newbatch;
+				bool		do_reset;
+
+				claim = pg_atomic_fetch_add_u64(&shstate->scan_cursor,
+												SHARED_AGG_SCAN_CHUNK);
+				if (claim >= shstate->nbuckets)
+				{
+					/*
+					 * Current table content exhausted.  If nothing was
+					 * spilled, we are done; detaching from the scan
+					 * barrier never blocks.  (All spill writes happened
+					 * before the build barrier, so nspilled is stable.)
+					 */
+					if (pg_atomic_read_u64(&shstate->nspilled) == 0 ||
+						!aggstate->shared_scan_attached)
+					{
+						if (aggstate->shared_scan_attached)
+						{
+							BarrierDetach(&shstate->scan_barrier);
+							aggstate->shared_scan_attached = false;
+						}
+						aggstate->agg_done = true;
+						return NULL;
+					}
+
+					/*
+					 * Spill batches remain.  The leader must not take part
+					 * in batch cycles when workers exist: workers emit
+					 * into tuple queues that only the leader drains, so a
+					 * leader blocked at this barrier while a worker is
+					 * blocked on a full queue would deadlock.  Bow out and
+					 * go back to draining queues; the workers process all
+					 * batches among themselves.  With no workers there are
+					 * no tuple queues, so the leader cycles alone safely.
+					 *
+					 * Note this can advance the barrier phase for waiting
+					 * workers without any of them "arriving last" — which
+					 * is exactly why batch advancement below is claimed
+					 * under batch_lock rather than derived from the
+					 * barrier's return value.
+					 */
+					if (!IsParallelWorker() &&
+						BarrierParticipants(&shstate->scan_barrier) > 1)
+					{
+						BarrierDetach(&shstate->scan_barrier);
+						aggstate->shared_scan_attached = false;
+						aggstate->agg_done = true;
+						return NULL;
+					}
+
+					/*
+					 * Snapshot the currently-loaded batch before waiting;
+					 * it cannot change during emission, and it is the
+					 * generation token for the advancement claim below.
+					 *
+					 * Also drop our current entry chunk: the claimant is
+					 * about to free all chunks wholesale, so any local
+					 * carve-out pointer would dangle.
+					 */
+					mybatch = shstate->cur_batch;
+					aggstate->shared_alloc_chunk = InvalidDsaPointer;
+					aggstate->shared_alloc_used = 0;
+					aggstate->shared_alloc_size = 0;
+
+					/* wait for everyone to finish emitting this table */
+					BarrierArriveAndWait(&shstate->scan_barrier,
+										 WAIT_EVENT_PARALLEL_HASH_AGG_EMIT);
+
+					/*
+					 * First through the lock finds cur_batch unchanged and
+					 * claims the advancement; everyone else sees the new
+					 * value and skips.  Empty partitions are skipped here
+					 * in one step, avoiding pointless reset/refill cycles.
+					 * The lock is held only for the decision — the O(n)
+					 * table reset happens outside it, while the others sit
+					 * in the interruptible barrier wait below.
+					 */
+					do_reset = false;
+					LWLockAcquire(&shstate->batch_lock, LW_EXCLUSIVE);
+					if (shstate->cur_batch == mybatch)
+					{
+						newbatch = mybatch + 1;
+						while (newbatch <= SHARED_AGG_SPILL_PARTITIONS &&
+							   pg_atomic_read_u64(&shstate->npart_spilled[newbatch - 1]) == 0)
+							newbatch++;
+
+						if (newbatch > SHARED_AGG_SPILL_PARTITIONS)
+							shstate->cur_batch = PHA_BATCHES_DONE;
+						else
+						{
+							shstate->cur_batch = newbatch;
+							do_reset = true;
+						}
+					}
+					LWLockRelease(&shstate->batch_lock);
+
+					if (do_reset)
+						shared_agg_reset_table(aggstate, area);
+
+					/*
+					 * Wait for the reset to complete.  cur_batch is stable
+					 * after this point: it was written before the claimant
+					 * arrived here, and the barrier orders that write
+					 * before our read.
+					 */
+					BarrierArriveAndWait(&shstate->scan_barrier,
+										 WAIT_EVENT_PARALLEL_HASH_AGG_BATCH);
+
+					newbatch = shstate->cur_batch;
+					if (newbatch == PHA_BATCHES_DONE)
+					{
+						BarrierDetach(&shstate->scan_barrier);
+						aggstate->shared_scan_attached = false;
+						aggstate->agg_done = true;
+						return NULL;
+					}
+
+					/* cooperatively re-aggregate the spill partition */
+					shared_agg_refill(aggstate, area, (int) (newbatch - 1));
+
+					/* wait until the batch is fully built everywhere */
+					BarrierArriveAndWait(&shstate->scan_barrier,
+										 WAIT_EVENT_PARALLEL_HASH_AGG_BATCH);
+
+					/* restart emission over the refilled table */
+					aggstate->shared_scan_bucket = 0;
+					aggstate->shared_scan_chunk_end = 0;
+					aggstate->shared_scan_entry = InvalidDsaPointer;
+					continue;
+				}
+				aggstate->shared_scan_bucket = claim;
+				aggstate->shared_scan_chunk_end =
+					Min(claim + SHARED_AGG_SCAN_CHUNK, shstate->nbuckets);
+			}
+			aggstate->shared_scan_entry =
+				buckets[aggstate->shared_scan_bucket++];
+		}
+
+		entry = (SharedAggEntry *)
+			dsa_get_address(area, aggstate->shared_scan_entry);
+		aggstate->shared_scan_entry = entry->next;
+
+		ResetExprContext(econtext);
+
+		/*
+		 * Transform the representative tuple back into one with the right
+		 * columns, exactly as agg_retrieve_hash_table_in_memory() does.
+		 */
+		ExecStoreMinimalTuple(SharedAggEntryTuple(entry, aggstate->numtrans),
+							  hashslot, false);
+		slot_getallattrs(hashslot);
+
+		ExecClearTuple(firstSlot);
+		memset(firstSlot->tts_isnull, true,
+			   firstSlot->tts_tupleDescriptor->natts * sizeof(bool));
+		for (i = 0; i < perhash->numhashGrpCols; i++)
+		{
+			int			varNumber = perhash->hashGrpColIdxInput[i] - 1;
+
+			firstSlot->tts_values[varNumber] = hashslot->tts_values[i];
+			firstSlot->tts_isnull[varNumber] = hashslot->tts_isnull[i];
+		}
+		ExecStoreVirtualTuple(firstSlot);
+
+		states = SharedAggEntryStates(entry);
+
+		/*
+		 * finalize_aggregates() wants a local AggStatePerGroupData array
+		 * with process-local pointers.  Copy the states into scratch,
+		 * translating by-ref dsa_pointers into mapped addresses; the
+		 * final functions treat the state as read-only, so handing them
+		 * the shared blob directly is safe.
+		 */
+		for (transno = 0; transno < aggstate->numtrans; transno++)
+		{
+			SharedAggTransInfo *info = &aggstate->shared_transinfo[transno];
+
+			scratch[transno] = states[transno];
+			if (info->blob_stored && !scratch[transno].transValueIsNull)
+				scratch[transno].transValue =
+					PointerGetDatum(dsa_get_address(area,
+													(dsa_pointer) states[transno].transValue));
+		}
+
+		econtext->ecxt_outertuple = firstSlot;
+		prepare_projection_slot(aggstate, econtext->ecxt_outertuple,
+								aggstate->current_set);
+		finalize_aggregates(aggstate, peragg, scratch);
+
+		result = project_aggregates(aggstate);
+		if (result)
+			return result;
+	}
 }
 
 /*
@@ -3714,8 +5126,17 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 							&aggstate->hash_planned_partitions);
 		find_hash_columns(aggstate);
 
+		/*
+		 * A parallel-aware hashed Agg cooperates on one hash table in shared
+		 * memory instead of building a private one.  Its executor-local
+		 * support is set up at the end of this function, once the pertrans
+		 * array has actually been filled in.
+		 */
+		aggstate->shared_mode = (node->plan.parallel_aware &&
+								 node->aggstrategy == AGG_HASHED);
+
 		/* Skip massive memory allocation if we are just doing EXPLAIN */
-		if (!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
+		if (!(eflags & EXEC_FLAG_EXPLAIN_ONLY) && !aggstate->shared_mode)
 			build_hash_tables(aggstate);
 
 		aggstate->table_filled = false;
@@ -3839,6 +5260,7 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 					elog(ERROR, "deserialfunc not provided for deserialization aggregation");
 				deserialfn_oid = aggform->aggdeserialfn;
 			}
+
 		}
 
 		/* Check that aggregate owner has permission to call component fns */
@@ -4113,6 +5535,15 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 		/* cache compiled expression for outer slot without NULL check */
 		phase->evaltrans_cache[0][0] = phase->evaltrans;
 	}
+
+	/*
+	 * Set up parallel shared hash aggregation support.  This must happen
+	 * here, after the loop above has populated every pertrans entry: the
+	 * per-transition classification reads pertrans->transtypeByVal and
+	 * pertrans->aggref, which are all zeroes/NULL until then.
+	 */
+	if (aggstate->shared_mode)
+		shared_agg_init_support(aggstate);
 
 	return aggstate;
 }
@@ -4470,6 +5901,29 @@ ExecReScanAgg(AggState *node)
 
 	node->agg_done = false;
 
+	/*
+	 * Parallel shared hash aggregation: reset local state; the shared
+	 * coordination state is reset separately by ExecAggReInitializeDSM
+	 * before workers are relaunched.  The old shared table is leaked in
+	 * the per-query DSA until end of query (v0 prototype limitation).
+	 */
+	if (node->shared_mode)
+	{
+		node->table_filled = false;
+		node->shared_attached = false;
+		node->shared_scan_attached = false;
+		node->shared_scan_bucket = 0;
+		node->shared_scan_chunk_end = 0;
+		node->shared_scan_entry = InvalidDsaPointer;
+		node->shared_alloc_chunk = InvalidDsaPointer;
+		node->shared_alloc_used = 0;
+		node->shared_alloc_size = 0;
+
+		if (outerPlan->chgParam == NULL)
+			ExecReScan(outerPlan);
+		return;
+	}
+
 	if (node->aggstrategy == AGG_HASHED)
 	{
 		/*
@@ -4782,6 +6236,18 @@ ExecAggEstimate(AggState *node, ParallelContext *pcxt)
 {
 	Size		size;
 
+	/* shared-build coordination state for Parallel Hash Aggregate */
+	if (node->shared_mode && pcxt->nworkers > 0)
+	{
+		Size		shsize;
+
+		shsize = add_size(MAXALIGN(sizeof(SharedAggBuildState)),
+						  mul_size(SHARED_AGG_SPILL_PARTITIONS,
+								   MAXALIGN(sts_estimate(pcxt->nworkers + 1))));
+		shm_toc_estimate_chunk(&pcxt->estimator, shsize);
+		shm_toc_estimate_keys(&pcxt->estimator, 1);
+	}
+
 	/* don't need this if not instrumenting or no workers */
 	if (!node->ss.ps.instrument || pcxt->nworkers == 0)
 		return;
@@ -4803,6 +6269,68 @@ ExecAggInitializeDSM(AggState *node, ParallelContext *pcxt)
 {
 	Size		size;
 
+	/* shared-build coordination state for Parallel Hash Aggregate */
+	if (node->shared_mode && pcxt->nworkers > 0)
+	{
+		SharedAggBuildState *shstate;
+		Size		shsize;
+		int			nparticipants = pcxt->nworkers + 1;
+		int			i;
+
+		shsize = add_size(MAXALIGN(sizeof(SharedAggBuildState)),
+						  mul_size(SHARED_AGG_SPILL_PARTITIONS,
+								   MAXALIGN(sts_estimate(nparticipants))));
+		shstate = (SharedAggBuildState *)
+			shm_toc_allocate(pcxt->toc, shsize);
+		BarrierInit(&shstate->build_barrier, 0);
+		BarrierInit(&shstate->scan_barrier, 0);
+		shstate->nparticipants = nparticipants;
+		shstate->nbuckets = 0;
+		shstate->buckets = InvalidDsaPointer;
+		pg_atomic_init_u64(&shstate->nentries, 0);
+		pg_atomic_init_u64(&shstate->scan_cursor, 0);
+		pg_atomic_init_u64(&shstate->mem_used, 0);
+		pg_atomic_init_u32(&shstate->spill_mode, 0);
+		pg_atomic_init_u64(&shstate->nspilled, 0);
+		for (i = 0; i < SHARED_AGG_SPILL_PARTITIONS; i++)
+			pg_atomic_init_u64(&shstate->npart_spilled[i], 0);
+		shstate->cur_batch = 0;
+		LWLockInitialize(&shstate->batch_lock, LWTRANCHE_PARALLEL_HASH_AGG);
+		shstate->chunk_head = InvalidDsaPointer;
+		shstate->mem_limit =
+			mul_size(get_hash_memory_limit(), nparticipants);
+		for (i = 0; i < SHARED_AGG_NUM_STRIPES; i++)
+			LWLockInitialize(&shstate->stripe_locks[i].lock,
+							 LWTRANCHE_PARALLEL_HASH_AGG);
+
+		/* set up the spill partitions' shared tuplestores */
+		SharedFileSetInit(&shstate->fileset, pcxt->seg);
+		node->shared_spill_acc =
+			palloc(SHARED_AGG_SPILL_PARTITIONS *
+				   sizeof(SharedTuplestoreAccessor *));
+		for (i = 0; i < SHARED_AGG_SPILL_PARTITIONS; i++)
+		{
+			char		name[MAXPGPATH];
+
+			snprintf(name, MAXPGPATH, "pha%d.%d",
+					 node->ss.ps.plan->plan_node_id, i);
+			node->shared_spill_acc[i] =
+				sts_initialize(SharedAggPartitionSts(shstate, i),
+							   nparticipants,
+							   ParallelWorkerNumber + 1,
+							   sizeof(uint32),
+							   SHARED_TUPLESTORE_SINGLE_PASS,
+							   &shstate->fileset,
+							   name);
+		}
+
+		shm_toc_insert(pcxt->toc,
+					   node->ss.ps.plan->plan_node_id +
+					   PARALLEL_KEY_AGG_SHARED_OFFSET,
+					   shstate);
+		node->shared_build = shstate;
+	}
+
 	/* don't need this if not instrumenting or no workers */
 	if (!node->ss.ps.instrument || pcxt->nworkers == 0)
 		return;
@@ -4818,6 +6346,45 @@ ExecAggInitializeDSM(AggState *node, ParallelContext *pcxt)
 }
 
 /* ----------------------------------------------------------------
+ *		ExecAggReInitializeDSM
+ *
+ *		Reset shared-build state before relaunching workers for a rescan.
+ *		The previous bucket array and entries are intentionally leaked in
+ *		the per-query DSA until end of query (v0 prototype limitation).
+ * ----------------------------------------------------------------
+ */
+void
+ExecAggReInitializeDSM(AggState *node, ParallelContext *pcxt)
+{
+	SharedAggBuildState *shstate = node->shared_build;
+
+	if (shstate == NULL)
+		return;
+
+	/*
+	 * Reinitializing the shared tuplestores after a spilling run would
+	 * require recreating their backing files; not supported yet.
+	 */
+	if (pg_atomic_read_u64(&shstate->nspilled) > 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot rescan Parallel Hash Aggregate after it has spilled to disk")));
+
+	BarrierInit(&shstate->build_barrier, 0);
+	BarrierInit(&shstate->scan_barrier, 0);
+	shstate->nbuckets = 0;
+	shstate->buckets = InvalidDsaPointer;
+	shstate->cur_batch = 0;
+	shstate->chunk_head = InvalidDsaPointer;
+	pg_atomic_write_u64(&shstate->nentries, 0);
+	pg_atomic_write_u64(&shstate->scan_cursor, 0);
+	pg_atomic_write_u64(&shstate->mem_used, 0);
+	pg_atomic_write_u32(&shstate->spill_mode, 0);
+	for (int i = 0; i < SHARED_AGG_SPILL_PARTITIONS; i++)
+		pg_atomic_write_u64(&shstate->npart_spilled[i], 0);
+}
+
+/* ----------------------------------------------------------------
  *		ExecAggInitializeWorker
  *
  *		Attach worker to DSM space for aggregate statistics.
@@ -4826,6 +6393,29 @@ ExecAggInitializeDSM(AggState *node, ParallelContext *pcxt)
 void
 ExecAggInitializeWorker(AggState *node, ParallelWorkerContext *pwcxt)
 {
+	if (node->shared_mode)
+	{
+		SharedAggBuildState *shstate;
+		int			i;
+
+		shstate = (SharedAggBuildState *)
+			shm_toc_lookup(pwcxt->toc,
+						   node->ss.ps.plan->plan_node_id +
+						   PARALLEL_KEY_AGG_SHARED_OFFSET,
+						   false);
+		node->shared_build = shstate;
+
+		SharedFileSetAttach(&shstate->fileset, pwcxt->seg);
+		node->shared_spill_acc =
+			palloc(SHARED_AGG_SPILL_PARTITIONS *
+				   sizeof(SharedTuplestoreAccessor *));
+		for (i = 0; i < SHARED_AGG_SPILL_PARTITIONS; i++)
+			node->shared_spill_acc[i] =
+				sts_attach(SharedAggPartitionSts(shstate, i),
+						   ParallelWorkerNumber + 1,
+						   &shstate->fileset);
+	}
+
 	node->shared_info =
 		shm_toc_lookup(pwcxt->toc, node->ss.ps.plan->plan_node_id, true);
 }
@@ -4841,6 +6431,24 @@ ExecAggRetrieveInstrumentation(AggState *node)
 {
 	Size		size;
 	SharedAggInfo *si;
+
+	/*
+	 * Copy shared-build spill statistics into backend-local fields while
+	 * the DSM segment is still attached; EXPLAIN runs after it is gone.
+	 */
+	if (node->shared_build != NULL)
+	{
+		SharedAggBuildState *shstate = node->shared_build;
+		int			i;
+
+		node->shared_nspilled = pg_atomic_read_u64(&shstate->nspilled);
+		node->shared_nbatches = 0;
+		for (i = 0; i < SHARED_AGG_SPILL_PARTITIONS; i++)
+		{
+			if (pg_atomic_read_u64(&shstate->npart_spilled[i]) > 0)
+				node->shared_nbatches++;
+		}
+	}
 
 	if (node->shared_info == NULL)
 		return;

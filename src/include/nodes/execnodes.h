@@ -2505,6 +2505,34 @@ typedef struct AggState
 	AggStatePerGroup *all_pergroups;	/* array of first ->pergroups, than
 										 * ->hash_pergroup */
 	SharedAggInfo *shared_info; /* one entry per worker */
+
+	/*
+	 * These fields are used for parallel shared hash aggregation, where all
+	 * participants cooperatively build a single hash table in dynamic shared
+	 * memory (per-stripe LWLocks; by-value transition states stored inline,
+	 * plain by-ref states as DSA blobs; 'internal' states unsupported).
+	 */
+	bool		shared_mode;	/* is this a Parallel (shared) HashAggregate? */
+	struct SharedAggBuildState *shared_build;	/* coordination state in DSM,
+												 * or NULL */
+	struct SharedAggTransInfo *shared_transinfo;	/* per-trans advance info */
+	AggStatePerGroup shared_scratch_pergroup;	/* contiguous scratch for
+												 * finalization */
+	bool		shared_attached;	/* attached to the build barrier? */
+	bool		shared_scan_attached;	/* attached to the scan barrier? */
+	ExprContext *shared_exprcontext;	/* for hash/equality evaluation */
+	ExprState  *shared_hashexpr;	/* computes group-key hash over hashslot */
+	ExprState  *shared_eqexpr;	/* compares hashslot against stored key */
+	TupleTableSlot *shared_keyslot; /* minimal slot for stored key tuples */
+	struct SharedTuplestoreAccessor **shared_spill_acc;	/* per spill partition */
+	uint64		shared_nspilled;	/* spilled tuples (copied for EXPLAIN) */
+	int			shared_nbatches;	/* nonempty spill partitions (ditto) */
+	uint64		shared_scan_bucket; /* next bucket within claimed chunk */
+	uint64		shared_scan_chunk_end;	/* end of currently claimed chunk */
+	uint64		shared_scan_entry;	/* dsa_pointer of next chain entry */
+	uint64		shared_alloc_chunk; /* dsa_pointer of my current entry chunk */
+	Size		shared_alloc_used;	/* bytes carved from it so far */
+	Size		shared_alloc_size;	/* its total usable size */
 } AggState;
 
 /* ----------------

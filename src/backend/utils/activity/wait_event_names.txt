@@ -146,6 +146,9 @@ MULTIXACT_CREATION	"Waiting for a multixact creation to complete."
 PARALLEL_BITMAP_SCAN	"Waiting for parallel bitmap scan to become initialized."
 PARALLEL_CREATE_INDEX_SCAN	"Waiting for parallel <command>CREATE INDEX</command> workers to finish heap scan."
 PARALLEL_FINISH	"Waiting for parallel workers to finish computing."
+PARALLEL_HASH_AGG_BATCH	"Waiting for a Parallel Hash Aggregate spill batch to be reset or loaded."
+PARALLEL_HASH_AGG_BUILD	"Waiting for other Parallel Hash Aggregate participants to finish building the shared hash table."
+PARALLEL_HASH_AGG_EMIT	"Waiting for other Parallel Hash Aggregate participants to finish emitting groups."
 PROCARRAY_GROUP_UPDATE	"Waiting for the group leader to clear the transaction ID at transaction end."
 PROC_SIGNAL_BARRIER	"Waiting for a barrier event to be processed by all backends."
 PROMOTE	"Waiting for standby promotion."
@@ -417,6 +420,7 @@ XactSLRU	"Waiting to access the transaction status SLRU cache."
 ParallelVacuumDSA	"Waiting for parallel vacuum dynamic shared memory allocation."
 AioUringCompletion	"Waiting for another process to complete IO via io_uring."
 ShmemIndex	"Waiting to find or allocate space in shared memory."
+ParallelHashAgg	"Waiting to access a Parallel Hash Aggregate shared hash table."
 
 # No "ABI_compatibility" region here as WaitEventLWLock has its own C code.
 
