@@ -1397,12 +1397,6 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 		aclcheck_error(ACLCHECK_NOT_OWNER, stmt->objtype,
 					   NameListToString(stmt->func->objname));
 
-	if (procForm->prokind == PROKIND_AGGREGATE)
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is an aggregate function",
-						NameListToString(stmt->func->objname))));
-
 	is_procedure = (procForm->prokind == PROKIND_PROCEDURE);
 
 	/* Examine requested actions. */
@@ -1424,6 +1418,23 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 									 &parallel_item) == false)
 			elog(ERROR, "option \"%s\" not recognized", defel->defname);
 	}
+
+	/*
+	 * An aggregate's pg_proc row is a stub, so most alterable attributes
+	 * are meaningless for it.  Attaching a support function is useful,
+	 * though: it allows plan-time rewriting of existing aggregates via
+	 * SupportRequestSimplifyAggref, which CREATE AGGREGATE cannot
+	 * retrofit.  Allow SUPPORT and nothing else.
+	 */
+	if (procForm->prokind == PROKIND_AGGREGATE &&
+		(volatility_item || strict_item || security_def_item ||
+		 leakproof_item || set_items != NIL || cost_item ||
+		 rows_item || parallel_item))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is an aggregate function",
+						NameListToString(stmt->func->objname)),
+				 errhint("Only SUPPORT can be altered for an aggregate function.")));
 
 	if (volatility_item)
 		procForm->provolatile = interpret_func_volatility(volatility_item);
