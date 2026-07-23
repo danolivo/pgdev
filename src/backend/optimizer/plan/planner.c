@@ -7337,6 +7337,65 @@ done:
 }
 
 /*
+ * parallel_shared_hashagg_possible
+ *
+ * Check whether every aggregate in the query can run under the parallel
+ * shared hash aggregation strategy (Parallel Hash Aggregate, v0).
+ *
+ * Transition states live in dynamic shared memory and are mutated in place
+ * by whichever participant sees a row for the group.  Pass-by-value states
+ * are stored inline; plain pass-by-reference states (varlena or fixed-
+ * length) are stored as self-contained DSA blobs.  States of the 'internal'
+ * pseudo-type — a by-value pointer to an opaque struct with interior
+ * process-local pointers — are deliberately NOT supported for now: the
+ * only generic mechanism (keeping the state serialized and converting
+ * around every transition call) was prototyped and rejected as too
+ * expensive per row.  Aggregates needing shared-table support should
+ * instead declare a flat transition representation (see the
+ * shared_numeric_agg extension for sum/avg(numeric)).
+ *
+ * DISTINCT/ORDER BY aggregates and ordered-set aggregates are out for the
+ * same reasons they cannot use partial aggregation.  General parallel-safety
+ * of the target list has already been established by consider_parallel.
+ */
+static bool
+parallel_shared_hashagg_possible(PlannerInfo *root, RelOptInfo *grouped_rel,
+								 List *havingQual)
+{
+	List	   *exprs;
+	ListCell   *lc;
+
+	exprs = pull_var_clause((Node *) grouped_rel->reltarget->exprs,
+							PVC_INCLUDE_AGGREGATES);
+	exprs = list_concat(exprs,
+						pull_var_clause((Node *) havingQual,
+										PVC_INCLUDE_AGGREGATES));
+
+	foreach(lc, exprs)
+	{
+		Aggref	   *aggref = (Aggref *) lfirst(lc);
+
+		if (!IsA(aggref, Aggref))
+			continue;
+
+		/* resolved by preprocess_aggref() before path generation */
+		if (!OidIsValid(aggref->aggtranstype))
+			return false;
+
+		if (aggref->aggdistinct != NIL || aggref->aggorder != NIL)
+			return false;
+
+		if (aggref->aggkind != AGGKIND_NORMAL)
+			return false;
+
+		if (aggref->aggtranstype == INTERNALOID)
+			return false;
+	}
+
+	return true;
+}
+
+/*
  * add_paths_to_grouping_rel
  *
  * Add non-partial paths to grouping relation.
@@ -7573,6 +7632,81 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 									 havingQual,
 									 agg_final_costs,
 									 dNumFinalGroups));
+		}
+
+		/*
+		 * Generate a Parallel Hash Aggregate path: a parallel-aware hashed
+		 * Agg directly over the cheapest partial input path.  All
+		 * participants cooperatively build one shared hash table and then
+		 * emit disjoint subsets of the finalized groups, so no Finalize
+		 * stage exists; the Gather node added by gather_grouping_paths()
+		 * merely collects finished rows.
+		 *
+		 * Aggregate transition happens exactly once per input row (as in
+		 * AGGSPLIT_SIMPLE), so this requires no combine/serial functions;
+		 * but the shared transition states restrict which aggregates are
+		 * eligible -- see parallel_shared_hashagg_possible().
+		 */
+		if (enable_parallel_hash_agg &&
+			!parse->groupingSets &&
+			parse->groupClause != NIL &&
+			grouped_rel->consider_parallel &&
+			input_rel->partial_pathlist != NIL &&
+			parallel_shared_hashagg_possible(root, grouped_rel, havingQual))
+		{
+			Path	   *cheapest_partial_path =
+				linitial(input_rel->partial_pathlist);
+			AggPath    *aggpath;
+			double		nparticipants;
+
+			aggpath = create_agg_path(root,
+									  grouped_rel,
+									  cheapest_partial_path,
+									  grouped_rel->reltarget,
+									  AGG_HASHED,
+									  AGGSPLIT_SIMPLE,
+									  root->processed_groupClause,
+									  havingQual,
+									  agg_costs,
+									  dNumGroups);
+			aggpath->path.parallel_aware = true;
+
+			/*
+			 * Each participant emits a disjoint share of the groups.
+			 *
+			 * Add a contention surcharge for the shared build, calibrated
+			 * from benchmarks (uniform / mid / hot-key group profiles at
+			 * 2-4 participants, plus an 13-participant uniform series):
+			 * with many rows per group, concurrent updates of the same
+			 * groups serialize on the bucket stripe locks and the shared
+			 * table measurably loses to Partial/Finalize, whose Finalize
+			 * over few groups is trivial.  The serialized work is the
+			 * transition work itself, so scale by transCost.per_tuple,
+			 * participants beyond the first, and a factor saturating in
+			 * rows-per-group: negligible below ~100 rows/group, dominant
+			 * beyond ~10000.  The half-way constant (6000) reproduces the
+			 * measured plan-choice crossover; refine as more workloads
+			 * are measured.
+			 */
+			nparticipants = cheapest_partial_path->parallel_workers + 1;
+			aggpath->path.rows = clamp_row_est(dNumGroups / nparticipants);
+
+			{
+				double		total_rows =
+					cheapest_partial_path->rows * nparticipants;
+				double		rows_per_group =
+					total_rows / Max(dNumGroups, 1.0);
+				double		contention_factor =
+					rows_per_group / (rows_per_group + 6000.0);
+
+				aggpath->path.total_cost +=
+					agg_costs->transCost.per_tuple *
+					cheapest_partial_path->rows *
+					(nparticipants - 1) *
+					contention_factor;
+			}
+
+			add_partial_path(grouped_rel, (Path *) aggpath);
 		}
 	}
 
