@@ -43,3 +43,27 @@ CREATE AGGREGATE avg(numeric) (
     FINALFUNC   = numeric_flat_avg_final,
     PARALLEL    = SAFE
 );
+
+-- Plan-time substitution: the support function below is attached to the
+-- stock aggregates and rewrites sum(numeric)/avg(numeric) into the flat
+-- variants when enable_parallel_hash_agg is on, parallelism is possible,
+-- and the argument's typmod bounds all values to the flat lane window.
+-- With it in place, neither queries nor search_path need changing.
+
+CREATE FUNCTION shared_numeric_agg_support(internal)
+RETURNS internal
+AS 'MODULE_PATHNAME'
+LANGUAGE C IMMUTABLE STRICT;
+
+ALTER FUNCTION pg_catalog.sum(numeric) SUPPORT shared_numeric_agg_support;
+ALTER FUNCTION pg_catalog.avg(numeric) SUPPORT shared_numeric_agg_support;
+
+-- NOTE: the ALTERs record a dependency of the stock aggregates on the
+-- support function, so DROP EXTENSION is refused until the support links
+-- are detached (there is no ALTER ... SUPPORT NONE yet):
+--   UPDATE pg_proc SET prosupport = 0
+--    WHERE oid IN ('pg_catalog.sum(numeric)'::regprocedure,
+--                  'pg_catalog.avg(numeric)'::regprocedure);
+--   DELETE FROM pg_depend
+--    WHERE refobjid = 'shared_numeric_agg_support(internal)'::regprocedure
+--      AND classid = 'pg_proc'::regclass;

@@ -36,9 +36,18 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_aggregate.h"
+#include "catalog/pg_type_d.h"
 #include "fmgr.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/pathnodes.h"
+#include "nodes/supportnodes.h"
+#include "optimizer/cost.h"
+#include "parser/parse_func.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
+#include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "varatt.h"
 
@@ -165,6 +174,7 @@ PG_FUNCTION_INFO_V1(numeric_flat_sum_trans);
 PG_FUNCTION_INFO_V1(numeric_flat_sum_combine);
 PG_FUNCTION_INFO_V1(numeric_flat_sum_final);
 PG_FUNCTION_INFO_V1(numeric_flat_avg_final);
+PG_FUNCTION_INFO_V1(shared_numeric_agg_support);
 
 /*
  * Create a zeroed state.  In an aggregate context allocate it there (the
@@ -479,4 +489,93 @@ numeric_flat_avg_final(PG_FUNCTION_ARGS)
 	sum = flatsum_build_result(state);
 	return DirectFunctionCall2(numeric_div, sum,
 							   NumericGetDatum(int64_to_numeric(state->nvalues)));
+}
+
+/* typmod decoding, same as numeric.c's private macros */
+#define FLATSUM_TYPMOD_PRECISION(t)	((((t) - VARHDRSZ) >> 16) & 0xffff)
+#define FLATSUM_TYPMOD_SCALE(t)		(((((t) - VARHDRSZ) & 0x7ff) ^ 1024) - 1024)
+
+/*
+ * Planner support function, attached to pg_catalog.sum(numeric) and
+ * avg(numeric) by the install script (via ALTER FUNCTION ... SUPPORT).
+ *
+ * On SupportRequestSimplifyAggref, replace the stock aggregate with our
+ * flat-state twin so that queries become eligible for parallel shared
+ * hash aggregation without any query or search_path change.
+ *
+ * The replacement is refused unless the argument's typmod proves that no
+ * input can fall outside the flat state's lane window: the flat variants
+ * raise an error there, while the stock aggregates would not.  For inputs
+ * like numeric(15,2) the two are otherwise result-identical, including
+ * display scale (avg divides through numeric_div on both sides).
+ */
+Datum
+shared_numeric_agg_support(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	if (IsA(rawreq, SupportRequestSimplifyAggref))
+	{
+		SupportRequestSimplifyAggref *req = (SupportRequestSimplifyAggref *) rawreq;
+		Aggref	   *aggref = req->aggref;
+		char	   *aggname;
+		TargetEntry *tle;
+		int32		typmod;
+		int			precision;
+		int			scale;
+		Oid			nspoid;
+		Oid			argtypes[1] = {NUMERICOID};
+		Oid			replacement;
+		Aggref	   *newagg;
+
+		/* Rewrite only when the parallel shared hash path could profit. */
+		if (!enable_parallel_hash_agg ||
+			req->root == NULL ||
+			req->root->glob == NULL ||
+			!req->root->glob->parallelModeOK)
+			PG_RETURN_POINTER(NULL);
+
+		if (aggref->aggfnoid == F_SUM_NUMERIC)
+			aggname = "sum";
+		else if (aggref->aggfnoid == F_AVG_NUMERIC)
+			aggname = "avg";
+		else
+			PG_RETURN_POINTER(NULL);
+
+		/* plain one-argument aggregation only */
+		if (aggref->aggkind != AGGKIND_NORMAL ||
+			list_length(aggref->args) != 1 ||
+			aggref->aggdistinct != NIL ||
+			aggref->aggorder != NIL)
+			PG_RETURN_POINTER(NULL);
+
+		/* the typmod must bound the value range to the lane window */
+		tle = (TargetEntry *) linitial(aggref->args);
+		typmod = exprTypmod((Node *) tle->expr);
+		if (typmod < (int32) VARHDRSZ)
+			PG_RETURN_POINTER(NULL);
+		precision = FLATSUM_TYPMOD_PRECISION(typmod);
+		scale = FLATSUM_TYPMOD_SCALE(typmod);
+		if (precision - scale > DEC_DIGITS * (FLATSUM_MAX_WEIGHT + 1) ||
+			scale > DEC_DIGITS * (FLATSUM_NLANES - FLATSUM_MAX_WEIGHT - 1))
+			PG_RETURN_POINTER(NULL);
+
+		/*
+		 * Resolve the replacement aggregate living in the same schema as
+		 * this support function, independently of search_path.
+		 */
+		nspoid = get_func_namespace(fcinfo->flinfo->fn_oid);
+		replacement =
+			LookupFuncName(list_make2(makeString(get_namespace_name(nspoid)),
+									  makeString(aggname)),
+						   1, argtypes, true);
+		if (!OidIsValid(replacement) || replacement == aggref->aggfnoid)
+			PG_RETURN_POINTER(NULL);
+
+		newagg = copyObject(aggref);
+		newagg->aggfnoid = replacement;
+		PG_RETURN_POINTER(newagg);
+	}
+
+	PG_RETURN_POINTER(NULL);
 }
