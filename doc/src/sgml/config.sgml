@@ -6064,7 +6064,7 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
         aggregation instead of each worker building its own partial hash
         table for a later serial finalization step.  This is only
         available for aggregate transition states that are fixed-length
-        and passed by value.  The default is <literal>off</literal>.
+        and passed by value.  The default is <literal>on</literal>.
        </para>
       </listitem>
      </varlistentry>
