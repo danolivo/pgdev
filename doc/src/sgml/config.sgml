@@ -6050,6 +6050,25 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-enable-parallel-hash-agg" xreflabel="enable_parallel_hash_agg">
+      <term><varname>enable_parallel_hash_agg</varname> (<type>boolean</type>)
+       <indexterm>
+        <primary><varname>enable_parallel_hash_agg</varname> configuration parameter</primary>
+       </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Enables or disables the query planner's use of parallel shared
+        hash aggregation, in which all participating parallel workers
+        cooperatively build a single shared hash table for grouped
+        aggregation instead of each worker building its own partial hash
+        table for a later serial finalization step.  This is only
+        available for aggregate transition states that are fixed-length
+        and passed by value.  The default is <literal>off</literal>.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-enable-partition-pruning" xreflabel="enable_partition_pruning">
       <term><varname>enable_partition_pruning</varname> (<type>boolean</type>)
        <indexterm>

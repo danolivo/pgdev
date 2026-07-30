@@ -7337,6 +7337,71 @@ done:
 }
 
 /*
+ * parallel_shared_hashagg_possible
+ *
+ * Check whether every aggregate in the query can run under the parallel
+ * shared hash aggregation strategy (Parallel Hash Aggregate).
+ *
+ * Transition states live in dynamic shared memory and are mutated in place
+ * by whichever participant sees a row for the group.  That restricts
+ * the strategy to aggregates whose transition type is fixed-length and
+ * pass-by-value (e.g. sum(int4)/sum(int8)/count(*)/bool_and/bool_or/
+ * min/max on by-value types): such a state fits directly in the shared
+ * entry and is mutated in place, with no by-reference or DSA-blob storage
+ * machinery required at all.
+ *
+ * This excludes any pass-by-reference transition type, including plain
+ * varlena/fixed-length by-ref types (e.g. numeric, interval) and the
+ * 'internal' pseudo-type used by aggregates such as avg()/array_agg().
+ * Note that testing pass-by-value-ness alone is not enough: the
+ * 'internal' pseudo-type is itself pass-by-value (a pointer-sized Datum
+ * to a process-local, opaque struct), so it is rejected explicitly too.
+ *
+ * DISTINCT/ORDER BY aggregates and ordered-set aggregates are out for the
+ * same reasons they cannot use partial aggregation.  General parallel-safety
+ * of the target list has already been established by consider_parallel.
+ */
+static bool
+parallel_shared_hashagg_possible(PlannerInfo *root, RelOptInfo *grouped_rel,
+								 List *havingQual)
+{
+	List	   *exprs;
+	ListCell   *lc;
+
+	exprs = pull_var_clause((Node *) grouped_rel->reltarget->exprs,
+							PVC_INCLUDE_AGGREGATES);
+	exprs = list_concat(exprs,
+						pull_var_clause((Node *) havingQual,
+										PVC_INCLUDE_AGGREGATES));
+
+	foreach(lc, exprs)
+	{
+		Aggref	   *aggref = (Aggref *) lfirst(lc);
+
+		if (!IsA(aggref, Aggref))
+			continue;
+
+		/* resolved by preprocess_aggref() before path generation */
+		if (!OidIsValid(aggref->aggtranstype))
+			return false;
+
+		if (aggref->aggdistinct != NIL || aggref->aggorder != NIL)
+			return false;
+
+		if (aggref->aggkind != AGGKIND_NORMAL)
+			return false;
+
+		if (aggref->aggtranstype == INTERNALOID)
+			return false;
+
+		if (!get_typbyval(aggref->aggtranstype))
+			return false;
+	}
+
+	return true;
+}
+
+/*
  * add_paths_to_grouping_rel
  *
  * Add non-partial paths to grouping relation.
@@ -7573,6 +7638,137 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 									 havingQual,
 									 agg_final_costs,
 									 dNumFinalGroups));
+		}
+
+		/*
+		 * Generate a Parallel Hash Aggregate path: a parallel-aware hashed
+		 * Agg directly over the cheapest partial input path.  All
+		 * participants cooperatively build one shared hash table and then
+		 * emit disjoint subsets of the finalized groups, so no Finalize
+		 * stage exists; the Gather node added by gather_grouping_paths()
+		 * merely collects finished rows.
+		 *
+		 * Aggregate transition happens exactly once per input row (as in
+		 * AGGSPLIT_SIMPLE), so this requires no combine/serial functions;
+		 * but the shared transition states restrict which aggregates are
+		 * eligible -- see parallel_shared_hashagg_possible().
+		 */
+		if (enable_parallel_hash_agg &&
+			!parse->groupingSets &&
+			parse->groupClause != NIL &&
+			grouped_rel->consider_parallel &&
+			input_rel->partial_pathlist != NIL &&
+			parallel_shared_hashagg_possible(root, grouped_rel, havingQual))
+		{
+			Path	   *cheapest_partial_path =
+				linitial(input_rel->partial_pathlist);
+			AggPath    *aggpath;
+			double		nparticipants;
+
+			aggpath = create_agg_path(root,
+									  grouped_rel,
+									  cheapest_partial_path,
+									  grouped_rel->reltarget,
+									  AGG_HASHED,
+									  AGGSPLIT_SIMPLE,
+									  root->processed_groupClause,
+									  havingQual,
+									  agg_costs,
+									  dNumGroups);
+			aggpath->path.parallel_aware = true;
+
+			/*
+			 * Each participant emits a disjoint share of the groups.
+			 *
+			 * Add a surcharge for contention during the shared build.
+			 * With many rows per group, concurrent updates of the same
+			 * groups serialize on the bucket stripe locks, and the shared
+			 * table loses to Partial/Finalize, whose Finalize over few
+			 * groups is cheap.  What serializes is the transition work
+			 * itself, so scale by transCost.per_tuple, by the participants
+			 * beyond the first, and by a factor saturating in rows per
+			 * group: negligible below about a hundred rows per group,
+			 * dominant beyond a few thousand.
+			 *
+			 * Rows per group is an average and so cannot see skew, which
+			 * is the more dangerous failure mode: every row of a single
+			 * very frequent grouping key updates the same shared state,
+			 * so those rows serialize on one stripe lock however low the
+			 * average is, and more participants only lengthen the queue.
+			 * Estimate the hottest group's share of the input the same
+			 * way cost_hashjoin() estimates bucket skew, from the MCV
+			 * statistics, and charge for the serialized work following
+			 * Amdahl: doing those rows one-at-a-time instead of spread
+			 * over nparticipants costs an extra (nparticipants-1)/
+			 * nparticipants of their combined transition and locking
+			 * time.
+			 *
+			 * A group's frequency cannot exceed that of any one of its
+			 * columns' most common values, so the minimum across the
+			 * grouping columns bounds it from above; using the bound
+			 * assumes full correlation, erring toward Partial/Finalize,
+			 * whose skew behavior is benign.  Columns with no statistics
+			 * report zero, i.e. no evidence of skew -- the same optimism
+			 * cost_hashjoin() lives with.
+			 *
+			 * The lock cost constant reflects that under contention an
+			 * exclusive LWLock acquisition costs several times a simple
+			 * operator; measurements of the crossover against
+			 * Partial/Finalize on single-int4-key aggregation put it
+			 * around two operators' worth.
+			 */
+			nparticipants = cheapest_partial_path->parallel_workers + 1;
+			aggpath->path.rows = clamp_row_est(dNumGroups / nparticipants);
+
+			{
+				double		total_rows =
+					cheapest_partial_path->rows * nparticipants;
+				double		rows_per_group =
+					total_rows / Max(dNumGroups, 1.0);
+				double		contention_factor =
+					rows_per_group / (rows_per_group + 6000.0);
+				Selectivity group_mcv_freq = 0.0;
+				bool		mcv_known = false;
+				ListCell   *glc;
+
+				aggpath->path.total_cost +=
+					agg_costs->transCost.per_tuple *
+					cheapest_partial_path->rows *
+					(nparticipants - 1) *
+					contention_factor;
+
+				foreach(glc, get_sortgrouplist_exprs(root->processed_groupClause,
+													 parse->targetList))
+				{
+					Node	   *groupexpr = (Node *) lfirst(glc);
+					Selectivity mcv_freq;
+					Selectivity bucketsize_frac;
+
+					estimate_hash_bucket_stats(root, groupexpr,
+											   dNumGroups,
+											   &mcv_freq,
+											   &bucketsize_frac);
+					if (mcv_freq > 0.0 &&
+						(!mcv_known || mcv_freq < group_mcv_freq))
+					{
+						group_mcv_freq = mcv_freq;
+						mcv_known = true;
+					}
+				}
+
+				if (mcv_known && group_mcv_freq > 0.0)
+				{
+#define SHARED_AGG_LOCK_COST	(2.0 * cpu_operator_cost)
+					aggpath->path.total_cost +=
+						group_mcv_freq * total_rows *
+						(agg_costs->transCost.per_tuple +
+						 SHARED_AGG_LOCK_COST) *
+						(nparticipants - 1) / nparticipants;
+#undef SHARED_AGG_LOCK_COST
+				}
+			}
+
+			add_partial_path(grouped_rel, (Path *) aggpath);
 		}
 	}
 

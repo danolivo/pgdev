@@ -1579,6 +1579,16 @@ ExplainNode(PlanState *planstate, List *ancestors,
 					partialmode = "Finalize";
 					pname = psprintf("%s %s", partialmode, pname);
 				}
+				else if (plan->parallel_aware)
+				{
+					/*
+					 * Parallel Hash Aggregate: one shared hash table built
+					 * cooperatively; the generic "Parallel " prefix is added
+					 * below in text format, so only the structured-format
+					 * mode tag needs setting here.
+					 */
+					partialmode = "Shared";
+				}
 				else
 					partialmode = "Simple";
 			}
@@ -3764,6 +3774,26 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 			ExplainPropertyInteger("Planned Partitions", NULL,
 								   aggstate->hash_planned_partitions, es);
 
+		/* statistics of a Parallel (shared) HashAggregate */
+		if (es->analyze && aggstate->shared != NULL)
+		{
+			if (aggstate->shared_nbuckets > 0)
+			{
+				ExplainPropertyInteger("Shared Hash Buckets", NULL,
+									   aggstate->shared_nbuckets, es);
+				ExplainPropertyInteger("Shared Memory Usage", "kB",
+									   (aggstate->shared_mem_used + 1023) / 1024,
+									   es);
+			}
+			if (aggstate->shared_nspilled > 0)
+			{
+				ExplainPropertyInteger("Spilled Tuples", NULL,
+									   aggstate->shared_nspilled, es);
+				ExplainPropertyInteger("Spill Batches", NULL,
+									   aggstate->shared_nbatches, es);
+			}
+		}
+
 		/*
 		 * During parallel query the leader may have not helped out.  We
 		 * detect this by checking how much memory it used.  If we find it
@@ -3787,6 +3817,36 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 			ExplainIndentText(es);
 			appendStringInfo(es->str, "Planned Partitions: %d",
 							 aggstate->hash_planned_partitions);
+			gotone = true;
+		}
+
+		/* statistics of a Parallel (shared) HashAggregate */
+		if (es->analyze && aggstate->shared != NULL &&
+			aggstate->shared_nbuckets > 0)
+		{
+			if (!gotone)
+				ExplainIndentText(es);
+			else
+				appendStringInfoSpaces(es->str, 2);
+
+			appendStringInfo(es->str,
+							 "Shared Buckets: " UINT64_FORMAT "  Shared Memory Usage: " UINT64_FORMAT "kB",
+							 aggstate->shared_nbuckets,
+							 (aggstate->shared_mem_used + 1023) / 1024);
+			gotone = true;
+		}
+		if (es->analyze && aggstate->shared != NULL &&
+			aggstate->shared_nspilled > 0)
+		{
+			if (!gotone)
+				ExplainIndentText(es);
+			else
+				appendStringInfoSpaces(es->str, 2);
+
+			appendStringInfo(es->str,
+							 "Spilled Tuples: " UINT64_FORMAT "  Spill Batches: %d",
+							 aggstate->shared_nspilled,
+							 aggstate->shared_nbatches);
 			gotone = true;
 		}
 
