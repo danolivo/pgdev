@@ -1,0 +1,67 @@
+From 56918884d93faf4e0fc6434b6319e2a482cb8471 Mon Sep 17 00:00:00 2001
+From: Andrei Lepikhov <andrei.lepikhov@pgedge.com>
+Date: Thu, 30 Jul 2026 13:38:42 +0000
+Subject: [PATCH] Fix log threshold checks in emit-log hook (PG19 and
+ comparison direction)
+
+Two defects in the filter that replaced the pg18-020-LOG-to-DEBUG1
+core patch, both in the block that re-evaluates message visibility
+after demoting the retry messages from LOG to DEBUG1:
+
+1. PostgreSQL 19 changed the log_min_messages GUC from a plain int
+   into an int array indexed by backend type (see
+   is_log_level_output() and its callers in
+   src/backend/utils/error/elog.c).  The old comparison therefore
+   compared the array pointer against the error level on PG19 and
+   later, yielding an arbitrary result.  Use
+   log_min_messages[MyBackendType] under PG_VERSION_NUM >= 190000;
+   miscadmin.h is already included.
+
+2. The comparisons had their operands swapped on all PG versions:
+   'log_min_messages < edata->elevel' suppresses output when the
+   threshold is *more* verbose than the message.  In practice, with
+   the default log_min_messages = WARNING the demoted message was
+   still written to the server log (just relabelled DEBUG1), so the
+   filter silenced nothing by default, while lowering the threshold
+   to DEBUG5 for debugging suppressed the messages instead.  The
+   correct check is 'edata->elevel < threshold'.  A plain numeric
+   comparison matches core's is_log_level_output() for every
+   threshold value here because the demoted level DEBUG1 sorts below
+   LOG.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+ src/spock.c | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/src/spock.c b/src/spock.c
+index 0d23c2f..5937794 100644
+--- a/src/spock.c
++++ b/src/spock.c
+@@ -988,10 +988,20 @@ log_message_filter(ErrorData *edata)
+ 
+ 		if (lower_output_level)
+ 		{
+-			/* Reconsider decision on exposing the message */
+-			if (log_min_messages < edata->elevel)
++			/*
++			 * Reconsider the errstart() decision on exposing the message,
++			 * this time for the demoted level.  A plain comparison is
++			 * enough to mirror is_log_level_output() here because the
++			 * demoted level DEBUG1 sorts below LOG, so the LOG special
++			 * cases coincide with the numeric order.
++			 */
++#if PG_VERSION_NUM >= 190000
++			if (edata->elevel < log_min_messages[MyBackendType])
++#else
++			if (edata->elevel < log_min_messages)
++#endif
+ 				edata->output_to_server = false;
+-			if (client_min_messages < edata->elevel)
++			if (edata->elevel < client_min_messages)
+ 				edata->output_to_client = false;
+ 		}
+ 	}
+-- 
+2.43.0
+
