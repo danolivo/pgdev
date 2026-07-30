@@ -6062,9 +6062,12 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
         hash aggregation, in which all participating parallel workers
         cooperatively build a single shared hash table for grouped
         aggregation instead of each worker building its own partial hash
-        table for a later serial finalization step.  This is only
-        available for aggregate transition states that are fixed-length
-        and passed by value.  The default is <literal>on</literal>.
+        table for a later serial finalization step.  This is available
+        for any aggregate whose transition state is a regular data type;
+        aggregates using the <literal>internal</literal> pseudo-type for
+        their transition state, such as <function>avg</function> on
+        integer types, are not eligible.  The default is
+        <literal>on</literal>.
        </para>
       </listitem>
      </varlistentry>

@@ -7343,19 +7343,17 @@ done:
  * shared hash aggregation strategy (Parallel Hash Aggregate).
  *
  * Transition states live in dynamic shared memory and are mutated in place
- * by whichever participant sees a row for the group.  That restricts
- * the strategy to aggregates whose transition type is fixed-length and
- * pass-by-value (e.g. sum(int4)/sum(int8)/count(*)/bool_and/bool_or/
- * min/max on by-value types): such a state fits directly in the shared
- * entry and is mutated in place, with no by-reference or DSA-blob storage
- * machinery required at all.
+ * by whichever participant sees a row for the group.  Pass-by-value states
+ * sit directly in the shared entry; pass-by-reference states (varlena such
+ * as numeric or bytea, fixed-length by-ref such as interval) are stored as
+ * self-contained DSA blobs that the executor maps and updates in place
+ * where possible.
  *
- * This excludes any pass-by-reference transition type, including plain
- * varlena/fixed-length by-ref types (e.g. numeric, interval) and the
- * 'internal' pseudo-type used by aggregates such as avg()/array_agg().
- * Note that testing pass-by-value-ness alone is not enough: the
- * 'internal' pseudo-type is itself pass-by-value (a pointer-sized Datum
- * to a process-local, opaque struct), so it is rejected explicitly too.
+ * Only the 'internal' pseudo-type is excluded: it is a pass-by-value
+ * pointer to an opaque, process-local struct that no byte-copy can make
+ * shareable.  This rules out avg() on integers and array_agg-style
+ * aggregates, but admits e.g. sum(numeric), sum(int8), min/max on
+ * varlena types, and extension aggregates with flat by-ref states.
  *
  * DISTINCT/ORDER BY aggregates and ordered-set aggregates are out for the
  * same reasons they cannot use partial aggregation.  General parallel-safety
@@ -7392,9 +7390,6 @@ parallel_shared_hashagg_possible(PlannerInfo *root, RelOptInfo *grouped_rel,
 			return false;
 
 		if (aggref->aggtranstype == INTERNALOID)
-			return false;
-
-		if (!get_typbyval(aggref->aggtranstype))
 			return false;
 	}
 

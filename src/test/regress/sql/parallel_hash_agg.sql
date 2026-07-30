@@ -62,14 +62,44 @@ select count(*) as mismatched_rows from (
 ) diff;
 
 --
--- 3. Fallback: a query with a non-eligible aggregate in the same GROUP BY
--- (avg(int4) uses a by-reference array transition state; sum(numeric) uses
--- the numeric type, also by-reference) must NOT get a shared parallel plan;
--- the planner should fall back to the ordinary Partial/Finalize split.
+-- 3. Eligibility of by-reference transition states, which are stored as
+-- DSA blobs: min/max(numeric) qualify (their transition type is numeric
+-- itself).  Use a table with many small groups, where the shared strategy
+-- is the planner's own choice; compare against a copy that forbids
+-- parallelism via its reloption.
+--
+create table pha_num (g int4, y int8, n numeric(12,3));
+insert into pha_num
+  select i % 5000, (i % 211)::int8, (i % 173) + (i % 97) * 0.001
+  from generate_series(1, 20000) i;
+analyze pha_num;
+
+create table pha_num_ref as select * from pha_num;
+alter table pha_num_ref set (parallel_workers = 0);
+analyze pha_num_ref;
+
+explain (costs off)
+  select g, min(n), max(n), count(*)
+  from pha_num group by g;
+
+select count(*) as mismatched_rows from (
+    (select g, min(n) mn, max(n) mx, count(*) c from pha_num group by g
+     except
+     select g, min(n), max(n), count(*) from pha_num_ref group by g)
+    union all
+    (select g, min(n), max(n), count(*) from pha_num_ref group by g
+     except
+     select g, min(n), max(n), count(*) from pha_num group by g)
+) diff;
+
+-- ... while the 'internal' pseudo-type must still fall back: the stock
+-- sum(numeric) keeps its transition state in an opaque process-local
+-- struct that no byte-copy can make shareable.  (avg(int4), by contrast,
+-- uses a plain int8[] state and therefore qualifies.)
 --
 explain (costs off)
-  select g, avg(x), sum(y::numeric)
-  from pha_src group by g;
+  select g, sum(n), avg(x)
+  from pha_src, pha_num where pha_num.g = pha_src.g group by pha_src.g;
 
 --
 -- 4. Rescan.  A Gather on the inner side of a nested loop is re-executed

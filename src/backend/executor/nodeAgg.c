@@ -408,16 +408,24 @@ typedef struct SharedAggState
  * states ever need to be merged, because every input row's transition call
  * mutates the one shared per-group state, under a per-bucket-stripe LWLock.
  *
- * This implementation is restricted to aggregates whose transition type is
- * fixed-length and pass-by-value (e.g. sum(int4)/sum(int8)/count(*)/
- * bool_and/bool_or/min/max on by-value types).  Such states fit directly in
- * an AggStatePerGroupData's transValue Datum and are mutated in place by
- * advance_transition_function(); there is no by-reference or DSA-blob
- * storage of any kind.  Consequently:
- *	- aggregates with a pass-by-reference transition type (including
- *	  varlena states such as numeric, and the 'internal' pseudo-type used
- *	  by array_agg-style aggregates) are not eligible and are rejected by
- *	  the planner (see parallel_shared_hashagg_possible());
+	 * Two classes of transition state are supported.  Pass-by-value states
+ * fit directly in an AggStatePerGroupData's transValue Datum and are
+ * mutated in place by advance_transition_function().  Pass-by-reference
+ * states (varlena such as numeric or bytea, or fixed-length by-ref such
+ * as interval) are stored as self-contained blobs in the DSA area: the
+ * slot's transValue then holds a dsa_pointer rather than a local pointer,
+ * and shared_agg_advance_byref() translates it to a local address around
+ * each transition call, copying the result back only when the function
+ * returns a different pointer.  A function that modifies its state in
+ * place (the common pattern for custom bytea-state aggregates, sanctioned
+ * by AggCheckCallContext) is thereby mutating the shared blob directly,
+ * under the stripe lock, with no copy at all.  Values are detoasted and
+ * expanded datums flattened before storing, so a blob is always plain
+ * contiguous bytes that any participant may map.
+ *
+ * The 'internal' pseudo-type remains unsupported: it is a by-value pointer
+ * to an opaque struct with interior process-local pointers, which no
+ * byte-copy can make shareable.  Also:
  *	- no grouping sets, no DISTINCT/ORDER BY aggregates;
  *	- the table is sized once from the planner estimate and never grows;
  *	  underestimates only lengthen chains, they do not affect correctness;
@@ -495,13 +503,10 @@ StaticAssertDecl(SHARED_AGG_MAX_BUCKETS <=
 /*
  * How transition states are maintained in the shared table.
  *
- * Every eligible aggregate's transition state is fixed-length and
- * pass-by-value: an ordinary AggStatePerGroupData whose transValue is the
- * value itself, mutated in place by advance_transition_function().  There
- * is no by-reference or DSA-blob storage path.  Both the 'internal'
- * pseudo-type (a by-value pointer to an opaque, process-local struct) and
- * any genuinely pass-by-reference transition type (varlena such as
- * numeric, or fixed-length by-ref) are rejected by the planner (see
+ * Pass-by-value states live directly in the entry's AggStatePerGroupData.
+ * Pass-by-reference states live in separately allocated DSA blobs, with
+ * the slot's transValue holding the dsa_pointer; see the file header.
+ * The 'internal' pseudo-type is rejected by the planner (see
  * parallel_shared_hashagg_possible()); the check in
  * shared_agg_init_support() is a cross-check.
  */
@@ -518,6 +523,7 @@ typedef struct SharedAggTransInfo
 	ExprState **argstates_spill;	/* ditto, compiled for minimal-tuple
 									 * slots (spill batch reads) */
 	int			numargs;
+	bool		blob_stored;	/* transValue holds a dsa_pointer */
 	ExprState  *filterstate;	/* FILTER clause, or NULL */
 	ExprState  *filterstate_spill;	/* ditto, for spill batch reads */
 
@@ -785,6 +791,7 @@ static SharedAggEntry *shared_agg_chain_lookup(AggState *aggstate,
 static void shared_agg_insert(AggState *aggstate, dsa_area *area,
 							  TupleTableSlot *hashslot, uint32 hash,
 							  bool allow_spill);
+static void shared_agg_free_blobs(AggState *aggstate, dsa_area *area);
 static void shared_agg_free_table(dsa_area *area,
 								 SharedAggBuildState *shstate);
 static void shared_agg_reset_table(AggState *aggstate, dsa_area *area);
@@ -3410,9 +3417,10 @@ shared_agg_init_support(AggState *aggstate)
 		 * stored in the shared table.  Only fixed-length pass-by-value
 		 * transition types are supported.
 		 */
-		if (pertrans->aggtranstype == INTERNALOID || !pertrans->transtypeByVal)
+		if (pertrans->aggtranstype == INTERNALOID)
 			elog(ERROR, "aggregate %u is not supported by shared hash aggregation",
 				 aggref->aggfnoid);
+		info->blob_stored = !pertrans->transtypeByVal;
 
 		info->numargs = list_length(aggref->args);
 		info->argstates = palloc0(info->numargs * sizeof(ExprState *));
@@ -3567,10 +3575,236 @@ shared_agg_alloc_entry(AggState *aggstate, dsa_area *area, Size len,
 }
 
 /*
+ * Store a flat varlena as a DSA blob and account for it.
+ *
+ * Memory accounting only ever adds: blobs replaced during aggregation are
+ * freed but not subtracted, which can only make spilling kick in earlier --
+ * the safe direction.
+ */
+static dsa_pointer
+shared_agg_store_varlena(AggState *aggstate, dsa_area *area,
+						 struct varlena *val)
+{
+	SharedAggBuildState *shstate = aggstate->shared->build;
+	Size		sz = VARSIZE_ANY(val);
+	dsa_pointer sp;
+
+	sp = dsa_allocate(area, sz);
+	memcpy(dsa_get_address(area, sp), val, sz);
+	pg_atomic_add_fetch_u64(&shstate->mem_used, sz);
+	return sp;
+}
+
+/*
+ * Try to replace the state blob at state_dp with the new (flat, local)
+ * representation IN PLACE.  Steady-state aggregation tends to produce
+ * same-sized states row after row (fixed-scale sums, extrema of similar
+ * length, fixed-size accumulators), and overwriting in place avoids a
+ * dsa_allocate + dsa_free round trip per row -- dsa_allocate takes
+ * area-global locks, so this matters under concurrency.  Returns true if
+ * the blob was overwritten; false if the caller must allocate anew.
+ */
+static bool
+shared_agg_overwrite_blob(dsa_area *area, dsa_pointer state_dp,
+						  const void *newdata, Size newsz)
+{
+	void	   *old = dsa_get_address(area, state_dp);
+
+	if (VARSIZE_ANY(old) != newsz)
+		return false;
+	memcpy(old, newdata, newsz);
+	return true;
+}
+
+/*
+ * Copy a transition value into the DSA area as a self-contained blob,
+ * detoasting varlenas and flattening expanded datums, and return its
+ * dsa_pointer.
+ */
+static dsa_pointer
+shared_agg_store_datum(AggState *aggstate, dsa_area *area,
+					   AggStatePerTrans pertrans, Datum value)
+{
+	SharedAggBuildState *shstate = aggstate->shared->build;
+	dsa_pointer sp;
+	Size		sz;
+
+	if (pertrans->transtypeLen > 0)
+	{
+		/* fixed-length by-reference type (e.g. interval) */
+		sz = (Size) pertrans->transtypeLen;
+		sp = dsa_allocate(area, sz);
+		memcpy(dsa_get_address(area, sp), DatumGetPointer(value), sz);
+	}
+	else if (pertrans->transtypeLen == -2)
+	{
+		/* cstring */
+		sz = strlen(DatumGetCString(value)) + 1;
+		sp = dsa_allocate(area, sz);
+		memcpy(dsa_get_address(area, sp), DatumGetPointer(value), sz);
+	}
+	else if (VARATT_IS_EXTERNAL_EXPANDED(DatumGetPointer(value)))
+	{
+		/* expanded datum: flatten directly into the shared blob */
+		ExpandedObjectHeader *eoh = DatumGetEOHP(value);
+
+		sz = EOH_get_flat_size(eoh);
+		sp = dsa_allocate(area, sz);
+		EOH_flatten_into(eoh, dsa_get_address(area, sp), sz);
+	}
+	else
+	{
+		/* varlena: detoast (into per-tuple memory) and copy flat bytes */
+		return shared_agg_store_varlena(aggstate, area,
+										pg_detoast_datum((struct varlena *) DatumGetPointer(value)));
+	}
+
+	pg_atomic_add_fetch_u64(&shstate->mem_used, sz);
+	return sp;
+}
+
+/*
+ * Advance one by-ref transition state stored in the DSA area.  Caller holds
+ * the stripe LWLock and has staged the argument values.
+ *
+ * This mirrors advance_transition_function(), with the copy semantics
+ * replaced: the state Datum in the shared slot is a dsa_pointer, mapped to
+ * a local address around the call; a new result is copied into DSA and the
+ * old blob freed.  A transition function that returns its own input
+ * unchanged (min/max) or scribbles on it in place (custom bytea states,
+ * sanctioned via AggCheckCallContext) touches the shared blob directly and
+ * requires no copy.
+ *
+ * Note: transition functions that allocate their result in the aggcontext
+ * (as AggCheckCallContext invites) leak that local copy until end of query
+ * in shared mode, since we immediately copy it into DSA; the aggcontext is
+ * not reset between groups here.  Bounded by input size per row, but worth
+ * remembering when profiling memory.
+ */
+static void
+shared_agg_advance_byref(AggState *aggstate, dsa_area *area,
+						 AggStatePerTrans pertrans,
+						 SharedAggTransInfo *info,
+						 AggStatePerGroup pergroupstate)
+{
+	FunctionCallInfo fcinfo = pertrans->transfn_fcinfo;
+	MemoryContext oldContext;
+	Datum		newVal;
+	void	   *oldstate = NULL;
+	int			i;
+
+	for (i = 0; i < info->numargs; i++)
+	{
+		fcinfo->args[i + 1].value = info->pending_args[i];
+		fcinfo->args[i + 1].isnull = info->pending_nulls[i];
+	}
+
+	if (pertrans->transfn.fn_strict)
+	{
+		for (i = 1; i <= pertrans->numTransInputs; i++)
+		{
+			if (fcinfo->args[i].isnull)
+				return;
+		}
+		if (pergroupstate->noTransValue)
+		{
+			/*
+			 * First non-NULL input becomes the state (the agg's input type
+			 * is binary-compatible with its transtype, as for the regular
+			 * path).
+			 */
+			pergroupstate->transValue =
+				(Datum) shared_agg_store_datum(aggstate, area, pertrans,
+											   fcinfo->args[1].value);
+			pergroupstate->transValueIsNull = false;
+			pergroupstate->noTransValue = false;
+			return;
+		}
+		if (pergroupstate->transValueIsNull)
+			return;
+	}
+
+	oldContext = MemoryContextSwitchTo(aggstate->tmpcontext->ecxt_per_tuple_memory);
+
+	/* set up aggstate->curpertrans for AggGetAggref() */
+	aggstate->curpertrans = pertrans;
+
+	if (!pergroupstate->transValueIsNull)
+	{
+		oldstate = dsa_get_address(area, (dsa_pointer) pergroupstate->transValue);
+		fcinfo->args[0].value = PointerGetDatum(oldstate);
+		fcinfo->args[0].isnull = false;
+	}
+	else
+	{
+		fcinfo->args[0].value = (Datum) 0;
+		fcinfo->args[0].isnull = true;
+	}
+	fcinfo->isnull = false;
+
+	newVal = FunctionCallInvoke(fcinfo);
+
+	aggstate->curpertrans = NULL;
+
+	if (fcinfo->isnull)
+	{
+		if (!pergroupstate->transValueIsNull)
+			dsa_free(area, (dsa_pointer) pergroupstate->transValue);
+		pergroupstate->transValue = (Datum) 0;
+		pergroupstate->transValueIsNull = true;
+	}
+	else if (DatumGetPointer(newVal) != oldstate)
+	{
+		/*
+		 * Prefer overwriting the existing blob in place: fixed-length
+		 * states are always the same size, and varlena states usually
+		 * stabilize (fixed-scale sums, extrema of similar length),
+		 * avoiding per-row dsa_allocate/dsa_free traffic.
+		 */
+		if (!pergroupstate->transValueIsNull && pertrans->transtypeLen > 0)
+		{
+			memcpy(dsa_get_address(area, (dsa_pointer) pergroupstate->transValue),
+				   DatumGetPointer(newVal), (Size) pertrans->transtypeLen);
+		}
+		else
+		{
+			struct varlena *flat = NULL;
+
+			if (!pergroupstate->transValueIsNull &&
+				pertrans->transtypeLen == -1 &&
+				!VARATT_IS_EXTERNAL_EXPANDED(DatumGetPointer(newVal)))
+				flat = pg_detoast_datum((struct varlena *) DatumGetPointer(newVal));
+
+			if (flat != NULL &&
+				shared_agg_overwrite_blob(area,
+										  (dsa_pointer) pergroupstate->transValue,
+										  flat, VARSIZE_ANY(flat)))
+			{
+				/* overwritten in place */
+			}
+			else
+			{
+				dsa_pointer newsp;
+
+				newsp = shared_agg_store_datum(aggstate, area, pertrans,
+											   newVal);
+				if (!pergroupstate->transValueIsNull)
+					dsa_free(area, (dsa_pointer) pergroupstate->transValue);
+				pergroupstate->transValue = (Datum) newsp;
+				pergroupstate->transValueIsNull = false;
+				pergroupstate->noTransValue = false;
+			}
+		}
+	}
+	/* else: state was modified (or kept) in place in shared memory */
+
+	MemoryContextSwitchTo(oldContext);
+}
+
+/*
  * Apply the staged inputs to one shared entry's transition states.  Caller
  * holds the entry's stripe LWLock; keep this minimal -- no expression
- * evaluation happens here (it already happened pre-lock).  Every
- * transition type admitted to this path is fixed-length pass-by-value.
+ * evaluation happens here (it already happened pre-lock).
  */
 static void
 shared_agg_apply(AggState *aggstate, dsa_area *area, AggStatePerGroup states)
@@ -3588,7 +3822,12 @@ shared_agg_apply(AggState *aggstate, dsa_area *area, AggStatePerGroup states)
 		if (info->pending_skip)
 			continue;
 
-		Assert(pertrans->transtypeByVal);
+		if (info->blob_stored)
+		{
+			shared_agg_advance_byref(aggstate, area, pertrans, info,
+									 pergroupstate);
+			continue;
+		}
 
 		for (i = 0; i < info->numargs; i++)
 		{
@@ -3790,8 +4029,17 @@ shared_agg_insert(AggState *aggstate, dsa_area *area,
 			AggStatePerTrans pertrans = &aggstate->pertrans[transno];
 			AggStatePerGroup pergroupstate = &states[transno];
 
-			Assert(pertrans->transtypeByVal);
-			initialize_aggregate(aggstate, pertrans, pergroupstate);
+			if (pertrans->transtypeByVal || pertrans->initValueIsNull)
+				initialize_aggregate(aggstate, pertrans, pergroupstate);
+			else
+			{
+				/* non-NULL by-ref initcond: copy the blob into DSA */
+				pergroupstate->transValue =
+					(Datum) shared_agg_store_datum(aggstate, area, pertrans,
+												   pertrans->initValue);
+				pergroupstate->transValueIsNull = false;
+				pergroupstate->noTransValue = false;
+			}
 		}
 
 		/*
@@ -3845,6 +4093,51 @@ shared_agg_insert(AggState *aggstate, dsa_area *area,
  * spill batches, this is for tearing the table down entirely.  Caller must
  * be certain that no participant can still be touching it.
  */
+/*
+ * Free every separately allocated by-ref state blob reachable from the
+ * bucket array.  Entry memory itself is freed wholesale via the chunk
+ * list; this walk is needed only when some transition keeps its state in
+ * a blob, so callers skip it entirely for all-by-value aggregation.
+ *
+ * Caller must be certain no participant can be touching the table.
+ */
+static void
+shared_agg_free_blobs(AggState *aggstate, dsa_area *area)
+{
+	SharedAggBuildState *shstate = aggstate->shared->build;
+	dsa_pointer_atomic *buckets;
+	bool		have_blobs = false;
+	int			transno;
+	uint64		i;
+
+	for (transno = 0; transno < aggstate->numtrans; transno++)
+		have_blobs |= aggstate->shared->transinfo[transno].blob_stored;
+	if (!have_blobs || !DsaPointerIsValid(shstate->buckets))
+		return;
+
+	buckets = (dsa_pointer_atomic *) dsa_get_address(area, shstate->buckets);
+	for (i = 0; i < shstate->nbuckets; i++)
+	{
+		dsa_pointer entryp = dsa_pointer_atomic_read(&buckets[i]);
+
+		while (DsaPointerIsValid(entryp))
+		{
+			SharedAggEntry *entry = (SharedAggEntry *)
+				dsa_get_address(area, entryp);
+			AggStatePerGroup states = shared_agg_entry_states(entry);
+
+			for (transno = 0; transno < aggstate->numtrans; transno++)
+			{
+				if (aggstate->shared->transinfo[transno].blob_stored &&
+					!states[transno].transValueIsNull)
+					dsa_free(area,
+							 (dsa_pointer) states[transno].transValue);
+			}
+			entryp = entry->next;
+		}
+	}
+}
+
 static void
 shared_agg_free_table(dsa_area *area, SharedAggBuildState *shstate)
 {
@@ -3878,6 +4171,9 @@ shared_agg_reset_table(AggState *aggstate, dsa_area *area)
 		dsa_get_address(area, shstate->buckets);
 	dsa_pointer chunkp;
 	uint64		i;
+
+	/* by-ref state blobs are allocated apart from the entry chunks */
+	shared_agg_free_blobs(aggstate, area);
 
 	/* free all entry chunks wholesale */
 	chunkp = shstate->chunk_head;
@@ -4369,12 +4665,22 @@ agg_retrieve_shared_hash_table(AggState *aggstate)
 		states = shared_agg_entry_states(entry);
 
 		/*
-		 * finalize_aggregates() wants a local AggStatePerGroupData array.
-		 * Every transValue here is a plain by-value Datum, so a flat copy
-		 * suffices -- no dsa_pointer translation is ever needed.
+		 * finalize_aggregates() wants a local AggStatePerGroupData array
+		 * with process-local pointers.  Copy the states into scratch,
+		 * translating by-ref dsa_pointers into mapped addresses; the
+		 * final functions treat the state as read-only, so handing them
+		 * the shared blob directly is safe.
 		 */
 		for (transno = 0; transno < aggstate->numtrans; transno++)
+		{
+			SharedAggTransInfo *info = &aggstate->shared->transinfo[transno];
+
 			scratch[transno] = states[transno];
+			if (info->blob_stored && !scratch[transno].transValueIsNull)
+				scratch[transno].transValue =
+					PointerGetDatum(dsa_get_address(area,
+													(dsa_pointer) states[transno].transValue));
+		}
 
 		econtext->ecxt_outertuple = firstSlot;
 		prepare_projection_slot(aggstate, econtext->ecxt_outertuple,
@@ -6384,7 +6690,10 @@ ExecAggReInitializeDSM(AggState *node, ParallelContext *pcxt)
 	 */
 	Assert(area != NULL);
 	if (area != NULL)
+	{
+		shared_agg_free_blobs(node, area);
 		shared_agg_free_table(area, shstate);
+	}
 
 	BarrierInit(&shstate->build_barrier, 0);
 	BarrierInit(&shstate->scan_barrier, 0);
