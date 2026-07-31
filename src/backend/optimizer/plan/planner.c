@@ -7362,6 +7362,24 @@ static bool shared_hashagg_safe_transtype(Oid transtype);
  */
 #define SHARED_AGG_MIN_GROUPS	1000.0
 
+/*
+ * Rows per group at which stripe-lock contention is charged at half its
+ * asymptotic weight.  Not derived from anything: fitted to the crossover
+ * against Partial/Finalize measured on single-int4-key aggregation, on one
+ * machine.  The shape is defensible -- as it saturates, the surcharge
+ * approaches transCost * rows * (N-1)/N, the Amdahl limit of fully serialised
+ * transition work -- but the constant is a calibration, and a two-socket
+ * machine or a costlier transition function would want a different one.
+ */
+#define SHARED_AGG_CONTENTION_HALFWAY	6000.0
+
+/*
+ * Cost of one exclusive stripe LWLock acquisition, in cpu_operator_cost units.
+ * Under contention an LWLock costs several times a simple operator; the
+ * measured crossover puts it around two operators' worth.
+ */
+#define SHARED_AGG_LOCK_COST	(2.0 * cpu_operator_cost)
+
 static bool
 shared_hashagg_worth_trying(double dNumGroups, List *partial_pathlist)
 {
@@ -7441,12 +7459,7 @@ parallel_shared_hashagg_possible(PlannerInfo *root)
 		if (!shared_hashagg_safe_transtype(aggref->aggtranstype))
 			return false;
 
-		/*
-		 * And only pass-by-value states for now: a by-reference state is just
-		 * bytes and could be stored alongside the entry, but the transition
-		 * function may repalloc() or pfree() what it is handed and DSA memory
-		 * survives neither.  A separate patch deals with those.
-		 */
+		/* by-value states only until a later patch; see 0001 */
 		if (!get_typbyval(aggref->aggtranstype))
 			return false;
 
@@ -7941,10 +7954,118 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 			aggpath->numGroups = dNumGroups;
 
 			/*
-			 * Each participant emits a disjoint share of the groups.  What the
-			 * shared states cost to keep consistent between them is priced in a
-			 * separate patch.
+			 * Each participant emits a disjoint share of the groups.
+			 *
+			 * Add a surcharge for contention during the shared build.
+			 * With many rows per group, concurrent updates of the same
+			 * groups serialize on the bucket stripe locks, and the shared
+			 * table loses to Partial/Finalize, whose Finalize over few
+			 * groups is cheap.  What serializes is the transition work
+			 * itself, so scale by transCost.per_tuple, by the participants
+			 * beyond the first, and by a factor saturating in rows per
+			 * group: negligible below about a hundred rows per group,
+			 * dominant beyond a few thousand.
+			 *
+			 * Rows per group is an average and so cannot see skew, which
+			 * is the more dangerous failure mode: every row of a single
+			 * very frequent grouping key updates the same shared state,
+			 * so those rows serialize on one stripe lock however low the
+			 * average is, and more participants only lengthen the queue.
+			 * Estimate the hottest group's share of the input the same
+			 * way cost_hashjoin() estimates bucket skew, from the MCV
+			 * statistics, and charge for the serialized work following
+			 * Amdahl: doing those rows one-at-a-time instead of spread
+			 * over nparticipants costs an extra (nparticipants-1)/
+			 * nparticipants of their combined transition and locking
+			 * time.
+			 *
+			 * A group's frequency cannot exceed that of any one of its
+			 * columns' most common values, so the minimum across the
+			 * grouping columns bounds it from above; using the bound
+			 * assumes full correlation, erring toward Partial/Finalize,
+			 * whose skew behavior is benign.  Columns with no statistics
+			 * report zero, i.e. no evidence of skew -- the same optimism
+			 * cost_hashjoin() lives with.
+			 *
+			 * Finally, every input row takes and releases an exclusive
+			 * stripe LWLock whether or not anyone contends for it.  That is
+			 * charged unconditionally: it is the strategy's fixed per-row tax,
+			 * and leaving it out of the model made a pure GROUP BY with no
+			 * aggregates at all -- transCost.per_tuple zero, both surcharges
+			 * therefore zero -- look free.
+			 *
+			 * (cost_agg() has already set ->rows from the per-participant group
+			 * count passed above, so there is nothing to correct here.)
 			 */
+			{
+				double		total_rows =
+					cheapest_partial_path->rows * nparticipants;
+				double		rows_per_group =
+					total_rows / Max(dNumGroups, 1.0);
+				double		contention_factor =
+					rows_per_group / (rows_per_group + SHARED_AGG_CONTENTION_HALFWAY);
+				Selectivity group_mcv_freq = 0.0;
+				Cost		surcharge;
+				bool		mcv_known = false;
+				ListCell   *glc;
+
+				/*
+				 * Both surcharges are transition-time costs, and cost_agg()
+				 * puts transition work in startup_cost because a hashed Agg
+				 * cannot emit until it has read its input.  Charging only
+				 * total_cost would let compare_fractional_path_costs() discount
+				 * the whole surcharge under a LIMIT -- which is to say, the
+				 * plan the surcharges exist to discourage would be chosen
+				 * precisely when a LIMIT was present.
+				 */
+				surcharge =
+					agg_costs->transCost.per_tuple *
+					cheapest_partial_path->rows *
+					(nparticipants - 1) *
+					contention_factor;
+				surcharge +=
+					cheapest_partial_path->rows * SHARED_AGG_LOCK_COST;
+
+				/*
+				 * Skew evidence is only meaningful for this relation's own
+				 * expressions.  Under partitionwise aggregation a child
+				 * grouped rel is costed here with the PARENT's grouping
+				 * expressions, which would send examine_variable() looking up
+				 * statistics for the wrong relation; no evidence beats wrong
+				 * evidence.
+				 */
+				if (!IS_OTHER_REL(grouped_rel))
+				{
+					foreach(glc, get_sortgrouplist_exprs(root->processed_groupClause,
+														 parse->targetList))
+					{
+						Node	   *groupexpr = (Node *) lfirst(glc);
+						Selectivity mcv_freq;
+						Selectivity bucketsize_frac;
+
+						estimate_hash_bucket_stats(root, groupexpr,
+												   dNumGroups,
+												   &mcv_freq,
+												   &bucketsize_frac);
+						if (mcv_freq > 0.0 &&
+							(!mcv_known || mcv_freq < group_mcv_freq))
+						{
+							group_mcv_freq = mcv_freq;
+							mcv_known = true;
+						}
+					}
+				}
+
+				if (mcv_known && group_mcv_freq > 0.0)
+					surcharge +=
+						group_mcv_freq * total_rows *
+						(agg_costs->transCost.per_tuple +
+						 SHARED_AGG_LOCK_COST) *
+						(nparticipants - 1) / nparticipants;
+
+				aggpath->path.startup_cost += surcharge;
+				aggpath->path.total_cost += surcharge;
+			}
 
 			add_partial_path(grouped_rel, (Path *) aggpath);
 		}
