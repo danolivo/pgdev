@@ -16,13 +16,16 @@ set parallel_tuple_cost = 0;
 set min_parallel_table_scan_size = 0;
 set max_parallel_workers_per_gather = 2;
 
+-- Note the group count: the planner refuses the shared strategy below a
+-- floor (SHARED_AGG_MIN_GROUPS), because with few groups the Finalize stage
+-- it eliminates is cheap and the contention it adds is not.
 create table pha_src (g int4, x int4, y int8, b bool);
 insert into pha_src
-  select i % 100,
+  select i % 2000,
          (i % 7)::int4,
          (i % 13)::int8,
          (i % 2 = 0)
-  from generate_series(1, 10000) i;
+  from generate_series(1, 20000) i;
 analyze pha_src;
 
 --
@@ -98,7 +101,7 @@ select count(*) as mismatched_rows from (
 -- uses a plain int8[] state and therefore qualifies.)
 --
 explain (costs off)
-  select g, sum(n), avg(x)
+  select pha_src.g, sum(n), avg(x)
   from pha_src, pha_num where pha_num.g = pha_src.g group by pha_src.g;
 
 --
@@ -113,7 +116,7 @@ explain (costs off)
     (select g, sum(x) as sx from pha_src group by g) ss
     right join (values (1), (2), (3)) v(k) on true;
 
--- three identical passes over 100 groups
+-- three identical passes over the same groups
 select count(*) as nrows, sum(sx) as checksum from
   (select g, sum(x) as sx from pha_src group by g) ss
   right join (values (1), (2), (3)) v(k) on true;
@@ -190,8 +193,87 @@ select explain_pha_spill($$
   select g, sum(x), count(*) from pha_spill_src group by g
 $$);
 
+--
+-- 6. Stopping early over a spilled table.  A participant that stops before
+-- the batch cycle is over must leave the scan barrier on its way out;
+-- otherwise the participants still cycling wait for an arrival that will
+-- never come, and the query hangs rather than failing.
+--
+select count(*) from
+  (select g, sum(x) from pha_spill_src group by g limit 5) ss;
+
+--
+-- 7. Rescan after a spill.  The spill tuplestores are single-pass, so each
+-- re-execution needs fresh ones; this used to be refused outright at run
+-- time, which made a legitimately planned query fail as a function of how
+-- much data it happened to meet.
+--
+set enable_material = off;
+
+select count(*) as nrows, sum(sx) as checksum from
+  (select g, sum(x) as sx from pha_spill_src group by g) ss
+  right join (values (1), (2)) v(k) on true;
+
+select count(*) * 2 as nrows, sum(sx) * 2 as checksum from
+  (select g, sum(x) as sx from pha_spill_src group by g) ss;
+
+reset enable_material;
 reset work_mem;
 reset hash_mem_multiplier;
+
+--
+-- 8. By-reference states whose size changes from row to row, which is what
+-- exercises both branches of the blob update: overwrite in place when the
+-- new state is the same size, allocate and free when it is not.
+--
+create table pha_text (g int4, t text);
+insert into pha_text
+  select i % 3000, repeat('abc', 1 + (i % 17))
+  from generate_series(1, 30000) i;
+analyze pha_text;
+
+create table pha_text_ref as select * from pha_text;
+alter table pha_text_ref set (parallel_workers = 0);
+analyze pha_text_ref;
+
+explain (costs off)
+  select g, min(t), max(t) from pha_text group by g;
+
+select count(*) as mismatched_rows from (
+    (select g, min(t) mn, max(t) mx from pha_text group by g
+     except
+     select g, min(t), max(t) from pha_text_ref group by g)
+    union all
+    (select g, min(t), max(t) from pha_text_ref group by g
+     except
+     select g, min(t), max(t) from pha_text group by g)
+) diff;
+
+--
+-- 9. A parallel-aware Agg has to be able to run with no parallel context at
+-- all.  ExecutePlan() does not enter parallel mode when it has been given a
+-- tuple count, which is the case for SPI with a row limit -- how PL/pgSQL
+-- runs SELECT ... INTO -- and for cursor FETCH.  There is then no shared
+-- table to build, and the node must fall back to a private one instead of
+-- complaining that it was never initialized.
+--
+do $$
+declare
+    nrows   int8;
+    total   int8;
+begin
+    select count(*), sum(sx) into nrows, total
+      from (select g, sum(x) as sx from pha_src group by g) ss;
+    raise notice 'serial fallback: nrows=%, total=%', nrows, total;
+end
+$$;
+
+begin;
+declare pha_cur cursor for
+  select g, sum(x) as sx from pha_src group by g order by g;
+fetch 3 from pha_cur;
+commit;
+
 reset enable_sort;
 reset enable_parallel_hash_agg;
 reset parallel_setup_cost;

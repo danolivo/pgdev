@@ -387,11 +387,33 @@ EXPLAIN SELECT * FROM pgbench_accounts WHERE filler LIKE '%x%';
   </para>
 
   <para>
+    For grouped aggregation there is a second strategy, which avoids the
+    serial finalization step altogether: all participating processes
+    cooperatively build one hash table in shared memory, so that each group has
+    a single transition state that every row is applied to directly, and then
+    each process emits a disjoint share of the finished groups.  There are no
+    partial results and therefore nothing to merge, which is reflected in the
+    plan as a single <literal>Parallel HashAggregate</literal> node under
+    <literal>Gather</literal>, with no <literal>Partial</literal> or
+    <literal>Finalize</literal> node.  Because it removes precisely the cost
+    described above, the planner favours it for the many-groups case that
+    penalizes two-stage aggregation; because the shared states must instead be
+    kept consistent between processes, it is unfavourable when there are few
+    groups or when one grouping key is very much more common than the rest.
+    The choice is made on cost, and can be disabled with
+    <xref linkend="guc-enable-parallel-hash-agg"/>, whose description lists
+    which aggregates are eligible.
+  </para>
+
+  <para>
     Parallel aggregation is not supported in all situations.  Each aggregate
     must be <link linkend="parallel-safety">safe</link> for parallelism and must
     have a combine function.  If the aggregate has a transition state of type
     <literal>internal</literal>, it must have serialization and deserialization
-    functions.  See <xref linkend="sql-createaggregate"/> for more details.
+    functions.  (The shared-table strategy described above requires none of
+    these three, as it never transfers or merges a transition state; it has its
+    own restrictions instead.)  See
+    <xref linkend="sql-createaggregate"/> for more details.
     Parallel aggregation is not supported if any aggregate function call
     contains <literal>DISTINCT</literal> or <literal>ORDER BY</literal> clause and is also
     not supported for ordered set aggregates or when  the query involves

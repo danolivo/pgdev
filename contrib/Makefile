@@ -6,7 +6,6 @@ include $(top_builddir)/src/Makefile.global
 
 SUBDIRS = \
 		amcheck		\
-		shared_numeric_agg	\
 		auth_delay	\
 		auto_explain	\
 		basic_archive	\
@@ -47,6 +46,7 @@ SUBDIRS = \
 		pg_walinspect	\
 		postgres_fdw	\
 		seg		\
+		shared_numeric_agg	\
 		spi		\
 		tablefunc	\
 		tcn		\

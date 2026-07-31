@@ -3768,9 +3768,14 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 		agg->aggstrategy != AGG_MIXED)
 		return;
 
+	/*
+	 * A parallel-aware Agg partitions its spill by a fixed number of
+	 * partitions, so hash_planned_partitions -- computed for the private table
+	 * it never built -- would be reporting a plan that does not exist.
+	 */
 	if (es->format != EXPLAIN_FORMAT_TEXT)
 	{
-		if (es->costs)
+		if (es->costs && !agg->plan.parallel_aware)
 			ExplainPropertyInteger("Planned Partitions", NULL,
 								   aggstate->hash_planned_partitions, es);
 
@@ -3779,7 +3784,7 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 		{
 			if (aggstate->shared_nbuckets > 0)
 			{
-				ExplainPropertyInteger("Shared Hash Buckets", NULL,
+				ExplainPropertyInteger("Shared Buckets", NULL,
 									   aggstate->shared_nbuckets, es);
 				ExplainPropertyInteger("Shared Memory Usage", "kB",
 									   (aggstate->shared_mem_used + 1023) / 1024,
@@ -3812,7 +3817,8 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 	{
 		bool		gotone = false;
 
-		if (es->costs && aggstate->hash_planned_partitions > 0)
+		if (es->costs && aggstate->hash_planned_partitions > 0 &&
+			!agg->plan.parallel_aware)
 		{
 			ExplainIndentText(es);
 			appendStringInfo(es->str, "Planned Partitions: %d",

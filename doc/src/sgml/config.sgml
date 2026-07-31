@@ -6062,12 +6062,30 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
         hash aggregation, in which all participating parallel workers
         cooperatively build a single shared hash table for grouped
         aggregation instead of each worker building its own partial hash
-        table for a later serial finalization step.  This is available
-        for any aggregate whose transition state is a regular data type;
-        aggregates using the <literal>internal</literal> pseudo-type for
-        their transition state, such as <function>avg</function> on
-        integer types, are not eligible.  The default is
+        table for a later serial finalization step.  The default is
         <literal>on</literal>.
+       </para>
+       <para>
+        This strategy is available for an aggregate whose transition state is
+        a regular data type and whose final function does not modify that
+        state.  Aggregates using the <literal>internal</literal> pseudo-type
+        for their transition state are not eligible, since such a state is
+        private to one process; this excludes, for example,
+        <function>sum</function> and <function>avg</function> on
+        <type>bigint</type> and <type>numeric</type>.  It is also not used for
+        grouping sets, nor for aggregates with <literal>DISTINCT</literal> or
+        <literal>ORDER BY</literal>, and the planner will not choose it when
+        it estimates few enough groups that the finalization step it avoids
+        would have been cheap.
+       </para>
+       <para>
+        Note that the shared hash table is allowed the memory that the
+        per-worker tables it replaces would have used in total, that is
+        <xref linkend="guc-work-mem"/> multiplied by
+        <xref linkend="guc-hash-mem-multiplier"/> multiplied by the number of
+        participating processes.  As with other hash-based plans, exceeding
+        that limit causes the remaining input to be spilled to temporary
+        files rather than the query to fail.
        </para>
       </listitem>
      </varlistentry>

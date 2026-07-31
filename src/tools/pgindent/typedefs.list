@@ -873,6 +873,7 @@ FixedParallelExecutorState
 FixedParallelState
 FixedParamState
 FlagMode
+FlatSumState
 Float
 FlushPosition
 FmgrBuiltin
@@ -2866,7 +2867,12 @@ SetToDefault
 SetVarReturningType_context
 SetupWorkerPtrType
 ShDependObjectInfo
+SharedAggBuildState
+SharedAggChunk
+SharedAggEntry
 SharedAggInfo
+SharedAggState
+SharedAggTransInfo
 SharedBitmapHeapInstrumentation
 SharedBitmapState
 SharedDependencyObjectType
