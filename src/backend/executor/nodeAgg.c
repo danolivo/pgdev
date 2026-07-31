@@ -7089,6 +7089,38 @@ ExecAggRetrieveInstrumentation(AggState *node)
 	Size		size;
 	SharedAggInfo *si;
 
+	/*
+	 * Copy shared-build spill statistics into backend-local fields while
+	 * the DSM segment is still attached; EXPLAIN runs after it is gone.
+	 */
+	if (node->shared != NULL && node->shared->build != NULL)
+	{
+		SharedAggBuildState *shstate = node->shared->build;
+		int			i;
+
+		node->shared_nspilled = shared_agg_nspilled(shstate);
+		node->shared_nbuckets = shstate->nbuckets;
+		/*
+		 * Report the high-water mark, and read it as signed: the counter is
+		 * maintained with wrapping adds (see shared_agg_account()), so a
+		 * trailing negative flush must show as zero rather than as sixteen
+		 * exabytes.
+		 */
+		{
+			int64		peak;
+
+			shared_agg_note_mem_peak(shstate);
+			peak = (int64) pg_atomic_read_u64(&shstate->mem_peak);
+			node->shared_mem_used = peak > 0 ? (uint64) peak : 0;
+		}
+		node->shared_nbatches = 0;
+		for (i = 0; i < SHARED_AGG_SPILL_PARTITIONS; i++)
+		{
+			if (pg_atomic_read_u64(&shstate->npart_spilled[i]) > 0)
+				node->shared_nbatches++;
+		}
+	}
+
 	if (node->shared_info == NULL)
 		return;
 

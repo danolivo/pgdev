@@ -153,6 +153,38 @@ select count(*) as mismatched_rows from (
     select * from pha_spill_shared except select * from pha_spill_ref
 ) diff;
 
+-- mask the actual counters (which legitimately vary with the number of
+-- workers the system happens to launch) so the test only asserts that the
+-- spill-statistics lines are present, not their exact values
+create function explain_pha_spill(query text) returns setof text
+language plpgsql as
+$$
+declare
+    ln text;
+begin
+    for ln in
+        execute 'explain (analyze, costs off, timing off, summary off, buffers off) ' || query
+    loop
+        -- mask counters that legitimately vary with how many workers the
+        -- system happens to launch, keeping only structural plan shape and
+        -- the presence of the spill-statistics fields under test
+        ln := regexp_replace(ln, 'Shared Buckets: [0-9]+', 'Shared Buckets: N', 'g');
+        ln := regexp_replace(ln, 'Shared Peak Memory Usage: [0-9]+kB', 'Shared Peak Memory Usage: NkB', 'g');
+        ln := regexp_replace(ln, 'Spilled Tuples: [0-9]+', 'Spilled Tuples: N', 'g');
+        ln := regexp_replace(ln, 'Spill Batches: [0-9]+', 'Spill Batches: N', 'g');
+        ln := regexp_replace(ln, 'Workers Launched: [0-9]+', 'Workers Launched: N', 'g');
+        ln := regexp_replace(ln, 'Rows Removed by Filter: [0-9]+', 'Rows Removed by Filter: N', 'g');
+        ln := regexp_replace(ln, 'rows=[0-9]+(\.[0-9]+)?', 'rows=N', 'g');
+        ln := regexp_replace(ln, 'loops=[0-9]+', 'loops=N', 'g');
+        return next ln;
+    end loop;
+end;
+$$;
+
+select explain_pha_spill($$
+  select g, sum(x), count(*) from pha_spill_src group by g
+$$);
+
 --
 -- 6. Stopping early over a spilled table.  A participant that stops before
 -- the batch cycle is over must leave the scan barrier on its way out;
