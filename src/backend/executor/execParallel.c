@@ -1071,6 +1071,10 @@ ExecParallelReInitializeDSM(PlanState *planstate,
 				ExecHashJoinReInitializeDSM((HashJoinState *) planstate,
 											pcxt);
 			break;
+		case T_AggState:
+			if (planstate->plan->parallel_aware)
+				ExecAggReInitializeDSM((AggState *) planstate, pcxt);
+			break;
 		case T_BitmapIndexScanState:
 		case T_HashState:
 		case T_SortState:

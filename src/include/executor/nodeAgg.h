@@ -324,6 +324,7 @@ typedef struct AggStatePerHashData
 
 extern AggState *ExecInitAgg(Agg *node, EState *estate, int eflags);
 extern void ExecEndAgg(AggState *node);
+extern void ExecShutdownAgg(AggState *node);
 extern void ExecReScanAgg(AggState *node);
 
 extern Size hash_agg_entry_size(int numTrans, Size tupleWidth,
@@ -335,6 +336,7 @@ extern void hash_agg_set_limits(double hashentrysize, double input_groups,
 /* parallel instrumentation support */
 extern void ExecAggEstimate(AggState *node, ParallelContext *pcxt);
 extern void ExecAggInitializeDSM(AggState *node, ParallelContext *pcxt);
+extern void ExecAggReInitializeDSM(AggState *node, ParallelContext *pcxt);
 extern void ExecAggInitializeWorker(AggState *node, ParallelWorkerContext *pwcxt);
 extern void ExecAggRetrieveInstrumentation(AggState *node);
 

@@ -2505,6 +2505,14 @@ typedef struct AggState
 	AggStatePerGroup *all_pergroups;	/* array of first ->pergroups, than
 										 * ->hash_pergroup */
 	SharedAggInfo *shared_info; /* one entry per worker */
+
+	/*
+	 * Parallel shared hash aggregation: all participants of a parallel query
+	 * cooperatively build a single hash table in dynamic shared memory and
+	 * then emit disjoint shares of the finished groups.  Non-NULL only for a
+	 * parallel-aware hashed Agg; the state itself is private to nodeAgg.c.
+	 */
+	struct SharedAggState *shared;
 } AggState;
 
 /* ----------------

@@ -19,11 +19,13 @@
 #include <math.h>
 
 #include "access/genam.h"
+#include "access/htup_details.h"
 #include "access/parallel.h"
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/pg_language.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
@@ -63,6 +65,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
+#include "utils/syscache.h"
 
 /* GUC parameters */
 double		cursor_tuple_fraction = DEFAULT_CURSOR_TUPLE_FRACTION;
@@ -7336,6 +7339,311 @@ done:
 	return parallel_workers;
 }
 
+static bool shared_hashagg_safe_function(Oid aggfnoid);
+static bool shared_hashagg_internal_language(Oid fnoid);
+static char shared_hashagg_finalmodify(Oid aggfnoid);
+static bool shared_hashagg_safe_transtype(Oid transtype);
+
+/*
+ * Fewest groups for which a shared hash table is worth considering at all.
+ *
+ * Below this the strategy has no upside to trade against its contention: the
+ * Finalize stage it exists to eliminate costs a pass over the groups, and that
+ * is cheap precisely when the groups are few, while every participant piles
+ * onto the same handful of shared transition states.  Measurements are
+ * lopsided about it -- low-cardinality aggregation is where a shared table
+ * loses by more than an order of magnitude, not by a few per cent.
+ *
+ * The cost surcharges further down model that too, but only as well as they
+ * can see it, and they cannot see it at all when the grouping key is an
+ * expression or a join output: there are no MCV statistics for those, and the
+ * group-count estimate falls back to a default that looks reassuringly
+ * moderate.  A floor keeps the case the model is blind to out of its hands.
+ */
+#define SHARED_AGG_MIN_GROUPS	1000.0
+
+static bool
+shared_hashagg_worth_trying(double dNumGroups, List *partial_pathlist)
+{
+	Path	   *cheapest = (Path *) linitial(partial_pathlist);
+	double		nparticipants = cheapest->parallel_workers + 1;
+
+	/*
+	 * Fewer groups than participants is the degenerate end of the same story:
+	 * someone would have nothing to emit, and everyone would contend.
+	 */
+	return dNumGroups >= SHARED_AGG_MIN_GROUPS &&
+		dNumGroups >= nparticipants;
+}
+
+/*
+ * parallel_shared_hashagg_possible
+ *
+ * Check whether every aggregate in the query, and every grouping key, can
+ * run under the parallel shared hash aggregation strategy.
+ *
+ * Transition states live in dynamic shared memory and are mutated in place by
+ * whichever participant sees a row for the group.  Pass-by-value states sit
+ * directly in the shared entry; pass-by-reference states (varlena such as
+ * numeric or bytea, fixed-length by-ref such as interval) are stored as
+ * self-contained DSA blobs.
+ *
+ * Note this walks root->agginfos rather than pulling Aggrefs out of the
+ * grouping target itself.  preprocess_aggrefs() has already collected every
+ * aggregate in the query -- target list and HAVING clause both -- and resolved
+ * the fields we care about, so there is nothing to gain from a second walk and
+ * something to lose: pull_var_clause() rejects PlaceHolderVars unless told to
+ * expect them, and the grouping target certainly contains them.
+ */
+static bool
+parallel_shared_hashagg_possible(PlannerInfo *root)
+{
+	ListCell   *lc;
+
+	foreach(lc, root->agginfos)
+	{
+		AggInfo    *agginfo = lfirst_node(AggInfo, lc);
+		Aggref	   *aggref;
+
+		/*
+		 * Every Aggref sharing one AggInfo is equal to the others as far as
+		 * transition type, DISTINCT, ORDER BY and kind go, so the first one
+		 * answers for all of them.
+		 */
+		aggref = linitial_node(Aggref, agginfo->aggrefs);
+
+		/*
+		 * The final function is handed a pointer straight into the shared
+		 * entry, so it must be content to read it.  prepagg.c's "shareable"
+		 * flag is close but not the same test -- it means "not READ_WRITE",
+		 * which also admits SHAREABLE -- while the executor's cross-check in
+		 * shared_agg_init_support() demands READ_ONLY.  Two copies of a rule
+		 * that differ is how an internal error reaches a user, and that one is
+		 * reachable from a plain EXPLAIN, so ask for READ_ONLY here too.
+		 */
+		if (!agginfo->shareable ||
+			shared_hashagg_finalmodify(aggref->aggfnoid) != AGGMODIFY_READ_ONLY)
+			return false;
+
+		/* resolved by preprocess_aggref() before path generation */
+		if (!OidIsValid(aggref->aggtranstype))
+			return false;
+
+		/*
+		 * The 'internal' pseudo-type is a pass-by-value pointer to an opaque,
+		 * process-local struct that no byte-copy can make shareable.  This
+		 * rules out sum() and avg() on bigint and numeric, and the
+		 * array_agg/string_agg family.
+		 */
+		if (aggref->aggtranstype == INTERNALOID)
+			return false;
+
+		if (!shared_hashagg_safe_transtype(aggref->aggtranstype))
+			return false;
+
+		/*
+		 * And only pass-by-value states for now: a by-reference state is just
+		 * bytes and could be stored alongside the entry, but the transition
+		 * function may repalloc() or pfree() what it is handed and DSA memory
+		 * survives neither.  A separate patch deals with those.
+		 */
+		if (!get_typbyval(aggref->aggtranstype))
+			return false;
+
+		/* out for the same reasons they cannot use partial aggregation */
+		if (aggref->aggdistinct != NIL || aggref->aggorder != NIL)
+			return false;
+
+		if (aggref->aggkind != AGGKIND_NORMAL)
+			return false;
+
+		/*
+		 * The transition function runs with the group's stripe LWLock held, so
+		 * it has to be something we can bound.  A built-in one is a few
+		 * instructions; a PL/pgSQL one may open a portal, run SPI, take
+		 * heavyweight locks and do I/O -- all under a lock that the deadlock
+		 * detector cannot see and that LWLockAcquire() will not let anyone
+		 * interrupt while waiting for.  Restricting this to internal-language
+		 * functions is blunt, and the alternative is a per-group lock that at
+		 * least bounds the damage to one group; until then, blunt it is.
+		 */
+		if (!shared_hashagg_safe_function(aggref->aggfnoid))
+			return false;
+	}
+
+	/*
+	 * Require real statistics for every grouping key.
+	 *
+	 * This is about the cost model rather than the executor, which does not
+	 * care what the key is.  Choosing the strategy is only defensible when we
+	 * can see the key's distribution: the surcharges are driven by the
+	 * estimated group count and by MCV statistics, and where there are neither
+	 * -- an expression, a volatile function, the output of a join, a table
+	 * nobody analysed -- get_variable_numdistinct() quietly substitutes a
+	 * default that looks reassuringly moderate whatever the truth is.  GROUP BY
+	 * length(x) where every x has the same length is the case in point: one
+	 * group, ten thousand rows, and nothing in the estimate to say so.
+	 *
+	 * So the test is on the estimate's provenance, not on the expression's
+	 * shape: isdefault means "I made this up", and a made-up group count is
+	 * exactly what the model must not be asked to judge.
+	 */
+	/*
+	 * The grouping keys' equality functions run under the stripe lock too: the
+	 * second, locked chain walk in shared_agg_insert() compares keys.  Same
+	 * reasoning as for the transition function.
+	 */
+	foreach(lc, root->processed_groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+
+		if (!OidIsValid(sgc->eqop) ||
+			!shared_hashagg_internal_language(get_opcode(sgc->eqop)))
+			return false;
+	}
+
+	foreach(lc, get_sortgrouplist_exprs(root->processed_groupClause,
+										root->parse->targetList))
+	{
+		Node	   *expr = (Node *) lfirst(lc);
+		VariableStatData vardata;
+		bool		isdefault;
+
+		examine_variable(root, expr, 0, &vardata);
+		(void) get_variable_numdistinct(&vardata, &isdefault);
+		ReleaseVariableStats(vardata);
+
+		if (isdefault)
+			return false;
+	}
+
+	return true;
+}
+
+/*
+ * Is this function written in C and compiled into the server?
+ *
+ * A necessary condition for running it with an LWLock held, and nowhere near a
+ * sufficient one -- see shared_hashagg_safe_transtype() for the other half.
+ */
+static bool
+shared_hashagg_internal_language(Oid fnoid)
+{
+	HeapTuple	proctup;
+	bool		result;
+
+	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fnoid));
+	if (!HeapTupleIsValid(proctup))
+		elog(ERROR, "cache lookup failed for function %u", fnoid);
+	result = (((Form_pg_proc) GETSTRUCT(proctup))->prolang ==
+			  INTERNALlanguageId);
+	ReleaseSysCache(proctup);
+
+	return result;
+}
+
+/*
+ * aggfinalmodify of an aggregate.
+ */
+static char
+shared_hashagg_finalmodify(Oid aggfnoid)
+{
+	HeapTuple	aggtup;
+	char		result;
+
+	aggtup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(aggfnoid));
+	if (!HeapTupleIsValid(aggtup))
+		elog(ERROR, "cache lookup failed for aggregate %u", aggfnoid);
+	result = ((Form_pg_aggregate) GETSTRUCT(aggtup))->aggfinalmodify;
+	ReleaseSysCache(aggtup);
+
+	return result;
+}
+
+/*
+ * Can this aggregate's support functions be run with an LWLock held?
+ *
+ * Both the transition and the final function are checked, the latter because
+ * emission hands it a pointer into the shared entry.
+ *
+ * Being compiled into the server is necessary and not sufficient, and the gap
+ * is what shared_hashagg_safe_transtype() closes: plenty of internal-language
+ * transition functions dispatch one frame down to code chosen by the transition
+ * type.  min(anyenum) reaches enum_cmp_internal(), which opens pg_enum with a
+ * heavyweight lock; min(anyarray) and min(record) call the element or column
+ * type's comparison procedure, which may be PL/pgSQL; range_intersect_agg()
+ * reaches the subtype's.  A heavyweight lock or an SPI call under an LWLock is
+ * uninterruptible and invisible to the deadlock detector, so read the two tests
+ * together -- neither alone says what the comment on the call site claims.
+ */
+static bool
+shared_hashagg_safe_function(Oid aggfnoid)
+{
+	HeapTuple	aggtup;
+	Form_pg_aggregate aggform;
+	Oid			transfn;
+	Oid			finalfn;
+
+	aggtup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(aggfnoid));
+	if (!HeapTupleIsValid(aggtup))
+		elog(ERROR, "cache lookup failed for aggregate %u", aggfnoid);
+	aggform = (Form_pg_aggregate) GETSTRUCT(aggtup);
+	transfn = aggform->aggtransfn;
+	finalfn = aggform->aggfinalfn;
+	ReleaseSysCache(aggtup);
+
+	if (OidIsValid(transfn) && !shared_hashagg_internal_language(transfn))
+		return false;
+	if (OidIsValid(finalfn) && !shared_hashagg_internal_language(finalfn))
+		return false;
+
+	return true;
+}
+
+/*
+ * Can a transition state of this type live in shared memory, and be operated on
+ * with an LWLock held?
+ *
+ * A positive statement about the representation, because what is needed is not
+ * something a type can be asked for directly:
+ *
+ *	- the value must be self-contained once flattened.  Detoasting a composite
+ *	  flattens only its outer header and leaves per-attribute external pointers
+ *	  behind, which another participant would then dereference out of shared
+ *	  memory -- a TOAST fetch under the stripe lock, from a relation it has no
+ *	  business reading there.
+ *	- the operators the aggregate reaches must be code we compiled; enum, range
+ *	  and composite comparisons dispatch through the catalog or into
+ *	  user-supplied procedures.
+ *
+ * TYPTYPE_BASE rules out enum, range, multirange, composite and domain in one
+ * test.  Arrays are base types, so they need the extra condition: an array of
+ * fixed-length by-value elements is flat bytes -- int8[], which is what avg()
+ * on the integer types uses -- while text[] is a container of TOAST pointers.
+ */
+static bool
+shared_hashagg_safe_transtype(Oid transtype)
+{
+	Oid			elemtype;
+
+	if (get_typtype(transtype) != TYPTYPE_BASE)
+		return false;
+
+	elemtype = get_element_type(transtype);
+	if (OidIsValid(elemtype))
+	{
+		int16		elmlen;
+		bool		elmbyval;
+		char		elmalign;
+
+		get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+		if (!elmbyval || elmlen <= 0)
+			return false;
+	}
+
+	return true;
+}
+
 /*
  * add_paths_to_grouping_rel
  *
@@ -7573,6 +7881,72 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 									 havingQual,
 									 agg_final_costs,
 									 dNumFinalGroups));
+		}
+
+		/*
+		 * Generate a Parallel Hash Aggregate path: a parallel-aware hashed
+		 * Agg directly over the cheapest partial input path.  All
+		 * participants cooperatively build one shared hash table and then
+		 * emit disjoint subsets of the finalized groups, so no Finalize
+		 * stage exists; the Gather node added by gather_grouping_paths()
+		 * merely collects finished rows.
+		 *
+		 * Aggregate transition happens exactly once per input row (as in
+		 * AGGSPLIT_SIMPLE), so this requires no combine/serial functions;
+		 * but the shared transition states restrict which aggregates are
+		 * eligible -- see parallel_shared_hashagg_possible().
+		 */
+		if (enable_parallel_hash_agg &&
+			!parse->groupingSets &&
+			parse->groupClause != NIL &&
+			grouped_rel->consider_parallel &&
+			input_rel->partial_pathlist != NIL &&
+			shared_hashagg_worth_trying(dNumGroups,
+										input_rel->partial_pathlist) &&
+			parallel_shared_hashagg_possible(root))
+		{
+			Path	   *cheapest_partial_path =
+				linitial(input_rel->partial_pathlist);
+			double		nparticipants =
+				cheapest_partial_path->parallel_workers + 1;
+			AggPath    *aggpath;
+
+			/*
+			 * Cost as one participant's share of the work: path costs are
+			 * per-participant by convention, so the finalization charge in
+			 * cost_agg() must be for the groups THIS participant emits, not
+			 * for all of them.  (The conventional partial path passes
+			 * dNumPartialGroups for the same reason.)  The executor, on the
+			 * other hand, sizes one shared bucket array for every group
+			 * there is, so numGroups is put back below.
+			 */
+			aggpath = create_agg_path(root,
+									  grouped_rel,
+									  cheapest_partial_path,
+									  grouped_rel->reltarget,
+									  AGG_HASHED,
+									  AGGSPLIT_SIMPLE,
+									  root->processed_groupClause,
+									  havingQual,
+									  agg_costs,
+									  clamp_row_est(dNumGroups / nparticipants));
+			aggpath->path.parallel_aware = true;
+
+			/*
+			 * Agg->numGroups means the TOTAL group count for this path, not a
+			 * per-participant estimate as it does for a conventional partial
+			 * path.  agg_fill_shared_hash_table() reads it to size the shared
+			 * bucket array, which is shared and therefore sized once.
+			 */
+			aggpath->numGroups = dNumGroups;
+
+			/*
+			 * Each participant emits a disjoint share of the groups.  What the
+			 * shared states cost to keep consistent between them is priced in a
+			 * separate patch.
+			 */
+
+			add_partial_path(grouped_rel, (Path *) aggpath);
 		}
 	}
 

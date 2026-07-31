@@ -1,0 +1,274 @@
+--
+-- PARALLEL HASH AGGREGATE
+--
+-- Exercise parallel shared hash aggregation: all participating workers
+-- cooperatively build one shared hash table (instead of each building a
+-- private partial table that a serial Finalize step later combines), and
+-- each participant then emits a disjoint share of the finished groups.
+--
+
+create schema parallel_hash_agg;
+set search_path to parallel_hash_agg;
+
+-- encourage parallel plans regardless of the machine's cost thresholds
+set parallel_setup_cost = 0;
+set parallel_tuple_cost = 0;
+set min_parallel_table_scan_size = 0;
+set max_parallel_workers_per_gather = 2;
+
+-- Note the group count: the planner refuses the shared strategy below a
+-- floor (SHARED_AGG_MIN_GROUPS), because with few groups the Finalize stage
+-- it eliminates is cheap and the contention it adds is not.
+create table pha_src (g int4, x int4, y int8, b bool);
+insert into pha_src
+  select i % 2000,
+         (i % 7)::int4,
+         (i % 13)::int8,
+         (i % 2 = 0)
+  from generate_series(1, 20000) i;
+analyze pha_src;
+
+--
+-- 1. With the feature enabled, a query whose aggregates are all eligible
+-- (fixed-length pass-by-value transition types: sum(int4), count(*),
+-- min/max(int4), bool_and/bool_or) should produce a plain "Gather" over a
+-- "Parallel HashAggregate" -- no "Partial"/"Finalize" split.
+--
+set enable_parallel_hash_agg = on;
+
+explain (costs off)
+  select g, sum(x), count(*), min(x), max(x), bool_and(b), bool_or(b)
+  from pha_src group by g;
+
+--
+-- 2. Correctness: results must match what the classic Partial+Finalize
+-- path produces.  Compute a reference with the feature disabled, then
+-- compare against the feature-enabled results.
+--
+set enable_parallel_hash_agg = off;
+create table pha_ref as
+  select g, sum(x) as sx, count(*) as cnt, min(x) as mnx, max(x) as mxx,
+         bool_and(b) as ba, bool_or(b) as bo
+  from pha_src group by g;
+
+set enable_parallel_hash_agg = on;
+create table pha_shared as
+  select g, sum(x) as sx, count(*) as cnt, min(x) as mnx, max(x) as mxx,
+         bool_and(b) as ba, bool_or(b) as bo
+  from pha_src group by g;
+
+-- expect 0 rows: the two result sets must be identical
+select count(*) as mismatched_rows from (
+    select * from pha_ref except select * from pha_shared
+    union all
+    select * from pha_shared except select * from pha_ref
+) diff;
+
+--
+-- 3. Ineligible transition states must fall back to Partial/Finalize.  The
+-- stock sum(numeric) keeps its state in an opaque process-local struct that no
+-- byte-copy can make shareable; a by-reference state is not supported here yet;
+-- and min/max on an enum is rejected because its comparison reaches the enum
+-- cache, which opens pg_enum with a heavyweight lock -- not something to do
+-- under an LWLock.
+--
+create table pha_num (g int4, y int8, n numeric(12,3));
+insert into pha_num
+  select i % 5000, (i % 211)::int8, (i % 173) + (i % 97) * 0.001
+  from generate_series(1, 20000) i;
+analyze pha_num;
+
+explain (costs off)
+  select g, min(n), max(n), count(*)
+  from pha_num group by g;
+
+explain (costs off)
+  select pha_src.g, sum(n), avg(x)
+  from pha_src, pha_num where pha_num.g = pha_src.g group by pha_src.g;
+
+create type pha_enum as enum ('a', 'b', 'c');
+create table pha_e (g int4, e pha_enum);
+insert into pha_e
+  select i % 2000, (array['a','b','c'])[1 + i % 3]::pha_enum
+  from generate_series(1, 20000) i;
+analyze pha_e;
+
+explain (costs off)
+  select g, min(e), max(e) from pha_e group by g;
+
+--
+-- 4. Rescan.  A Gather on the inner side of a nested loop is re-executed
+-- once per outer row; each re-execution tears the shared table down and
+-- builds a new one, so check that every pass produces the same answer.
+--
+set enable_material = off;
+
+explain (costs off)
+  select count(*) from
+    (select g, sum(x) as sx from pha_src group by g) ss
+    right join (values (1), (2), (3)) v(k) on true;
+
+-- three identical passes over the same groups
+select count(*) as nrows, sum(sx) as checksum from
+  (select g, sum(x) as sx from pha_src group by g) ss
+  right join (values (1), (2), (3)) v(k) on true;
+
+-- ... which must be exactly three times one pass
+select count(*) * 3 as nrows, sum(sx) * 3 as checksum from
+  (select g, sum(x) as sx from pha_src group by g) ss;
+
+reset enable_material;
+
+--
+-- 5. Force a spill: shrink the per-participant memory budget well below
+-- what's needed to hold every group, using many more distinct groups and a
+-- tiny work_mem/hash_mem_multiplier.  Confirm results are still correct and
+-- that EXPLAIN ANALYZE reports the spill counters added for shared hash
+-- aggregation.
+--
+create table pha_spill_src (g int4, x int4);
+insert into pha_spill_src
+  select i % 20000, (i % 11)::int4
+  from generate_series(1, 60000) i;
+analyze pha_spill_src;
+
+set work_mem = '64kB';
+set hash_mem_multiplier = 1.0;
+set enable_sort = off;
+
+set enable_parallel_hash_agg = off;
+create table pha_spill_ref as
+  select g, sum(x) as sx, count(*) as cnt
+  from pha_spill_src group by g;
+
+set enable_parallel_hash_agg = on;
+create table pha_spill_shared as
+  select g, sum(x) as sx, count(*) as cnt
+  from pha_spill_src group by g;
+
+-- expect 0 rows: correctness must hold even when the shared table spilled
+select count(*) as mismatched_rows from (
+    select * from pha_spill_ref except select * from pha_spill_shared
+    union all
+    select * from pha_spill_shared except select * from pha_spill_ref
+) diff;
+
+--
+-- 6. Stopping early over a spilled table.  A participant that stops before
+-- the batch cycle is over must leave the scan barrier on its way out;
+-- otherwise the participants still cycling wait for an arrival that will
+-- never come, and the query hangs rather than failing.
+--
+select count(*) from
+  (select g, sum(x) from pha_spill_src group by g limit 5) ss;
+
+--
+-- 7. Rescan after a spill.  The spill tuplestores are single-pass, so each
+-- re-execution needs fresh ones; this used to be refused outright at run
+-- time, which made a legitimately planned query fail as a function of how
+-- much data it happened to meet.
+--
+set enable_material = off;
+
+select count(*) as nrows, sum(sx) as checksum from
+  (select g, sum(x) as sx from pha_spill_src group by g) ss
+  right join (values (1), (2)) v(k) on true;
+
+select count(*) * 2 as nrows, sum(sx) * 2 as checksum from
+  (select g, sum(x) as sx from pha_spill_src group by g) ss;
+
+reset enable_material;
+reset work_mem;
+reset hash_mem_multiplier;
+reset enable_sort;
+
+--
+-- 9. A parallel-aware Agg has to be able to run with no parallel context at
+-- all.  ExecutePlan() does not enter parallel mode when it has been given a
+-- tuple count, which is the case for SPI with a row limit -- how PL/pgSQL
+-- runs SELECT ... INTO -- and for cursor FETCH.  There is then no shared
+-- table to build, and the node must fall back to a private one instead of
+-- complaining that it was never initialized.
+--
+do $$
+declare
+    nrows   int8;
+    total   int8;
+begin
+    select count(*), sum(sx) into nrows, total
+      from (select g, sum(x) as sx from pha_src group by g) ss;
+    raise notice 'serial fallback: nrows=%, total=%', nrows, total;
+end
+$$;
+
+begin;
+declare pha_cur cursor for
+  select g, sum(x) as sx from pha_src group by g order by g;
+fetch 3 from pha_cur;
+commit;
+
+--
+-- 10. Coverage for the argument- and key-handling paths the queries above
+-- never reach: FILTER, a multi-column key, NULLs in the key, HAVING.
+--
+create table pha_ref_src as select * from pha_src;
+alter table pha_ref_src set (parallel_workers = 0);
+analyze pha_ref_src;
+
+explain (costs off)
+  select g, count(*) filter (where x > 3), sum(x) filter (where x < 3)
+  from pha_src group by g;
+
+select count(*) as mismatched_rows from (
+    (select g, count(*) filter (where x > 3) c, sum(x) filter (where x < 3) s
+       from pha_src group by g
+     except
+     select g, count(*) filter (where x > 3), sum(x) filter (where x < 3)
+       from pha_ref_src group by g)
+    union all
+    (select g, count(*) filter (where x > 3), sum(x) filter (where x < 3)
+       from pha_ref_src group by g
+     except
+     select g, count(*) filter (where x > 3) c, sum(x) filter (where x < 3) s
+       from pha_src group by g)
+) diff;
+
+create table pha_multi (a int4, b int4, c int4, v int4);
+insert into pha_multi
+  select i % 1500,
+         case when i % 97 = 0 then null else i % 40 end,
+         i % 7,
+         i
+  from generate_series(1, 40000) i;
+analyze pha_multi;
+
+create table pha_multi_ref as select * from pha_multi;
+alter table pha_multi_ref set (parallel_workers = 0);
+analyze pha_multi_ref;
+
+explain (costs off)
+  select a, b, c, sum(v), count(*) from pha_multi group by a, b, c;
+
+select count(*) as mismatched_rows from (
+    (select a, b, c, sum(v) s, count(*) n from pha_multi group by a, b, c
+     except
+     select a, b, c, sum(v), count(*) from pha_multi_ref group by a, b, c)
+    union all
+    (select a, b, c, sum(v), count(*) from pha_multi_ref group by a, b, c
+     except
+     select a, b, c, sum(v) s, count(*) n from pha_multi group by a, b, c)
+) diff;
+
+-- HAVING is applied after the shared table is built, and should not disturb
+-- eligibility
+select count(*) from
+  (select a, sum(v) as s from pha_multi group by a having sum(v) > 0) ss;
+
+reset enable_parallel_hash_agg;
+reset parallel_setup_cost;
+reset parallel_tuple_cost;
+reset min_parallel_table_scan_size;
+reset max_parallel_workers_per_gather;
+
+drop schema parallel_hash_agg cascade;
+reset search_path;

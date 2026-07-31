@@ -3758,9 +3758,17 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 		agg->aggstrategy != AGG_MIXED)
 		return;
 
+	/*
+	 * A node that built the shared table partitions its spill a fixed number of
+	 * ways, so hash_planned_partitions -- computed for the private table it
+	 * never built -- would be reporting a plan that does not exist.  Note the
+	 * test is on ->shared rather than on plan.parallel_aware: a parallel-aware
+	 * Agg that found no parallel context did build the private table, planned
+	 * partitions and all.
+	 */
 	if (es->format != EXPLAIN_FORMAT_TEXT)
 	{
-		if (es->costs)
+		if (es->costs && aggstate->shared == NULL)
 			ExplainPropertyInteger("Planned Partitions", NULL,
 								   aggstate->hash_planned_partitions, es);
 
@@ -3782,7 +3790,8 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 	{
 		bool		gotone = false;
 
-		if (es->costs && aggstate->hash_planned_partitions > 0)
+		if (es->costs && aggstate->hash_planned_partitions > 0 &&
+			aggstate->shared == NULL)
 		{
 			ExplainIndentText(es);
 			appendStringInfo(es->str, "Planned Partitions: %d",

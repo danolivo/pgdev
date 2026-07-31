@@ -2866,7 +2866,12 @@ SetToDefault
 SetVarReturningType_context
 SetupWorkerPtrType
 ShDependObjectInfo
+SharedAggBuildState
+SharedAggChunk
+SharedAggEntry
 SharedAggInfo
+SharedAggState
+SharedAggTransInfo
 SharedBitmapHeapInstrumentation
 SharedBitmapState
 SharedDependencyObjectType
