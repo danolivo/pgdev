@@ -167,8 +167,56 @@ typedef struct FlatSumState
 
 #define FLATSUM_STATE_SIZE	(sizeof(FlatSumState))
 
+/*
+ * Decimal digits of the lane window reserved for accumulation, so that summing
+ * any number of in-range values cannot overflow it.  The row count is bounded
+ * by 2^63 < 1e19, so nineteen digits suffice.  See the typmod gate in
+ * shared_numeric_agg_support().
+ */
+#define FLATSUM_SUM_HEADROOM	19
+
 /* lane index for NBASE weight w */
 #define FLATSUM_LANE(w)		(FLATSUM_MAX_WEIGHT - (w))
+
+/*
+ * Fetch and validate a state argument.
+ *
+ * These functions are ordinary C functions in pg_proc, so nothing stops a user
+ * from calling them directly with a bytea of any length -- and a short one
+ * would have flatsum_add() writing a couple of hundred bytes past its end.  An
+ * Assert is no defence here: it is compiled out of production builds, which is
+ * exactly where it would matter.  int4_avg_accum() runtime-checks its array
+ * state for the same reason.
+ */
+static FlatSumState *
+flatsum_get_state(FunctionCallInfo fcinfo, int argno)
+{
+	bytea	   *raw = PG_GETARG_BYTEA_P(argno);
+
+	if (VARSIZE(raw) != FLATSUM_STATE_SIZE)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid transition state for flat numeric aggregation"),
+				 errdetail("Expected %zu bytes, got %zu.",
+						   (Size) FLATSUM_STATE_SIZE,
+						   (Size) VARSIZE(raw))));
+
+	return (FlatSumState *) raw;
+}
+
+/*
+ * Same, for a state that arrives by value rather than as our own accumulator:
+ * bytea is int-aligned (typalign 'i'), so a state embedded in a heap tuple can
+ * land on a 4-byte boundary, and reading its int64 fields in place would be a
+ * SIGBUS on any platform that means it.  Copy to an aligned local.
+ */
+static void
+flatsum_get_state_copy(FunctionCallInfo fcinfo, int argno, FlatSumState *dst)
+{
+	FlatSumState *src = flatsum_get_state(fcinfo, argno);
+
+	memcpy(dst, src, FLATSUM_STATE_SIZE);
+}
 
 PG_FUNCTION_INFO_V1(numeric_flat_sum_trans);
 PG_FUNCTION_INFO_V1(numeric_flat_sum_combine);
@@ -280,8 +328,7 @@ numeric_flat_sum_trans(PG_FUNCTION_ARGS)
 	}
 	else
 	{
-		state = (FlatSumState *) PG_GETARG_BYTEA_P(0);
-		Assert(VARSIZE(state) == FLATSUM_STATE_SIZE);
+		state = flatsum_get_state(fcinfo, 0);
 		if (PG_ARGISNULL(1))
 			PG_RETURN_POINTER(state);	/* stock sum ignores NULL inputs */
 	}
@@ -299,6 +346,7 @@ numeric_flat_sum_combine(PG_FUNCTION_ARGS)
 {
 	FlatSumState *state1;
 	FlatSumState *state2;
+	FlatSumState incoming;
 	int			i;
 
 	if (PG_ARGISNULL(0))
@@ -307,17 +355,16 @@ numeric_flat_sum_combine(PG_FUNCTION_ARGS)
 			PG_RETURN_NULL();
 		/* must copy: state2 may live in the other worker's serialized copy */
 		state1 = flatsum_new_state(fcinfo);
-		state2 = (FlatSumState *) PG_GETARG_BYTEA_P(1);
-		memcpy((char *) state1 + VARHDRSZ, (char *) state2 + VARHDRSZ,
+		flatsum_get_state_copy(fcinfo, 1, &incoming);
+		memcpy((char *) state1 + VARHDRSZ, (char *) &incoming + VARHDRSZ,
 			   FLATSUM_STATE_SIZE - VARHDRSZ);
 		PG_RETURN_POINTER(state1);
 	}
-	state1 = (FlatSumState *) PG_GETARG_BYTEA_P(0);
-	Assert(VARSIZE(state1) == FLATSUM_STATE_SIZE);
+	state1 = flatsum_get_state(fcinfo, 0);
 	if (PG_ARGISNULL(1))
 		PG_RETURN_POINTER(state1);
-	state2 = (FlatSumState *) PG_GETARG_BYTEA_P(1);
-	Assert(VARSIZE(state2) == FLATSUM_STATE_SIZE);
+	flatsum_get_state_copy(fcinfo, 1, &incoming);
+	state2 = &incoming;
 
 	state1->flags |= state2->flags;
 	state1->nvalues += state2->nvalues;
@@ -467,7 +514,7 @@ numeric_flat_sum_final(PG_FUNCTION_ARGS)
 
 	if (PG_ARGISNULL(0))
 		PG_RETURN_NULL();
-	state = (FlatSumState *) PG_GETARG_BYTEA_P(0);
+	state = flatsum_get_state(fcinfo, 0);
 	if (state->nvalues == 0)
 		PG_RETURN_NULL();
 
@@ -482,7 +529,7 @@ numeric_flat_avg_final(PG_FUNCTION_ARGS)
 
 	if (PG_ARGISNULL(0))
 		PG_RETURN_NULL();
-	state = (FlatSumState *) PG_GETARG_BYTEA_P(0);
+	state = flatsum_get_state(fcinfo, 0);
 	if (state->nvalues == 0)
 		PG_RETURN_NULL();
 
@@ -549,14 +596,27 @@ shared_numeric_agg_support(PG_FUNCTION_ARGS)
 			aggref->aggorder != NIL)
 			PG_RETURN_POINTER(NULL);
 
-		/* the typmod must bound the value range to the lane window */
+		/*
+		 * The typmod must bound the value range to the lane window -- with
+		 * room to spare, because what has to fit is the SUM, not the values.
+		 *
+		 * This substitution is invisible to the user, so it must never turn a
+		 * working query into an error.  Bounding each value to the window is
+		 * not enough for that: numeric(64,0) values individually fit exactly,
+		 * yet two of them near 1e63 overflow the top lane and raise an
+		 * out-of-range error where the stock aggregate would happily return a
+		 * wider numeric.  Since nvalues cannot exceed 2^63, reserving
+		 * FLATSUM_SUM_HEADROOM decimal digits of the window makes the overflow
+		 * arithmetically unreachable rather than merely unlikely.
+		 */
 		tle = (TargetEntry *) linitial(aggref->args);
 		typmod = exprTypmod((Node *) tle->expr);
 		if (typmod < (int32) VARHDRSZ)
 			PG_RETURN_POINTER(NULL);
 		precision = FLATSUM_TYPMOD_PRECISION(typmod);
 		scale = FLATSUM_TYPMOD_SCALE(typmod);
-		if (precision - scale > DEC_DIGITS * (FLATSUM_MAX_WEIGHT + 1) ||
+		if (precision - scale > DEC_DIGITS * (FLATSUM_MAX_WEIGHT + 1) -
+			FLATSUM_SUM_HEADROOM ||
 			scale > DEC_DIGITS * (FLATSUM_NLANES - FLATSUM_MAX_WEIGHT - 1))
 			PG_RETURN_POINTER(NULL);
 
