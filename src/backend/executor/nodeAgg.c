@@ -273,7 +273,6 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/dsa.h"
-#include "utils/wait_event.h"
 #include "utils/expandeddatum.h"
 #include "utils/injection_point.h"
 #include "utils/logtape.h"
@@ -283,6 +282,7 @@
 #include "utils/sharedtuplestore.h"
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
+#include "utils/wait_event.h"
 
 /*
  * Control how many partitions are created when spilling HashAgg to
@@ -386,6 +386,7 @@ typedef struct SharedAggState
 	bool		attached;		/* attached to the build barrier? */
 	bool		scan_attached;	/* attached to the scan barrier? */
 	ExprContext *exprcontext;	/* for hash/equality evaluation */
+	ExprContext *byrefcontext;	/* aggregate context for by-ref transitions */
 	ExprState  *hashexpr;		/* computes group-key hash over hashslot */
 	ExprState  *eqexpr;			/* compares hashslot against stored key */
 	TupleTableSlot *keyslot;	/* minimal slot for stored key tuples */
@@ -396,6 +397,19 @@ typedef struct SharedAggState
 	dsa_pointer alloc_chunk;	/* my current entry chunk */
 	Size		alloc_used;		/* bytes carved from it so far */
 	Size		alloc_size;		/* its total usable size */
+	dsa_pointer_atomic *buckets_base;	/* cached local address of ->buckets */
+	uint32		generation;		/* build generation we last contributed to */
+
+	/*
+	 * Unflushed DSA bytes, not yet added to the shared mem_used counter.  A
+	 * single shared atomic touched on every allocation is a scalability wall
+	 * -- one cache line written by every participant -- so accumulate locally
+	 * and publish in SHARED_AGG_MEM_FLUSH_SIZE lumps, the way nodeHash.c
+	 * accounts for memory at chunk granularity rather than per tuple.  Signed,
+	 * because freeing a replaced by-reference state can make it negative
+	 * before the next flush.
+	 */
+	int64		mem_unflushed;
 } SharedAggState;
 
 /*
@@ -408,7 +422,7 @@ typedef struct SharedAggState
  * states ever need to be merged, because every input row's transition call
  * mutates the one shared per-group state, under a per-bucket-stripe LWLock.
  *
-	 * Two classes of transition state are supported.  Pass-by-value states
+ * Two classes of transition state are supported.  Pass-by-value states
  * fit directly in an AggStatePerGroupData's transValue Datum and are
  * mutated in place by advance_transition_function().  Pass-by-reference
  * states (varlena such as numeric or bytea, or fixed-length by-ref such
@@ -427,15 +441,17 @@ typedef struct SharedAggState
  * to an opaque struct with interior process-local pointers, which no
  * byte-copy can make shareable.  Also:
  *	- no grouping sets, no DISTINCT/ORDER BY aggregates;
+ *	- the final function must be READ_ONLY: it is handed a pointer straight
+ *	  into shared memory;
  *	- the table is sized once from the planner estimate and never grows;
- *	  underestimates only lengthen chains, they do not affect correctness;
- *	- rescan is not supported.
+ *	  underestimates only lengthen chains, they do not affect correctness.
  *
- * Spilling to disk is still supported: a fixed-length-only hash table can
- * still exceed the memory budget given enough distinct groups, so when the
- * shared table's memory budget is exhausted, further input is spilled to
- * hash-partitioned shared tuplestores and processed in batches once the
- * in-memory table has been emitted.
+ * Spilling to disk is supported: when the shared table's memory budget is
+ * exhausted, further input is spilled to hash-partitioned shared tuplestores
+ * and processed in batches once the in-memory table has been emitted.  Note the
+ * budget is get_hash_memory_limit() times the number of participants, since one
+ * shared table stands in for the private table each of them would otherwise
+ * have built.
  *
  * The shared bucket array holds dsa_pointers to chains of SharedAggEntry.
  * All chain reads and mutations during the build phase happen under the
@@ -624,6 +640,18 @@ typedef struct SharedAggBuildState
 	Barrier		build_barrier;	/* synchronizes build vs. emission */
 	Barrier		scan_barrier;	/* synchronizes spill-batch cycles */
 	int			nparticipants;	/* leader + planned workers */
+
+	/*
+	 * Bumped by ExecAggReInitializeDSM() for every rescan, and recorded
+	 * locally by each participant that builds.  A participant that finds the
+	 * build already finished is normally a worker that attached late and can
+	 * safely contribute nothing -- but if it has already built THIS
+	 * generation, it is instead being rescanned without a reinitialization in
+	 * between, and contributing nothing would mean silently returning no
+	 * rows.  See the late-attacher path in agg_fill_shared_hash_table().
+	 */
+	uint32		generation;
+
 	uint64		nbuckets;		/* size of shared bucket array (power of 2) */
 	dsa_pointer buckets;		/* -> dsa_pointer_atomic[nbuckets] */
 	pg_atomic_uint64 scan_cursor;	/* next bucket to claim for emission */
@@ -675,10 +703,24 @@ typedef struct SharedAggBuildState
  * A group's key hashes to exactly one bucket, and a bucket maps to exactly
  * one stripe: this is the entire duplicate-prevention argument.  Two
  * participants inserting the same new group necessarily contend on the same
- * stripe lock, so the second finds the first's entry.
+ * stripe lock, so the second finds the first's entry.  Any function of
+ * bucketno alone preserves that, which leaves us free to choose one that
+ * behaves better in the cache.
+ *
+ * Hence the shift: eight dsa_pointers share a cache line of the bucket array,
+ * so mapping consecutive buckets to DIFFERENT stripes would let two
+ * participants holding two different stripe locks write the same line and
+ * bounce it between cores -- reintroducing on the bucket array exactly the
+ * false sharing that padding the locks was meant to prevent.  Grouping a
+ * line's worth of buckets under one stripe means whoever writes that line
+ * holds that lock.
  */
+#define SHARED_AGG_BUCKETS_PER_LINE \
+	(PG_CACHE_LINE_SIZE / sizeof(dsa_pointer_atomic))
+
 #define SharedAggStripeLock(shstate, bucketno) \
-	(&(shstate)->stripe_locks[(bucketno) % SHARED_AGG_NUM_STRIPES].lock)
+	(&(shstate)->stripe_locks[((bucketno) / SHARED_AGG_BUCKETS_PER_LINE) % \
+							  SHARED_AGG_NUM_STRIPES].lock)
 
 /*
  * Entries are carved out of per-participant chunks rather than allocated
@@ -791,11 +833,14 @@ static SharedAggEntry *shared_agg_chain_lookup(AggState *aggstate,
 static void shared_agg_insert(AggState *aggstate, dsa_area *area,
 							  TupleTableSlot *hashslot, uint32 hash,
 							  bool allow_spill);
+static void shared_agg_spill_tuple(AggState *aggstate, uint32 partno,
+								   TupleTableSlot *inputslot, uint32 hash);
 static void shared_agg_free_blobs(AggState *aggstate, dsa_area *area);
 static void shared_agg_free_table(dsa_area *area,
 								 SharedAggBuildState *shstate);
 static void shared_agg_reset_table(AggState *aggstate, dsa_area *area);
 static void shared_agg_refill(AggState *aggstate, dsa_area *area, int batchno);
+static void shared_agg_fall_back(AggState *aggstate);
 static void agg_fill_shared_hash_table(AggState *aggstate);
 static TupleTableSlot *agg_retrieve_shared_hash_table(AggState *aggstate);
 static Datum GetAggInitVal(Datum textInitVal, Oid transtype);
@@ -2617,10 +2662,26 @@ ExecAgg(PlanState *pstate)
 			case AGG_HASHED:
 				if (node->shared != NULL)
 				{
-					if (!node->table_filled)
-						agg_fill_shared_hash_table(node);
-					result = agg_retrieve_shared_hash_table(node);
-					break;
+					/*
+					 * A parallel-aware hashed Agg is meant to cooperate on one
+					 * table in shared memory -- but there is not always a
+					 * parallel context to put it in, so decide here rather
+					 * than in ExecInitAgg().  ExecutePlan() runs the plan
+					 * without one whenever it was given a tuple count (cursor
+					 * FETCH, or SPI_execute() with tcount > 0, which is how
+					 * PL/pgSQL runs SELECT ... INTO), and
+					 * InitializeParallelDSM() falls back to private memory if
+					 * it cannot create a segment at all.
+					 */
+					if (node->shared->build == NULL)
+						shared_agg_fall_back(node);
+					else
+					{
+						if (!node->table_filled)
+							agg_fill_shared_hash_table(node);
+						result = agg_retrieve_shared_hash_table(node);
+						break;
+					}
 				}
 				if (!node->table_filled)
 					agg_fill_hash_table(node);
@@ -3356,6 +3417,7 @@ shared_agg_init_support(AggState *aggstate)
 	AggStatePerHash perhash = &aggstate->perhash[0];
 	EState	   *estate = aggstate->ss.ps.state;
 	TupleDesc	keyDesc = perhash->hashslot->tts_tupleDescriptor;
+	bool		have_blobs = false;
 	int			transno;
 
 	/* planner only generates this for plain GROUP BY */
@@ -3410,17 +3472,43 @@ shared_agg_init_support(AggState *aggstate)
 		int			i;
 
 		/*
-		 * Cross-check the planner's eligibility decision.  Note that
-		 * testing transtypeByVal alone would NOT suffice: the 'internal'
-		 * pseudo-type is itself pass-by-value (a pointer-sized Datum),
-		 * while the pointed-to struct is process-local and must never be
-		 * stored in the shared table.  Only fixed-length pass-by-value
-		 * transition types are supported.
+		 * Cross-check the planner's eligibility decision.  Note that testing
+		 * transtypeByVal alone would NOT suffice: the 'internal' pseudo-type
+		 * is itself pass-by-value (a pointer-sized Datum), while the
+		 * pointed-to struct is process-local and must never be stored in the
+		 * shared table.  Everything else is stored either inline in the entry
+		 * (pass-by-value) or as a separate DSA blob (pass-by-reference).
 		 */
 		if (pertrans->aggtranstype == INTERNALOID)
 			elog(ERROR, "aggregate %u is not supported by shared hash aggregation",
 				 aggref->aggfnoid);
+
+		/*
+		 * Likewise for the final function's licence to modify the state.
+		 * agg_retrieve_shared_hash_table() hands it a pointer straight into
+		 * the shared entry (or blob), so anything other than READ_ONLY could
+		 * scribble on -- or pfree() -- shared memory.
+		 */
+		{
+			HeapTuple	aggtup;
+			char		finalmodify;
+
+			aggtup = SearchSysCache1(AGGFNOID,
+									 ObjectIdGetDatum(aggref->aggfnoid));
+			if (!HeapTupleIsValid(aggtup))
+				elog(ERROR, "cache lookup failed for aggregate %u",
+					 aggref->aggfnoid);
+			finalmodify =
+				((Form_pg_aggregate) GETSTRUCT(aggtup))->aggfinalmodify;
+			ReleaseSysCache(aggtup);
+
+			if (finalmodify != AGGMODIFY_READ_ONLY)
+				elog(ERROR, "aggregate %u is not supported by shared hash aggregation",
+					 aggref->aggfnoid);
+		}
+
 		info->blob_stored = !pertrans->transtypeByVal;
+		have_blobs |= info->blob_stored;
 
 		info->numargs = list_length(aggref->args);
 		info->argstates = palloc0(info->numargs * sizeof(ExprState *));
@@ -3464,6 +3552,14 @@ shared_agg_init_support(AggState *aggstate)
 		aggstate->ss.ps.outerops = save_outerops;
 		aggstate->ss.ps.outeropsfixed = save_outeropsfixed;
 	}
+
+	/*
+	 * By-reference states need a context of their own to be the aggregate
+	 * context during transition calls; see shared_agg_advance_byref() for why
+	 * hashcontext will not do.
+	 */
+	if (have_blobs)
+		aggstate->shared->byrefcontext = CreateExprContext(estate);
 }
 
 /*
@@ -3516,6 +3612,83 @@ shared_agg_prepare_inputs(AggState *aggstate, bool from_spill)
 }
 
 /*
+ * Local address of the shared bucket array.
+ *
+ * Cached rather than re-derived per row: dsa_get_address() is not free (it
+ * checks for freed segments, which costs a read barrier -- cheap on x86, a
+ * real instruction on weakly-ordered machines), and this used to be called
+ * once per row plus once per chain hop.
+ *
+ * The cached address stays valid because the bucket array outlives everything
+ * that could invalidate it: it is allocated once by the elected participant
+ * and freed only by shared_agg_free_table(), long after the last probe.  A
+ * batch reset recycles the array rather than reallocating it, but clears the
+ * cache anyway, so this survives a change of mind there.  nodeHash.c likewise
+ * re-fetches its bucket base once per batch.
+ */
+static inline dsa_pointer_atomic *
+shared_agg_buckets(AggState *aggstate, dsa_area *area)
+{
+	SharedAggState *shared = aggstate->shared;
+
+	if (shared->buckets_base == NULL)
+		shared->buckets_base = (dsa_pointer_atomic *)
+			dsa_get_address(area, shared->build->buckets);
+
+	return shared->buckets_base;
+}
+
+/*
+ * Publish locally accumulated DSA byte counts once they reach this much.
+ * Small enough that the spill decision stays timely (the shared counter can
+ * lag by at most this much per participant), large enough that the counter's
+ * cache line is not written on every row.
+ */
+#define SHARED_AGG_MEM_FLUSH_SIZE	(64 * 1024)
+
+/*
+ * Account for a change in the DSA bytes backing the shared table: positive
+ * when allocating, negative when freeing.
+ *
+ * Deliberately approximate.  Updating one shared atomic per allocation puts
+ * every participant on the same cache line, which is a scalability wall, so
+ * accumulate locally and publish in lumps -- the same trade nodeHash.c makes
+ * by accounting at chunk rather than tuple granularity.  The only consumer is
+ * the spill threshold in shared_agg_insert(), which is inherently fuzzy
+ * anyway (compare hash_agg_check_limits() on the private path).
+ *
+ * Since one participant may free a blob another allocated, a lagging negative
+ * flush can transiently drive the shared total below zero.  Readers must
+ * therefore interpret it as signed rather than trusting it to stay positive.
+ */
+static inline void
+shared_agg_account(AggState *aggstate, int64 delta)
+{
+	SharedAggState *shared = aggstate->shared;
+
+	shared->mem_unflushed += delta;
+
+	if (shared->mem_unflushed >= SHARED_AGG_MEM_FLUSH_SIZE ||
+		shared->mem_unflushed <= -SHARED_AGG_MEM_FLUSH_SIZE)
+	{
+		pg_atomic_fetch_add_u64(&shared->build->mem_used,
+								(uint64) shared->mem_unflushed);
+		shared->mem_unflushed = 0;
+	}
+}
+
+/*
+ * Read the shared byte total.  See shared_agg_account(): the counter is
+ * maintained with wrapping unsigned adds but must be read as signed, a
+ * negative value simply meaning "no memory pressure to speak of".
+ */
+static inline int64
+shared_agg_mem_used(SharedAggBuildState *shstate)
+{
+	return (int64) pg_atomic_read_u64(&shstate->mem_used);
+}
+
+/*
  * Allocate space for one hash table entry, carving it from the
  * participant's current chunk (allocating and publishing a fresh chunk
  * when needed).  Oversized entries get a dedicated chunk.  Returns the
@@ -3559,7 +3732,7 @@ shared_agg_alloc_entry(AggState *aggstate, dsa_area *area, Size len,
 		shstate->chunk_head = chunkp;
 		LWLockRelease(&shstate->batch_lock);
 
-		pg_atomic_add_fetch_u64(&shstate->mem_used, chunksz);
+		shared_agg_account(aggstate, (int64) chunksz);
 
 		aggstate->shared->alloc_chunk = chunkp;
 		aggstate->shared->alloc_used = SharedAggChunkHeaderSize;
@@ -3576,23 +3749,52 @@ shared_agg_alloc_entry(AggState *aggstate, dsa_area *area, Size len,
 
 /*
  * Store a flat varlena as a DSA blob and account for it.
- *
- * Memory accounting only ever adds: blobs replaced during aggregation are
- * freed but not subtracted, which can only make spilling kick in earlier --
- * the safe direction.
  */
 static dsa_pointer
 shared_agg_store_varlena(AggState *aggstate, dsa_area *area,
 						 struct varlena *val)
 {
-	SharedAggBuildState *shstate = aggstate->shared->build;
 	Size		sz = VARSIZE_ANY(val);
 	dsa_pointer sp;
 
 	sp = dsa_allocate(area, sz);
 	memcpy(dsa_get_address(area, sp), val, sz);
-	pg_atomic_add_fetch_u64(&shstate->mem_used, sz);
+	shared_agg_account(aggstate, (int64) sz);
 	return sp;
+}
+
+/*
+ * Size of a stored state blob, as shared_agg_store_datum() computed it.  The
+ * two must be kept in step: this is what the memory accounting gives back.
+ */
+static inline Size
+shared_agg_blob_size(AggStatePerTrans pertrans, void *blob)
+{
+	if (pertrans->transtypeLen > 0)
+		return (Size) pertrans->transtypeLen;
+	if (pertrans->transtypeLen == -2)
+		return strlen((char *) blob) + 1;
+	return VARSIZE_ANY(blob);
+}
+
+/*
+ * Free a by-reference state blob, undoing its accounting.
+ *
+ * Giving the bytes back matters more than it might look.  A transition
+ * function whose result changes size from row to row (min/max over
+ * varying-length text, sums of mixed scale) allocates and frees a blob per
+ * row; counting only the allocations would grow the total without bound and
+ * flip a table whose real footprint is a few megabytes into spill mode,
+ * sending the entire remaining input to disk for nothing.
+ */
+static void
+shared_agg_free_blob(AggState *aggstate, dsa_area *area,
+					 AggStatePerTrans pertrans, dsa_pointer sp)
+{
+	Size		sz = shared_agg_blob_size(pertrans, dsa_get_address(area, sp));
+
+	dsa_free(area, sp);
+	shared_agg_account(aggstate, -(int64) sz);
 }
 
 /*
@@ -3625,7 +3827,6 @@ static dsa_pointer
 shared_agg_store_datum(AggState *aggstate, dsa_area *area,
 					   AggStatePerTrans pertrans, Datum value)
 {
-	SharedAggBuildState *shstate = aggstate->shared->build;
 	dsa_pointer sp;
 	Size		sz;
 
@@ -3659,7 +3860,7 @@ shared_agg_store_datum(AggState *aggstate, dsa_area *area,
 										pg_detoast_datum((struct varlena *) DatumGetPointer(value)));
 	}
 
-	pg_atomic_add_fetch_u64(&shstate->mem_used, sz);
+	shared_agg_account(aggstate, (int64) sz);
 	return sp;
 }
 
@@ -3675,11 +3876,14 @@ shared_agg_store_datum(AggState *aggstate, dsa_area *area,
  * sanctioned via AggCheckCallContext) touches the shared blob directly and
  * requires no copy.
  *
- * Note: transition functions that allocate their result in the aggcontext
- * (as AggCheckCallContext invites) leak that local copy until end of query
- * in shared mode, since we immediately copy it into DSA; the aggcontext is
- * not reset between groups here.  Bounded by input size per row, but worth
- * remembering when profiling memory.
+ * A transition function is entitled to build its result in the aggregate
+ * context, as AggCheckCallContext() invites it to.  We copy that result into
+ * the shared blob immediately, which makes the local one garbage -- and
+ * nothing resets hashcontext during a shared build, so leaving it there would
+ * cost ngroups * statesize of backend-local memory that the shared budget
+ * knows nothing about and that no amount of spilling would relieve.  So the
+ * aggregate context for the duration of the call is a context of our own,
+ * which we reset once the result has been copied out.
  */
 static void
 shared_agg_advance_byref(AggState *aggstate, dsa_area *area,
@@ -3688,23 +3892,38 @@ shared_agg_advance_byref(AggState *aggstate, dsa_area *area,
 						 AggStatePerGroup pergroupstate)
 {
 	FunctionCallInfo fcinfo = pertrans->transfn_fcinfo;
+	ExprContext *byrefcxt = aggstate->shared->byrefcontext;
+	ExprContext *save_aggcontext;
 	MemoryContext oldContext;
 	Datum		newVal;
 	void	   *oldstate = NULL;
 	int			i;
 
-	for (i = 0; i < info->numargs; i++)
+	Assert(byrefcxt != NULL);
+
+	for (i = 0; i < info->numargs; i++)	/* stage the arguments */
 	{
 		fcinfo->args[i + 1].value = info->pending_args[i];
 		fcinfo->args[i + 1].isnull = info->pending_nulls[i];
 	}
+
+	/*
+	 * Switch before anything that can allocate.  shared_agg_store_datum() may
+	 * detoast, and in the strict branch below that would otherwise land in
+	 * whatever context ExecAgg() happened to leave current -- the per-query
+	 * one, which is reset only at end of query.
+	 */
+	oldContext = MemoryContextSwitchTo(aggstate->tmpcontext->ecxt_per_tuple_memory);
 
 	if (pertrans->transfn.fn_strict)
 	{
 		for (i = 1; i <= pertrans->numTransInputs; i++)
 		{
 			if (fcinfo->args[i].isnull)
+			{
+				MemoryContextSwitchTo(oldContext);
 				return;
+			}
 		}
 		if (pergroupstate->noTransValue)
 		{
@@ -3718,16 +3937,22 @@ shared_agg_advance_byref(AggState *aggstate, dsa_area *area,
 											   fcinfo->args[1].value);
 			pergroupstate->transValueIsNull = false;
 			pergroupstate->noTransValue = false;
+			MemoryContextSwitchTo(oldContext);
 			return;
 		}
 		if (pergroupstate->transValueIsNull)
+		{
+			MemoryContextSwitchTo(oldContext);
 			return;
+		}
 	}
-
-	oldContext = MemoryContextSwitchTo(aggstate->tmpcontext->ecxt_per_tuple_memory);
 
 	/* set up aggstate->curpertrans for AggGetAggref() */
 	aggstate->curpertrans = pertrans;
+
+	/* ... and curaggcontext for AggCheckCallContext(); see the header comment */
+	save_aggcontext = aggstate->curaggcontext;
+	aggstate->curaggcontext = byrefcxt;
 
 	if (!pergroupstate->transValueIsNull)
 	{
@@ -3745,11 +3970,13 @@ shared_agg_advance_byref(AggState *aggstate, dsa_area *area,
 	newVal = FunctionCallInvoke(fcinfo);
 
 	aggstate->curpertrans = NULL;
+	aggstate->curaggcontext = save_aggcontext;
 
 	if (fcinfo->isnull)
 	{
 		if (!pergroupstate->transValueIsNull)
-			dsa_free(area, (dsa_pointer) pergroupstate->transValue);
+			shared_agg_free_blob(aggstate, area, pertrans,
+								 (dsa_pointer) pergroupstate->transValue);
 		pergroupstate->transValue = (Datum) 0;
 		pergroupstate->transValueIsNull = true;
 	}
@@ -3789,7 +4016,8 @@ shared_agg_advance_byref(AggState *aggstate, dsa_area *area,
 				newsp = shared_agg_store_datum(aggstate, area, pertrans,
 											   newVal);
 				if (!pergroupstate->transValueIsNull)
-					dsa_free(area, (dsa_pointer) pergroupstate->transValue);
+					shared_agg_free_blob(aggstate, area, pertrans,
+										 (dsa_pointer) pergroupstate->transValue);
 				pergroupstate->transValue = (Datum) newsp;
 				pergroupstate->transValueIsNull = false;
 				pergroupstate->noTransValue = false;
@@ -3799,6 +4027,19 @@ shared_agg_advance_byref(AggState *aggstate, dsa_area *area,
 	/* else: state was modified (or kept) in place in shared memory */
 
 	MemoryContextSwitchTo(oldContext);
+
+	/*
+	 * The shared blob now holds everything we need, so discard whatever the
+	 * transition function built in the aggregate context.
+	 *
+	 * Unless it registered a cleanup callback: those are meant to fire at end
+	 * of query, not once per row, and the data they expect to find is in this
+	 * very context.  Such an aggregate keeps accumulating local copies, as it
+	 * did before -- there is no fixing that short of a context per group, and
+	 * no in-core aggregate combines a callback with a by-reference state.
+	 */
+	if (byrefcxt->ecxt_callbacks == NULL)
+		ResetExprContext(byrefcxt);
 }
 
 /*
@@ -3858,6 +4099,52 @@ shared_agg_nspilled(SharedAggBuildState *shstate)
 }
 
 /*
+ * Write one input tuple to a spill partition's shared tuplestore.
+ *
+ * Mirrors hashagg_spill_tuple() on the private path, and for the same reasons:
+ * project away the columns no aggregate or grouping key needs before writing,
+ * and let ExecFetchSlotMinimalTuple() hand back the tuple already in the slot
+ * rather than copying it.  Writing whole outer tuples costs real I/O on a wide
+ * table -- fifty columns per row where one is wanted.
+ */
+static void
+shared_agg_spill_tuple(AggState *aggstate, uint32 partno,
+					   TupleTableSlot *inputslot, uint32 hash)
+{
+	TupleTableSlot *spillslot;
+	MinimalTuple tuple;
+	bool		shouldFree;
+
+	if (!aggstate->all_cols_needed)
+	{
+		spillslot = aggstate->hash_spill_wslot;
+		slot_getsomeattrs(inputslot, aggstate->max_colno_needed);
+		ExecClearTuple(spillslot);
+		for (int i = 0; i < spillslot->tts_tupleDescriptor->natts; i++)
+		{
+			if (bms_is_member(i + 1, aggstate->colnos_needed))
+			{
+				spillslot->tts_values[i] = inputslot->tts_values[i];
+				spillslot->tts_isnull[i] = inputslot->tts_isnull[i];
+			}
+			else
+				spillslot->tts_isnull[i] = true;
+		}
+		ExecStoreVirtualTuple(spillslot);
+	}
+	else
+		spillslot = inputslot;
+
+	tuple = ExecFetchSlotMinimalTuple(spillslot, &shouldFree);
+
+	sts_puttuple(aggstate->shared->spill_acc[partno], &hash, tuple);
+	pg_atomic_fetch_add_u64(&aggstate->shared->build->npart_spilled[partno], 1);
+
+	if (shouldFree)
+		pfree(tuple);
+}
+
+/*
  * Walk one bucket chain looking for the group whose key is in hashslot.
  * Returns the entry, or NULL if the chain does not contain the group.
  *
@@ -3888,11 +4175,21 @@ shared_agg_chain_lookup(AggState *aggstate, dsa_area *area, dsa_pointer head,
 				return cand;
 		}
 		/*
-		 * A plain load: ->next is written before its entry is published and
-		 * never changed afterwards, so the barrier taken by the unlocked
-		 * caller before the first dereference covers the whole chain.  The
-		 * same reasoning, and the same plain load, applies to
-		 * HashJoinTupleData.next.shared in nodeHash.c.
+		 * A plain load.  ->next is written before its entry is published and
+		 * never changed afterwards, so no synchronisation is needed to read
+		 * it -- but note carefully what orders the loads of the NEXT entry's
+		 * contents against this one.  It is not the read barrier the unlocked
+		 * caller took: that orders only the bucket-head load against what
+		 * follows, and says nothing about hop N.  What orders each hop is that
+		 * the address being dereferenced is itself derived from the value just
+		 * loaded, plus the read barrier inside dsa_get_address() (via
+		 * check_for_freed_segments()) at the top of the next iteration.
+		 *
+		 * Do not "optimise" that call away without replacing the barrier.
+		 * Parallel hash join is no precedent here: it pushes onto bucket
+		 * chains during PHJ_BUILD_HASH_INNER and walks them only in
+		 * PHJ_BATCH_PROBE, so it never has a reader on a chain that is being
+		 * inserted into, and never needed this argument.
 		 */
 		entryp = cand->next;
 	}
@@ -3914,8 +4211,7 @@ shared_agg_insert(AggState *aggstate, dsa_area *area,
 {
 	SharedAggBuildState *shstate = aggstate->shared->build;
 	ExprContext *tmpcontext = aggstate->tmpcontext;
-	dsa_pointer_atomic *buckets = (dsa_pointer_atomic *)
-		dsa_get_address(area, shstate->buckets);
+	dsa_pointer_atomic *buckets = shared_agg_buckets(aggstate, area);
 	uint64		mask = shstate->nbuckets - 1;
 	uint64		bucketno = hash & mask;
 	LWLock	   *lock = SharedAggStripeLock(shstate, bucketno);
@@ -3980,7 +4276,7 @@ shared_agg_insert(AggState *aggstate, dsa_area *area,
 		AggStatePerGroup states;
 		MemoryContext oldcxt;
 		int			transno;
-		uint64		used;
+		int64		used;
 
 		/*
 		 * Over budget?  Route the whole input tuple to its spill partition
@@ -4003,12 +4299,8 @@ shared_agg_insert(AggState *aggstate, dsa_area *area,
 			 * stripe lock; spilled rows are the rarer case, so we accept
 			 * the double evaluation.
 			 */
-			oldcxt = MemoryContextSwitchTo(tmpcontext->ecxt_per_tuple_memory);
-			mt = ExecCopySlotMinimalTuple(tmpcontext->ecxt_outertuple);
-			MemoryContextSwitchTo(oldcxt);
-
-			sts_puttuple(aggstate->shared->spill_acc[partno], &hash, mt);
-			pg_atomic_fetch_add_u64(&shstate->npart_spilled[partno], 1);
+			shared_agg_spill_tuple(aggstate, partno,
+								   tmpcontext->ecxt_outertuple, hash);
 			return;
 		}
 
@@ -4057,8 +4349,8 @@ shared_agg_insert(AggState *aggstate, dsa_area *area,
 		 * shared_agg_alloc_entry(); here just check the budget and flip
 		 * into spill mode when exceeded.
 		 */
-		used = pg_atomic_read_u64(&shstate->mem_used);
-		if (allow_spill && used > shstate->mem_limit)
+		used = shared_agg_mem_used(shstate);
+		if (allow_spill && used > (int64) shstate->mem_limit)
 			pg_atomic_write_u32(&shstate->spill_mode, 1);
 
 		entry = newentry;
@@ -4086,14 +4378,6 @@ shared_agg_insert(AggState *aggstate, dsa_area *area,
  * blob to free separately.
  */
 /*
- * Release everything the shared table owns in the DSA: the entry chunks and
- * the bucket array itself.
- *
- * Unlike shared_agg_reset_table(), which recycles the bucket array between
- * spill batches, this is for tearing the table down entirely.  Caller must
- * be certain that no participant can still be touching it.
- */
-/*
  * Free every separately allocated by-ref state blob reachable from the
  * bucket array.  Entry memory itself is freed wholesale via the chunk
  * list; this walk is needed only when some transition keeps its state in
@@ -4115,7 +4399,7 @@ shared_agg_free_blobs(AggState *aggstate, dsa_area *area)
 	if (!have_blobs || !DsaPointerIsValid(shstate->buckets))
 		return;
 
-	buckets = (dsa_pointer_atomic *) dsa_get_address(area, shstate->buckets);
+	buckets = shared_agg_buckets(aggstate, area);
 	for (i = 0; i < shstate->nbuckets; i++)
 	{
 		dsa_pointer entryp = dsa_pointer_atomic_read(&buckets[i]);
@@ -4138,6 +4422,14 @@ shared_agg_free_blobs(AggState *aggstate, dsa_area *area)
 	}
 }
 
+/*
+ * Release everything the shared table owns in the DSA: the entry chunks and
+ * the bucket array itself.
+ *
+ * Unlike shared_agg_reset_table(), which recycles the bucket array between
+ * spill batches, this is for tearing the table down entirely.  Caller must
+ * be certain that no participant can still be touching it.
+ */
 static void
 shared_agg_free_table(dsa_area *area, SharedAggBuildState *shstate)
 {
@@ -4167,8 +4459,7 @@ static void
 shared_agg_reset_table(AggState *aggstate, dsa_area *area)
 {
 	SharedAggBuildState *shstate = aggstate->shared->build;
-	dsa_pointer_atomic *buckets = (dsa_pointer_atomic *)
-		dsa_get_address(area, shstate->buckets);
+	dsa_pointer_atomic *buckets = shared_agg_buckets(aggstate, area);
 	dsa_pointer chunkp;
 	uint64		i;
 
@@ -4194,6 +4485,14 @@ shared_agg_reset_table(AggState *aggstate, dsa_area *area)
 	 */
 	for (i = 0; i < shstate->nbuckets; i++)
 		dsa_pointer_atomic_write(&buckets[i], InvalidDsaPointer);
+
+	/*
+	 * The total is rewritten outright rather than adjusted, so any bytes this
+	 * participant has not yet published must be dropped, not flushed later on
+	 * top of the new baseline.  The others clear theirs in the batch cycle in
+	 * agg_retrieve_shared_hash_table(), where they also drop their chunks.
+	 */
+	aggstate->shared->mem_unflushed = 0;
 
 	pg_atomic_write_u64(&shstate->scan_cursor, 0);
 	pg_atomic_write_u64(&shstate->mem_used,
@@ -4247,6 +4546,32 @@ shared_agg_refill(AggState *aggstate, dsa_area *area, int batchno)
 }
 
 /*
+ * shared_agg_fall_back
+ *		Abandon the shared table and run as an ordinary hashed Agg.
+ *
+ * Called at most once, from the first ExecAgg() call, when it turns out that
+ * no DSM segment exists to hold the shared table.  We are then the only
+ * participant, so a private table computes exactly the same result: the
+ * strategy is AGGSPLIT_SIMPLE whether or not the node is parallel_aware, so
+ * unlike the Partial/Finalize split there is nothing for anyone else to
+ * combine.  Parallel hash join makes the same accommodation in
+ * ExecHashTableCreate().
+ *
+ * ExecInitAgg() skipped build_hash_tables() on our behalf, so do it now.
+ * Clearing ->shared is what routes every later decision -- emission, rescan,
+ * shutdown, EXPLAIN -- down the private path.
+ */
+static void
+shared_agg_fall_back(AggState *aggstate)
+{
+	Assert(aggstate->shared != NULL && aggstate->shared->build == NULL);
+	Assert(!aggstate->table_filled);
+
+	aggstate->shared = NULL;
+	build_hash_tables(aggstate);
+}
+
+/*
  * Cooperatively build the shared hash table.
  *
  * Every participant attaches to the build barrier, one of them is elected to
@@ -4267,8 +4592,14 @@ agg_fill_shared_hash_table(AggState *aggstate)
 	ExprContext *tmpcontext = aggstate->tmpcontext;
 	ExprContext *hashcxt;
 
-	if (shstate == NULL || area == NULL)
-		elog(ERROR, "parallel shared hash aggregation is not initialized");
+	/*
+	 * ExecAgg() sent us here only after finding ->build, and a DSA area comes
+	 * with the parallel context that produced it.  Callers with no parallel
+	 * context are routed to shared_agg_fall_back() instead.
+	 */
+	Assert(shstate != NULL);
+	if (area == NULL)
+		elog(ERROR, "parallel shared hash aggregation requires a DSA area");
 
 	hashcxt = aggstate->shared->exprcontext;
 	build_barrier = &shstate->build_barrier;
@@ -4436,6 +4767,7 @@ agg_fill_shared_hash_table(AggState *aggstate)
 		aggstate->shared->attached = false;
 
 		aggstate->table_filled = true;
+		aggstate->shared->generation = shstate->generation;
 		aggstate->shared->scan_bucket = 0;
 		aggstate->shared->scan_chunk_end = 0;
 		aggstate->shared->scan_entry = InvalidDsaPointer;
@@ -4447,7 +4779,17 @@ agg_fill_shared_hash_table(AggState *aggstate)
 	 * and other participants may be arbitrarily deep into emission or
 	 * batch cycles, whose barrier phases we cannot join coherently.
 	 * Contribute nothing; the other participants cover all groups.
+	 *
+	 * Unless we are the one who built it.  Then this is not a late attach at
+	 * all but a rescan that did not go through ExecAggReInitializeDSM(), and
+	 * "contribute nothing" would mean returning no rows at all -- silently.
+	 * The planner is not supposed to produce such a shape (parallel-aware
+	 * paths reach the executor only through partial_pathlist), so complain
+	 * rather than trust that it never will.
 	 */
+	if (aggstate->shared->generation == shstate->generation)
+		elog(ERROR, "parallel hash aggregation rescanned without reinitialization");
+
 	BarrierDetach(build_barrier);
 	aggstate->shared->attached = false;
 	aggstate->shared->scan_attached = false;
@@ -4478,7 +4820,7 @@ agg_retrieve_shared_hash_table(AggState *aggstate)
 	if (aggstate->agg_done)
 		return NULL;
 
-	buckets = (dsa_pointer_atomic *) dsa_get_address(area, shstate->buckets);
+	buckets = shared_agg_buckets(aggstate, area);
 
 	for (;;)
 	{
@@ -4559,9 +4901,28 @@ agg_retrieve_shared_hash_table(AggState *aggstate)
 					 * carve-out pointer would dangle.
 					 */
 					mybatch = shstate->cur_batch;
+
+					/*
+					 * Someone else may already have finished the last batch.
+					 * Detach rather than arrive: an arrival would be waiting
+					 * for participants that have all gone home, and the
+					 * newbatch arithmetic below has no meaning for the
+					 * sentinel value (mybatch + 1 wraps to zero and would
+					 * index npart_spilled[] at -1).
+					 */
+					if (mybatch == PHA_BATCHES_DONE)
+					{
+						BarrierDetach(&shstate->scan_barrier);
+						aggstate->shared->scan_attached = false;
+						aggstate->agg_done = true;
+						return NULL;
+					}
+
 					aggstate->shared->alloc_chunk = InvalidDsaPointer;
 					aggstate->shared->alloc_used = 0;
 					aggstate->shared->alloc_size = 0;
+					aggstate->shared->mem_unflushed = 0;
+					aggstate->shared->buckets_base = NULL;
 
 					/* wait for everyone to finish emitting this table */
 					BarrierArriveAndWait(&shstate->scan_barrier,
@@ -4624,6 +4985,7 @@ agg_retrieve_shared_hash_table(AggState *aggstate)
 										 WAIT_EVENT_PARALLEL_HASH_AGG_BATCH);
 
 					/* restart emission over the refilled table */
+					buckets = shared_agg_buckets(aggstate, area);
 					aggstate->shared->scan_bucket = 0;
 					aggstate->shared->scan_chunk_end = 0;
 					aggstate->shared->scan_entry = InvalidDsaPointer;
@@ -5566,7 +5928,6 @@ ExecInitAgg(Agg *node, EState *estate, int eflags)
 					elog(ERROR, "deserialfunc not provided for deserialization aggregation");
 				deserialfn_oid = aggform->aggdeserialfn;
 			}
-
 		}
 
 		/* Check that aggregate owner has permission to call component fns */
@@ -6195,6 +6556,52 @@ ExecEndAgg(AggState *node)
 	ExecEndNode(outerPlan);
 }
 
+/*
+ * ExecShutdownAgg
+ *
+ *		Leave the shared hash table's barriers before the parallel context
+ *		can go away.
+ *
+ *		Caller obligation this exists to satisfy: a participant that stops
+ *		early -- LIMIT satisfied, tuple queue detached, subplan answered --
+ *		must not remain attached to a barrier.  Participants still cycling
+ *		through spill batches wait in agg_retrieve_shared_hash_table() for
+ *		every attached participant to arrive, and one that has walked away
+ *		never will; the result is an undetected hang rather than an error.
+ *
+ *		This cannot be done in ExecEndAgg(): by then ExecShutdownGather() has
+ *		run ExecParallelCleanup(), which destroyed the segment the barriers
+ *		live in.  ExecShutdownHashJoin() exists for the same reason.
+ */
+void
+ExecShutdownAgg(AggState *node)
+{
+	SharedAggState *shared = node->shared;
+
+	if (shared == NULL || shared->build == NULL)
+		return;
+
+	/*
+	 * The build barrier is attached and detached within a single ExecAgg()
+	 * call, so we cannot be holding it between calls.
+	 */
+	Assert(!shared->attached);
+
+	if (shared->scan_attached)
+	{
+		BarrierDetach(&shared->build->scan_barrier);
+		shared->scan_attached = false;
+	}
+
+	/*
+	 * No more groups will be emitted.  Note we deliberately keep ->build:
+	 * ExecShutdownGather() reads the shared spill counters through it in
+	 * ExecAggRetrieveInstrumentation(), and that runs after us but while the
+	 * segment is still mapped.
+	 */
+	node->agg_done = true;
+}
+
 void
 ExecReScanAgg(AggState *node)
 {
@@ -6224,6 +6631,26 @@ ExecReScanAgg(AggState *node)
 		node->shared->alloc_chunk = InvalidDsaPointer;
 		node->shared->alloc_used = 0;
 		node->shared->alloc_size = 0;
+		node->shared->buckets_base = NULL;
+		node->shared->mem_unflushed = 0;
+
+		/*
+		 * Note we deliberately do NOT clear ->generation: it records which
+		 * build we contributed to, and agg_fill_shared_hash_table() compares
+		 * it against the shared value to tell a genuine late attach from a
+		 * rescan that skipped ExecAggReInitializeDSM().
+		 *
+		 * Reset the aggregate contexts as the private path does below, both to
+		 * fire any transition-function shutdown callbacks and to release what
+		 * shared_agg_advance_byref() could not (see the callback caveat
+		 * there); skipping this leaks per rescan, which for an Agg on the
+		 * inner side of a nested loop means leaking per outer row.
+		 */
+		for (setno = 0; setno < numGroupingSets; setno++)
+			ReScanExprContext(node->aggcontexts[setno]);
+		ReScanExprContext(node->hashcontext);
+		if (node->shared->byrefcontext != NULL)
+			ReScanExprContext(node->shared->byrefcontext);
 
 		if (outerPlan->chgParam == NULL)
 			ExecReScan(outerPlan);
@@ -6599,6 +7026,7 @@ ExecAggInitializeDSM(AggState *node, ParallelContext *pcxt)
 		for (i = 0; i < SHARED_AGG_SPILL_PARTITIONS; i++)
 			pg_atomic_init_u64(&shstate->npart_spilled[i], 0);
 		shstate->cur_batch = 0;
+		shstate->generation = 1;	/* 0 means "not seen" locally */
 		LWLockInitialize(&shstate->batch_lock, LWTRANCHE_PARALLEL_HASH_AGG);
 		shstate->chunk_head = InvalidDsaPointer;
 		shstate->mem_limit =
@@ -6671,15 +7099,6 @@ ExecAggReInitializeDSM(AggState *node, ParallelContext *pcxt)
 	shstate = node->shared->build;
 
 	/*
-	 * Reinitializing the shared tuplestores after a spilling run would
-	 * require recreating their backing files; not supported yet.
-	 */
-	if (shared_agg_nspilled(shstate) > 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot rescan a parallel hash aggregate after it has spilled to disk")));
-
-	/*
 	 * Release the table the previous run built.  This is the only place it
 	 * can be done: the workers of that run have exited by the time
 	 * ExecParallelReinitialize() calls us, and it is also the only caller
@@ -6688,21 +7107,51 @@ ExecAggReInitializeDSM(AggState *node, ParallelContext *pcxt)
 	 * rescan, so a parallel Agg on the inner side of a nested loop would
 	 * leak in proportion to the number of outer rows.
 	 */
-	Assert(area != NULL);
-	if (area != NULL)
-	{
-		shared_agg_free_blobs(node, area);
-		shared_agg_free_table(area, shstate);
-	}
+	if (area == NULL)
+		elog(ERROR, "parallel shared hash aggregation requires a DSA area");
+
+	shared_agg_free_blobs(node, area);
+	shared_agg_free_table(area, shstate);
+	node->shared->buckets_base = NULL;
+	node->shared->mem_unflushed = 0;
 
 	BarrierInit(&shstate->build_barrier, 0);
 	BarrierInit(&shstate->scan_barrier, 0);
 	shstate->cur_batch = 0;
+	shstate->generation++;
 	pg_atomic_write_u64(&shstate->scan_cursor, 0);
 	pg_atomic_write_u64(&shstate->mem_used, 0);
 	pg_atomic_write_u32(&shstate->spill_mode, 0);
 	for (int i = 0; i < SHARED_AGG_SPILL_PARTITIONS; i++)
 		pg_atomic_write_u64(&shstate->npart_spilled[i], 0);
+
+	/*
+	 * Recreate the spill tuplestores.  The previous run's are unusable: they
+	 * were opened SHARED_TUPLESTORE_SINGLE_PASS, so reading them destroyed
+	 * their contents, and their write state is spent.  Reinitializing in place
+	 * with a generation-stamped name gives this run its own backing files;
+	 * anything left over from the previous run goes away with the fileset at
+	 * end of query.
+	 *
+	 * Doing this unconditionally, rather than only when the previous run
+	 * spilled, keeps one code path instead of two and costs nothing measurable
+	 * next to relaunching workers.
+	 */
+	for (int i = 0; i < SHARED_AGG_SPILL_PARTITIONS; i++)
+	{
+		char		name[MAXPGPATH];
+
+		snprintf(name, MAXPGPATH, "pha%d.%u.%d",
+				 node->ss.ps.plan->plan_node_id, shstate->generation, i);
+		node->shared->spill_acc[i] =
+			sts_initialize(SharedAggPartitionSts(shstate, i),
+						   shstate->nparticipants,
+						   ParallelWorkerNumber + 1,
+						   sizeof(uint32),
+						   SHARED_TUPLESTORE_SINGLE_PASS,
+						   &shstate->fileset,
+						   name);
+	}
 }
 
 /* ----------------------------------------------------------------

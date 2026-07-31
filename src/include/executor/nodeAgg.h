@@ -324,6 +324,7 @@ typedef struct AggStatePerHashData
 
 extern AggState *ExecInitAgg(Agg *node, EState *estate, int eflags);
 extern void ExecEndAgg(AggState *node);
+extern void ExecShutdownAgg(AggState *node);
 extern void ExecReScanAgg(AggState *node);
 
 extern Size hash_agg_entry_size(int numTrans, Size tupleWidth,
