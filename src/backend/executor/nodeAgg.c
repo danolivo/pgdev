@@ -390,7 +390,9 @@ typedef struct SharedAggState
 	ExprState  *hashexpr;		/* computes group-key hash over hashslot */
 	ExprState  *eqexpr;			/* compares hashslot against stored key */
 	TupleTableSlot *keyslot;	/* minimal slot for stored key tuples */
-	struct SharedTuplestoreAccessor **spill_acc;	/* per spill partition */
+	struct SharedTuplestoreAccessor **child_acc;	/* write side, per child */
+	int			nchild_acc;		/* children child_acc was opened for */
+	struct SharedTuplestoreAccessor *read_acc;	/* read side of cur_batch */
 	uint64		scan_bucket;	/* next bucket within claimed chunk */
 	uint64		scan_chunk_end; /* end of currently claimed chunk */
 	dsa_pointer scan_entry;		/* next chain entry to emit */
@@ -413,8 +415,9 @@ typedef struct SharedAggState
 
 	/*
 	 * Rows this participant has written to each spill partition, not yet
-	 * published.  Flushed by shared_agg_flush_spill_counts() before the build
-	 * barrier, while nobody can be reading the shared counters.
+	 * published.  Flushed by shared_agg_flush_counters() before a barrier, while
+	 * nobody can be reading the shared counters.  Allocated once for the
+	 * maximum fanout, so it never has to be resized per level.
 	 */
 	uint64	   *nspilled_local;
 } SharedAggState;
@@ -461,9 +464,13 @@ typedef struct SharedAggState
  * and processed in batches once the in-memory table has been emitted.  The
  * budget is get_hash_memory_limit() times the number of participants, since one
  * shared table stands in for the private table each of them would otherwise
- * have built.  Note "budget", not "bound": partitioning is single level, so a
- * batch whose own groups exceed the budget grows past it rather than
- * partitioning again.
+ * have built.
+ *
+ * Partitioning is recursive: a batch that does not fit either spills in its
+ * turn, splitting on the hash bits its ancestors have not spent, so the budget
+ * is a bound and not merely a target.  Batches are held on a queue in shared
+ * memory, which is the only structural difference from the private path's local
+ * List; the hash-bit bookkeeping is the same as hashagg_spill_init()'s.
  *
  * The shared bucket array holds dsa_pointers to chains of SharedAggEntry.
  * All chain reads and mutations during the build phase happen under the
@@ -498,26 +505,68 @@ typedef struct SharedAggState
 #define SHARED_AGG_MAX_BUCKETS		(UINT64CONST(1) << 24)
 
 /*
- * Number of spill partitions (single level, no recursive repartitioning).
- * Partition selection uses the top hash bits, disjoint from the bucket
- * number's low bits.  The count is a heuristic.
+ * Spill partitioning.
+ *
+ * The hash is a budget of 32 bits, spent from the most significant end.  A
+ * table's rows all share the top used_bits of their hashes; when such a table
+ * overflows, the next SHARED_AGG_SPILL_BITS bits below those choose which
+ * partition a row goes to.  Reusing bits already spent would put everything in
+ * one partition and make no progress -- which is the whole reason used_bits has
+ * to be carried along with a batch.
+ *
+ * Same scheme as the private path's hashagg_spill_init(), and for the same
+ * reason.
  */
 #define SHARED_AGG_SPILL_BITS		5
 #define SHARED_AGG_SPILL_PARTITIONS (1 << SHARED_AGG_SPILL_BITS)
-#define SharedAggSpillPartition(hash) \
-	((hash) >> (32 - SHARED_AGG_SPILL_BITS))
 
 /*
- * The bucket number comes from the low bits of the hash and the spill
- * partition from the high bits.  They must not overlap: if they did, the
- * partition a row spills to would correlate with its bucket number, which
- * would not fail visibly -- it would just quietly wreck the balance of the
- * spill partitions.  Raising SHARED_AGG_MAX_BUCKETS past this bound is
- * therefore not a free change.
+ * How many bits a table at this depth may still spend, and hence how many
+ * partitions it can split into.  Zero means the budget is exhausted: every row
+ * left has an identical hash, so no split can shrink the table, and growing
+ * past the budget is then the only option and the correct one.  The private
+ * path stops for the same reason, and parallel hash join calls this deciding
+ * "repartitioning is not helping".
+ */
+#define SharedAggSpillBits(used_bits) \
+	Min(SHARED_AGG_SPILL_BITS, 32 - (used_bits))
+
+#define SharedAggSpillPartition(hash, used_bits, nbits) \
+	(((hash) >> (32 - (used_bits) - (nbits))) & ((1u << (nbits)) - 1))
+
+/*
+ * At the first spill level the partition comes from the top hash bits and the
+ * bucket number from the low ones, so they do not interfere.  Deeper levels
+ * eventually spend bits that the bucket number also uses; that costs some
+ * bucket-array balance within those batches and nothing else, and by then the
+ * batches are small.  The assert covers the level that matters.
  */
 StaticAssertDecl(SHARED_AGG_MAX_BUCKETS <=
 				 (UINT64CONST(1) << (32 - SHARED_AGG_SPILL_BITS)),
 				 "shared hash agg bucket and spill partition hash bits overlap");
+
+/*
+ * One spill batch: the rows of one partition, plus what is needed to split it
+ * again if it turns out not to fit either.
+ *
+ * A SharedTuplestore of sts_estimate(nparticipants) bytes follows the struct,
+ * the same "variable-sized objects follow this struct" arrangement
+ * ParallelHashJoinBatch uses.  Batches are allocated one at a time from the DSA
+ * rather than as an array, so that each can be freed as soon as it has been
+ * read; the queue below links them.
+ */
+typedef struct SharedAggBatch
+{
+	dsa_pointer next;			/* next batch in the shared work queue */
+	uint32		used_bits;		/* hash bits spent by this batch's ancestors
+								 * and by the split that produced it; every row
+								 * in it shares them */
+	pg_atomic_uint64 ntuples;	/* rows written to it */
+} SharedAggBatch;
+
+#define SharedAggBatchHeaderSize	MAXALIGN(sizeof(SharedAggBatch))
+#define SharedAggBatchSts(batch) \
+	((SharedTuplestore *) ((char *) (batch) + SharedAggBatchHeaderSize))
 
 /* Build-barrier phases */
 #define PHA_BUILD_ELECT				0
@@ -676,42 +725,52 @@ typedef struct SharedAggBuildState
 	pg_atomic_uint32 spill_mode;	/* nonzero: stop creating new groups */
 
 	/*
-	 * Tuples spilled, per partition.  Published once per participant when it
-	 * stops writing, not once per spilled row: these 32 counters occupy four
-	 * cache lines that every participant would otherwise write on every
-	 * spilled row, which is the same scalability wall shared_agg_account()
-	 * goes to some trouble to avoid for mem_used.  Every consumer reads them
-	 * at a point where they are stable.
+	 * The batch work queue, and the state of the table currently loaded.
 	 *
-	 * There is deliberately no total kept alongside: it is the sum of these,
-	 * and the total is wanted on only a handful of occasions.
+	 * A queue rather than a counter, because a batch that does not fit has to
+	 * be able to add its own children to the work still outstanding -- which is
+	 * what makes the memory budget a bound instead of a suggestion.  The private
+	 * path keeps the same thing as a local List; ours has to live in shared
+	 * memory, which is the only real difference.
+	 *
+	 * children points at an array of nchildren dsa_pointers: the spill targets
+	 * of the table being built right now.  They are created before anybody
+	 * starts filling that table, so no participant ever has to stop mid-scan and
+	 * coordinate the creation of a spill target -- the awkward part of parallel
+	 * hash join's equivalent, and avoidable here only because we never move an
+	 * existing group out of the table.
+	 *
+	 * nchildren == 0 means the hash-bit budget is spent and this table cannot
+	 * spill any further; see SharedAggSpillBits().
 	 */
-	pg_atomic_uint64 npart_spilled[SHARED_AGG_SPILL_PARTITIONS];
+	dsa_pointer batch_queue;	/* head of the queue of pending batches */
+	dsa_pointer batch_queue_tail;	/* tail, for O(1) append */
+	dsa_pointer cur_batch;		/* batch loaded in the table, or invalid during
+								 * the initial in-memory phase */
+	dsa_pointer children;		/* -> dsa_pointer[nchildren] */
+	int			nchildren;
+	uint32		cur_used_bits;	/* hash bits spent by the current table */
+	uint64		nbatches_total; /* batches ever created; also names their files */
+	uint64		nbatches_queued;	/* batches that got rows, for EXPLAIN */
+	pg_atomic_uint64 nspilled_total; /* rows ever spilled, for EXPLAIN */
 
 	/*
-	 * cur_batch: 0 = in-memory phase, 1..NPARTITIONS = spill batches,
-	 * PHA_BATCHES_DONE = all done.  Advanced under batch_lock by whichever
-	 * participant gets there first after the emit-done barrier wait.
+	 * Guards the queue, the batch transition, and the entry chunk list.
 	 *
-	 * This does not have to be done under a lock, and an earlier version of
-	 * this comment claimed it did: it asserted that a detach-driven phase
-	 * advance leaves nobody elected, so a barrier-return election could be
-	 * lost.  That is wrong.  BarrierArriveAndWait() elects one of the awoken
-	 * backends precisely when the phase advanced without an arrival --
-	 * barrier.c, "if the barrier advanced because someone detached, then one
-	 * of the backends that is awoken will need to be elected".  The lock and
-	 * the cur_batch generation token are therefore belt and braces, and could
-	 * be replaced by a barrier-return election; that is a simplification worth
-	 * making, but not one to make blind, since this is the most delicate code
-	 * in the node.
+	 * The transition could instead be claimed off BarrierArriveAndWait()'s
+	 * return value: barrier.c elects one of the awoken backends even when the
+	 * phase advanced because somebody detached rather than arrived ("if the
+	 * barrier advanced because someone detached, then one of the backends that
+	 * is awoken will need to be elected").  A lock is used anyway because the
+	 * claimant has real shared state to mutate -- popping the queue, freeing the
+	 * batch just finished, publishing the next one -- and doing that under a
+	 * lock reads better than doing it under an election.
+	 *
+	 * Its own tranche, because "the stripe locks are melting" and "everyone is
+	 * queued at a batch transition" are opposite diagnoses and pg_stat_activity
+	 * should be able to tell them apart.
 	 */
-	uint32		cur_batch;
-	LWLock		batch_lock;		/* protects cur_batch transitions and the
-								 * entry chunk list.  Its own tranche, because
-								 * "the stripe locks are melting" and "everyone
-								 * is queued at a batch transition" are opposite
-								 * diagnoses and pg_stat_activity should be able
-								 * to tell them apart. */
+	LWLock		batch_lock;
 	dsa_pointer chunk_head;		/* list of entry chunks, for wholesale free */
 
 	SharedFileSet fileset;		/* backing files for spill partitions */
@@ -797,11 +856,6 @@ typedef struct SharedAggChunk
 } SharedAggChunk;
 
 #define SharedAggChunkHeaderSize	MAXALIGN(sizeof(SharedAggChunk))
-
-#define SharedAggPartitionSts(shstate, i) \
-	((SharedTuplestore *) ((char *) (shstate) + \
-						   MAXALIGN(sizeof(SharedAggBuildState)) + \
-						   (i) * MAXALIGN(sts_estimate((shstate)->nparticipants))))
 
 static void select_current_set(AggState *aggstate, int setno, bool is_hash);
 static void initialize_phase(AggState *aggstate, int newphase);
@@ -889,13 +943,20 @@ static SharedAggEntry *shared_agg_chain_lookup(AggState *aggstate,
 static void shared_agg_insert(AggState *aggstate, dsa_area *area,
 							  TupleTableSlot *hashslot, uint32 hash,
 							  bool allow_spill);
+static SharedAggBatch *shared_agg_child(AggState *aggstate, dsa_area *area,
+									   int n);
+static void shared_agg_create_children(AggState *aggstate, dsa_area *area);
+static void shared_agg_open_children(AggState *aggstate, dsa_area *area);
+static void shared_agg_close_child_accessors(AggState *aggstate);
+static void shared_agg_close_children(AggState *aggstate, dsa_area *area);
+static bool shared_agg_more_batches(AggState *aggstate, dsa_area *area);
 static void shared_agg_spill_tuple(AggState *aggstate, uint32 partno,
 								   TupleTableSlot *inputslot, uint32 hash);
 static void shared_agg_free_blobs(AggState *aggstate, dsa_area *area);
 static void shared_agg_free_table(dsa_area *area,
 								 SharedAggBuildState *shstate);
 static void shared_agg_reset_table(AggState *aggstate, dsa_area *area);
-static void shared_agg_refill(AggState *aggstate, dsa_area *area, int batchno);
+static void shared_agg_refill(AggState *aggstate, dsa_area *area);
 static void shared_agg_fall_back(AggState *aggstate);
 static void agg_fill_shared_hash_table(AggState *aggstate);
 static TupleTableSlot *agg_retrieve_shared_hash_table(AggState *aggstate);
@@ -3781,6 +3842,188 @@ shared_agg_note_mem_peak(SharedAggBuildState *shstate)
 }
 
 /*
+ * Local address of child n of the table currently being built.
+ */
+static SharedAggBatch *
+shared_agg_child(AggState *aggstate, dsa_area *area, int n)
+{
+	SharedAggBuildState *shstate = aggstate->shared->build;
+	dsa_pointer *children;
+
+	Assert(n < shstate->nchildren);
+	children = (dsa_pointer *) dsa_get_address(area, shstate->children);
+
+	return (SharedAggBatch *) dsa_get_address(area, children[n]);
+}
+
+/*
+ * Create the spill targets for a table that is about to be built.
+ *
+ * Called by one participant only, before anybody starts filling that table --
+ * the elected one during the build phase, the batch claimant afterwards.  The
+ * caller must have set shstate->cur_used_bits already.
+ *
+ * The batches are created empty and most of them usually stay that way; an
+ * empty SharedTuplestore is a few hundred bytes of DSA and no file at all, and
+ * shared_agg_close_children() gives the unused ones straight back.  Paying that
+ * to avoid coordinating a mid-scan allocation is a good trade.
+ */
+static void
+shared_agg_create_children(AggState *aggstate, dsa_area *area)
+{
+	SharedAggBuildState *shstate = aggstate->shared->build;
+	dsa_pointer *children;
+	Size		batchsz;
+	int			nbits;
+	int			i;
+
+	nbits = SharedAggSpillBits(shstate->cur_used_bits);
+	shstate->nchildren = (nbits > 0) ? (1 << nbits) : 0;
+	shstate->children = InvalidDsaPointer;
+
+	if (shstate->nchildren == 0)
+		return;					/* hash bits exhausted; this table cannot spill */
+
+	batchsz = SharedAggBatchHeaderSize +
+		MAXALIGN(sts_estimate(shstate->nparticipants));
+
+	shstate->children =
+		dsa_allocate(area, shstate->nchildren * sizeof(dsa_pointer));
+	children = (dsa_pointer *) dsa_get_address(area, shstate->children);
+
+	for (i = 0; i < shstate->nchildren; i++)
+	{
+		SharedAggBatch *child;
+		char		name[MAXPGPATH];
+
+		children[i] = dsa_allocate0(area, batchsz);
+		child = (SharedAggBatch *) dsa_get_address(area, children[i]);
+		child->next = InvalidDsaPointer;
+		child->used_bits = shstate->cur_used_bits + nbits;
+		pg_atomic_init_u64(&child->ntuples, 0);
+
+		/*
+		 * The name has to be unique across the whole fileset, and batches come
+		 * and go, so number them from a counter that only ever increases.
+		 */
+		snprintf(name, MAXPGPATH, "pha%d.%u." UINT64_FORMAT,
+				 aggstate->ss.ps.plan->plan_node_id, shstate->generation,
+				 shstate->nbatches_total + i);
+		sts_initialize(SharedAggBatchSts(child),
+					   shstate->nparticipants,
+					   ParallelWorkerNumber + 1,
+					   sizeof(uint32),
+					   SHARED_TUPLESTORE_SINGLE_PASS,
+					   &shstate->fileset,
+					   name);
+	}
+	shstate->nbatches_total += shstate->nchildren;
+}
+
+/*
+ * Open this participant's write accessors for the current children.
+ *
+ * Every participant calls this after the barrier that published them.  Note
+ * sts_attach() only allocates a local accessor -- it mutates nothing shared --
+ * so the participant that ran sts_initialize() attaches here too rather than
+ * keeping the accessor that call returned; one code path instead of two.
+ */
+static void
+shared_agg_open_children(AggState *aggstate, dsa_area *area)
+{
+	SharedAggState *shared = aggstate->shared;
+	SharedAggBuildState *shstate = shared->build;
+	int			i;
+
+	shared_agg_close_child_accessors(aggstate);
+
+	shared->nchild_acc = shstate->nchildren;
+	if (shared->nchild_acc == 0)
+		return;
+
+	shared->child_acc = palloc(shared->nchild_acc *
+							   sizeof(SharedTuplestoreAccessor *));
+	for (i = 0; i < shared->nchild_acc; i++)
+		shared->child_acc[i] =
+			sts_attach(SharedAggBatchSts(shared_agg_child(aggstate, area, i)),
+					   ParallelWorkerNumber + 1,
+					   &shstate->fileset);
+}
+
+/*
+ * Drop this participant's write accessors.
+ */
+static void
+shared_agg_close_child_accessors(AggState *aggstate)
+{
+	SharedAggState *shared = aggstate->shared;
+	int			i;
+
+	if (shared->child_acc == NULL)
+		return;
+
+	for (i = 0; i < shared->nchild_acc; i++)
+	{
+		if (shared->child_acc[i] != NULL)
+			pfree(shared->child_acc[i]);
+	}
+	pfree(shared->child_acc);
+	shared->child_acc = NULL;
+	shared->nchild_acc = 0;
+	memset(shared->nspilled_local, 0,
+		   SHARED_AGG_SPILL_PARTITIONS * sizeof(uint64));
+}
+
+/*
+ * Queue the children that received rows and free the ones that did not.
+ *
+ * Runs in the batch claimant, after every participant has stopped writing (the
+ * emit barrier guarantees that) and therefore after the counters are final.
+ */
+static void
+shared_agg_close_children(AggState *aggstate, dsa_area *area)
+{
+	SharedAggBuildState *shstate = aggstate->shared->build;
+	dsa_pointer *children;
+	int			i;
+
+	if (shstate->nchildren == 0)
+		return;
+
+	children = (dsa_pointer *) dsa_get_address(area, shstate->children);
+
+	for (i = 0; i < shstate->nchildren; i++)
+	{
+		SharedAggBatch *child =
+			(SharedAggBatch *) dsa_get_address(area, children[i]);
+
+		if (pg_atomic_read_u64(&child->ntuples) == 0)
+		{
+			dsa_free(area, children[i]);
+			continue;
+		}
+
+		shstate->nbatches_queued++;
+
+		child->next = InvalidDsaPointer;
+		if (DsaPointerIsValid(shstate->batch_queue_tail))
+		{
+			SharedAggBatch *tail = (SharedAggBatch *)
+				dsa_get_address(area, shstate->batch_queue_tail);
+
+			tail->next = children[i];
+		}
+		else
+			shstate->batch_queue = children[i];
+		shstate->batch_queue_tail = children[i];
+	}
+
+	dsa_free(area, shstate->children);
+	shstate->children = InvalidDsaPointer;
+	shstate->nchildren = 0;
+}
+
+/*
  * Publish this participant's spill counts and its unflushed byte count.
  *
  * Must be called before arriving at the build barrier, and again before
@@ -3788,7 +4031,7 @@ shared_agg_note_mem_peak(SharedAggBuildState *shstate)
  * totals to decide whether anything spilled and which partitions are empty.
  */
 static void
-shared_agg_flush_counters(AggState *aggstate)
+shared_agg_flush_counters(AggState *aggstate, dsa_area *area)
 {
 	SharedAggState *shared = aggstate->shared;
 	int			partno;
@@ -3800,11 +4043,24 @@ shared_agg_flush_counters(AggState *aggstate)
 		shared->mem_unflushed = 0;
 	}
 
-	for (partno = 0; partno < SHARED_AGG_SPILL_PARTITIONS; partno++)
+	/*
+	 * Our accessors must describe the children the shared state currently has,
+	 * or shared_agg_child() below indexes something that has been handed to the
+	 * queue and freed.  Every caller runs before the emit barrier at which the
+	 * claimant closes them; keep it that way.
+	 */
+	Assert(shared->nchild_acc == 0 ||
+		   shared->nchild_acc == shared->build->nchildren);
+
+	for (partno = 0; partno < shared->nchild_acc; partno++)
 	{
 		if (shared->nspilled_local[partno] != 0)
 		{
-			pg_atomic_fetch_add_u64(&shared->build->npart_spilled[partno],
+			SharedAggBatch *child = shared_agg_child(aggstate, area, partno);
+
+			pg_atomic_fetch_add_u64(&child->ntuples,
+									shared->nspilled_local[partno]);
+			pg_atomic_fetch_add_u64(&shared->build->nspilled_total,
 									shared->nspilled_local[partno]);
 			shared->nspilled_local[partno] = 0;
 		}
@@ -4249,15 +4505,34 @@ shared_agg_apply(AggState *aggstate, dsa_area *area, AggStatePerGroup states)
 static uint64
 shared_agg_nspilled(SharedAggBuildState *shstate)
 {
-	uint64		total = 0;
-	int			i;
-
-	for (i = 0; i < SHARED_AGG_SPILL_PARTITIONS; i++)
-		total += pg_atomic_read_u64(&shstate->npart_spilled[i]);
-
-	return total;
+	return pg_atomic_read_u64(&shstate->nspilled_total);
 }
 
+/*
+ * Is there any batch left to process?
+ *
+ * Either one is already queued, or the table just emitted spilled into children
+ * that have not been queued yet -- the claimant queues them at the transition,
+ * so before that point the children's own counters are the only evidence.
+ * Callers must have flushed their counters.
+ */
+static bool
+shared_agg_more_batches(AggState *aggstate, dsa_area *area)
+{
+	SharedAggBuildState *shstate = aggstate->shared->build;
+	int			i;
+
+	if (DsaPointerIsValid(shstate->batch_queue))
+		return true;
+
+	for (i = 0; i < shstate->nchildren; i++)
+	{
+		if (pg_atomic_read_u64(&shared_agg_child(aggstate, area, i)->ntuples) > 0)
+			return true;
+	}
+
+	return false;
+}
 /*
  * Write one input tuple to a spill partition's shared tuplestore.
  *
@@ -4297,7 +4572,8 @@ shared_agg_spill_tuple(AggState *aggstate, uint32 partno,
 
 	tuple = ExecFetchSlotMinimalTuple(spillslot, &shouldFree);
 
-	sts_puttuple(aggstate->shared->spill_acc[partno], &hash, tuple);
+	Assert(partno < aggstate->shared->nchild_acc);
+	sts_puttuple(aggstate->shared->child_acc[partno], &hash, tuple);
 	aggstate->shared->nspilled_local[partno]++;
 
 	if (shouldFree)
@@ -4467,11 +4743,23 @@ shared_agg_insert(AggState *aggstate, dsa_area *area,
 		 * instead of growing the table.  Existing groups keep advancing in
 		 * place above, so memory use is stable in spill mode -- the same
 		 * semantics as the private hashagg's hash_spill_mode.
+		 *
+		 * Note the decision is per GROUP, not per row: a group is either wholly
+		 * in the table or wholly in one partition.  That is what lets a batch be
+		 * split again without ever producing two states for one group, which we
+		 * would have no combine function to merge.
+		 *
+		 * nchildren == 0 means the hash bits are spent and there is nowhere left
+		 * to spill; the table grows instead, and correctly so, since every row
+		 * still here has the same hash.
 		 */
-		if (allow_spill &&
+		if (allow_spill && shstate->nchildren > 0 &&
 			pg_atomic_read_u32(&shstate->spill_mode) != 0)
 		{
-			uint32		partno = SharedAggSpillPartition(hash);
+			int			nbits = SharedAggSpillBits(shstate->cur_used_bits);
+			uint32		partno = SharedAggSpillPartition(hash,
+														 shstate->cur_used_bits,
+														 nbits);
 
 			LWLockRelease(lock);
 
@@ -4541,10 +4829,31 @@ shared_agg_insert(AggState *aggstate, dsa_area *area,
 	}
 
 	/*
-	 * Apply the staged inputs, still under the stripe lock.  This is why
-	 * only LWLocks are acceptable here: a transition function can
-	 * ereport(ERROR), and LWLocks are released by transaction abort,
-	 * whereas a spinlock would stay wedged.
+	 * Apply the staged inputs, still under the stripe lock.
+	 *
+	 * This has to be an LWLock, and not because a transition function can
+	 * ereport(ERROR) -- a PG_TRY block could release a spinlock on the way
+	 * out, so that argument does not settle it.  The reasons it has to be an
+	 * LWLock are:
+	 *
+	 * spin.h's contract is "must not be held for more than a few
+	 * instructions", and goes on to assume no CHECK_FOR_INTERRUPTS() can
+	 * happen inside.  What we hold this across is an arbitrary transition
+	 * function, plus -- on the by-reference path -- pg_detoast_datum() and
+	 * dsa_allocate(), which can reach dsm_create() and the filesystem.  That
+	 * is not a few instructions by any reading.
+	 *
+	 * Spinlock waiters burn CPU rather than sleeping, so a long hold costs one
+	 * core per waiter instead of one sleeping process.
+	 *
+	 * And a hold that outlasts s_lock()'s patience does not merely block: it
+	 * PANICs.  s_lock_stuck() fires after roughly a minute of contention and
+	 * takes the whole instance down.  A slow transition function would turn a
+	 * bad plan into a cluster restart.
+	 *
+	 * Also, spinlock waits do not show up in pg_stat_activity, and for a
+	 * strategy whose entire risk profile is contention that alone would be
+	 * disqualifying.
 	 */
 	shared_agg_apply(aggstate, area, shared_agg_entry_states(entry));
 
@@ -4691,6 +5000,24 @@ shared_agg_reset_table(AggState *aggstate, dsa_area *area)
 	aggstate->shared->mem_unflushed = 0;
 
 	/*
+	 * Clear spill mode for the incoming batch.
+	 *
+	 * This is load-bearing now in a way it was not when batches could not
+	 * re-spill.  spill_mode means "stop creating groups"; a batch is loaded into
+	 * an empty table, so every row in it is a new group, so a batch inheriting
+	 * spill mode from its parent would spill its entire contents without
+	 * aggregating a single row -- and so would its children, all the way down
+	 * until the hash bits ran out.  The result would be a six-level disk shuffle
+	 * of the whole spilled input followed by an unbounded table, which is very
+	 * much worse than the single-level behaviour this replaced.
+	 *
+	 * agg_refill_hash_table() clears hash_spill_mode at the same point and for
+	 * the same reason.  Safe to write unsynchronised: this runs in the claimant
+	 * between the two batch barriers, when nobody is inserting.
+	 */
+	pg_atomic_write_u32(&shstate->spill_mode, 0);
+
+	/*
 	 * Record the high-water mark before rebasing.  Reporting the last batch's
 	 * footprint would be reporting the smallest number of the run, which is
 	 * precisely the wrong one to show someone sizing work_mem.
@@ -4707,14 +5034,14 @@ shared_agg_reset_table(AggState *aggstate, dsa_area *area)
  * remaining participants call this concurrently; sts_parallel_scan_next
  * hands out disjoint tuples.
  *
- * Note that batches do not re-spill.  Partitioning is single level, so if
- * one partition's groups exceed the budget on their own, the table grows
- * past it rather than partitioning again.
+ * A batch that does not fit re-spills into its own children, which the
+ * transition in agg_retrieve_shared_hash_table() then appends to the queue.
+ * That is what bounds memory; see shared_agg_create_children().
  */
 static void
-shared_agg_refill(AggState *aggstate, dsa_area *area, int batchno)
+shared_agg_refill(AggState *aggstate, dsa_area *area)
 {
-	SharedTuplestoreAccessor *acc = aggstate->shared->spill_acc[batchno];
+	SharedTuplestoreAccessor *acc = aggstate->shared->read_acc;
 	AggStatePerHash perhash = &aggstate->perhash[0];
 	ExprContext *tmpcontext = aggstate->tmpcontext;
 	TupleTableSlot *spillslot = aggstate->hash_spill_rslot;
@@ -4740,12 +5067,26 @@ shared_agg_refill(AggState *aggstate, dsa_area *area, int batchno)
 
 		prepare_hash_slot(perhash, spillslot, hashslot);
 		shared_agg_prepare_inputs(aggstate, true);
-		shared_agg_insert(aggstate, area, hashslot, hash, false);
+
+		/*
+		 * allow_spill is true here, unlike in an earlier revision of this code.
+		 * A batch that does not fit either has to be able to spill in its turn,
+		 * or the memory budget is not a bound at all -- which is the guarantee
+		 * the private path has had since PostgreSQL 13.
+		 */
+		shared_agg_insert(aggstate, area, hashslot, hash, true);
 
 		ResetExprContext(aggstate->shared->exprcontext);
 		ResetExprContext(tmpcontext);
 	}
 	sts_end_parallel_scan(acc);
+
+	/*
+	 * Stop writing to the children before anyone can try to read them:
+	 * sts_begin_parallel_scan() asserts that no participant is still writing.
+	 */
+	for (int i = 0; i < aggstate->shared->nchild_acc; i++)
+		sts_end_write(aggstate->shared->child_acc[i]);
 }
 
 /*
@@ -4914,6 +5255,14 @@ agg_fill_shared_hash_table(AggState *aggstate)
 				dsa_pointer_atomic_init(&buckets[i], InvalidDsaPointer);
 			pg_atomic_add_fetch_u64(&shstate->mem_used,
 									nbuckets * sizeof(dsa_pointer_atomic));
+
+			/*
+			 * ... and the spill targets for this table, while we are the only
+			 * one running.  No rows have been read yet, so nothing can have
+			 * needed them earlier.
+			 */
+			shstate->cur_used_bits = 0;
+			shared_agg_create_children(aggstate, area);
 		}
 		BarrierArriveAndWait(build_barrier, WAIT_EVENT_PARALLEL_HASH_AGG_ALLOCATE);
 		phase = PHA_BUILD_RUN;
@@ -4927,6 +5276,9 @@ agg_fill_shared_hash_table(AggState *aggstate)
 	if (phase == PHA_BUILD_RUN)
 	{
 		TupleTableSlot *hashslot = perhash->hashslot;
+
+		/* the children are published by now; open our write side of them */
+		shared_agg_open_children(aggstate, area);
 
 		select_current_set(aggstate, 0, true);
 
@@ -4980,8 +5332,8 @@ agg_fill_shared_hash_table(AggState *aggstate)
 		{
 			int			partno;
 
-			for (partno = 0; partno < SHARED_AGG_SPILL_PARTITIONS; partno++)
-				sts_end_write(aggstate->shared->spill_acc[partno]);
+			for (partno = 0; partno < aggstate->shared->nchild_acc; partno++)
+				sts_end_write(aggstate->shared->child_acc[partno]);
 		}
 
 		/*
@@ -4989,7 +5341,7 @@ agg_fill_shared_hash_table(AggState *aggstate)
 		 * build barrier.  Everything past it -- the emptiness tests that drive
 		 * batch selection, and EXPLAIN's totals -- reads them as final.
 		 */
-		shared_agg_flush_counters(aggstate);
+		shared_agg_flush_counters(aggstate, area);
 		BarrierAttach(&shstate->scan_barrier);
 		aggstate->shared->scan_attached = true;
 
@@ -5081,8 +5433,8 @@ agg_retrieve_shared_hash_table(AggState *aggstate)
 			if (aggstate->shared->scan_bucket >= aggstate->shared->scan_chunk_end)
 			{
 				uint64		claim;
-				uint32		mybatch;
-				uint32		newbatch;
+				dsa_pointer mybatch;
+				bool		have_batch;
 				bool		do_reset;
 
 				claim = pg_atomic_fetch_add_u64(&shstate->scan_cursor,
@@ -5095,7 +5447,9 @@ agg_retrieve_shared_hash_table(AggState *aggstate)
 					 * barrier never blocks.  (All spill writes happened
 					 * before the build barrier, so nspilled is stable.)
 					 */
-					if (shared_agg_nspilled(shstate) == 0 ||
+					shared_agg_flush_counters(aggstate, area);
+
+					if (!shared_agg_more_batches(aggstate, area) ||
 						!aggstate->shared->scan_attached)
 					{
 						if (aggstate->shared->scan_attached)
@@ -5132,43 +5486,35 @@ agg_retrieve_shared_hash_table(AggState *aggstate)
 					}
 
 					/*
-					 * Snapshot the currently-loaded batch before waiting;
-					 * it cannot change during emission, and it is the
-					 * generation token for the advancement claim below.
-					 *
-					 * Also drop our current entry chunk: the claimant is
-					 * about to free all chunks wholesale, so any local
-					 * carve-out pointer would dangle.
+					 * Snapshot the currently-loaded batch before waiting: it
+					 * cannot change during emission, and it is the generation
+					 * token that decides who claims the transition below.
 					 */
 					mybatch = shstate->cur_batch;
 
 					/*
-					 * Someone else may already have finished the last batch.
-					 * Detach rather than arrive: an arrival would be waiting
-					 * for participants that have all gone home, and the
-					 * newbatch arithmetic below has no meaning for the
-					 * sentinel value (mybatch + 1 wraps to zero and would
-					 * index npart_spilled[] at -1).
+					 * Publish before waiting.  The claimant reads the children's
+					 * row counts to decide which of them are worth queueing, and
+					 * it must see everything every participant wrote.
 					 */
-					if (mybatch == PHA_BATCHES_DONE)
-					{
-						BarrierDetach(&shstate->scan_barrier);
-						aggstate->shared->scan_attached = false;
-						aggstate->agg_done = true;
-						return NULL;
-					}
+					shared_agg_flush_counters(aggstate, area);
 
 					/*
-					 * Publish before waiting: the claimant below reads
-					 * npart_spilled[] to pick the next non-empty batch, and it
-					 * must see everything every participant wrote.
+					 * Drop our local pointers into the table: the claimant is
+					 * about to free the chunks wholesale, and our write
+					 * accessors belong to a set of children that is about to be
+					 * handed to the queue.
 					 */
-					shared_agg_flush_counters(aggstate);
-
 					aggstate->shared->alloc_chunk = InvalidDsaPointer;
 					aggstate->shared->alloc_used = 0;
 					aggstate->shared->alloc_size = 0;
 					aggstate->shared->buckets_base = NULL;
+					shared_agg_close_child_accessors(aggstate);
+					if (aggstate->shared->read_acc != NULL)
+					{
+						pfree(aggstate->shared->read_acc);
+						aggstate->shared->read_acc = NULL;
+					}
 
 					/* wait for everyone to finish emitting this table */
 					BarrierArriveAndWait(&shstate->scan_barrier,
@@ -5176,46 +5522,73 @@ agg_retrieve_shared_hash_table(AggState *aggstate)
 
 					/*
 					 * First through the lock finds cur_batch unchanged and
-					 * claims the advancement; everyone else sees the new
-					 * value and skips.  Empty partitions are skipped here
-					 * in one step, avoiding pointless reset/refill cycles.
-					 * The lock is held only for the decision -- the O(n)
-					 * table reset happens outside it, while the others sit
+					 * claims the transition; everyone else sees the new value
+					 * and skips.  The lock covers only the queue surgery -- the
+					 * O(n) table reset happens outside it, while the others sit
 					 * in the interruptible barrier wait below.
+					 */
+					/*
+					 * The queue surgery below runs under batch_lock, which
+					 * includes creating the next table's spill targets and hence
+					 * a dsa_allocate() per child -- one of which may reach
+					 * dsm_create() and the filesystem.  That is a long hold for
+					 * an LWLock, and tolerable only because nothing can be
+					 * waiting for it: batch_lock is otherwise taken only by
+					 * shared_agg_alloc_entry() during inserts, and no
+					 * participant is inserting between these two barriers.  If
+					 * that ever stops being true, elect the claimant under the
+					 * lock and do the work outside it.
 					 */
 					do_reset = false;
 					LWLockAcquire(&shstate->batch_lock, LW_EXCLUSIVE);
 					if (shstate->cur_batch == mybatch)
 					{
-						newbatch = mybatch + 1;
-						while (newbatch <= SHARED_AGG_SPILL_PARTITIONS &&
-							   pg_atomic_read_u64(&shstate->npart_spilled[newbatch - 1]) == 0)
-							newbatch++;
+						/*
+						 * Hand the children of the table we just finished to the
+						 * queue (the empty ones are freed), then retire the
+						 * batch that fed it and take the next one.
+						 */
+						shared_agg_close_children(aggstate, area);
 
-						if (newbatch > SHARED_AGG_SPILL_PARTITIONS)
-							shstate->cur_batch = PHA_BATCHES_DONE;
-						else
+						if (DsaPointerIsValid(mybatch))
+							dsa_free(area, mybatch);
+
+						shstate->cur_batch = shstate->batch_queue;
+						if (DsaPointerIsValid(shstate->batch_queue))
 						{
-							shstate->cur_batch = newbatch;
+							SharedAggBatch *next = (SharedAggBatch *)
+								dsa_get_address(area, shstate->batch_queue);
+
+							shstate->batch_queue = next->next;
+							if (!DsaPointerIsValid(shstate->batch_queue))
+								shstate->batch_queue_tail = InvalidDsaPointer;
+
+							/*
+							 * Give the incoming table its own spill targets
+							 * before anyone starts filling it, using the hash
+							 * bits this batch has not spent yet.
+							 */
+							shstate->cur_used_bits = next->used_bits;
+							shared_agg_create_children(aggstate, area);
 							do_reset = true;
 						}
 					}
 					LWLockRelease(&shstate->batch_lock);
 
+					/* only the claimant resets, and only if it took a batch */
 					if (do_reset)
 						shared_agg_reset_table(aggstate, area);
 
 					/*
-					 * Wait for the reset to complete.  cur_batch is stable
-					 * after this point: it was written before the claimant
-					 * arrived here, and the barrier orders that write
-					 * before our read.
+					 * Wait for the reset.  cur_batch is stable after this: it
+					 * was written before the claimant arrived here, and the
+					 * barrier orders that write before our read.
 					 */
 					BarrierArriveAndWait(&shstate->scan_barrier,
 										 WAIT_EVENT_PARALLEL_HASH_AGG_BATCH);
 
-					newbatch = shstate->cur_batch;
-					if (newbatch == PHA_BATCHES_DONE)
+					have_batch = DsaPointerIsValid(shstate->cur_batch);
+					if (!have_batch)
 					{
 						BarrierDetach(&shstate->scan_barrier);
 						aggstate->shared->scan_attached = false;
@@ -5223,10 +5596,18 @@ agg_retrieve_shared_hash_table(AggState *aggstate)
 						return NULL;
 					}
 
-					/* cooperatively re-aggregate the spill partition */
-					shared_agg_refill(aggstate, area, (int) (newbatch - 1));
+					/* open our side of the new batch and its spill targets */
+					aggstate->shared->read_acc =
+						sts_attach(SharedAggBatchSts((SharedAggBatch *)
+													 dsa_get_address(area, shstate->cur_batch)),
+								   ParallelWorkerNumber + 1,
+								   &shstate->fileset);
+					shared_agg_open_children(aggstate, area);
 
-					shared_agg_flush_counters(aggstate);
+					/* cooperatively re-aggregate the batch */
+					shared_agg_refill(aggstate, area);
+
+					shared_agg_flush_counters(aggstate, area);
 
 					/* wait until the batch is fully built everywhere */
 					BarrierArriveAndWait(&shstate->scan_barrier,
@@ -7239,9 +7620,15 @@ ExecAggEstimate(AggState *node, ParallelContext *pcxt)
 	{
 		Size		shsize;
 
-		shsize = add_size(MAXALIGN(sizeof(SharedAggBuildState)),
-						  mul_size(SHARED_AGG_SPILL_PARTITIONS,
-								   MAXALIGN(sts_estimate(pcxt->nworkers + 1))));
+		/*
+		 * Only the coordination struct.  The spill tuplestores used to be
+		 * reserved here too -- 32 of them, per Agg node, whether or not the
+		 * query ever spilled -- and they now live in the DSA, created a level at
+		 * a time as batches appear.  Partitionwise aggregation puts one of these
+		 * nodes per partition in a plan, so what sits in the fixed segment
+		 * matters.
+		 */
+		shsize = MAXALIGN(sizeof(SharedAggBuildState));
 		shm_toc_estimate_chunk(&pcxt->estimator, shsize);
 		shm_toc_estimate_keys(&pcxt->estimator, 1);
 	}
@@ -7275,9 +7662,7 @@ ExecAggInitializeDSM(AggState *node, ParallelContext *pcxt)
 		int			nparticipants = pcxt->nworkers + 1;
 		int			i;
 
-		shsize = add_size(MAXALIGN(sizeof(SharedAggBuildState)),
-						  mul_size(SHARED_AGG_SPILL_PARTITIONS,
-								   MAXALIGN(sts_estimate(nparticipants))));
+		shsize = MAXALIGN(sizeof(SharedAggBuildState));
 		shstate = (SharedAggBuildState *)
 			shm_toc_allocate(pcxt->toc, shsize);
 		BarrierInit(&shstate->build_barrier, 0);
@@ -7289,9 +7674,15 @@ ExecAggInitializeDSM(AggState *node, ParallelContext *pcxt)
 		pg_atomic_init_u64(&shstate->mem_used, 0);
 		pg_atomic_init_u64(&shstate->mem_peak, 0);
 		pg_atomic_init_u32(&shstate->spill_mode, 0);
-		for (i = 0; i < SHARED_AGG_SPILL_PARTITIONS; i++)
-			pg_atomic_init_u64(&shstate->npart_spilled[i], 0);
-		shstate->cur_batch = 0;
+		shstate->batch_queue = InvalidDsaPointer;
+		shstate->batch_queue_tail = InvalidDsaPointer;
+		shstate->cur_batch = InvalidDsaPointer;
+		shstate->children = InvalidDsaPointer;
+		shstate->nchildren = 0;
+		shstate->cur_used_bits = 0;
+		shstate->nbatches_total = 0;
+		shstate->nbatches_queued = 0;
+		pg_atomic_init_u64(&shstate->nspilled_total, 0);
 		shstate->generation = 1;	/* 0 means "not seen" locally */
 		LWLockInitialize(&shstate->batch_lock, LWTRANCHE_PARALLEL_HASH_AGG_BATCH);
 		shstate->chunk_head = InvalidDsaPointer;
@@ -7317,28 +7708,14 @@ ExecAggInitializeDSM(AggState *node, ParallelContext *pcxt)
 			LWLockInitialize(&shstate->stripe_locks[i].lock,
 							 LWTRANCHE_PARALLEL_HASH_AGG);
 
-		/* set up the spill partitions' shared tuplestores */
+		/*
+		 * The fileset the batches' backing files live in.  The batches
+		 * themselves are created in the DSA by whichever participant is elected
+		 * to prepare a table; see shared_agg_create_children().
+		 */
 		SharedFileSetInit(&shstate->fileset, pcxt->seg);
-		node->shared->spill_acc =
-			palloc(SHARED_AGG_SPILL_PARTITIONS *
-				   sizeof(SharedTuplestoreAccessor *));
 		node->shared->nspilled_local =
 			palloc0(SHARED_AGG_SPILL_PARTITIONS * sizeof(uint64));
-		for (i = 0; i < SHARED_AGG_SPILL_PARTITIONS; i++)
-		{
-			char		name[MAXPGPATH];
-
-			snprintf(name, MAXPGPATH, "pha%d.%d",
-					 node->ss.ps.plan->plan_node_id, i);
-			node->shared->spill_acc[i] =
-				sts_initialize(SharedAggPartitionSts(shstate, i),
-							   nparticipants,
-							   ParallelWorkerNumber + 1,
-							   sizeof(uint32),
-							   SHARED_TUPLESTORE_SINGLE_PASS,
-							   &shstate->fileset,
-							   name);
-		}
 
 		shm_toc_insert(pcxt->toc,
 					   node->ss.ps.plan->plan_node_id +
@@ -7373,7 +7750,6 @@ ExecAggReInitializeDSM(AggState *node, ParallelContext *pcxt)
 {
 	SharedAggBuildState *shstate;
 	dsa_area   *area = node->ss.ps.state->es_query_dsa;
-	uint64		nspilled;
 
 	/*
 	 * Called for any parallel-aware Agg, but only a hashed one has shared
@@ -7395,10 +7771,42 @@ ExecAggReInitializeDSM(AggState *node, ParallelContext *pcxt)
 	if (area == NULL)
 		elog(ERROR, "parallel shared hash aggregation requires a DSA area");
 
-	nspilled = shared_agg_nspilled(shstate);
-
 	shared_agg_free_blobs(node, area);
 	shared_agg_free_table(area, shstate);
+
+	/*
+	 * Discard whatever the previous run left in the batch queue.  Everything
+	 * here is DSA-allocated and would otherwise live until end of query, which
+	 * for a rescan-per-outer-row plan means growing without bound.  The backing
+	 * files go with the fileset; deleting them eagerly would want their names
+	 * tracked, and is worth doing.
+	 */
+	shared_agg_close_child_accessors(node);
+	if (node->shared->read_acc != NULL)
+	{
+		pfree(node->shared->read_acc);
+		node->shared->read_acc = NULL;
+	}
+	if (shstate->nchildren > 0)
+	{
+		dsa_pointer *children =
+			(dsa_pointer *) dsa_get_address(area, shstate->children);
+
+		for (int i = 0; i < shstate->nchildren; i++)
+			dsa_free(area, children[i]);
+		dsa_free(area, shstate->children);
+	}
+	if (DsaPointerIsValid(shstate->cur_batch))
+		dsa_free(area, shstate->cur_batch);
+	while (DsaPointerIsValid(shstate->batch_queue))
+	{
+		dsa_pointer next = ((SharedAggBatch *)
+							dsa_get_address(area, shstate->batch_queue))->next;
+
+		dsa_free(area, shstate->batch_queue);
+		shstate->batch_queue = next;
+	}
+
 	node->shared->buckets_base = NULL;
 	node->shared->mem_unflushed = 0;
 	memset(node->shared->nspilled_local, 0,
@@ -7406,50 +7814,19 @@ ExecAggReInitializeDSM(AggState *node, ParallelContext *pcxt)
 
 	BarrierInit(&shstate->build_barrier, 0);
 	BarrierInit(&shstate->scan_barrier, 0);
-	shstate->cur_batch = 0;
+	shstate->batch_queue = InvalidDsaPointer;
+	shstate->batch_queue_tail = InvalidDsaPointer;
+	shstate->cur_batch = InvalidDsaPointer;
+	shstate->children = InvalidDsaPointer;
+	shstate->nchildren = 0;
+	shstate->cur_used_bits = 0;
+	shstate->nbatches_queued = 0;
+	pg_atomic_write_u64(&shstate->nspilled_total, 0);
 	shstate->generation++;
 	pg_atomic_write_u64(&shstate->scan_cursor, 0);
 	pg_atomic_write_u64(&shstate->mem_used, 0);
 	pg_atomic_write_u64(&shstate->mem_peak, 0);
 	pg_atomic_write_u32(&shstate->spill_mode, 0);
-	for (int i = 0; i < SHARED_AGG_SPILL_PARTITIONS; i++)
-		pg_atomic_write_u64(&shstate->npart_spilled[i], 0);
-
-	/*
-	 * Recreate the spill tuplestores, but only if the previous run used them.
-	 * They were opened SHARED_TUPLESTORE_SINGLE_PASS, so reading them
-	 * destroyed their contents and spent their write state; a generation
-	 * stamp in the name gives this run its own backing files.
-	 *
-	 * Only if, because this is not free and a rescan is not rare.  Each
-	 * sts_initialize() palloc's a fresh accessor, so the previous run's have to
-	 * go -- they are in the per-query context and a parallel Agg on the inner
-	 * side of a nested loop is reinitialized once per outer row.  The files of
-	 * a run that did spill do outlive it, until the fileset goes away at end of
-	 * query; bounding that properly wants the names tracked so they can be
-	 * deleted here.
-	 */
-	if (nspilled > 0)
-	{
-		for (int i = 0; i < SHARED_AGG_SPILL_PARTITIONS; i++)
-		{
-			char		name[MAXPGPATH];
-
-			if (node->shared->spill_acc[i] != NULL)
-				pfree(node->shared->spill_acc[i]);
-
-			snprintf(name, MAXPGPATH, "pha%d.%u.%d",
-					 node->ss.ps.plan->plan_node_id, shstate->generation, i);
-			node->shared->spill_acc[i] =
-				sts_initialize(SharedAggPartitionSts(shstate, i),
-							   shstate->nparticipants,
-							   ParallelWorkerNumber + 1,
-							   sizeof(uint32),
-							   SHARED_TUPLESTORE_SINGLE_PASS,
-							   &shstate->fileset,
-							   name);
-		}
-	}
 }
 
 /* ----------------------------------------------------------------
@@ -7464,7 +7841,6 @@ ExecAggInitializeWorker(AggState *node, ParallelWorkerContext *pwcxt)
 	if (node->shared != NULL)
 	{
 		SharedAggBuildState *shstate;
-		int			i;
 
 		shstate = (SharedAggBuildState *)
 			shm_toc_lookup(pwcxt->toc,
@@ -7473,17 +7849,14 @@ ExecAggInitializeWorker(AggState *node, ParallelWorkerContext *pwcxt)
 						   false);
 		node->shared->build = shstate;
 
+		/*
+		 * Just the fileset here.  Accessors for individual batches are opened
+		 * where the batch becomes current, because the set of batches is not
+		 * known until the query runs.
+		 */
 		SharedFileSetAttach(&shstate->fileset, pwcxt->seg);
-		node->shared->spill_acc =
-			palloc(SHARED_AGG_SPILL_PARTITIONS *
-				   sizeof(SharedTuplestoreAccessor *));
 		node->shared->nspilled_local =
 			palloc0(SHARED_AGG_SPILL_PARTITIONS * sizeof(uint64));
-		for (i = 0; i < SHARED_AGG_SPILL_PARTITIONS; i++)
-			node->shared->spill_acc[i] =
-				sts_attach(SharedAggPartitionSts(shstate, i),
-						   ParallelWorkerNumber + 1,
-						   &shstate->fileset);
 	}
 
 	node->shared_info =
@@ -7509,7 +7882,6 @@ ExecAggRetrieveInstrumentation(AggState *node)
 	if (node->shared != NULL && node->shared->build != NULL)
 	{
 		SharedAggBuildState *shstate = node->shared->build;
-		int			i;
 
 		node->shared_nspilled = shared_agg_nspilled(shstate);
 		node->shared_nbuckets = shstate->nbuckets;
@@ -7526,12 +7898,7 @@ ExecAggRetrieveInstrumentation(AggState *node)
 			peak = (int64) pg_atomic_read_u64(&shstate->mem_peak);
 			node->shared_mem_used = peak > 0 ? (uint64) peak : 0;
 		}
-		node->shared_nbatches = 0;
-		for (i = 0; i < SHARED_AGG_SPILL_PARTITIONS; i++)
-		{
-			if (pg_atomic_read_u64(&shstate->npart_spilled[i]) > 0)
-				node->shared_nbatches++;
-		}
+		node->shared_nbatches = shstate->nbatches_queued;
 	}
 
 	if (node->shared_info == NULL)
