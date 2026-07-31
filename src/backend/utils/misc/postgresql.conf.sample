@@ -438,7 +438,7 @@
 #enable_nestloop = on
 #enable_parallel_append = on
 #enable_parallel_hash = on
-#enable_parallel_hash_agg = off
+#enable_parallel_hash_agg = on
 #enable_partition_pruning = on
 #enable_partitionwise_join = off
 #enable_partitionwise_aggregate = off

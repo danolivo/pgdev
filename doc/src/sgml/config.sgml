@@ -6063,7 +6063,7 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
         cooperatively build a single shared hash table for grouped
         aggregation instead of each worker building its own partial hash
         table for a later serial finalization step.  The default is
-        <literal>off</literal>.
+        <literal>on</literal>.
        </para>
        <para>
         This strategy is available for an aggregate whose transition state is
