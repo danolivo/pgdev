@@ -19,6 +19,7 @@
 #include <math.h>
 
 #include "access/genam.h"
+#include "access/htup_details.h"
 #include "access/parallel.h"
 #include "access/sysattr.h"
 #include "access/table.h"
@@ -63,6 +64,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/selfuncs.h"
+#include "utils/syscache.h"
 
 /* GUC parameters */
 double		cursor_tuple_fraction = DEFAULT_CURSOR_TUPLE_FRACTION;
@@ -7337,6 +7339,53 @@ done:
 }
 
 /*
+ * Fewest groups for which a shared hash table is worth considering at all.
+ *
+ * Below this the strategy has no upside to trade against its contention: the
+ * Finalize stage it exists to eliminate costs a pass over the groups, and that
+ * is cheap precisely when the groups are few, while every participant piles
+ * onto the same handful of shared transition states.  Measurements are
+ * lopsided about it -- low-cardinality aggregation is where a shared table
+ * loses by more than an order of magnitude, not by a few per cent.
+ *
+ * The cost surcharges further down model that too, but only as well as they
+ * can see it, and they cannot see it at all when the grouping key is an
+ * expression or a join output: there are no MCV statistics for those, and the
+ * group-count estimate falls back to a default that looks reassuringly
+ * moderate.  A floor keeps the case the model is blind to out of its hands.
+ */
+#define SHARED_AGG_MIN_GROUPS	1000.0
+
+/*
+ * Rows per group at which stripe-lock contention is charged at half its
+ * asymptotic weight.  Not derived from anything: fitted to the crossover
+ * against Partial/Finalize measured on single-int4-key aggregation, on one
+ * machine.  The shape is defensible -- as it saturates, the surcharge
+ * approaches transCost * rows * (N-1)/N, the Amdahl limit of fully serialised
+ * transition work -- but the constant is a calibration, and a two-socket
+ * machine or a costlier transition function would want a different one.
+ */
+#define SHARED_AGG_CONTENTION_HALFWAY	6000.0
+
+/*
+ * Cost of one exclusive stripe LWLock acquisition, in cpu_operator_cost units.
+ * Under contention an LWLock costs several times a simple operator; the
+ * measured crossover puts it around two operators' worth.
+ */
+#define SHARED_AGG_LOCK_COST	(2.0 * cpu_operator_cost)
+
+static bool
+shared_hashagg_worth_trying(double dNumGroups, double nparticipants)
+{
+	/*
+	 * Fewer groups than participants is the degenerate end of the same story:
+	 * someone would have nothing to emit, and everyone would contend.
+	 */
+	return dNumGroups >= SHARED_AGG_MIN_GROUPS &&
+		dNumGroups >= nparticipants;
+}
+
+/*
  * parallel_shared_hashagg_possible
  *
  * Check whether every aggregate in the query can run under the parallel
@@ -7391,6 +7440,29 @@ parallel_shared_hashagg_possible(PlannerInfo *root, RelOptInfo *grouped_rel,
 
 		if (aggref->aggtranstype == INTERNALOID)
 			return false;
+
+		/*
+		 * The final function is handed a pointer straight into the shared
+		 * entry, so it must be content to read it.  READ_ONLY is only the
+		 * default; an aggregate declared otherwise is entitled to modify or
+		 * even pfree() what it is given, which for shared memory is a crash.
+		 */
+		{
+			HeapTuple	aggtup;
+			char		finalmodify;
+
+			aggtup = SearchSysCache1(AGGFNOID,
+									 ObjectIdGetDatum(aggref->aggfnoid));
+			if (!HeapTupleIsValid(aggtup))
+				elog(ERROR, "cache lookup failed for aggregate %u",
+					 aggref->aggfnoid);
+			finalmodify =
+				((Form_pg_aggregate) GETSTRUCT(aggtup))->aggfinalmodify;
+			ReleaseSysCache(aggtup);
+
+			if (finalmodify != AGGMODIFY_READ_ONLY)
+				return false;
+		}
 	}
 
 	return true;
@@ -7653,6 +7725,8 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 			parse->groupClause != NIL &&
 			grouped_rel->consider_parallel &&
 			input_rel->partial_pathlist != NIL &&
+			shared_hashagg_worth_trying(dNumGroups,
+										((Path *) linitial(input_rel->partial_pathlist))->parallel_workers + 1) &&
 			parallel_shared_hashagg_possible(root, grouped_rel, havingQual))
 		{
 			Path	   *cheapest_partial_path =
@@ -7660,6 +7734,17 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 			AggPath    *aggpath;
 			double		nparticipants;
 
+			nparticipants = cheapest_partial_path->parallel_workers + 1;
+
+			/*
+			 * Cost as one participant's share of the work: path costs are
+			 * per-participant by convention, so the finalization charge in
+			 * cost_agg() must be for the groups THIS participant emits, not
+			 * for all of them.  (The conventional partial path passes
+			 * dNumPartialGroups for the same reason.)  The executor, on the
+			 * other hand, sizes one shared bucket array for every group
+			 * there is, so numGroups is put back below.
+			 */
 			aggpath = create_agg_path(root,
 									  grouped_rel,
 									  cheapest_partial_path,
@@ -7669,8 +7754,16 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 									  root->processed_groupClause,
 									  havingQual,
 									  agg_costs,
-									  dNumGroups);
+									  clamp_row_est(dNumGroups / nparticipants));
 			aggpath->path.parallel_aware = true;
+
+			/*
+			 * Agg->numGroups means the TOTAL group count for this path, not a
+			 * per-participant estimate as it does for a conventional partial
+			 * path.  agg_fill_shared_hash_table() reads it to size the shared
+			 * bucket array, which is shared and therefore sized once.
+			 */
+			aggpath->numGroups = dNumGroups;
 
 			/*
 			 * Each participant emits a disjoint share of the groups.
@@ -7706,13 +7799,13 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 			 * report zero, i.e. no evidence of skew -- the same optimism
 			 * cost_hashjoin() lives with.
 			 *
-			 * The lock cost constant reflects that under contention an
-			 * exclusive LWLock acquisition costs several times a simple
-			 * operator; measurements of the crossover against
-			 * Partial/Finalize on single-int4-key aggregation put it
-			 * around two operators' worth.
+			 * Finally, every input row takes and releases an exclusive
+			 * stripe LWLock whether or not anyone contends for it.  That is
+			 * charged unconditionally: it is the strategy's fixed per-row tax,
+			 * and leaving it out of the model made a pure GROUP BY with no
+			 * aggregates at all -- transCost.per_tuple zero, both surcharges
+			 * therefore zero -- look free.
 			 */
-			nparticipants = cheapest_partial_path->parallel_workers + 1;
 			aggpath->path.rows = clamp_row_est(dNumGroups / nparticipants);
 
 			{
@@ -7721,7 +7814,7 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 				double		rows_per_group =
 					total_rows / Max(dNumGroups, 1.0);
 				double		contention_factor =
-					rows_per_group / (rows_per_group + 6000.0);
+					rows_per_group / (rows_per_group + SHARED_AGG_CONTENTION_HALFWAY);
 				Selectivity group_mcv_freq = 0.0;
 				bool		mcv_known = false;
 				ListCell   *glc;
@@ -7732,35 +7825,45 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 					(nparticipants - 1) *
 					contention_factor;
 
-				foreach(glc, get_sortgrouplist_exprs(root->processed_groupClause,
-													 parse->targetList))
-				{
-					Node	   *groupexpr = (Node *) lfirst(glc);
-					Selectivity mcv_freq;
-					Selectivity bucketsize_frac;
+				aggpath->path.total_cost +=
+					cheapest_partial_path->rows * SHARED_AGG_LOCK_COST;
 
-					estimate_hash_bucket_stats(root, groupexpr,
-											   dNumGroups,
-											   &mcv_freq,
-											   &bucketsize_frac);
-					if (mcv_freq > 0.0 &&
-						(!mcv_known || mcv_freq < group_mcv_freq))
+				/*
+				 * Skew evidence is only meaningful for this relation's own
+				 * expressions.  Under partitionwise aggregation a child
+				 * grouped rel is costed here with the PARENT's grouping
+				 * expressions, which would send examine_variable() looking up
+				 * statistics for the wrong relation; no evidence beats wrong
+				 * evidence.
+				 */
+				if (!IS_OTHER_REL(grouped_rel))
+				{
+					foreach(glc, get_sortgrouplist_exprs(root->processed_groupClause,
+														 parse->targetList))
 					{
-						group_mcv_freq = mcv_freq;
-						mcv_known = true;
+						Node	   *groupexpr = (Node *) lfirst(glc);
+						Selectivity mcv_freq;
+						Selectivity bucketsize_frac;
+
+						estimate_hash_bucket_stats(root, groupexpr,
+												   dNumGroups,
+												   &mcv_freq,
+												   &bucketsize_frac);
+						if (mcv_freq > 0.0 &&
+							(!mcv_known || mcv_freq < group_mcv_freq))
+						{
+							group_mcv_freq = mcv_freq;
+							mcv_known = true;
+						}
 					}
 				}
 
 				if (mcv_known && group_mcv_freq > 0.0)
-				{
-#define SHARED_AGG_LOCK_COST	(2.0 * cpu_operator_cost)
 					aggpath->path.total_cost +=
 						group_mcv_freq * total_rows *
 						(agg_costs->transCost.per_tuple +
 						 SHARED_AGG_LOCK_COST) *
 						(nparticipants - 1) / nparticipants;
-#undef SHARED_AGG_LOCK_COST
-				}
 			}
 
 			add_partial_path(grouped_rel, (Path *) aggpath);
