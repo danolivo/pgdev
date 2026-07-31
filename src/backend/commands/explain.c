@@ -3769,13 +3769,16 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 		return;
 
 	/*
-	 * A parallel-aware Agg partitions its spill by a fixed number of
-	 * partitions, so hash_planned_partitions -- computed for the private table
-	 * it never built -- would be reporting a plan that does not exist.
+	 * A node that built the shared table partitions its spill a fixed number of
+	 * ways, so hash_planned_partitions -- computed for the private table it
+	 * never built -- would be reporting a plan that does not exist.  Note the
+	 * test is on ->shared rather than on plan.parallel_aware: a parallel-aware
+	 * Agg that found no parallel context did build the private table, planned
+	 * partitions and all.
 	 */
 	if (es->format != EXPLAIN_FORMAT_TEXT)
 	{
-		if (es->costs && !agg->plan.parallel_aware)
+		if (es->costs && aggstate->shared == NULL)
 			ExplainPropertyInteger("Planned Partitions", NULL,
 								   aggstate->hash_planned_partitions, es);
 
@@ -3786,7 +3789,7 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 			{
 				ExplainPropertyInteger("Shared Buckets", NULL,
 									   aggstate->shared_nbuckets, es);
-				ExplainPropertyInteger("Shared Memory Usage", "kB",
+				ExplainPropertyInteger("Shared Peak Memory Usage", "kB",
 									   (aggstate->shared_mem_used + 1023) / 1024,
 									   es);
 			}
@@ -3818,7 +3821,7 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 		bool		gotone = false;
 
 		if (es->costs && aggstate->hash_planned_partitions > 0 &&
-			!agg->plan.parallel_aware)
+			aggstate->shared == NULL)
 		{
 			ExplainIndentText(es);
 			appendStringInfo(es->str, "Planned Partitions: %d",
@@ -3836,7 +3839,7 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 				appendStringInfoSpaces(es->str, 2);
 
 			appendStringInfo(es->str,
-							 "Shared Buckets: " UINT64_FORMAT "  Shared Memory Usage: " UINT64_FORMAT "kB",
+							 "Shared Buckets: " UINT64_FORMAT "  Shared Peak Memory Usage: " UINT64_FORMAT "kB",
 							 aggstate->shared_nbuckets,
 							 (aggstate->shared_mem_used + 1023) / 1024);
 			gotone = true;

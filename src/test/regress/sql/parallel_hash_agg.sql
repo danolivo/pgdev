@@ -177,7 +177,7 @@ begin
         -- system happens to launch, keeping only structural plan shape and
         -- the presence of the spill-statistics fields under test
         ln := regexp_replace(ln, 'Shared Buckets: [0-9]+', 'Shared Buckets: N', 'g');
-        ln := regexp_replace(ln, 'Shared Memory Usage: [0-9]+kB', 'Shared Memory Usage: NkB', 'g');
+        ln := regexp_replace(ln, 'Shared Peak Memory Usage: [0-9]+kB', 'Shared Peak Memory Usage: NkB', 'g');
         ln := regexp_replace(ln, 'Spilled Tuples: [0-9]+', 'Spilled Tuples: N', 'g');
         ln := regexp_replace(ln, 'Spill Batches: [0-9]+', 'Spill Batches: N', 'g');
         ln := regexp_replace(ln, 'Workers Launched: [0-9]+', 'Workers Launched: N', 'g');

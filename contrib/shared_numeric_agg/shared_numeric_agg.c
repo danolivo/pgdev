@@ -5,13 +5,14 @@
  *
  * Motivation: the stock sum(numeric)/avg(numeric) keep their running state
  * in an 'internal' C struct with growable digit buffers, which cannot live
- * in shared memory; Parallel Shared Hash Aggregation then has to serialize
- * and deserialize that state around every transition call.  These variants
- * keep the state as a plain bytea of fixed size, updated strictly in
- * place: under the shared hash table's by-ref path a transition call
- * scribbles directly on the DSA blob and returns the same pointer, so
- * advancing a group costs a digit decode plus a few int64 additions —
- * no palloc, no DSA traffic, no serialization.
+ * in shared memory at all -- so Parallel Shared Hash Aggregation cannot use
+ * those aggregates, and falls back to Partial/Finalize for them.  These
+ * variants keep the state as a plain bytea of fixed size, updated strictly
+ * in place: advancing a group costs a digit decode plus a few int64
+ * additions, with no palloc and no reallocation.  The shared hash table
+ * hands the transition function a private copy of the blob and writes the
+ * result back, so "in place" saves the allocation but not the write-back
+ * memcpy; nodeAgg.c explains why it does not hand out shared addresses.
  *
  * State representation: a fixed window of signed int64 "lanes", one per
  * NBASE(=10000) digit position, covering weights FLATSUM_MAX_WEIGHT down
@@ -179,43 +180,71 @@ typedef struct FlatSumState
 #define FLATSUM_LANE(w)		(FLATSUM_MAX_WEIGHT - (w))
 
 /*
- * Fetch and validate a state argument.
- *
- * These functions are ordinary C functions in pg_proc, so nothing stops a user
- * from calling them directly with a bytea of any length -- and a short one
- * would have flatsum_add() writing a couple of hundred bytes past its end.  An
- * Assert is no defence here: it is compiled out of production builds, which is
- * exactly where it would matter.  int4_avg_accum() runtime-checks its array
- * state for the same reason.
+ * Check that a state argument is the right length.
  */
-static FlatSumState *
-flatsum_get_state(FunctionCallInfo fcinfo, int argno)
+static void
+flatsum_check_state_size(bytea *raw)
 {
-	bytea	   *raw = PG_GETARG_BYTEA_P(argno);
-
 	if (VARSIZE(raw) != FLATSUM_STATE_SIZE)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("invalid transition state for flat numeric aggregation"),
-				 errdetail("Expected %zu bytes, got %zu.",
-						   (Size) FLATSUM_STATE_SIZE,
-						   (Size) VARSIZE(raw))));
+				 errdetail("Expected %u bytes, got %u.",
+						   (unsigned int) FLATSUM_STATE_SIZE,
+						   (unsigned int) VARSIZE(raw))));
+}
+
+/*
+ * Fetch and validate our own accumulator.
+ *
+ * Two hazards, both arising from the same fact: these are ordinary C functions
+ * in pg_proc, so nothing stops a user from calling them directly.
+ *
+ * A bytea of the wrong length would have flatsum_add() writing a couple of
+ * hundred bytes past its end.  An Assert is no defence -- it is compiled out of
+ * exactly the builds where it would matter -- so the length is checked for real,
+ * as int4_avg_accum() checks its array state.
+ *
+ * And a state that did not come from us need not be aligned: bytea is
+ * int-aligned (typalign 'i'), so one living in a heap tuple can land on a
+ * four-byte boundary, and reading its int64 fields in place is a SIGBUS wherever
+ * that is enforced.  Rather than copy in and out of an aligned local on every
+ * path, require an aggregate context: within one, the state is always something
+ * we allocated ourselves -- in the aggregate context, or as the private copy
+ * nodeAgg.c makes for the shared hash table -- and MAXALIGNed either way.
+ * Outside one there is no legitimate caller.
+ */
+static FlatSumState *
+flatsum_get_state(FunctionCallInfo fcinfo, int argno)
+{
+	bytea	   *raw;
+
+	if (!AggCheckCallContext(fcinfo, NULL))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("aggregate function %u called in non-aggregate context",
+						fcinfo->flinfo->fn_oid)));
+
+	raw = PG_GETARG_BYTEA_P(argno);
+	flatsum_check_state_size(raw);
+	Assert(((uintptr_t) raw) == MAXALIGN((uintptr_t) raw));
 
 	return (FlatSumState *) raw;
 }
 
 /*
- * Same, for a state that arrives by value rather than as our own accumulator:
- * bytea is int-aligned (typalign 'i'), so a state embedded in a heap tuple can
- * land on a 4-byte boundary, and reading its int64 fields in place would be a
- * SIGBUS on any platform that means it.  Copy to an aligned local.
+ * Same, for the second argument of the combine function.  That one is not our
+ * accumulator: it arrives from another participant, possibly still inside the
+ * tuple it was serialized into, so it is copied to an aligned local before its
+ * int64 fields are read.
  */
 static void
 flatsum_get_state_copy(FunctionCallInfo fcinfo, int argno, FlatSumState *dst)
 {
-	FlatSumState *src = flatsum_get_state(fcinfo, argno);
+	bytea	   *raw = PG_GETARG_BYTEA_P(argno);
 
-	memcpy(dst, src, FLATSUM_STATE_SIZE);
+	flatsum_check_state_size(raw);
+	memcpy(dst, raw, FLATSUM_STATE_SIZE);
 }
 
 PG_FUNCTION_INFO_V1(numeric_flat_sum_trans);
@@ -310,10 +339,12 @@ flatsum_add(FlatSumState *state, struct NumericData *num)
  * Transition function: sfunc(state bytea, value numeric) -> bytea.
  *
  * Not strict: it must create the state on first call.  When a state
- * exists it is updated IN PLACE and the same pointer returned — under
- * the shared hash table this mutates the shared blob directly with no
- * per-row allocation, and in the regular executor it is the sanctioned
- * AggCheckCallContext scribble pattern.
+ * exists it is updated IN PLACE and the same pointer returned, which is the
+ * sanctioned AggCheckCallContext scribble pattern.  Under the shared hash
+ * table the state is a private copy that nodeAgg.c writes back -- it does not
+ * hand out shared addresses -- and mutating in place still avoids a per-row
+ * allocation there, since the size never changes and the write-back is a
+ * memcpy over the existing blob.
  */
 Datum
 numeric_flat_sum_trans(PG_FUNCTION_ARGS)

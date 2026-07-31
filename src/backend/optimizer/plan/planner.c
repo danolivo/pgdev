@@ -7375,8 +7375,11 @@ done:
 #define SHARED_AGG_LOCK_COST	(2.0 * cpu_operator_cost)
 
 static bool
-shared_hashagg_worth_trying(double dNumGroups, double nparticipants)
+shared_hashagg_worth_trying(double dNumGroups, List *partial_pathlist)
 {
+	Path	   *cheapest = (Path *) linitial(partial_pathlist);
+	double		nparticipants = cheapest->parallel_workers + 1;
+
 	/*
 	 * Fewer groups than participants is the degenerate end of the same story:
 	 * someone would have nothing to emit, and everyone would contend.
@@ -7388,81 +7391,99 @@ shared_hashagg_worth_trying(double dNumGroups, double nparticipants)
 /*
  * parallel_shared_hashagg_possible
  *
- * Check whether every aggregate in the query can run under the parallel
- * shared hash aggregation strategy (Parallel Hash Aggregate).
+ * Check whether every aggregate in the query, and every grouping key, can
+ * run under the parallel shared hash aggregation strategy.
  *
- * Transition states live in dynamic shared memory and are mutated in place
- * by whichever participant sees a row for the group.  Pass-by-value states
- * sit directly in the shared entry; pass-by-reference states (varlena such
- * as numeric or bytea, fixed-length by-ref such as interval) are stored as
- * self-contained DSA blobs that the executor maps and updates in place
- * where possible.
+ * Transition states live in dynamic shared memory and are mutated in place by
+ * whichever participant sees a row for the group.  Pass-by-value states sit
+ * directly in the shared entry; pass-by-reference states (varlena such as
+ * numeric or bytea, fixed-length by-ref such as interval) are stored as
+ * self-contained DSA blobs.
  *
- * Only the 'internal' pseudo-type is excluded: it is a pass-by-value
- * pointer to an opaque, process-local struct that no byte-copy can make
- * shareable.  This rules out avg() on integers and array_agg-style
- * aggregates, but admits e.g. sum(numeric), sum(int8), min/max on
- * varlena types, and extension aggregates with flat by-ref states.
- *
- * DISTINCT/ORDER BY aggregates and ordered-set aggregates are out for the
- * same reasons they cannot use partial aggregation.  General parallel-safety
- * of the target list has already been established by consider_parallel.
+ * Note this walks root->agginfos rather than pulling Aggrefs out of the
+ * grouping target itself.  preprocess_aggrefs() has already collected every
+ * aggregate in the query -- target list and HAVING clause both -- and resolved
+ * the fields we care about, so there is nothing to gain from a second walk and
+ * something to lose: pull_var_clause() rejects PlaceHolderVars unless told to
+ * expect them, and the grouping target certainly contains them.
  */
 static bool
-parallel_shared_hashagg_possible(PlannerInfo *root, RelOptInfo *grouped_rel,
-								 List *havingQual)
+parallel_shared_hashagg_possible(PlannerInfo *root)
 {
-	List	   *exprs;
 	ListCell   *lc;
 
-	exprs = pull_var_clause((Node *) grouped_rel->reltarget->exprs,
-							PVC_INCLUDE_AGGREGATES);
-	exprs = list_concat(exprs,
-						pull_var_clause((Node *) havingQual,
-										PVC_INCLUDE_AGGREGATES));
-
-	foreach(lc, exprs)
+	foreach(lc, root->agginfos)
 	{
-		Aggref	   *aggref = (Aggref *) lfirst(lc);
+		AggInfo    *agginfo = lfirst_node(AggInfo, lc);
+		Aggref	   *aggref;
 
-		if (!IsA(aggref, Aggref))
-			continue;
+		/*
+		 * Every Aggref sharing one AggInfo is equal to the others as far as
+		 * transition type, DISTINCT, ORDER BY and kind go, so the first one
+		 * answers for all of them.
+		 */
+		aggref = linitial_node(Aggref, agginfo->aggrefs);
+
+		/*
+		 * "shareable" is prepagg.c's record of aggfinalmodify != READ_WRITE.
+		 * We need exactly that guarantee for a different reason: emission
+		 * hands the final function a pointer straight into the shared entry,
+		 * so a function entitled to modify -- or pfree() -- what it is given
+		 * would be scribbling on shared memory.
+		 */
+		if (!agginfo->shareable)
+			return false;
 
 		/* resolved by preprocess_aggref() before path generation */
 		if (!OidIsValid(aggref->aggtranstype))
 			return false;
 
+		/*
+		 * The 'internal' pseudo-type is a pass-by-value pointer to an opaque,
+		 * process-local struct that no byte-copy can make shareable.  This
+		 * rules out sum() and avg() on bigint and numeric, and the
+		 * array_agg/string_agg family.
+		 */
+		if (aggref->aggtranstype == INTERNALOID)
+			return false;
+
+		/* out for the same reasons they cannot use partial aggregation */
 		if (aggref->aggdistinct != NIL || aggref->aggorder != NIL)
 			return false;
 
 		if (aggref->aggkind != AGGKIND_NORMAL)
 			return false;
+	}
 
-		if (aggref->aggtranstype == INTERNALOID)
+	/*
+	 * Require every grouping key to be a plain column reference.
+	 *
+	 * This is about the cost model rather than the executor, which does not
+	 * care what the key is.  Choosing this strategy is only defensible when we
+	 * can see the key's distribution: the surcharges below are driven by the
+	 * estimated group count and by MCV statistics, and for an expression --
+	 * or the output of a volatile function, or of a join -- there are no
+	 * statistics at all and the group count falls back to a default that looks
+	 * reassuringly moderate whatever the truth is.  GROUP BY length(x) where
+	 * every x has the same length is the case in point: one group, and nothing
+	 * in the estimate says so.
+	 *
+	 * A conservative gate, then, and knowingly blunter than it needs to be:
+	 * the property actually wanted is a non-default ndistinct for each key,
+	 * which examine_variable() could tell us at the cost of duplicating a good
+	 * deal of estimate_hash_bucket_stats().  Worth revisiting once there is
+	 * field experience to say how much this gives up.
+	 */
+	foreach(lc, get_sortgrouplist_exprs(root->processed_groupClause,
+										root->parse->targetList))
+	{
+		Node	   *expr = (Node *) lfirst(lc);
+
+		while (expr != NULL && IsA(expr, RelabelType))
+			expr = (Node *) ((RelabelType *) expr)->arg;
+
+		if (expr == NULL || !IsA(expr, Var))
 			return false;
-
-		/*
-		 * The final function is handed a pointer straight into the shared
-		 * entry, so it must be content to read it.  READ_ONLY is only the
-		 * default; an aggregate declared otherwise is entitled to modify or
-		 * even pfree() what it is given, which for shared memory is a crash.
-		 */
-		{
-			HeapTuple	aggtup;
-			char		finalmodify;
-
-			aggtup = SearchSysCache1(AGGFNOID,
-									 ObjectIdGetDatum(aggref->aggfnoid));
-			if (!HeapTupleIsValid(aggtup))
-				elog(ERROR, "cache lookup failed for aggregate %u",
-					 aggref->aggfnoid);
-			finalmodify =
-				((Form_pg_aggregate) GETSTRUCT(aggtup))->aggfinalmodify;
-			ReleaseSysCache(aggtup);
-
-			if (finalmodify != AGGMODIFY_READ_ONLY)
-				return false;
-		}
 	}
 
 	return true;
@@ -7726,15 +7747,14 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 			grouped_rel->consider_parallel &&
 			input_rel->partial_pathlist != NIL &&
 			shared_hashagg_worth_trying(dNumGroups,
-										((Path *) linitial(input_rel->partial_pathlist))->parallel_workers + 1) &&
-			parallel_shared_hashagg_possible(root, grouped_rel, havingQual))
+										input_rel->partial_pathlist) &&
+			parallel_shared_hashagg_possible(root))
 		{
 			Path	   *cheapest_partial_path =
 				linitial(input_rel->partial_pathlist);
+			double		nparticipants =
+				cheapest_partial_path->parallel_workers + 1;
 			AggPath    *aggpath;
-			double		nparticipants;
-
-			nparticipants = cheapest_partial_path->parallel_workers + 1;
 
 			/*
 			 * Cost as one participant's share of the work: path costs are
@@ -7805,9 +7825,10 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 			 * and leaving it out of the model made a pure GROUP BY with no
 			 * aggregates at all -- transCost.per_tuple zero, both surcharges
 			 * therefore zero -- look free.
+			 *
+			 * (cost_agg() has already set ->rows from the per-participant group
+			 * count passed above, so there is nothing to correct here.)
 			 */
-			aggpath->path.rows = clamp_row_est(dNumGroups / nparticipants);
-
 			{
 				double		total_rows =
 					cheapest_partial_path->rows * nparticipants;
@@ -7816,16 +7837,25 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 				double		contention_factor =
 					rows_per_group / (rows_per_group + SHARED_AGG_CONTENTION_HALFWAY);
 				Selectivity group_mcv_freq = 0.0;
+				Cost		surcharge;
 				bool		mcv_known = false;
 				ListCell   *glc;
 
-				aggpath->path.total_cost +=
+				/*
+				 * Both surcharges are transition-time costs, and cost_agg()
+				 * puts transition work in startup_cost because a hashed Agg
+				 * cannot emit until it has read its input.  Charging only
+				 * total_cost would let compare_fractional_path_costs() discount
+				 * the whole surcharge under a LIMIT -- which is to say, the
+				 * plan the surcharges exist to discourage would be chosen
+				 * precisely when a LIMIT was present.
+				 */
+				surcharge =
 					agg_costs->transCost.per_tuple *
 					cheapest_partial_path->rows *
 					(nparticipants - 1) *
 					contention_factor;
-
-				aggpath->path.total_cost +=
+				surcharge +=
 					cheapest_partial_path->rows * SHARED_AGG_LOCK_COST;
 
 				/*
@@ -7859,11 +7889,14 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 				}
 
 				if (mcv_known && group_mcv_freq > 0.0)
-					aggpath->path.total_cost +=
+					surcharge +=
 						group_mcv_freq * total_rows *
 						(agg_costs->transCost.per_tuple +
 						 SHARED_AGG_LOCK_COST) *
 						(nparticipants - 1) / nparticipants;
+
+				aggpath->path.startup_cost += surcharge;
+				aggpath->path.total_cost += surcharge;
 			}
 
 			add_partial_path(grouped_rel, (Path *) aggpath);
