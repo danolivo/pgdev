@@ -7459,10 +7459,6 @@ parallel_shared_hashagg_possible(PlannerInfo *root)
 		if (!shared_hashagg_safe_transtype(aggref->aggtranstype))
 			return false;
 
-		/* by-value states only until a later patch; see 0001 */
-		if (!get_typbyval(aggref->aggtranstype))
-			return false;
-
 		/* out for the same reasons they cannot use partial aggregation */
 		if (aggref->aggdistinct != NIL || aggref->aggorder != NIL)
 			return false;

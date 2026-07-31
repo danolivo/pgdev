@@ -65,12 +65,11 @@ select count(*) as mismatched_rows from (
 ) diff;
 
 --
--- 3. Ineligible transition states must fall back to Partial/Finalize.  The
--- stock sum(numeric) keeps its state in an opaque process-local struct that no
--- byte-copy can make shareable; a by-reference state is not supported here yet;
--- and min/max on an enum is rejected because its comparison reaches the enum
--- cache, which opens pg_enum with a heavyweight lock -- not something to do
--- under an LWLock.
+-- 3. Eligibility of by-reference transition states, which are stored as
+-- DSA blobs: min/max(numeric) qualify (their transition type is numeric
+-- itself).  Use a table with many small groups, where the shared strategy
+-- is the planner's own choice; compare against a copy that forbids
+-- parallelism via its reloption.
 --
 create table pha_num (g int4, y int8, n numeric(12,3));
 insert into pha_num
@@ -78,23 +77,32 @@ insert into pha_num
   from generate_series(1, 20000) i;
 analyze pha_num;
 
+create table pha_num_ref as select * from pha_num;
+alter table pha_num_ref set (parallel_workers = 0);
+analyze pha_num_ref;
+
 explain (costs off)
   select g, min(n), max(n), count(*)
   from pha_num group by g;
 
+select count(*) as mismatched_rows from (
+    (select g, min(n) mn, max(n) mx, count(*) c from pha_num group by g
+     except
+     select g, min(n), max(n), count(*) from pha_num_ref group by g)
+    union all
+    (select g, min(n), max(n), count(*) from pha_num_ref group by g
+     except
+     select g, min(n), max(n), count(*) from pha_num group by g)
+) diff;
+
+-- ... while the 'internal' pseudo-type must still fall back: the stock
+-- sum(numeric) keeps its transition state in an opaque process-local
+-- struct that no byte-copy can make shareable.  (avg(int4), by contrast,
+-- uses a plain int8[] state and therefore qualifies.)
+--
 explain (costs off)
   select pha_src.g, sum(n), avg(x)
   from pha_src, pha_num where pha_num.g = pha_src.g group by pha_src.g;
-
-create type pha_enum as enum ('a', 'b', 'c');
-create table pha_e (g int4, e pha_enum);
-insert into pha_e
-  select i % 2000, (array['a','b','c'])[1 + i % 3]::pha_enum
-  from generate_series(1, 20000) i;
-analyze pha_e;
-
-explain (costs off)
-  select g, min(e), max(e) from pha_e group by g;
 
 --
 -- 4. Rescan.  A Gather on the inner side of a nested loop is re-executed
@@ -213,6 +221,34 @@ reset enable_material;
 reset work_mem;
 reset hash_mem_multiplier;
 reset enable_sort;
+
+--
+-- 8. By-reference states whose size changes from row to row, which is what
+-- exercises both branches of the blob update: overwrite in place when the
+-- new state is the same size, allocate and free when it is not.
+--
+create table pha_text (g int4, t text);
+insert into pha_text
+  select i % 3000, repeat('abc', 1 + (i % 17))
+  from generate_series(1, 30000) i;
+analyze pha_text;
+
+create table pha_text_ref as select * from pha_text;
+alter table pha_text_ref set (parallel_workers = 0);
+analyze pha_text_ref;
+
+explain (costs off)
+  select g, min(t), max(t) from pha_text group by g;
+
+select count(*) as mismatched_rows from (
+    (select g, min(t) mn, max(t) mx from pha_text group by g
+     except
+     select g, min(t), max(t) from pha_text_ref group by g)
+    union all
+    (select g, min(t), max(t) from pha_text_ref group by g
+     except
+     select g, min(t), max(t) from pha_text group by g)
+) diff;
 
 --
 -- 9. A parallel-aware Agg has to be able to run with no parallel context at
