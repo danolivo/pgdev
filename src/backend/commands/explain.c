@@ -3843,7 +3843,7 @@ show_hashagg_info(AggState *aggstate, ExplainState *es)
 				appendStringInfoSpaces(es->str, 2);
 
 			appendStringInfo(es->str,
-							 "Spilled Tuples: " UINT64_FORMAT "  Spill Batches: %d",
+							 "Spilled Tuples: " UINT64_FORMAT "  Spill Batches: " UINT64_FORMAT,
 							 aggstate->shared_nspilled,
 							 aggstate->shared_nbatches);
 			gotone = true;

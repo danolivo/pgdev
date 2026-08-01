@@ -2866,6 +2866,7 @@ SetToDefault
 SetVarReturningType_context
 SetupWorkerPtrType
 ShDependObjectInfo
+SharedAggBatch
 SharedAggBuildState
 SharedAggChunk
 SharedAggEntry
