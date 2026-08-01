@@ -834,23 +834,45 @@ typedef struct SharedAggBuildState
 	(&(shstate)->stripe_locks[(bucketno) % SHARED_AGG_NUM_STRIPES].lock)
 
 /*
- * Bucket index for a hash: the low bits, rotated up.
+ * Bucket index for a hash: the low bits, with the mask narrowed to the bits
+ * that spill partitioning has not already spent.
  *
- * Not a plain mask.  Every row in a spill batch agrees in its top
- * cur_used_bits hash bits -- that is what routed it there -- while the bucket
- * array is sized once from the original group estimate and never shrinks.  So
- * a plain low-bit mask makes the two ranges overlap as soon as
- * cur_used_bits + log2(nbuckets) passes 32, and part of the array becomes
- * unreachable: for a 2^23-bucket table, half of it at depth two and 63/64 of
- * it at depth three, with the chains correspondingly longer.  Rotating
- * decouples the two, at the cost of one instruction per row.
+ * SharedAggSpillPartition() takes its bits from the top of the hash, so every
+ * row in a batch agrees in its top cur_used_bits bits.  The bucket array,
+ * meanwhile, is sized once from the original group estimate and never shrinks.
+ * Once cur_used_bits + log2(nbuckets) passes 32 the two ranges overlap and the
+ * upper part of the array becomes unreachable -- for a 2^23-bucket table, half
+ * of it at depth two and 63/64 of it at depth three, with the chains that much
+ * longer.
  *
- * Any function of the hash alone preserves the duplicate-prevention argument
- * above, and this one keeps the count a power of two, which both the stripe
- * modulo and the sizing code rely on.
+ * Narrowing the mask confines a deep batch to a prefix of the array instead.
+ * That wastes the tail, which is the right trade: a batch at depth three holds
+ * a thousandth of the groups and has no use for 2^23 buckets.  What it must not
+ * do is pile them into a fraction of the array while the sizing code believes
+ * otherwise.
+ *
+ * Do not be tempted to rotate the hash instead.  A fixed rotation cannot work,
+ * because the amount would have to depend on cur_used_bits: any fixed rotation
+ * pulls some of the spent top bits into the index, and one by 16 is strictly
+ * worse than the plain mask at every depth -- four of the five bits spent by
+ * the very first spill level land inside the index of a 2^15-bucket table,
+ * where the plain mask loses none.  That was tried and reverted.
+ *
+ * Derived per row rather than cached, deliberately.  Every participant must map
+ * a given hash to the same bucket or the duplicate-prevention argument above
+ * fails, and both inputs are shared fields that change only while everyone is
+ * parked at a barrier.  A cached mask would be one more thing to forget to
+ * update at a batch transition.
+ *
+ * At the bit-exhaustion limit (cur_used_bits == 32) this yields bucket 0 for
+ * everything, and therefore one stripe.  That is not a degradation: every row
+ * still in play has an identical hash, so no mapping could spread them.
  */
-#define SharedAggBucketNo(hash, nbuckets) \
-	((uint64) pg_rotate_right32((hash), 16) & ((uint64) (nbuckets) - 1))
+#define SharedAggBucketBits(shstate) \
+	Min(pg_leftmost_one_pos64((shstate)->nbuckets), \
+		32 - (int) (shstate)->cur_used_bits)
+#define SharedAggBucketNo(shstate, hash) \
+	((uint64) (hash) & ((UINT64CONST(1) << SharedAggBucketBits(shstate)) - 1))
 
 /*
  * Entries are carved out of per-participant chunks rather than allocated
@@ -978,6 +1000,7 @@ static bool shared_agg_more_batches(AggState *aggstate, dsa_area *area);
 static void shared_agg_spill_tuple(AggState *aggstate, uint32 partno,
 								   TupleTableSlot *inputslot, uint32 hash);
 static void shared_agg_free_blobs(AggState *aggstate, dsa_area *area);
+static void shared_agg_detach_scan(AggState *aggstate, dsa_area *area);
 static void shared_agg_free_table(dsa_area *area,
 								 SharedAggBuildState *shstate);
 static void shared_agg_reset_table(AggState *aggstate, dsa_area *area);
@@ -4795,10 +4818,14 @@ shared_agg_insert(AggState *aggstate, dsa_area *area,
 	SharedAggBuildState *shstate = aggstate->shared->build;
 	ExprContext *tmpcontext = aggstate->tmpcontext;
 	dsa_pointer_atomic *buckets = shared_agg_buckets(aggstate, area);
-	uint64		bucketno = SharedAggBucketNo(hash, shstate->nbuckets);
-	LWLock	   *lock = SharedAggStripeLock(shstate, bucketno);
+	uint64		bucketno;
+	LWLock	   *lock;
 	SharedAggEntry *entry;
 	dsa_pointer head;
+
+	Assert(shstate->nbuckets > 0);
+	bucketno = SharedAggBucketNo(shstate, hash);
+	lock = SharedAggStripeLock(shstate, bucketno);
 
 	/*
 	 * Probe the chain without holding the stripe lock.
@@ -5088,6 +5115,44 @@ shared_agg_free_table(dsa_area *area, SharedAggBuildState *shstate)
 		shstate->buckets = InvalidDsaPointer;
 	}
 	shstate->nbuckets = 0;
+}
+
+/*
+ * Detach from the scan barrier and, if we were the last participant out,
+ * release the table.
+ *
+ * Every exit from the batch cycle goes through here.  There are four of them --
+ * work exhausted, no batch after a reset, the leader bowing out, and
+ * ExecShutdownAgg() -- and the release has to happen on whichever one turns out
+ * to be last.  Two of the four were missing it, which is a leak of the whole
+ * table (up to hash_mem x participants of es_query_dsa) on the early-stop path
+ * that the regression suite already exercises.  Parallel hash join frees at
+ * PHJ_BUILD_FREE and checks BarrierArriveAndDetach()'s return value for exactly
+ * this reason; ExecHashTableDetach() is the model.
+ *
+ * Safe wherever the detach itself is safe: a true return says no other
+ * participant is attached, so nobody can be reading the table.  The caller must
+ * not hand out a previously returned tuple afterwards, which the executor's
+ * contract already forbids -- a tuple dies at the next call into the node.
+ *
+ * Idempotent, so a second shutdown or a shutdown after normal completion costs
+ * nothing.
+ */
+static void
+shared_agg_detach_scan(AggState *aggstate, dsa_area *area)
+{
+	SharedAggState *shared = aggstate->shared;
+
+	if (!shared->scan_attached)
+		return;
+
+	if (BarrierDetach(&shared->build->scan_barrier) && area != NULL)
+	{
+		shared_agg_free_blobs(aggstate, area);
+		shared_agg_free_table(area, shared->build);
+		shared->buckets_base = NULL;
+	}
+	shared->scan_attached = false;
 }
 
 /*
@@ -5610,38 +5675,7 @@ agg_retrieve_shared_hash_table(AggState *aggstate)
 					if (!shared_agg_more_batches(aggstate, area) ||
 						!aggstate->shared->scan_attached)
 					{
-						if (aggstate->shared->scan_attached)
-						{
-							bool		last;
-
-							last = BarrierDetach(&shstate->scan_barrier);
-							aggstate->shared->scan_attached = false;
-
-							/*
-							 * Whoever leaves last releases the table.  Doing
-							 * it here and not only in
-							 * ExecAggReInitializeDSM() matters because a
-							 * completed table otherwise occupies
-							 * es_query_dsa until the Gather shuts down --
-							 * and under Parallel Append with partitionwise
-							 * aggregation that is one whole table per child
-							 * node, all resident at once.  Parallel hash
-							 * join frees at PHJ_BUILD_FREE for the same
-							 * reason.
-							 *
-							 * Safe at this point and only at this point: the
-							 * detach return value says every other
-							 * participant has gone, and we are about to
-							 * return NULL, so the tuple we returned last is
-							 * already dead by the executor's contract.
-							 */
-							if (last)
-							{
-								shared_agg_free_blobs(aggstate, area);
-								shared_agg_free_table(area, shstate);
-								aggstate->shared->buckets_base = NULL;
-							}
-						}
+						shared_agg_detach_scan(aggstate, area);
 						aggstate->agg_done = true;
 						return NULL;
 					}
@@ -5666,17 +5700,10 @@ agg_retrieve_shared_hash_table(AggState *aggstate)
 					{
 						/*
 						 * We just tested for other participants, so we cannot
-						 * be the last to leave; check the return value anyway
-						 * rather than have two detach sites that treat it
-						 * differently.
+						 * be the last out; go through the common path anyway
+						 * rather than have four detach sites that differ.
 						 */
-						if (BarrierDetach(&shstate->scan_barrier))
-						{
-							shared_agg_free_blobs(aggstate, area);
-							shared_agg_free_table(area, shstate);
-							aggstate->shared->buckets_base = NULL;
-						}
-						aggstate->shared->scan_attached = false;
+						shared_agg_detach_scan(aggstate, area);
 						aggstate->agg_done = true;
 						return NULL;
 					}
@@ -5786,8 +5813,7 @@ agg_retrieve_shared_hash_table(AggState *aggstate)
 					have_batch = DsaPointerIsValid(shstate->cur_batch);
 					if (!have_batch)
 					{
-						BarrierDetach(&shstate->scan_barrier);
-						aggstate->shared->scan_attached = false;
+						shared_agg_detach_scan(aggstate, area);
 						aggstate->agg_done = true;
 						return NULL;
 					}
@@ -7432,11 +7458,13 @@ ExecShutdownAgg(AggState *node)
 	 */
 	Assert(!shared->attached);
 
-	if (shared->scan_attached)
-	{
-		BarrierDetach(&shared->build->scan_barrier);
-		shared->scan_attached = false;
-	}
+	/*
+	 * Release the table if we are the last participant out.  Early termination
+	 * (LIMIT, a detached tuple queue) reaches the batch cycle's exit only here,
+	 * so leaving the return value unexamined leaked the whole table on exactly
+	 * the path the "stopping early over a spilled table" test covers.
+	 */
+	shared_agg_detach_scan(node, node->ss.ps.state->es_query_dsa);
 
 	/*
 	 * Nothing will be emitted after a shutdown, and saying so here means a
