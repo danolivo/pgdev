@@ -2520,7 +2520,7 @@ typedef struct AggState
 	 * rather than in SharedAggState because explain.c reads them.
 	 */
 	uint64		shared_nspilled;
-	int			shared_nbatches;
+	uint64		shared_nbatches;
 	uint64		shared_nbuckets;
 	uint64		shared_mem_used;
 } AggState;

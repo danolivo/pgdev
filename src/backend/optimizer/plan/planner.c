@@ -7453,9 +7453,30 @@ shared_hashagg_worth_trying(double dNumGroups, List *partial_pathlist)
  * expect them, and the grouping target certainly contains them.
  */
 static bool
-parallel_shared_hashagg_possible(PlannerInfo *root)
+parallel_shared_hashagg_possible(PlannerInfo *root, RelOptInfo *grouped_rel)
 {
 	ListCell   *lc;
+
+	/*
+	 * Refuse a child grouped rel outright.
+	 *
+	 * Under partitionwise aggregation create_partitionwise_grouping_paths()
+	 * passes the same root down for every child, so root->processed_groupClause
+	 * and root->parse->targetList here are the PARENT's expressions.  The
+	 * statistics test below would therefore judge a child by the partitioned
+	 * parent's distribution -- and the cost model declines to trust exactly
+	 * that data, on the grounds that no evidence beats wrong evidence.  Two
+	 * tests reading the same wrong evidence and disagreeing about whether to
+	 * believe it is worse than not offering the strategy.
+	 *
+	 * This is also the honest state of the combination: the resource
+	 * accounting for N shared tables under one Parallel Append -- a per-node
+	 * budget already multiplied by the participant count, and a stripe lock
+	 * array in the fixed DSM segment multiplied by the partition count -- is
+	 * unanalysed.  Re-enable it deliberately, with its own tests.
+	 */
+	if (IS_OTHER_REL(grouped_rel))
+		return false;
 
 	foreach(lc, root->agginfos)
 	{
@@ -7681,22 +7702,33 @@ shared_hashagg_safe_function(Oid aggfnoid)
 static bool
 shared_hashagg_safe_transtype(Oid transtype)
 {
-	Oid			elemtype;
-
 	if (get_typtype(transtype) != TYPTYPE_BASE)
 		return false;
 
-	elemtype = get_element_type(transtype);
-	if (OidIsValid(elemtype))
-	{
-		int16		elmlen;
-		bool		elmbyval;
-		char		elmalign;
-
-		get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
-		if (!elmbyval || elmlen <= 0)
-			return false;
-	}
+	/*
+	 * No arrays, even of fixed-length by-value elements.
+	 *
+	 * An earlier revision admitted them, on the grounds that a flat int8[]
+	 * accumulator is only ever read by memcpy.  That is true of int4_avg_accum
+	 * and float8_accum; it is not true of the transition function in general,
+	 * and this gate can only see the type.  min(anyarray) and max(anyarray)
+	 * resolve aggtranstype to a concrete array of a by-value element --
+	 * min(int4[]) passes every other test here -- and array_smaller() reaches
+	 * array_cmp(), which does lookup_type_cache() and then calls the element
+	 * type's comparison procedure.  For a user-defined by-value base type that
+	 * procedure may be PL/pgSQL, and it would run under the stripe lock.  Note
+	 * shared_hashagg_safe_keytype() already refuses arrays on the key side; the
+	 * two sides were inconsistent.
+	 *
+	 * The cost of this is real and worth stating: it excludes avg(int2),
+	 * avg(int4) and the whole float8 statistics family (stddev, var*, corr,
+	 * regr_*), which are the numerically largest eligible group.  Readmitting
+	 * them wants a test on the transition FUNCTION rather than the type -- a
+	 * declared pg_aggregate property, or an audited list -- plus warming the
+	 * element type's typcache entry before the lock.  Until then, out.
+	 */
+	if (OidIsValid(get_element_type(transtype)))
+		return false;
 
 	return true;
 }
@@ -8008,7 +8040,7 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 			input_rel->partial_pathlist != NIL &&
 			shared_hashagg_worth_trying(dNumGroups,
 										input_rel->partial_pathlist) &&
-			parallel_shared_hashagg_possible(root))
+			parallel_shared_hashagg_possible(root, grouped_rel))
 		{
 			Path	   *cheapest_partial_path =
 				linitial(input_rel->partial_pathlist);
