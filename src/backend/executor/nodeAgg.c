@@ -386,6 +386,8 @@ typedef struct SharedAggState
 	AggStatePerGroup scratch_pergroup;	/* contiguous scratch for finalization */
 	bool		attached;		/* attached to the build barrier? */
 	bool		scan_attached;	/* attached to the scan barrier? */
+	int			scan_participants;	/* membership when we attached; see
+									 * agg_retrieve_shared_hash_table() */
 	ExprContext *exprcontext;	/* for hash/equality evaluation */
 	ExprContext *byrefcontext;	/* aggregate context for by-ref transitions */
 	ExprState  *hashexpr;		/* computes group-key hash over hashslot */
@@ -5153,6 +5155,7 @@ shared_agg_detach_scan(AggState *aggstate, dsa_area *area)
 		shared->buckets_base = NULL;
 	}
 	shared->scan_attached = false;
+	shared->scan_participants = 0;
 }
 
 /*
@@ -5571,6 +5574,21 @@ agg_fill_shared_hash_table(AggState *aggstate)
 		/* wait for all attached participants to finish feeding the table */
 		BarrierArriveAndWait(build_barrier, WAIT_EVENT_PARALLEL_HASH_AGG_BUILD);
 
+		/*
+		 * Record the scan barrier's membership, now that it is at its maximum.
+		 *
+		 * This is deliberately after the build barrier and not next to the
+		 * attach above.  Every feeder attaches to the scan barrier before
+		 * arriving at the build barrier, but they do so at different times, so
+		 * a participant that attaches early sees a count that is still rising.
+		 * Past the build barrier every feeder has attached and nothing else
+		 * ever will, so from here the count can only fall -- which is the
+		 * property the leader's bow-out depends on, and what the assertion in
+		 * agg_retrieve_shared_hash_table() checks.
+		 */
+		aggstate->shared->scan_participants =
+			BarrierParticipants(&shstate->scan_barrier);
+
 		/* every byte is accounted for by now, so the peak is knowable */
 		shared_agg_note_mem_peak(shstate);
 
@@ -5694,7 +5712,30 @@ agg_retrieve_shared_hash_table(AggState *aggstate)
 					 * workers without any of them arriving last; barrier.c
 					 * elects one of them regardless, so the advancement claim
 					 * below could have used the barrier's return value.
+					 *
+					 * The test reads BarrierParticipants(), which barrier.c
+					 * documents as being for debugging only -- so what makes
+					 * the answer trustworthy is not the accessor but the
+					 * invariant behind it: there is exactly one BarrierAttach()
+					 * on this barrier, it happens before the build barrier, and
+					 * every participant is past the build barrier by the time
+					 * it can reach here.  Membership can therefore only fall
+					 * from what we saw when we attached, so a "> 1" answer
+					 * cannot be stale in the dangerous direction (it can only
+					 * make us bow out when we need not have, which costs
+					 * nothing but the leader's help).
+					 *
+					 * Assert it, because the whole no-deadlock argument for
+					 * emitting while attached rests on it, and because a second
+					 * attach site added later would break it silently.  A
+					 * documented non-debug accessor in barrier.c would let the
+					 * test itself stop violating the contract; until then this
+					 * is what pins the reasoning down.
 					 */
+					Assert(aggstate->shared->scan_attached);
+					Assert(BarrierParticipants(&shstate->scan_barrier) <=
+						   aggstate->shared->scan_participants);
+
 					if (!IsParallelWorker() &&
 						BarrierParticipants(&shstate->scan_barrier) > 1)
 					{
