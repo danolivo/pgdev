@@ -332,6 +332,75 @@ select count(*) as mismatched_rows from (
 select count(*) from
   (select a, sum(v) as s from pha_multi group by a having sum(v) > 0) ss;
 
+--
+-- 11. Grouping keys whose equality operator dispatches at run time.  The
+-- locked chain walk compares keys, so an equality that resolves the operand's
+-- comparison procedure through the typcache would open catalogs -- and
+-- possibly call a user-supplied procedure -- while holding a stripe lock.
+-- Being compiled into the server is not enough: range_eq, record_eq and
+-- array_eq all are.  Each of these must fall back to Partial/Finalize.
+--
+create type pha_colour as enum ('r', 'g', 'b');
+create type pha_pair as (a text, b text);
+create domain pha_posint as int4 check (value > 0);
+
+create table pha_keys (
+    i    int4,
+    rng  int4range,
+    en   pha_colour,
+    rec  pha_pair,
+    arr  text[],
+    barr int8[],
+    dom  pha_posint,
+    v    int4
+);
+insert into pha_keys
+  select i % 1500,
+         int4range(i % 1500, (i % 1500) + 10),
+         (array['r', 'g', 'b'])[1 + i % 3]::pha_colour,
+         row(md5((i % 1500)::text), 'b')::pha_pair,
+         array[md5((i % 1500)::text)],
+         array[(i % 1500)::int8],
+         (i % 1500) + 1,
+         i % 7
+  from generate_series(1, 20000) i;
+analyze pha_keys;
+
+-- None of these may produce "Parallel HashAggregate": a range key dispatches
+-- through the subtype's comparison, a composite through each field's, an array
+-- through its element's -- including int8[], whose flat representation is safe
+-- as a transition state but not as a key.  Where they land instead is the
+-- planner's business and varies with the key's width; the range case happens to
+-- prefer a serial plan outright.
+explain (costs off) select rng, sum(v) from pha_keys group by rng;
+explain (costs off) select rec, sum(v) from pha_keys group by rec;
+explain (costs off) select arr, sum(v) from pha_keys group by arr;
+explain (costs off) select barr, sum(v) from pha_keys group by barr;
+
+-- An enum key is refused for the same reason.  Pair it with a high-cardinality
+-- column so the group count clears SHARED_AGG_MIN_GROUPS; grouped alone it
+-- would be refused by the floor instead, and prove nothing about the operator.
+explain (costs off) select en, i, sum(v) from pha_keys group by en, i;
+
+-- ... while a domain over an eligible base type inherits int4's operators and
+-- is still accepted: expect "Parallel HashAggregate".
+explain (costs off) select dom, sum(v) from pha_keys group by dom;
+
+-- and the refused keys must still give the right answers
+create table pha_keys_ref as select * from pha_keys;
+alter table pha_keys_ref set (parallel_workers = 0);
+analyze pha_keys_ref;
+
+select count(*) as mismatched_rows from (
+    (select rng::text r, sum(v) s from pha_keys group by rng
+     except
+     select rng::text, sum(v) from pha_keys_ref group by rng)
+    union all
+    (select rng::text, sum(v) from pha_keys_ref group by rng
+     except
+     select rng::text r, sum(v) s from pha_keys group by rng)
+) diff;
+
 reset enable_parallel_hash_agg;
 reset parallel_setup_cost;
 reset parallel_tuple_cost;
