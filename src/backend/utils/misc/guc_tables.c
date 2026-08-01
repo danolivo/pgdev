@@ -403,6 +403,19 @@ static const struct config_enum_entry recovery_prefetch_options[] = {
 	{NULL, 0, false}
 };
 
+static const struct config_enum_entry debug_parallel_hash_agg_options[] = {
+	{"off", DEBUG_PARALLEL_HASH_AGG_OFF, false},
+	{"on", DEBUG_PARALLEL_HASH_AGG_ON, false},
+	{"force", DEBUG_PARALLEL_HASH_AGG_FORCE, false},
+	{"true", DEBUG_PARALLEL_HASH_AGG_ON, true},
+	{"false", DEBUG_PARALLEL_HASH_AGG_OFF, true},
+	{"yes", DEBUG_PARALLEL_HASH_AGG_ON, true},
+	{"no", DEBUG_PARALLEL_HASH_AGG_OFF, true},
+	{"1", DEBUG_PARALLEL_HASH_AGG_ON, true},
+	{"0", DEBUG_PARALLEL_HASH_AGG_OFF, true},
+	{NULL, 0, false}
+};
+
 static const struct config_enum_entry debug_parallel_query_options[] = {
 	{"off", DEBUG_PARALLEL_OFF, false},
 	{"on", DEBUG_PARALLEL_ON, false},
