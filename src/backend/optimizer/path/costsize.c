@@ -166,6 +166,7 @@ bool		enable_parallel_hash_agg = false;
 bool		enable_partition_pruning = true;
 bool		enable_presorted_aggregate = true;
 bool		enable_async_append = true;
+int			debug_parallel_hash_agg = DEBUG_PARALLEL_HASH_AGG_ON;
 
 typedef struct
 {

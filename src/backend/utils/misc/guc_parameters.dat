@@ -692,6 +692,15 @@
   options => 'debug_logical_replication_streaming_options',
 },
 
+{ name => 'debug_parallel_hash_agg', type => 'enum', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
+  short_desc => 'Forces the planner\'s use of parallel shared hash aggregation.',
+  long_desc => 'With "force", the shared hash table strategy is chosen whenever it is eligible, bypassing the cost model that would otherwise decline it. This exists to measure the strategy where the cost model rejects it; the eligibility rules that keep unsafe types and functions out of shared memory still apply.',
+  flags => 'GUC_NOT_IN_SAMPLE | GUC_EXPLAIN',
+  variable => 'debug_parallel_hash_agg',
+  boot_val => 'DEBUG_PARALLEL_HASH_AGG_ON',
+  options => 'debug_parallel_hash_agg_options',
+},
+
 { name => 'debug_parallel_query', type => 'enum', context => 'PGC_USERSET', group => 'DEVELOPER_OPTIONS',
   short_desc => 'Forces the planner\'s use parallel query nodes.',
   long_desc => 'This can be useful for testing the parallel query infrastructure by forcing the planner to generate plans that contain nodes that perform tuple communication between workers and the main process.',

@@ -40,6 +40,20 @@ typedef enum
 	CONSTRAINT_EXCLUSION_PARTITION, /* apply c_e to otherrels only */
 }			ConstraintExclusionType;
 
+/*
+ * Values for the developer-only debug_parallel_hash_agg GUC.  FORCE exists so
+ * that the shared-hash-table strategy can be measured against Partial/Finalize
+ * at points where the cost model would decline it -- there is otherwise no way
+ * to obtain the counterfactual, since penalising Partial/Finalize with
+ * parallel_tuple_cost drives the planner to a serial plan instead.
+ */
+typedef enum
+{
+	DEBUG_PARALLEL_HASH_AGG_OFF,	/* never generate the shared path */
+	DEBUG_PARALLEL_HASH_AGG_ON, /* let enable_* and the cost model decide */
+	DEBUG_PARALLEL_HASH_AGG_FORCE,	/* generate it whenever it is eligible */
+}			DebugParallelHashAggType;
+
 
 /*
  * prototypes for costsize.c
@@ -69,6 +83,7 @@ extern PGDLLIMPORT bool enable_partitionwise_aggregate;
 extern PGDLLIMPORT bool enable_parallel_append;
 extern PGDLLIMPORT bool enable_parallel_hash;
 extern PGDLLIMPORT bool enable_parallel_hash_agg;
+extern PGDLLIMPORT int debug_parallel_hash_agg;
 extern PGDLLIMPORT bool enable_partition_pruning;
 extern PGDLLIMPORT bool enable_presorted_aggregate;
 extern PGDLLIMPORT bool enable_async_append;

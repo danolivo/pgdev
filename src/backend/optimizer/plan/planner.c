@@ -7381,11 +7381,49 @@ static bool shared_hashagg_safe_keytype(Oid keytype);
  */
 #define SHARED_AGG_LOCK_COST	(2.0 * cpu_operator_cost)
 
+/*
+ * Is the shared strategy allowed to be considered at all?
+ *
+ * debug_parallel_hash_agg overrides enable_parallel_hash_agg in both
+ * directions so that a benchmark can select a strategy with one setting.
+ */
+static inline bool
+shared_hashagg_enabled(void)
+{
+	switch (debug_parallel_hash_agg)
+	{
+		case DEBUG_PARALLEL_HASH_AGG_OFF:
+			return false;
+		case DEBUG_PARALLEL_HASH_AGG_FORCE:
+			return true;
+		case DEBUG_PARALLEL_HASH_AGG_ON:
+			return enable_parallel_hash_agg;
+	}
+
+	/* not reached, but keeps compilers from guessing */
+	return enable_parallel_hash_agg;
+}
+
+static inline bool
+shared_hashagg_forced(void)
+{
+	return debug_parallel_hash_agg == DEBUG_PARALLEL_HASH_AGG_FORCE;
+}
+
 static bool
 shared_hashagg_worth_trying(double dNumGroups, List *partial_pathlist)
 {
 	Path	   *cheapest = (Path *) linitial(partial_pathlist);
 	double		nparticipants = cheapest->parallel_workers + 1;
+
+	/*
+	 * The whole point of the forcing mode is to reach the points this function
+	 * declines, so that the cost model's boundary can be compared against the
+	 * measured one.  Eligibility is a separate question and is not affected:
+	 * parallel_shared_hashagg_possible() still has the last word.
+	 */
+	if (shared_hashagg_forced())
+		return true;
 
 	/*
 	 * Fewer groups than participants is the degenerate end of the same story:
@@ -7963,7 +8001,7 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 		 * but the shared transition states restrict which aggregates are
 		 * eligible -- see parallel_shared_hashagg_possible().
 		 */
-		if (enable_parallel_hash_agg &&
+		if (shared_hashagg_enabled() &&
 			!parse->groupingSets &&
 			parse->groupClause != NIL &&
 			grouped_rel->consider_parallel &&
@@ -8119,6 +8157,26 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 
 				aggpath->path.startup_cost += surcharge;
 				aggpath->path.total_cost += surcharge;
+			}
+
+			/*
+			 * Bench-only: make the path win.  Costing it honestly and then
+			 * discarding the answer is deliberate -- wrapping the surcharge
+			 * block in a conditional instead would reindent sixty lines of the
+			 * base commit, and this commit is meant to be dropped cleanly
+			 * before the series is posted.  The wasted arithmetic costs
+			 * nothing anyone will measure, since forcing mode is not a
+			 * production setting.
+			 *
+			 * Zero is enough to beat the Partial/Finalize path here, but not by
+			 * itself enough to beat a serial plan: gather_grouping_paths() adds
+			 * parallel_setup_cost above this.  Set parallel_setup_cost = 0 as
+			 * well when the shared path must be chosen unconditionally.
+			 */
+			if (shared_hashagg_forced())
+			{
+				aggpath->path.startup_cost = 0.0;
+				aggpath->path.total_cost = 0.0;
 			}
 
 			add_partial_path(grouped_rel, (Path *) aggpath);
