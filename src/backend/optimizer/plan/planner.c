@@ -7343,6 +7343,7 @@ static bool shared_hashagg_safe_function(Oid aggfnoid);
 static bool shared_hashagg_internal_language(Oid fnoid);
 static char shared_hashagg_finalmodify(Oid aggfnoid);
 static bool shared_hashagg_safe_transtype(Oid transtype);
+static bool shared_hashagg_safe_keytype(Oid keytype);
 
 /*
  * Fewest groups for which a shared hash table is worth considering at all.
@@ -7481,6 +7482,29 @@ parallel_shared_hashagg_possible(PlannerInfo *root)
 	}
 
 	/*
+	 * The grouping keys' equality functions run under the stripe lock too: the
+	 * second, locked chain walk in shared_agg_insert() compares keys.  Same
+	 * reasoning as for the transition function -- and, because being compiled
+	 * into the server is not by itself enough, the same reasoning as for the
+	 * transition *type* as well.  See shared_hashagg_safe_keytype().
+	 */
+	foreach(lc, root->processed_groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		Oid			lefttype;
+		Oid			righttype;
+
+		if (!OidIsValid(sgc->eqop) ||
+			!shared_hashagg_internal_language(get_opcode(sgc->eqop)))
+			return false;
+
+		op_input_types(sgc->eqop, &lefttype, &righttype);
+		if (!shared_hashagg_safe_keytype(lefttype) ||
+			!shared_hashagg_safe_keytype(righttype))
+			return false;
+	}
+
+	/*
 	 * Require real statistics for every grouping key.
 	 *
 	 * This is about the cost model rather than the executor, which does not
@@ -7497,20 +7521,6 @@ parallel_shared_hashagg_possible(PlannerInfo *root)
 	 * shape: isdefault means "I made this up", and a made-up group count is
 	 * exactly what the model must not be asked to judge.
 	 */
-	/*
-	 * The grouping keys' equality functions run under the stripe lock too: the
-	 * second, locked chain walk in shared_agg_insert() compares keys.  Same
-	 * reasoning as for the transition function.
-	 */
-	foreach(lc, root->processed_groupClause)
-	{
-		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
-
-		if (!OidIsValid(sgc->eqop) ||
-			!shared_hashagg_internal_language(get_opcode(sgc->eqop)))
-			return false;
-	}
-
 	foreach(lc, get_sortgrouplist_exprs(root->processed_groupClause,
 										root->parse->targetList))
 	{
@@ -7649,6 +7659,54 @@ shared_hashagg_safe_transtype(Oid transtype)
 		if (!elmbyval || elmlen <= 0)
 			return false;
 	}
+
+	return true;
+}
+
+/*
+ * Can this grouping key's equality operator run with an LWLock held?
+ *
+ * shared_hashagg_internal_language() has already established that the operator's
+ * function is compiled into the server, which is necessary and not sufficient:
+ * several built-in equality functions are dispatchers rather than leaves.
+ * range_eq, record_eq, array_eq and the enum comparators resolve the operand's
+ * own comparison procedure at run time via lookup_type_cache(), which opens
+ * catalogs on a cold cache and may then call a user-supplied procedure for a
+ * subtype, element or field -- all under a lock the deadlock detector cannot
+ * see, and that LWLockAcquire() will not let anyone interrupt while waiting.
+ * That is precisely the hazard shared_hashagg_safe_transtype() refuses on the
+ * transition-state side; the key side needs the same answer.
+ *
+ * What separates the dispatchers from the leaves is visible in the operator's
+ * declared operand type rather than in the key's own type: a dispatching
+ * equality is declared over a pseudo-type (anyrange, anyarray, anyenum, record),
+ * while int4eq and texteq are declared over the concrete type they compare.  So
+ * this is shared_hashagg_safe_transtype()'s test asked of the operand.
+ *
+ * Testing the operand rather than the expression also gets domains right
+ * without a getBaseType() call: a domain inherits its base type's operators, so
+ * a domain over int4 arrives here as int4 and is accepted, while a domain over
+ * int4range arrives as anyrange and is not.
+ *
+ * The array condition is not redundant behind the TYPTYPE_BASE test, even
+ * though the built-in array equality is declared over anyarray.  Nothing stops
+ * someone declaring a concrete operator over int4[] whose procedure is
+ * array_eq, together with a hash opclass over hash_array; that would present an
+ * internal-language function and a base operand type while still dispatching.
+ * Note also that this rejects arrays whose elements are fixed-length and
+ * by-value, which shared_hashagg_safe_transtype() accepts -- the asymmetry is
+ * deliberate.  A flat int8[] transition state is safe because nothing reads it
+ * but memcpy; comparing two int8[] keys still goes through the element type's
+ * equality procedure, and so through the typcache.
+ */
+static bool
+shared_hashagg_safe_keytype(Oid keytype)
+{
+	if (get_typtype(keytype) != TYPTYPE_BASE)
+		return false;
+
+	if (OidIsValid(get_element_type(keytype)))
+		return false;
 
 	return true;
 }
