@@ -1614,3 +1614,278 @@ SELECT id FROM num_toast_test ORDER BY v, id;
 SELECT length(sum(v)::text) AS sum_digits FROM num_toast_test;
 
 DROP TABLE num_toast_test;
+
+--
+-- Tests for the int128 fast-path aggregate accumulator and its promotion
+-- to the digit-array accumulator.  Results must be identical no matter
+-- whether or when the promotion happened.
+--
+
+-- promotion at every spike position: a failure means the result depends on
+-- where the accumulator overflowed
+SELECT k AS spike_pos,
+       (SELECT sum(v) FROM (
+          SELECT CASE WHEN i = k
+                      THEN 99999999999999999999999999999999999999::numeric
+                      ELSE 1.01::numeric END AS v
+          FROM generate_series(0, 9) i) s) AS total
+FROM generate_series(0, 9) k;
+
+-- 38-digit values are wider than the fast lanes accept: promoted at once
+SELECT sum(v) FROM (VALUES
+  (99999999999999999999999999999999999999::numeric),
+  (99999999999999999999999999999999999999::numeric)) s(v);
+
+-- negative sums and sign-crossing on the digit-array path
+SELECT sum(v) FROM (VALUES
+  (-99999999999999999999999999999999999999::numeric),
+  (-99999999999999999999999999999999999999::numeric),
+  (99999999999999999999999999999999999999::numeric)) s(v);
+
+-- display scale must be the widest input dscale, before and after promotion
+SELECT sum(v) FROM (VALUES (1.5::numeric), (2.25::numeric), (3::numeric)) s(v);
+SELECT sum(v) FROM (VALUES (1.5::numeric), (0.0000000000::numeric)) s(v);
+SELECT sum(v) FROM (VALUES
+  (1.5::numeric),
+  (99999999999999999999999999999999999999::numeric),
+  (99999999999999999999999999999999999999::numeric),
+  (0.125::numeric)) s(v);
+
+-- avg across the promotion boundary divides through the regular path
+SELECT avg(v) FROM (VALUES
+  (99999999999999999999999999999999999999::numeric),
+  (1::numeric)) s(v);
+
+-- zero values may widen the accumulator scale beyond what int128 can
+-- represent for nonzero values; a later nonzero input must fall back
+-- cleanly and the result must keep the widest input dscale
+SELECT sum(v) FROM (VALUES
+  (0.00000000000000000000::numeric),
+  (0.0000000000000000000000000000000000000000::numeric),
+  (1.5::numeric)) s(v);
+
+-- a tiny first value puts the fast sum at a scale that an ordinary value
+-- cannot be converted to: the next input must fall back cleanly
+SELECT sum(v) FROM (VALUES
+  (0.00000000000000000000000000000000000000000000000001::numeric),
+  (2::numeric)) s(v);
+
+-- the native int128 lane: coefficients too wide for int64 stay fast, with
+-- negative values, sign crossing and a mix of display scales
+SELECT sum(v), avg(v) FROM (VALUES
+  (12345678901234567890.123456::numeric),
+  (-98765432109876543210.654321::numeric),
+  (11111111111111111111.1::numeric)) s(v);
+
+-- round values with many trailing zero digits use the lane's scaling
+SELECT sum(v) FROM (VALUES (9000000000000000000::numeric),
+                           (0.5::numeric)) s(v);
+
+-- the remaining scale-down cases of both lanes: an accumulator scale of 1
+-- (mod 4) leaves three excess decimal positions in the last stored digit, a
+-- scale of 3 (mod 4) leaves one.  The value with the narrower display scale
+-- comes first, so that each query meets both cases.
+SELECT sum(v), avg(v) FROM (VALUES (2.5::numeric), (1.125::numeric)) s(v);
+SELECT sum(v), avg(v) FROM (VALUES
+  (12345678901234567890.1::numeric),
+  (-2345678901234567890.123::numeric)) s(v);
+
+-- ten stored digits still fit the native int128 lane when the last one
+-- overshoots the scale by two or three positions: a 36-digit integer part
+-- with one or two decimals
+SELECT sum(v), avg(v) FROM (VALUES
+  (123456789012345678901234567890123456.5::numeric),
+  (-23456789012345678901234567890123456.78::numeric)) s(v);
+
+-- an upward shift of more than 18 decimal positions is applied in two steps
+-- in the native int128 lane: integer values at a display scale above 18, and
+-- round integers with more than 18 trailing zeroes.  The last query reaches
+-- the longest shift there is, 34 positions for a single stored digit.
+SELECT sum(v), avg(v) FROM (VALUES
+  (1.00000000000000000000::numeric),
+  (-7.00000000000000000000::numeric),
+  (2.50000000000000000000::numeric)) s(v);
+SELECT sum(v), avg(v) FROM (VALUES
+  (100000000000000000000::numeric),
+  (30000000000000000000000000000000000::numeric),
+  (0.5::numeric)) s(v);
+SELECT sum(v), avg(v) FROM (VALUES
+  (0.25::numeric),
+  (100000000000000000000000000000000::numeric)) s(v);
+
+-- fast sums beyond int64 take the 128-bit branch of the finalization
+SELECT sum(v), avg(v)
+FROM (SELECT 9123456789012345678.25::numeric AS v
+      FROM generate_series(1, 5)) s;
+
+-- promotion via add overflow: 36-digit values pass the width cap and the
+-- running sum outgrows int128 after 170 rows, in both directions
+SELECT sum(v), avg(v), sum(-v)
+FROM (SELECT 999999999999999999999999999999999999::numeric AS v
+      FROM generate_series(1, 200)) s;
+
+-- promotion via rescale overflow: the fast sum fits at scale 0 but not at
+-- the finer dscale of a later input
+SELECT sum(v) FROM (VALUES
+  (123456789012345678901234567890::numeric),
+  (0.1234567890::numeric),
+  (1::numeric)) s(v);
+
+-- specials bypass the accumulator in both modes
+SELECT sum(v) FROM (VALUES ('nan'::numeric), (1.1::numeric)) s(v);
+SELECT sum(v) FROM (VALUES ('inf'::numeric), ('-inf'::numeric), (1::numeric)) s(v);
+
+-- FILTER and DISTINCT go through the same transition function
+SELECT sum(v) FILTER (WHERE v < 10),
+       sum(DISTINCT v)
+FROM (VALUES (1.5::numeric), (1.5::numeric), (2.25::numeric),
+             (99999999999999999999999999999999999999::numeric)) s(v);
+
+-- moving-aggregate (window) mode: subtraction, promotion inside a frame,
+-- and dscale-retreat rescans must all give the plain-aggregation answer
+SELECT i, sum(v) OVER (ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+FROM (VALUES (1, 1.01::numeric),
+             (2, 99999999999999999999999999999999999999::numeric),
+             (3, 2.5::numeric),
+             (4, 3.000::numeric),
+             (5, 4::numeric),
+             (6, 99999999999999999999999999999999999999::numeric),
+             (7, 99999999999999999999999999999999999999::numeric)) t(i, v)
+ORDER BY i;
+SELECT i, sum(v) OVER w, avg(v) OVER w
+FROM (SELECT i, (i * 1.25)::numeric AS v FROM generate_series(1, 8) i) t
+WINDOW w AS (ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+ORDER BY i;
+-- inverse transition that overflows int128: at i = 173 the frame sum is
+-- 170 * X and removing the leading -X takes it past the int128 limit, which
+-- must promote rather than wrap
+SELECT i, s FROM (
+  SELECT i, sum(v) OVER (ORDER BY i ROWS BETWEEN 171 PRECEDING AND CURRENT ROW) AS s
+  FROM (SELECT i, CASE WHEN i = 1
+                       THEN -999999999999999999999999999999999999::numeric
+                       ELSE 999999999999999999999999999999999999::numeric END AS v
+        FROM generate_series(1, 175) i) t) w
+WHERE i >= 170
+ORDER BY i;
+-- removing the last finite input from a fast sum must reset its scale too.
+-- The NULL keeps the frame overlapping its predecessor, so the aggregate is
+-- not restarted and the 1.500 is removed by the inverse transition; the sum
+-- at i = 2 must not inherit its display scale
+SELECT i, sum(v) OVER (ORDER BY i ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING)
+FROM (VALUES (1, 1.500::numeric), (2, NULL),
+             (3, 2::numeric), (4, 3::numeric)) t(i, v)
+ORDER BY i;
+
+-- parallel plans: partial states pass through serialization, and the
+-- deserialized state returns to the fast representation whenever its sum
+-- fits.  Whether a given group ends up with mixed fast and promoted partial
+-- states depends on how the heap is split between processes, but the result
+-- must match the serial answer either way.
+CREATE TABLE num_fast_agg (grp int, v numeric);
+INSERT INTO num_fast_agg
+  SELECT i % 4, 1.01 FROM generate_series(1, 4000) i;
+INSERT INTO num_fast_agg VALUES
+  (0, 99999999999999999999999999999999999999),
+  (1, 99999999999999999999999999999999999999),
+  (1, 99999999999999999999999999999999999999);
+ANALYZE num_fast_agg;
+
+BEGIN;
+SET LOCAL parallel_setup_cost = 0;
+SET LOCAL parallel_tuple_cost = 0;
+SET LOCAL min_parallel_table_scan_size = 0;
+SET LOCAL max_parallel_workers_per_gather = 2;
+EXPLAIN (COSTS OFF)
+SELECT grp, sum(v), avg(v) FROM num_fast_agg GROUP BY grp ORDER BY grp;
+SELECT grp, sum(v), avg(v) FROM num_fast_agg GROUP BY grp ORDER BY grp;
+COMMIT;
+
+-- serial reference for the same data
+SELECT grp, sum(v), avg(v) FROM num_fast_agg GROUP BY grp ORDER BY grp;
+
+-- eager aggregation combines partial states deterministically in a single
+-- process.  Partial groups 0 and 1 carry a spike and are promoted, 2 and 3
+-- stay fast; the mapping below makes each final group combine one kind of
+-- pair: promoted then fast, fast then fast, promoted then promoted, fast then
+-- promoted.  (The order within a group follows the plan and is not
+-- guaranteed, but the result is invariant either way.)  A partial state that
+-- joins several final groups is combined several times, so the combine
+-- function must not modify its second argument.
+CREATE TABLE num_fast_agg_map (k int, fgrp int);
+INSERT INTO num_fast_agg_map VALUES
+  (0, 0), (2, 0),
+  (2, 1), (3, 1),
+  (0, 2), (1, 2),
+  (3, 3), (1, 3);
+ANALYZE num_fast_agg_map;
+
+BEGIN;
+SET LOCAL enable_eager_aggregate = on;
+SET LOCAL min_eager_agg_group_size = 0;
+SET LOCAL max_parallel_workers_per_gather = 0;
+EXPLAIN (COSTS OFF)
+SELECT m.fgrp, sum(t.v), avg(t.v)
+FROM num_fast_agg t JOIN num_fast_agg_map m ON t.grp = m.k
+GROUP BY m.fgrp ORDER BY m.fgrp;
+SELECT m.fgrp, sum(t.v), avg(t.v)
+FROM num_fast_agg t JOIN num_fast_agg_map m ON t.grp = m.k
+GROUP BY m.fgrp ORDER BY m.fgrp;
+SET LOCAL enable_eager_aggregate = off;
+SELECT m.fgrp, sum(t.v), avg(t.v)
+FROM num_fast_agg t JOIN num_fast_agg_map m ON t.grp = m.k
+GROUP BY m.fgrp ORDER BY m.fgrp;
+COMMIT;
+
+DROP TABLE num_fast_agg_map;
+DROP TABLE num_fast_agg;
+
+-- combining fast partial states held at different scales rescales the
+-- narrower side.  Partial group 0 sums at scale 2 and group 1 at scale 3.
+-- Group 2 is an all-zero sum at scale 0 and group 3 a sum at scale 50, so
+-- pairing them rescales a zero by more decimal digits than int128 holds.
+-- Group 4 is a large integer sum that cannot be rescaled to scale 50, so that
+-- pair overflows and is combined on the digit-array path.  Each pair appears
+-- in both orders; as above, the order actually used follows the plan, and
+-- the result is invariant either way.
+CREATE TABLE num_fast_agg_scale (grp int, v numeric);
+INSERT INTO num_fast_agg_scale
+  SELECT 0, 1.01 FROM generate_series(1, 200);
+INSERT INTO num_fast_agg_scale
+  SELECT 1, 0.001 FROM generate_series(1, 200);
+INSERT INTO num_fast_agg_scale
+  SELECT 2, 0 FROM generate_series(1, 200);
+INSERT INTO num_fast_agg_scale
+  SELECT 3, 0.00000000000000000000000000000000000000000000000001
+  FROM generate_series(1, 200);
+INSERT INTO num_fast_agg_scale
+  SELECT 4, 12345678901234567890 FROM generate_series(1, 200);
+ANALYZE num_fast_agg_scale;
+CREATE TABLE num_fast_agg_scale_map (k int, fgrp int);
+INSERT INTO num_fast_agg_scale_map VALUES
+  (0, 0), (1, 0),
+  (1, 1), (0, 1),
+  (2, 2), (3, 2),
+  (3, 3), (2, 3),
+  (4, 4), (3, 4),
+  (3, 5), (4, 5);
+ANALYZE num_fast_agg_scale_map;
+
+BEGIN;
+SET LOCAL enable_eager_aggregate = on;
+SET LOCAL min_eager_agg_group_size = 0;
+SET LOCAL max_parallel_workers_per_gather = 0;
+EXPLAIN (COSTS OFF)
+SELECT m.fgrp, sum(t.v), avg(t.v)
+FROM num_fast_agg_scale t JOIN num_fast_agg_scale_map m ON t.grp = m.k
+GROUP BY m.fgrp ORDER BY m.fgrp;
+SELECT m.fgrp, sum(t.v), avg(t.v)
+FROM num_fast_agg_scale t JOIN num_fast_agg_scale_map m ON t.grp = m.k
+GROUP BY m.fgrp ORDER BY m.fgrp;
+SET LOCAL enable_eager_aggregate = off;
+SELECT m.fgrp, sum(t.v), avg(t.v)
+FROM num_fast_agg_scale t JOIN num_fast_agg_scale_map m ON t.grp = m.k
+GROUP BY m.fgrp ORDER BY m.fgrp;
+COMMIT;
+
+DROP TABLE num_fast_agg_scale_map;
+DROP TABLE num_fast_agg_scale;
