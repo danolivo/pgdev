@@ -383,6 +383,236 @@ int128_div_mod_int32(INT128 *i128, int32 v, int32 *remainder)
 }
 
 /*
+ * Overflow-checked operations.
+ *
+ * These return true if the result would not fit in INT128, leaving the
+ * accumulator untouched; on success they update the accumulator in place
+ * and return false.  They exist for callers (such as numeric aggregate
+ * fast paths) that must detect overflow and fall back to a wider
+ * representation rather than error out.
+ */
+
+/*
+ * Add an INT128 value into an INT128 variable, checking for overflow.
+ *
+ * Returns true (leaving *i128 unchanged) if the sum does not fit,
+ * otherwise updates *i128 and returns false.
+ */
+static inline bool
+int128_add_int128_overflow(INT128 *i128, INT128 v)
+{
+#if USE_NATIVE_INT128 && defined(HAVE__BUILTIN_OP_OVERFLOW)
+	int128		result;
+
+	if (__builtin_add_overflow(*i128, v, &result))
+		return true;
+	*i128 = result;
+	return false;
+#else
+	/*
+	 * Signed overflow occurs iff the addends have the same sign and the
+	 * result's sign differs from it.  Compute the raw sum entirely in
+	 * unsigned arithmetic (which wraps by definition, so there is no
+	 * undefined behaviour to trip over), then apply the sign rule.
+	 */
+	INT128		result = *i128;
+	bool		lhs_neg = (PG_INT128_HI_INT64(result) < 0);
+	bool		rhs_neg = (PG_INT128_HI_INT64(v) < 0);
+
+#if USE_NATIVE_INT128
+	result = (int128) ((uint128) result + (uint128) v);
+#else
+	{
+		uint64		oldlo = result.lo;
+
+		result.lo += v.lo;
+		result.hi = (int64) ((uint64) result.hi + (uint64) v.hi +
+							 (result.lo < oldlo));
+	}
+#endif
+	if (lhs_neg == rhs_neg &&
+		(PG_INT128_HI_INT64(result) < 0) != lhs_neg)
+		return true;
+	*i128 = result;
+	return false;
+#endif
+}
+
+/*
+ * Subtract an INT128 value from an INT128 variable, checking for overflow.
+ *
+ * Returns true (leaving *i128 unchanged) if the difference does not fit,
+ * otherwise updates *i128 and returns false.  Note that a difference can
+ * overflow even when both operands are representable (opposite signs near
+ * the range limits), so this is not merely defensive.
+ */
+static inline bool
+int128_sub_int128_overflow(INT128 *i128, INT128 v)
+{
+#if USE_NATIVE_INT128 && defined(HAVE__BUILTIN_OP_OVERFLOW)
+	int128		result;
+
+	if (__builtin_sub_overflow(*i128, v, &result))
+		return true;
+	*i128 = result;
+	return false;
+#else
+	/*
+	 * Signed overflow occurs iff the operands have different signs and the
+	 * result's sign differs from the minuend's.
+	 */
+	INT128		result = *i128;
+	bool		lhs_neg = (PG_INT128_HI_INT64(result) < 0);
+	bool		rhs_neg = (PG_INT128_HI_INT64(v) < 0);
+
+#if USE_NATIVE_INT128
+	/* wrap-around-safe subtraction via unsigned arithmetic */
+	result = (int128) ((uint128) result - (uint128) v);
+#else
+	{
+		uint64		oldlo = result.lo;
+
+		result.lo -= v.lo;
+		result.hi = (int64) ((uint64) result.hi - (uint64) v.hi -
+							 (result.lo > oldlo));
+	}
+#endif
+	if (lhs_neg != rhs_neg &&
+		(PG_INT128_HI_INT64(result) < 0) != lhs_neg)
+		return true;
+	*i128 = result;
+	return false;
+#endif
+}
+
+/*
+ * Maximum exponent accepted by int128_mul_pow10_overflow: 10^38 is the
+ * largest power of ten representable in a signed 128-bit integer.
+ */
+#define INT128_POW10_MAX	38
+
+/*
+ * Multiply an INT128 variable by 10^k, checking for overflow.
+ *
+ * Returns true (leaving *i128 unchanged) if the product does not fit,
+ * otherwise updates *i128 and returns false.  The exponent must satisfy
+ * 0 <= k <= INT128_POW10_MAX; that is the caller's responsibility.
+ *
+ * This is the decimal-rescaling primitive: numeric fast paths use it to
+ * align fixed-point coefficients to a common scale.
+ */
+static inline bool
+int128_mul_pow10_overflow(INT128 *i128, int k)
+{
+	INT128		result = *i128;
+
+	Assert(k >= 0 && k <= INT128_POW10_MAX);
+
+	/* zero times anything stays zero (int128_is_zero() is declared below) */
+	if (PG_INT128_HI_INT64(result) == 0 && PG_INT128_LO_UINT64(result) == 0)
+		return false;
+
+	while (k > 0)
+	{
+#if USE_NATIVE_INT128 && defined(HAVE__BUILTIN_OP_OVERFLOW)
+		/* take the exponent in chunks whose power fits in int64 */
+		static const int64 pow10_64[] = {
+			INT64CONST(1),
+			INT64CONST(10),
+			INT64CONST(100),
+			INT64CONST(1000),
+			INT64CONST(10000),
+			INT64CONST(100000),
+			INT64CONST(1000000),
+			INT64CONST(10000000),
+			INT64CONST(100000000),
+			INT64CONST(1000000000),
+			INT64CONST(10000000000),
+			INT64CONST(100000000000),
+			INT64CONST(1000000000000),
+			INT64CONST(10000000000000),
+			INT64CONST(100000000000000),
+			INT64CONST(1000000000000000),
+			INT64CONST(10000000000000000),
+			INT64CONST(100000000000000000),
+			INT64CONST(1000000000000000000)
+		};
+		int			chunk = Min(k, 18);
+
+		if (__builtin_mul_overflow(result, pow10_64[chunk], &result))
+			return true;
+#else
+		/*
+		 * Portable path: multiply the absolute value by a power of ten that
+		 * fits in uint32, using 32-bit-limb schoolbook multiplication with
+		 * explicit carry propagation.  A conservative magnitude limit of
+		 * 2^127 - 1 is enforced for both signs (the unreachable corner -2^127
+		 * is reported as overflow, which merely sends the caller to its
+		 * fallback path).
+		 */
+		static const uint32 pow10_32[] = {
+			1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000,
+			1000000000
+		};
+		int			chunk = Min(k, 9);
+		uint32		m = pow10_32[chunk];
+		uint64		abs_hi;
+		uint64		abs_lo;
+		uint64		r0,
+					r1,
+					r2,
+					r3,
+					carry;
+		bool		neg;
+
+		neg = (PG_INT128_HI_INT64(result) < 0);
+		abs_hi = (uint64) PG_INT128_HI_INT64(result);
+		abs_lo = PG_INT128_LO_UINT64(result);
+		if (neg)
+		{
+			abs_lo = 0 - abs_lo;
+			abs_hi = 0 - abs_hi - (abs_lo != 0);
+		}
+
+		/* 32-bit limbs, least significant first */
+		r0 = (abs_lo & UINT64CONST(0xFFFFFFFF)) * m;
+		carry = r0 >> 32;
+		r0 &= UINT64CONST(0xFFFFFFFF);
+
+		r1 = (abs_lo >> 32) * m + carry;
+		carry = r1 >> 32;
+		r1 &= UINT64CONST(0xFFFFFFFF);
+
+		r2 = (abs_hi & UINT64CONST(0xFFFFFFFF)) * m + carry;
+		carry = r2 >> 32;
+		r2 &= UINT64CONST(0xFFFFFFFF);
+
+		r3 = (abs_hi >> 32) * m + carry;
+		if (r3 >> 32)
+			return true;		/* carried out of 128 bits */
+
+		abs_lo = (r1 << 32) | r0;
+		abs_hi = (r3 << 32) | r2;
+
+		/* magnitude must stay below 2^127 */
+		if (abs_hi >> 63)
+			return true;
+
+		if (neg)
+		{
+			abs_lo = 0 - abs_lo;
+			abs_hi = 0 - abs_hi - (abs_lo != 0);
+		}
+		result = make_int128((int64) abs_hi, abs_lo);
+#endif
+		k -= chunk;
+	}
+
+	*i128 = result;
+	return false;
+}
+
+/*
  * Test if an INT128 value is zero.
  */
 static inline bool
