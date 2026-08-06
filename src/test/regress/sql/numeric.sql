@@ -1658,3 +1658,29 @@ FROM (VALUES (1, 1.01::numeric),
              (6, 99999999999999999999999999999999999999::numeric),
              (7, 99999999999999999999999999999999999999::numeric)) t(i, v)
 ORDER BY i;
+
+-- parallel plans: a promoted partial state and a fast partial state must
+-- combine to the serial answer.  With the spikes spread across the table at
+-- least one worker promotes; whether the modes actually end up mixed depends
+-- on heap placement, but the result is invariant either way.
+CREATE TABLE num_fast_agg (grp int, v numeric);
+INSERT INTO num_fast_agg
+  SELECT i % 4, 1.01 FROM generate_series(1, 4000) i;
+INSERT INTO num_fast_agg VALUES
+  (0, 99999999999999999999999999999999999999),
+  (1, 99999999999999999999999999999999999999),
+  (1, 99999999999999999999999999999999999999);
+ANALYZE num_fast_agg;
+
+BEGIN;
+SET LOCAL parallel_setup_cost = 0;
+SET LOCAL parallel_tuple_cost = 0;
+SET LOCAL min_parallel_table_scan_size = 0;
+SET LOCAL max_parallel_workers_per_gather = 2;
+SELECT grp, sum(v), avg(v) FROM num_fast_agg GROUP BY grp ORDER BY grp;
+COMMIT;
+
+-- serial reference for the same data
+SELECT grp, sum(v), avg(v) FROM num_fast_agg GROUP BY grp ORDER BY grp;
+
+DROP TABLE num_fast_agg;

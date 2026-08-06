@@ -5284,18 +5284,6 @@ numeric_avg_combine(PG_FUNCTION_ARGS)
 	if (state2 == NULL)
 		PG_RETURN_POINTER(state1);
 
-	/*
-	 * Combining still speaks the digit-array representation only: fold any
-	 * fast-mode sum into it first.  (Note that state2 does not necessarily
-	 * come from numeric_avg_deserialize: single-process Finalize/Partial
-	 * plans pass states directly.)  A follow-up commit merges fast states
-	 * without this conversion.
-	 */
-	if (!state2->promoted)
-		promote_numeric_agg_state(state2);
-	if (state1 != NULL && !state1->promoted)
-		promote_numeric_agg_state(state1);
-
 	/* manually copy all fields from state2 to state1 */
 	if (state1 == NULL)
 	{
@@ -5309,9 +5297,15 @@ numeric_avg_combine(PG_FUNCTION_ARGS)
 		state1->maxScale = state2->maxScale;
 		state1->maxScaleCount = state2->maxScaleCount;
 
-		/* the clone is a digit-array state by construction */
-		state1->promoted = true;
-		accum_sum_copy(&state1->sumX, &state2->sumX);
+		/* clone state2's representation, whichever mode it is in */
+		state1->promoted = state2->promoted;
+		if (state2->promoted)
+			accum_sum_copy(&state1->sumX, &state2->sumX);
+		else
+		{
+			state1->sumX128 = state2->sumX128;
+			state1->fastScale = state2->fastScale;
+		}
 
 		MemoryContextSwitchTo(old_context);
 
@@ -5337,13 +5331,68 @@ numeric_avg_combine(PG_FUNCTION_ARGS)
 		else if (state2->maxScale == state1->maxScale)
 			state1->maxScaleCount += state2->maxScaleCount;
 
-		/* The rest of this needs to work in the aggregate context */
-		old_context = MemoryContextSwitchTo(agg_context);
+		/*
+		 * If both partial sums are in the fast representation, try to merge
+		 * them there: align the scales (rescaling an exact sum is exact, so a
+		 * later failure leaves a still-correct state1), then add.  Any
+		 * overflow demotes to the digit-array path below.
+		 */
+		if (!state1->promoted && !state2->promoted)
+		{
+			INT128		sum2 = state2->sumX128;
+			bool		ok = true;
 
-		/* Accumulate sums */
-		accum_sum_combine(&state1->sumX, &state2->sumX);
+			if (state2->fastScale > state1->fastScale)
+			{
+				int			k = state2->fastScale - state1->fastScale;
 
-		MemoryContextSwitchTo(old_context);
+				ok = (k <= INT128_POW10_MAX &&
+					  !int128_mul_pow10_overflow(&state1->sumX128, k));
+				if (ok)
+					state1->fastScale = state2->fastScale;
+			}
+			else if (state1->fastScale > state2->fastScale)
+			{
+				int			k = state1->fastScale - state2->fastScale;
+
+				/* rescale a local copy; state2 must not be modified */
+				ok = (k <= INT128_POW10_MAX &&
+					  !int128_mul_pow10_overflow(&sum2, k));
+			}
+
+			if (ok && !int128_add_int128_overflow(&state1->sumX128, sum2))
+				PG_RETURN_POINTER(state1);
+		}
+
+		/* At least one side needs the digit-array path: promote state1 */
+		if (!state1->promoted)
+			promote_numeric_agg_state(state1);
+
+		if (state2->promoted)
+		{
+			/* The rest of this needs to work in the aggregate context */
+			old_context = MemoryContextSwitchTo(agg_context);
+
+			/* Accumulate sums */
+			accum_sum_combine(&state1->sumX, &state2->sumX);
+
+			MemoryContextSwitchTo(old_context);
+		}
+		else
+		{
+			/* materialise state2's int128 sum and add it in */
+			NumericVar	tmp;
+
+			init_var(&tmp);
+			int128_to_numericvar_scaled(state2->sumX128, state2->fastScale,
+										&tmp);
+
+			old_context = MemoryContextSwitchTo(agg_context);
+			accum_sum_add(&state1->sumX, &tmp);
+			MemoryContextSwitchTo(old_context);
+
+			free_var(&tmp);
+		}
 	}
 	PG_RETURN_POINTER(state1);
 }
@@ -5367,26 +5416,38 @@ numeric_avg_serialize(PG_FUNCTION_ARGS)
 
 	state = (NumericAggState *) PG_GETARG_POINTER(0);
 
-	/*
-	 * The serialized format carries only the digit-array representation;
-	 * fold a fast-mode sum into it first.  This trades some of the fast
-	 * path's benefit in parallel plans for wire-format stability; teaching
-	 * the format about the fast representation is left for a separate
-	 * commit.
-	 */
-	if (!state->promoted)
-		promote_numeric_agg_state(state);
-
 	init_var(&tmp_var);
 
 	pq_begintypsend(&buf);
 
+	/*
+	 * mode byte: 0 = digit-array sum follows (the historical layout), 1 =
+	 * int128 fast sum follows.  This state only ever crosses same-binary
+	 * parallel-worker boundaries, so the format is free to change; the mode
+	 * byte lets a promoted worker and a non-promoted one coexist within one
+	 * Finalize node.
+	 */
+	pq_sendbyte(&buf, state->promoted ? 0 : 1);
+
 	/* N */
 	pq_sendint64(&buf, state->N);
 
-	/* sumX */
-	accum_sum_final(&state->sumX, &tmp_var);
-	numericvar_serialize(&buf, &tmp_var);
+	if (state->promoted)
+	{
+		/* sumX */
+		accum_sum_final(&state->sumX, &tmp_var);
+		numericvar_serialize(&buf, &tmp_var);
+	}
+	else
+	{
+		/* only sum/avg states can still be in the fast representation */
+		Assert(!state->calcSumX2);
+
+		/* sumX128, high half then low half, then its scale */
+		pq_sendint64(&buf, (uint64) PG_INT128_HI_INT64(state->sumX128));
+		pq_sendint64(&buf, PG_INT128_LO_UINT64(state->sumX128));
+		pq_sendint32(&buf, state->fastScale);
+	}
 
 	/* maxScale */
 	pq_sendint32(&buf, state->maxScale);
@@ -5439,15 +5500,45 @@ numeric_avg_deserialize(PG_FUNCTION_ARGS)
 
 	result = makeNumericAggStateCurrentContext(false);
 
-	/* the wire format carries the digit-array representation only */
-	result->promoted = true;
+	/* mode byte: see numeric_avg_serialize */
+	switch (pq_getmsgbyte(&buf))
+	{
+		case 0:
+			result->promoted = true;
+			break;
+		case 1:
+			result->promoted = false;
+			break;
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+					 errmsg("invalid numeric aggregate state mode")));
+	}
 
 	/* N */
 	result->N = pq_getmsgint64(&buf);
 
-	/* sumX */
-	numericvar_deserialize(&buf, &tmp_var);
-	accum_sum_add(&(result->sumX), &tmp_var);
+	if (result->promoted)
+	{
+		/* sumX */
+		numericvar_deserialize(&buf, &tmp_var);
+		accum_sum_add(&(result->sumX), &tmp_var);
+	}
+	else
+	{
+		int64		hi;
+		uint64		lo;
+
+		/* sumX128 and its scale */
+		hi = pq_getmsgint64(&buf);
+		lo = (uint64) pq_getmsgint64(&buf);
+		result->sumX128 = make_int128(hi, lo);
+		result->fastScale = pq_getmsgint(&buf, 4);
+		if (result->fastScale < 0 || result->fastScale > NUMERIC_DSCALE_MAX)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+					 errmsg("invalid numeric aggregate state scale")));
+	}
 
 	/* maxScale */
 	result->maxScale = pq_getmsgint(&buf, 4);
