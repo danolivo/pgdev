@@ -19,6 +19,29 @@ test_int128 = executable('test_int128',
 )
 testprep_targets += test_int128
 
+# The overflow-checked primitives in int128.h have three distinct bodies; see
+# the comment at the top of test_int128.c.  Build one binary per configuration
+# so the test exercises all of them rather than only the default.
+test_int128_native = executable('test_int128_native',
+  test_int128_sources,
+  dependencies: [frontend_code, libpq],
+  c_args: ['-DUSE_NATIVE_INT128=1'],
+  kwargs: default_bin_args + {
+    'install': false,
+  },
+)
+testprep_targets += test_int128_native
+
+test_int128_nobuiltin = executable('test_int128_nobuiltin',
+  test_int128_sources,
+  dependencies: [frontend_code, libpq],
+  c_args: ['-DUSE_NATIVE_INT128=1', '-DTEST_INT128_NO_BUILTIN_OVERFLOW'],
+  kwargs: default_bin_args + {
+    'install': false,
+  },
+)
+testprep_targets += test_int128_nobuiltin
+
 
 tests += {
   'name': 'test_int128',
@@ -28,6 +51,6 @@ tests += {
     'tests': [
       't/001_test_int128.pl',
     ],
-    'deps': [test_int128],
+    'deps': [test_int128, test_int128_native, test_int128_nobuiltin],
   },
 }

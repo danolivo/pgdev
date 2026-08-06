@@ -31,6 +31,17 @@
 #define USE_NATIVE_INT128 0
 #endif
 
+/*
+ * The overflow-checked primitives have a third configuration that neither
+ * setting of USE_NATIVE_INT128 reaches on a compiler that has the overflow
+ * builtins: native int128 arithmetic combined with the manual sign rule.
+ * Defining TEST_INT128_NO_BUILTIN_OVERFLOW suppresses the builtins so that
+ * combination can be built and checked here as well.
+ */
+#ifdef TEST_INT128_NO_BUILTIN_OVERFLOW
+#undef HAVE__BUILTIN_OP_OVERFLOW
+#endif
+
 #include "common/int128.h"
 #include "common/pg_prng.h"
 
@@ -87,6 +98,111 @@ main(int argc, char **argv)
 		count = strtol(argv[1], NULL, 0);
 	else
 		count = 1000000000;
+
+	/*
+	 * Deterministic boundary checks for the overflow-checked operations,
+	 * hitting the exact edges that random inputs will practically never find.
+	 * A failure here means overflow detection is wrong at the range limits.
+	 */
+	{
+		const int128 max128 = (int128) ((~(uint128) 0) >> 1);	/* 2^127 - 1 */
+		const int128 min128 = -max128 - 1;	/* -2^127 */
+		test128		a;
+		test128		saved;
+
+		/* max + 1 must overflow and leave the accumulator unchanged */
+		a.i128 = max128;
+		saved = a;
+		if (!int128_add_int128_overflow(&a.I128, int64_to_int128(1)) ||
+			a.hl.hi != saved.hl.hi || a.hl.lo != saved.hl.lo)
+		{
+			printf("add_overflow failure: max + 1\n");
+			return 1;
+		}
+
+		/* max + (-1) must not overflow */
+		a.i128 = max128;
+		if (int128_add_int128_overflow(&a.I128, int64_to_int128(-1)) ||
+			a.i128 != max128 - 1)
+		{
+			printf("add_overflow failure: max + (-1)\n");
+			return 1;
+		}
+
+		/* min - 1 must overflow and leave the accumulator unchanged */
+		a.i128 = min128;
+		saved = a;
+		if (!int128_sub_int128_overflow(&a.I128, int64_to_int128(1)) ||
+			a.hl.hi != saved.hl.hi || a.hl.lo != saved.hl.lo)
+		{
+			printf("sub_overflow failure: min - 1\n");
+			return 1;
+		}
+
+		/* min - min must not overflow (opposite-sign result crossing zero) */
+		a.i128 = min128;
+		saved = a;
+		if (int128_sub_int128_overflow(&a.I128, saved.I128) || a.i128 != 0)
+		{
+			printf("sub_overflow failure: min - min\n");
+			return 1;
+		}
+
+		/* max - (-1) must overflow */
+		a.i128 = max128;
+		if (!int128_sub_int128_overflow(&a.I128, int64_to_int128(-1)))
+		{
+			printf("sub_overflow failure: max - (-1)\n");
+			return 1;
+		}
+
+		/* (max / 10) * 10 fits; (max / 10 + 1) * 10 must overflow */
+		a.i128 = max128 / 10;
+		if (int128_mul_pow10_overflow(&a.I128, 1) ||
+			a.i128 != (max128 / 10) * 10)
+		{
+			printf("mul_pow10 failure: (max / 10) * 10\n");
+			return 1;
+		}
+		a.i128 = max128 / 10 + 1;
+		saved = a;
+		if (!int128_mul_pow10_overflow(&a.I128, 1) ||
+			a.hl.hi != saved.hl.hi || a.hl.lo != saved.hl.lo)
+		{
+			printf("mul_pow10 failure: (max / 10 + 1) * 10\n");
+			return 1;
+		}
+
+		/* k = 0 must be a no-op even at the extremes */
+		a.i128 = min128;
+		if (int128_mul_pow10_overflow(&a.I128, 0) || a.i128 != min128)
+		{
+			printf("mul_pow10 failure: min * 10^0\n");
+			return 1;
+		}
+
+		/* zero stays zero for the largest exponent */
+		a.i128 = 0;
+		if (int128_mul_pow10_overflow(&a.I128, 38) || a.i128 != 0)
+		{
+			printf("mul_pow10 failure: 0 * 10^38\n");
+			return 1;
+		}
+
+		/* 1 * 10^38 fits (10^38 < 2^127); 10 * 10^38 must overflow */
+		a.i128 = 1;
+		if (int128_mul_pow10_overflow(&a.I128, 38))
+		{
+			printf("mul_pow10 failure: 1 * 10^38\n");
+			return 1;
+		}
+		a.i128 = 10;
+		if (!int128_mul_pow10_overflow(&a.I128, 38))
+		{
+			printf("mul_pow10 failure: 10 * 10^38\n");
+			return 1;
+		}
+	}
 
 	while (count-- > 0)
 	{
@@ -210,6 +326,106 @@ main(int argc, char **argv)
 			printf("native = " INT128_HEX_FORMAT "\n", t1.hl.hi, t1.hl.lo);
 			printf("result = " INT128_HEX_FORMAT "\n", t2.hl.hi, t2.hl.lo);
 			return 1;
+		}
+
+		/* check overflow-checked 128-bit addition */
+		t1.hl.hi = x;
+		t1.hl.lo = y;
+		t2 = t1;
+		t3.hl.hi = z;
+		t3.hl.lo = w;
+		{
+			/* reference result via wrap-around-safe unsigned arithmetic */
+			test128		expected;
+			bool		exp_ovf;
+			bool		got_ovf;
+
+			expected.i128 = (int128) ((uint128) t1.i128 + (uint128) t3.i128);
+			exp_ovf = ((t1.i128 < 0) == (t3.i128 < 0) &&
+					   (expected.i128 < 0) != (t1.i128 < 0));
+			if (exp_ovf)
+				expected = t1;	/* accumulator must stay unchanged */
+
+			got_ovf = int128_add_int128_overflow(&t2.I128, t3.I128);
+
+			if (got_ovf != exp_ovf ||
+				t2.hl.hi != expected.hl.hi || t2.hl.lo != expected.hl.lo)
+			{
+				printf(INT128_HEX_FORMAT " +ovf " INT128_HEX_FORMAT "\n", x, y, z, w);
+				printf("expected ovf=%d " INT128_HEX_FORMAT "\n",
+					   exp_ovf, expected.hl.hi, expected.hl.lo);
+				printf("result   ovf=%d " INT128_HEX_FORMAT "\n",
+					   got_ovf, t2.hl.hi, t2.hl.lo);
+				return 1;
+			}
+		}
+
+		/* check overflow-checked 128-bit subtraction */
+		t1.hl.hi = x;
+		t1.hl.lo = y;
+		t2 = t1;
+		t3.hl.hi = z;
+		t3.hl.lo = w;
+		{
+			test128		expected;
+			bool		exp_ovf;
+			bool		got_ovf;
+
+			expected.i128 = (int128) ((uint128) t1.i128 - (uint128) t3.i128);
+			exp_ovf = ((t1.i128 < 0) != (t3.i128 < 0) &&
+					   (expected.i128 < 0) != (t1.i128 < 0));
+			if (exp_ovf)
+				expected = t1;
+
+			got_ovf = int128_sub_int128_overflow(&t2.I128, t3.I128);
+
+			if (got_ovf != exp_ovf ||
+				t2.hl.hi != expected.hl.hi || t2.hl.lo != expected.hl.lo)
+			{
+				printf(INT128_HEX_FORMAT " -ovf " INT128_HEX_FORMAT "\n", x, y, z, w);
+				printf("expected ovf=%d " INT128_HEX_FORMAT "\n",
+					   exp_ovf, expected.hl.hi, expected.hl.lo);
+				printf("result   ovf=%d " INT128_HEX_FORMAT "\n",
+					   got_ovf, t2.hl.hi, t2.hl.lo);
+				return 1;
+			}
+		}
+
+		/* check overflow-checked multiplication by 10^k */
+		t1.hl.hi = x;
+		t1.hl.lo = y;
+		t2 = t1;
+		{
+			const int128 max128 = (int128) ((~(uint128) 0) >> 1);
+			const int128 min128 = -max128 - 1;
+			int			k = (int) (pg_prng_uint32(&pg_global_prng_state) % 39);
+			int128		p10 = 1;
+			test128		expected;
+			bool		exp_ovf;
+			bool		got_ovf;
+
+			for (int i = 0; i < k; i++)
+				p10 *= 10;
+
+			exp_ovf = (t1.i128 != 0 && k > 0 &&
+					   (t1.i128 > max128 / p10 || t1.i128 < min128 / p10));
+			if (exp_ovf)
+				expected = t1;
+			else
+				expected.i128 = t1.i128 * p10;
+
+			got_ovf = int128_mul_pow10_overflow(&t2.I128, k);
+
+			if (got_ovf != exp_ovf ||
+				t2.hl.hi != expected.hl.hi || t2.hl.lo != expected.hl.lo)
+			{
+				printf(INT128_HEX_FORMAT " * 10^%d\n", x, y, k);
+				printf("expected ovf=%d " INT128_HEX_FORMAT "\n",
+					   exp_ovf, expected.hl.hi, expected.hl.lo);
+				printf("result   ovf=%d " INT128_HEX_FORMAT "\n",
+					   got_ovf, t2.hl.hi, t2.hl.lo);
+				return 1;
+			}
 		}
 
 		/* check 128/32-bit division */

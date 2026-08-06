@@ -8,20 +8,27 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-# Run the test program with 1M iterations
-my $exe = "test_int128";
+# One executable per implementation of the overflow-checked primitives: the
+# two-limb fallback, native int128 with the overflow builtins, and native
+# int128 with the manual sign rule.  See test_int128.c.
+my @exes = ('test_int128', 'test_int128_native', 'test_int128_nobuiltin');
+
+# Run each test program with 1M iterations
 my $size = 1_000_000;
 
-note "testing executable $exe";
-
-my ($stdout, $stderr) = run_command([ $exe, $size ]);
-
-SKIP:
+foreach my $exe (@exes)
 {
-	skip "no native int128 type", 2 if $stdout =~ /skipping tests/;
+	note "testing executable $exe";
 
-	is($stdout, "", "test_int128: no stdout");
-	is($stderr, "", "test_int128: no stderr");
+	my ($stdout, $stderr) = run_command([ $exe, $size ]);
+
+	SKIP:
+	{
+		skip "no native int128 type", 2 if $stdout =~ /skipping tests/;
+
+		is($stdout, "", "$exe: no stdout");
+		is($stderr, "", "$exe: no stderr");
+	}
 }
 
 done_testing();
