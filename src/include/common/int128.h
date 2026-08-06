@@ -474,4 +474,248 @@ int128_to_int64(INT128 val)
 #endif
 }
 
+/*
+ * Overflow-checked operations.
+ *
+ * These are for callers that must detect overflow and fall back to a wider
+ * representation rather than error out, so on overflow they leave their
+ * target untouched.
+ */
+
+/*
+ * Add an INT128 value into an INT128 variable, checking for overflow.
+ *
+ * Returns true (leaving *i128 unchanged) if the sum does not fit,
+ * otherwise updates *i128 and returns false.
+ */
+static inline bool
+int128_add_int128_overflow(INT128 *i128, INT128 v)
+{
+#if USE_NATIVE_INT128 && defined(HAVE__BUILTIN_OP_OVERFLOW)
+	/*
+	 * Compilers expand a 128-bit add-with-overflow inline (add/adc and a
+	 * flag test), so unlike multiplication this needs no runtime library
+	 * support.
+	 */
+	int128		result;
+
+	if (__builtin_add_overflow(*i128, v, &result))
+		return true;
+	*i128 = result;
+	return false;
+#else
+	/*
+	 * Signed overflow occurs iff the addends have the same sign and the
+	 * result's sign differs from it.  Compute the raw sum entirely in
+	 * unsigned arithmetic (which wraps by definition, so there is no
+	 * undefined behaviour to trip over), then apply the sign rule.
+	 */
+	INT128		result = *i128;
+	bool		lhs_neg = (PG_INT128_HI_INT64(result) < 0);
+	bool		rhs_neg = (PG_INT128_HI_INT64(v) < 0);
+
+#if USE_NATIVE_INT128
+	result = (int128) ((uint128) result + (uint128) v);
+#else
+	{
+		uint64		oldlo = result.lo;
+
+		result.lo += v.lo;
+		result.hi = (int64) ((uint64) result.hi + (uint64) v.hi +
+							 (result.lo < oldlo));
+	}
+#endif
+	if (lhs_neg == rhs_neg &&
+		(PG_INT128_HI_INT64(result) < 0) != lhs_neg)
+		return true;
+	*i128 = result;
+	return false;
+#endif
+}
+
+/*
+ * Largest k for which 10^k is representable in a signed 64-bit integer.
+ */
+#define INT64_POW10_MAX		18
+
+/*
+ * 10^k as int64, for 0 <= k <= INT64_POW10_MAX.  It is up to the caller to
+ * keep the index within that range.
+ */
+static const int64 pow10_int64[INT64_POW10_MAX + 1] = {
+	INT64CONST(1),
+	INT64CONST(10),
+	INT64CONST(100),
+	INT64CONST(1000),
+	INT64CONST(10000),
+	INT64CONST(100000),
+	INT64CONST(1000000),
+	INT64CONST(10000000),
+	INT64CONST(100000000),
+	INT64CONST(1000000000),
+	INT64CONST(10000000000),
+	INT64CONST(100000000000),
+	INT64CONST(1000000000000),
+	INT64CONST(10000000000000),
+	INT64CONST(100000000000000),
+	INT64CONST(1000000000000000),
+	INT64CONST(10000000000000000),
+	INT64CONST(100000000000000000),
+	INT64CONST(1000000000000000000)
+};
+
+/*
+ * Largest k for which 10^k is representable in a signed 128-bit integer.
+ */
+#define INT128_POW10_MAX	38
+
+/*
+ * Multiply an INT128 variable by 10^k, checking for overflow.
+ *
+ * Returns true (leaving *i128 unchanged) if the product does not fit,
+ * otherwise updates *i128 and returns false.  Any k >= 0 is accepted:
+ * zero stays zero, and any other value overflows for k > INT128_POW10_MAX.
+ *
+ * This is the decimal-rescaling primitive: it aligns fixed-point
+ * coefficients to a common scale.
+ *
+ * The overflow test is exact and the same on every platform: v * 10^k fits
+ * iff |v| <= floor((2^127 - 1) / 10^k).  One bound serves both signs,
+ * because 2^127 is not a multiple of 10: no product of 10^k (k > 0) can
+ * equal -2^127, so the extra negative value adds nothing.  Once the bound
+ * holds, the multiplication itself cannot overflow.
+ *
+ * __builtin_mul_overflow() is deliberately not used.  configure only
+ * verifies it for 64-bit operands; for 128-bit operands some compilers emit
+ * a call to a runtime helper (__muloti4) that libgcc does not provide.
+ */
+static inline bool
+int128_mul_pow10_overflow(INT128 *i128, int k)
+{
+	/* limits[k] = floor((2^127 - 1) / 10^k), as {high, low} 64-bit halves */
+	static const uint64 limits[INT128_POW10_MAX + 1][2] = {
+		{UINT64CONST(0x7FFFFFFFFFFFFFFF), UINT64CONST(0xFFFFFFFFFFFFFFFF)},
+		{UINT64CONST(0x0CCCCCCCCCCCCCCC), UINT64CONST(0xCCCCCCCCCCCCCCCC)},
+		{UINT64CONST(0x0147AE147AE147AE), UINT64CONST(0x147AE147AE147AE1)},
+		{UINT64CONST(0x0020C49BA5E353F7), UINT64CONST(0xCED916872B020C49)},
+		{UINT64CONST(0x000346DC5D638865), UINT64CONST(0x94AF4F0D844D013A)},
+		{UINT64CONST(0x000053E2D6238DA3), UINT64CONST(0xC21187E7C06E19B9)},
+		{UINT64CONST(0x000008637BD05AF6), UINT64CONST(0xC69B5A63F9A49C2C)},
+		{UINT64CONST(0x000000D6BF94D5E5), UINT64CONST(0x7A42BC3D32907604)},
+		{UINT64CONST(0x00000015798EE230), UINT64CONST(0x8C39DF9FB841A566)},
+		{UINT64CONST(0x0000000225C17D04), UINT64CONST(0xDAD2965CC5A02A23)},
+		{UINT64CONST(0x0000000036F9BFB3), UINT64CONST(0xAF7B756FAD5CD103)},
+		{UINT64CONST(0x00000000057F5FF8), UINT64CONST(0x5E592557F7BC7B4D)},
+		{UINT64CONST(0x00000000008CBCCC), UINT64CONST(0x096F5088CBF93F87)},
+		{UINT64CONST(0x00000000000E12E1), UINT64CONST(0x3424BB40E132865A)},
+		{UINT64CONST(0x0000000000016849), UINT64CONST(0xB86A12B9B01EA709)},
+		{UINT64CONST(0x0000000000002407), UINT64CONST(0x5F3DCEAC2B3643E7)},
+		{UINT64CONST(0x000000000000039A), UINT64CONST(0x5652FB1137856D30)},
+		{UINT64CONST(0x000000000000005C), UINT64CONST(0x3BD5191B525A2484)},
+		{UINT64CONST(0x0000000000000009), UINT64CONST(0x392EE8E921D5D073)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0xEC1E4A7DB69561A5)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x179CA10C9242235D)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x025C768141D369EF)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x003C7240202EBDCB)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x00060B6CD004AC94)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x00009ABE14CD4475)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x00000F79687AED3E)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x0000018C240C4AEC)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x000000279D346DE4)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x00000003F61ED7CA)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x0000000065697BFA)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x000000000A2425FF)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x0000000001039D66)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x000000000019F623)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x000000000002989D)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x0000000000004276)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x00000000000006A5)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x00000000000000AA)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x0000000000000011)},
+		{UINT64CONST(0x0000000000000000), UINT64CONST(0x0000000000000001)}
+	};
+
+	Assert(k >= 0);
+
+	if (k == 0 || int128_is_zero(*i128))
+		return false;
+	if (k > INT128_POW10_MAX)
+		return true;
+
+#if USE_NATIVE_INT128
+	{
+		int128		limit = make_int128((int64) limits[k][0], limits[k][1]);
+		int128		result = *i128;
+
+		if (result > limit || result < -limit)
+			return true;
+
+		/* the bound holds, so no partial product can overflow */
+		while (k > 0)
+		{
+			int			chunk = Min(k, INT64_POW10_MAX);
+
+			result *= pow10_int64[chunk];
+			k -= chunk;
+		}
+		*i128 = result;
+	}
+#else
+	{
+		static const uint32 pow10_32[] = {
+			1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000,
+			1000000000
+		};
+		bool		neg = (i128->hi < 0);
+		uint64		abs_hi = (uint64) i128->hi;
+		uint64		abs_lo = i128->lo;
+
+		/* magnitude; for -2^127 this is 2^127, still representable here */
+		if (neg)
+		{
+			abs_lo = 0 - abs_lo;
+			abs_hi = 0 - abs_hi - (abs_lo != 0);
+		}
+
+		if (abs_hi > limits[k][0] ||
+			(abs_hi == limits[k][0] && abs_lo > limits[k][1]))
+			return true;
+
+		/*
+		 * Multiply the magnitude by 10^k in chunks that fit in uint32, using
+		 * 32-bit-limb schoolbook multiplication.  The bound above guarantees
+		 * that nothing carries out of the top limb.
+		 */
+		while (k > 0)
+		{
+			int			chunk = Min(k, 9);
+			uint64		m = pow10_32[chunk];
+			uint64		r0,
+						r1,
+						r2,
+						r3;
+
+			r0 = (abs_lo & UINT64CONST(0xFFFFFFFF)) * m;
+			r1 = (abs_lo >> 32) * m + (r0 >> 32);
+			r2 = (abs_hi & UINT64CONST(0xFFFFFFFF)) * m + (r1 >> 32);
+			r3 = (abs_hi >> 32) * m + (r2 >> 32);
+			Assert((r3 >> 31) == 0);
+
+			abs_lo = (r1 << 32) | (r0 & UINT64CONST(0xFFFFFFFF));
+			abs_hi = (r3 << 32) | (r2 & UINT64CONST(0xFFFFFFFF));
+			k -= chunk;
+		}
+
+		if (neg)
+		{
+			abs_lo = 0 - abs_lo;
+			abs_hi = 0 - abs_hi - (abs_lo != 0);
+		}
+		i128->hi = (int64) abs_hi;
+		i128->lo = abs_lo;
+	}
+#endif
+	return false;
+}
+
 #endif							/* INT128_H */
