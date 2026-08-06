@@ -3895,3 +3895,148 @@ SELECT pg_lsn(18446744073709551616::numeric);
 ERROR:  pg_lsn out of range
 SELECT pg_lsn('NaN'::numeric);
 ERROR:  cannot convert NaN to pg_lsn
+--
+-- Tests for the int128 fast-path aggregate accumulator and its promotion
+-- to the digit-array accumulator.  Results must be identical no matter
+-- whether or when the promotion happened.
+--
+-- promotion at every spike position: a failure means the result depends on
+-- where the accumulator overflowed
+SELECT k AS spike_pos,
+       (SELECT sum(v) FROM (
+          SELECT CASE WHEN i = k
+                      THEN 99999999999999999999999999999999999999::numeric
+                      ELSE 1.01::numeric END AS v
+          FROM generate_series(0, 9) i) s) AS total
+FROM generate_series(0, 9) k;
+ spike_pos |                   total                    
+-----------+--------------------------------------------
+         0 | 100000000000000000000000000000000000008.09
+         1 | 100000000000000000000000000000000000008.09
+         2 | 100000000000000000000000000000000000008.09
+         3 | 100000000000000000000000000000000000008.09
+         4 | 100000000000000000000000000000000000008.09
+         5 | 100000000000000000000000000000000000008.09
+         6 | 100000000000000000000000000000000000008.09
+         7 | 100000000000000000000000000000000000008.09
+         8 | 100000000000000000000000000000000000008.09
+         9 | 100000000000000000000000000000000000008.09
+(10 rows)
+
+-- promotion via add overflow: two values that individually fit int128
+SELECT sum(v) FROM (VALUES
+  (99999999999999999999999999999999999999::numeric),
+  (99999999999999999999999999999999999999::numeric)) s(v);
+                   sum                   
+-----------------------------------------
+ 199999999999999999999999999999999999998
+(1 row)
+
+-- fast negative sums and sign-crossing
+SELECT sum(v) FROM (VALUES
+  (-99999999999999999999999999999999999999::numeric),
+  (-99999999999999999999999999999999999999::numeric),
+  (99999999999999999999999999999999999999::numeric)) s(v);
+                   sum                   
+-----------------------------------------
+ -99999999999999999999999999999999999999
+(1 row)
+
+-- display scale must be the widest input dscale, before and after promotion
+SELECT sum(v) FROM (VALUES (1.5::numeric), (2.25::numeric), (3::numeric)) s(v);
+ sum  
+------
+ 6.75
+(1 row)
+
+SELECT sum(v) FROM (VALUES (1.5::numeric), (0.0000000000::numeric)) s(v);
+     sum      
+--------------
+ 1.5000000000
+(1 row)
+
+SELECT sum(v) FROM (VALUES
+  (1.5::numeric),
+  (99999999999999999999999999999999999999::numeric),
+  (99999999999999999999999999999999999999::numeric),
+  (0.125::numeric)) s(v);
+                     sum                     
+---------------------------------------------
+ 199999999999999999999999999999999999999.625
+(1 row)
+
+-- avg across the promotion boundary divides through the regular path
+SELECT avg(v) FROM (VALUES
+  (99999999999999999999999999999999999999::numeric),
+  (1::numeric)) s(v);
+                  avg                   
+----------------------------------------
+ 50000000000000000000000000000000000000
+(1 row)
+
+-- zero values may widen the accumulator scale beyond what int128 can
+-- represent for nonzero values; a later nonzero input must fall back
+-- cleanly and the result must keep the widest input dscale
+SELECT sum(v) FROM (VALUES
+  (0.00000000000000000000::numeric),
+  (0.0000000000000000000000000000000000000000::numeric),
+  (1.5::numeric)) s(v);
+                    sum                     
+--------------------------------------------
+ 1.5000000000000000000000000000000000000000
+(1 row)
+
+-- a first value whose dscale alone exceeds the fast range
+SELECT sum(v) FROM (VALUES
+  (0.00000000000000000000000000000000000000000000000001::numeric),
+  (2::numeric)) s(v);
+                         sum                          
+------------------------------------------------------
+ 2.00000000000000000000000000000000000000000000000001
+(1 row)
+
+-- specials bypass the accumulator in both modes
+SELECT sum(v) FROM (VALUES ('nan'::numeric), (1.1::numeric)) s(v);
+ sum 
+-----
+ NaN
+(1 row)
+
+SELECT sum(v) FROM (VALUES ('inf'::numeric), ('-inf'::numeric), (1::numeric)) s(v);
+ sum 
+-----
+ NaN
+(1 row)
+
+-- FILTER and DISTINCT go through the same transition function
+SELECT sum(v) FILTER (WHERE v < 10),
+       sum(DISTINCT v)
+FROM (VALUES (1.5::numeric), (1.5::numeric), (2.25::numeric),
+             (99999999999999999999999999999999999999::numeric)) s(v);
+ sum  |                    sum                     
+------+--------------------------------------------
+ 5.25 | 100000000000000000000000000000000000002.75
+(1 row)
+
+-- moving-aggregate (window) mode: subtraction, promotion inside a frame,
+-- and dscale-retreat rescans must all give the plain-aggregation answer
+SELECT i, sum(v) OVER (ORDER BY i ROWS BETWEEN 2 PRECEDING AND CURRENT ROW)
+FROM (VALUES (1, 1.01::numeric),
+             (2, 99999999999999999999999999999999999999::numeric),
+             (3, 2.5::numeric),
+             (4, 3.000::numeric),
+             (5, 4::numeric),
+             (6, 99999999999999999999999999999999999999::numeric),
+             (7, 99999999999999999999999999999999999999::numeric)) t(i, v)
+ORDER BY i;
+ i |                     sum                     
+---+---------------------------------------------
+ 1 |                                        1.01
+ 2 |  100000000000000000000000000000000000000.01
+ 3 |  100000000000000000000000000000000000002.51
+ 4 | 100000000000000000000000000000000000004.500
+ 5 |                                       9.500
+ 6 | 100000000000000000000000000000000000006.000
+ 7 |     200000000000000000000000000000000000002
+(7 rows)
+
