@@ -494,6 +494,61 @@ static void dump_var(const char *str, NumericVar *var);
 	(weight) <= NUMERIC_SHORT_WEIGHT_MAX && \
 	(weight) >= NUMERIC_SHORT_WEIGHT_MIN)
 
+/* ----------
+ * Unpacking a numeric into a local buffer.
+ *
+ * Numerics reaching the comparison and hashing functions normally come
+ * straight out of a tuple, where they are stored with a one-byte varlena
+ * header.  DatumGetNumeric() then palloc's a copy with the four-byte header
+ * that the NUMERIC_* accessors require, which is a large share of the cost of
+ * these functions: they are hot, tiny, and otherwise allocation-free.  Since
+ * they never let the value outlive the call, they can unpack into a buffer on
+ * the caller's stack instead.  Only compressed, out-of-line, or unusually long
+ * values still take the DatumGetNumeric() path.
+ *
+ * NUMERIC_LOCAL_NDIGITS covers values of up to 128 decimal digits, well beyond
+ * anything used as a sort or hash key in practice.
+ * ----------
+ */
+#define NUMERIC_LOCAL_NDIGITS	32
+
+typedef union NumericLocalBuf
+{
+	struct NumericData num;
+	char		data[NUMERIC_HDRSZ + NUMERIC_LOCAL_NDIGITS * sizeof(NumericDigit)];
+} NumericLocalBuf;
+
+/*
+ * Return a four-byte-header Numeric for X, using *buf when possible.  Sets
+ * *needfree if the result was palloc'd and must be pfree'd by the caller.
+ */
+static inline Numeric
+numeric_unpack_local(Datum X, NumericLocalBuf *buf, bool *needfree)
+{
+	struct varlena *attr = (struct varlena *) DatumGetPointer(X);
+
+	*needfree = false;
+
+	if (VARATT_IS_SHORT(attr))
+	{
+		Size		data_size = VARSIZE_SHORT(attr) - VARHDRSZ_SHORT;
+
+		if (likely(data_size <= sizeof(buf->data) - VARHDRSZ))
+		{
+			SET_VARSIZE(&buf->num, data_size + VARHDRSZ);
+			memcpy((char *) &buf->num + VARHDRSZ,
+				   VARDATA_SHORT(attr), data_size);
+			return &buf->num;
+		}
+	}
+	else if (likely(!VARATT_IS_EXTENDED(attr)))
+		return (Numeric) attr;
+
+	/* compressed, out-of-line, or too long for the local buffer */
+	*needfree = true;
+	return DatumGetNumeric(X);
+}
+
 static void alloc_var(NumericVar *var, int ndigits);
 static void free_var(NumericVar *var);
 static void zero_var(NumericVar *var);
@@ -2285,15 +2340,19 @@ numeric_abbrev_abort(int memtupcount, SortSupport ssup)
 static int
 numeric_fast_cmp(Datum x, Datum y, SortSupport ssup)
 {
-	Numeric		nx = DatumGetNumeric(x);
-	Numeric		ny = DatumGetNumeric(y);
+	NumericLocalBuf bufx;
+	NumericLocalBuf bufy;
+	bool		freex;
+	bool		freey;
+	Numeric		nx = numeric_unpack_local(x, &bufx, &freex);
+	Numeric		ny = numeric_unpack_local(y, &bufy, &freey);
 	int			result;
 
 	result = cmp_numerics(nx, ny);
 
-	if (nx != DatumGetPointer(x))
+	if (unlikely(freex))
 		pfree(nx);
-	if (ny != DatumGetPointer(y))
+	if (unlikely(freey))
 		pfree(ny);
 
 	return result;
@@ -2422,14 +2481,20 @@ numeric_abbrev_convert_var(const NumericVar *var, NumericSortSupport *nss)
 Datum
 numeric_cmp(PG_FUNCTION_ARGS)
 {
-	Numeric		num1 = PG_GETARG_NUMERIC(0);
-	Numeric		num2 = PG_GETARG_NUMERIC(1);
+	NumericLocalBuf buf1;
+	NumericLocalBuf buf2;
+	bool		free1;
+	bool		free2;
+	Numeric		num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
+	Numeric		num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
 	int			result;
 
 	result = cmp_numerics(num1, num2);
 
-	PG_FREE_IF_COPY(num1, 0);
-	PG_FREE_IF_COPY(num2, 1);
+	if (unlikely(free1))
+		pfree(num1);
+	if (unlikely(free2))
+		pfree(num2);
 
 	PG_RETURN_INT32(result);
 }
@@ -2438,14 +2503,44 @@ numeric_cmp(PG_FUNCTION_ARGS)
 Datum
 numeric_eq(PG_FUNCTION_ARGS)
 {
-	Numeric		num1 = PG_GETARG_NUMERIC(0);
-	Numeric		num2 = PG_GETARG_NUMERIC(1);
+	struct varlena *att1 = (struct varlena *) PG_GETARG_POINTER(0);
+	struct varlena *att2 = (struct varlena *) PG_GETARG_POINTER(1);
+	NumericLocalBuf buf1;
+	NumericLocalBuf buf2;
+	bool		free1;
+	bool		free2;
+	Numeric		num1;
+	Numeric		num2;
 	bool		result;
+
+	/*
+	 * Identical stored representations always denote equal values, so for
+	 * equality (unlike ordering) we can start with a memcmp.  Values of the
+	 * same column share a display scale and store the same digits, so this
+	 * hits for nearly every comparison done by hash aggregation and hash
+	 * joins, and saves unpacking either input.  Values that compare equal
+	 * with different scales, and compressed or out-of-line values, just fall
+	 * through to the general case.
+	 */
+	if (likely(!VARATT_IS_COMPRESSED(att1) && !VARATT_IS_EXTERNAL(att1) &&
+			   !VARATT_IS_COMPRESSED(att2) && !VARATT_IS_EXTERNAL(att2)))
+	{
+		Size		len = VARSIZE_ANY_EXHDR(att1);
+
+		if (len == VARSIZE_ANY_EXHDR(att2) &&
+			memcmp(VARDATA_ANY(att1), VARDATA_ANY(att2), len) == 0)
+			PG_RETURN_BOOL(true);
+	}
+
+	num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
+	num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
 
 	result = cmp_numerics(num1, num2) == 0;
 
-	PG_FREE_IF_COPY(num1, 0);
-	PG_FREE_IF_COPY(num2, 1);
+	if (unlikely(free1))
+		pfree(num1);
+	if (unlikely(free2))
+		pfree(num2);
 
 	PG_RETURN_BOOL(result);
 }
@@ -2453,14 +2548,20 @@ numeric_eq(PG_FUNCTION_ARGS)
 Datum
 numeric_ne(PG_FUNCTION_ARGS)
 {
-	Numeric		num1 = PG_GETARG_NUMERIC(0);
-	Numeric		num2 = PG_GETARG_NUMERIC(1);
+	NumericLocalBuf buf1;
+	NumericLocalBuf buf2;
+	bool		free1;
+	bool		free2;
+	Numeric		num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
+	Numeric		num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
 	bool		result;
 
 	result = cmp_numerics(num1, num2) != 0;
 
-	PG_FREE_IF_COPY(num1, 0);
-	PG_FREE_IF_COPY(num2, 1);
+	if (unlikely(free1))
+		pfree(num1);
+	if (unlikely(free2))
+		pfree(num2);
 
 	PG_RETURN_BOOL(result);
 }
@@ -2468,14 +2569,20 @@ numeric_ne(PG_FUNCTION_ARGS)
 Datum
 numeric_gt(PG_FUNCTION_ARGS)
 {
-	Numeric		num1 = PG_GETARG_NUMERIC(0);
-	Numeric		num2 = PG_GETARG_NUMERIC(1);
+	NumericLocalBuf buf1;
+	NumericLocalBuf buf2;
+	bool		free1;
+	bool		free2;
+	Numeric		num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
+	Numeric		num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
 	bool		result;
 
 	result = cmp_numerics(num1, num2) > 0;
 
-	PG_FREE_IF_COPY(num1, 0);
-	PG_FREE_IF_COPY(num2, 1);
+	if (unlikely(free1))
+		pfree(num1);
+	if (unlikely(free2))
+		pfree(num2);
 
 	PG_RETURN_BOOL(result);
 }
@@ -2483,14 +2590,20 @@ numeric_gt(PG_FUNCTION_ARGS)
 Datum
 numeric_ge(PG_FUNCTION_ARGS)
 {
-	Numeric		num1 = PG_GETARG_NUMERIC(0);
-	Numeric		num2 = PG_GETARG_NUMERIC(1);
+	NumericLocalBuf buf1;
+	NumericLocalBuf buf2;
+	bool		free1;
+	bool		free2;
+	Numeric		num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
+	Numeric		num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
 	bool		result;
 
 	result = cmp_numerics(num1, num2) >= 0;
 
-	PG_FREE_IF_COPY(num1, 0);
-	PG_FREE_IF_COPY(num2, 1);
+	if (unlikely(free1))
+		pfree(num1);
+	if (unlikely(free2))
+		pfree(num2);
 
 	PG_RETURN_BOOL(result);
 }
@@ -2498,14 +2611,20 @@ numeric_ge(PG_FUNCTION_ARGS)
 Datum
 numeric_lt(PG_FUNCTION_ARGS)
 {
-	Numeric		num1 = PG_GETARG_NUMERIC(0);
-	Numeric		num2 = PG_GETARG_NUMERIC(1);
+	NumericLocalBuf buf1;
+	NumericLocalBuf buf2;
+	bool		free1;
+	bool		free2;
+	Numeric		num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
+	Numeric		num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
 	bool		result;
 
 	result = cmp_numerics(num1, num2) < 0;
 
-	PG_FREE_IF_COPY(num1, 0);
-	PG_FREE_IF_COPY(num2, 1);
+	if (unlikely(free1))
+		pfree(num1);
+	if (unlikely(free2))
+		pfree(num2);
 
 	PG_RETURN_BOOL(result);
 }
@@ -2513,14 +2632,20 @@ numeric_lt(PG_FUNCTION_ARGS)
 Datum
 numeric_le(PG_FUNCTION_ARGS)
 {
-	Numeric		num1 = PG_GETARG_NUMERIC(0);
-	Numeric		num2 = PG_GETARG_NUMERIC(1);
+	NumericLocalBuf buf1;
+	NumericLocalBuf buf2;
+	bool		free1;
+	bool		free2;
+	Numeric		num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
+	Numeric		num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
 	bool		result;
 
 	result = cmp_numerics(num1, num2) <= 0;
 
-	PG_FREE_IF_COPY(num1, 0);
-	PG_FREE_IF_COPY(num2, 1);
+	if (unlikely(free1))
+		pfree(num1);
+	if (unlikely(free2))
+		pfree(num2);
 
 	PG_RETURN_BOOL(result);
 }
@@ -2720,7 +2845,10 @@ in_range_numeric_numeric(PG_FUNCTION_ARGS)
 Datum
 hash_numeric(PG_FUNCTION_ARGS)
 {
-	Numeric		key = PG_GETARG_NUMERIC(0);
+	NumericLocalBuf localbuf;
+	bool		needfree;
+	Numeric		key = numeric_unpack_local(PG_GETARG_DATUM(0), &localbuf,
+										   &needfree);
 	Datum		digit_hash;
 	Datum		result;
 	int			weight;
@@ -2732,7 +2860,11 @@ hash_numeric(PG_FUNCTION_ARGS)
 
 	/* If it's NaN or infinity, don't try to hash the rest of the fields */
 	if (NUMERIC_IS_SPECIAL(key))
+	{
+		if (unlikely(needfree))
+			pfree(key);
 		PG_RETURN_UINT32(0);
+	}
 
 	weight = NUMERIC_WEIGHT(key);
 	start_offset = 0;
@@ -2764,7 +2896,11 @@ hash_numeric(PG_FUNCTION_ARGS)
 	 * regardless of any other fields.
 	 */
 	if (NUMERIC_NDIGITS(key) == start_offset)
+	{
+		if (unlikely(needfree))
+			pfree(key);
 		PG_RETURN_UINT32(-1);
+	}
 
 	for (i = NUMERIC_NDIGITS(key) - 1; i >= 0; i--)
 	{
@@ -2790,6 +2926,9 @@ hash_numeric(PG_FUNCTION_ARGS)
 	/* Mix in the weight, via XOR */
 	result = digit_hash ^ weight;
 
+	if (unlikely(needfree))
+		pfree(key);
+
 	PG_RETURN_DATUM(result);
 }
 
@@ -2800,7 +2939,10 @@ hash_numeric(PG_FUNCTION_ARGS)
 Datum
 hash_numeric_extended(PG_FUNCTION_ARGS)
 {
-	Numeric		key = PG_GETARG_NUMERIC(0);
+	NumericLocalBuf localbuf;
+	bool		needfree;
+	Numeric		key = numeric_unpack_local(PG_GETARG_DATUM(0), &localbuf,
+										   &needfree);
 	uint64		seed = PG_GETARG_INT64(1);
 	Datum		digit_hash;
 	Datum		result;
@@ -2813,7 +2955,11 @@ hash_numeric_extended(PG_FUNCTION_ARGS)
 
 	/* If it's NaN or infinity, don't try to hash the rest of the fields */
 	if (NUMERIC_IS_SPECIAL(key))
+	{
+		if (unlikely(needfree))
+			pfree(key);
 		PG_RETURN_UINT64(seed);
+	}
 
 	weight = NUMERIC_WEIGHT(key);
 	start_offset = 0;
@@ -2831,7 +2977,11 @@ hash_numeric_extended(PG_FUNCTION_ARGS)
 	}
 
 	if (NUMERIC_NDIGITS(key) == start_offset)
+	{
+		if (unlikely(needfree))
+			pfree(key);
 		PG_RETURN_UINT64(seed - 1);
+	}
 
 	for (i = NUMERIC_NDIGITS(key) - 1; i >= 0; i--)
 	{
@@ -2850,6 +3000,9 @@ hash_numeric_extended(PG_FUNCTION_ARGS)
 								   seed);
 
 	result = UInt64GetDatum(DatumGetUInt64(digit_hash) ^ weight);
+
+	if (unlikely(needfree))
+		pfree(key);
 
 	PG_RETURN_DATUM(result);
 }
