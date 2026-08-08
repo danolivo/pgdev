@@ -21,6 +21,20 @@ GROUP BY по 20 колонкам, 1 млн строк:
 
 ---
 
+## Сразу оговорюсь: Америку я не открываю
+
+Медлительность numeric — старая и хорошо известная тема в pgsql-hackers, работа над ней идёт больше десяти лет подряд. Небольшая хронология, чтобы было видно масштаб:
+
+- **2012.** Коммит с говорящим названием [«Speed up operations on numeric, mostly by avoiding palloc() overhead»](https://www.postgresql.org/message-id/E1TbAvI-0001Ze-Qx@gemulon.postgresql.org). Уже тогда было понятно, что numeric теряет время не только на арифметике.
+- **2013.** Обсуждение [добавления в PostgreSQL десятичной плавающей точки IEEE 754:2008 вместе с аппаратной поддержкой](https://www.postgresql.org/message-id/flat/51B7B932.3000407%402ndquadrant.com) — к этой ветке мы ещё вернёмся в разделе про decimal128. Тогда же отдельно обсуждали [ускорение avg(numeric)](https://www.postgresql.org/message-id/51DAF8E4.20402%40agliodbs.com).
+- **2015.** Принят патч [«Using 128-bit integers for sum, avg and statistics aggregates»](https://commitfest.postgresql.org/3/26/) — 128-битная арифметика в переходных состояниях агрегатов там, где компилятор её поддерживает.
+- **2024.** Joel Jacobson и Dean Rasheed разогнали [умножение](https://www.postgresql.org/message-id/CAEZATCV2qPTGo2Fd8xDs06Q7iU5aorgSa9+Fw9zkuQv1y15rcw@mail.gmail.com) и [деление](https://www.postgresql.org/message-id/CAEZATCVHR10BPDJSANh0u2+Sg6atO3mD0G+CjKDNRMD-C8hKzQ@mail.gmail.com); в обсуждении умножения заявлены ускорения от 25 до 81 %, и всё это попало в [релиз PostgreSQL 18](https://www.postgresql.org/docs/current/release-18.html).
+- **2025.** Ветка [«Improving and extending int128.h to more of numeric.c»](https://www.postgresql.org/message-id/CAEZATCWjPZ6w_JZDZmDJPJhYKKJZx8ywxbZYbvSbtrtKyvN-qw%40mail.gmail.com): int128 расширяют на большую часть `numeric.c`, чтобы агрегаты считали в 128 битах на всех платформах, а не только там, где такой тип есть в компиляторе.
+
+Обратите внимание на одну деталь в этом списке. Почти всё перечисленное — про **арифметику**: умножение, деление, агрегаты. А самая дорогая статья в моём замере, как выяснится дальше, лежит совсем не там. Так что эта статья — не «я нашёл проблему», а «вот куда именно уходит время и какая его часть до сих пор почти не тронута».
+
+---
+
 ## Из чего сделан numeric
 
 Начнём с того, как значение вообще лежит в таблице.
@@ -430,7 +444,7 @@ select (1e16::float8 - 1e16::float8 + 1.0)::text;   -- 1
 
 Так почему в PostgreSQL нет decimal128?
 
-Попытки были. Было [обсуждение в pgsql-hackers 2013 года](https://www.postgresql.org/message-id/51B7B932.3000407@2ndquadrant.com) — добавить DECIMAL32/64/128 поверх gcc-шных `_Decimal*` с неявным приведением к numeric. Была [более поздняя ветка Decimal64/Decimal128](https://www.postgresql.org/message-id/CAFWGqnsuyOKdOwsNLVtDU1LLjS=66xmxxxS8Chnng_zSB5_uCg@mail.gmail.com) и [расширение pgdecimal2](https://pgxn.org/dist/pgdecimal2/) поверх библиотеки decNumber; по замерам автора арифметика decimal64 выходит примерно вдвое быстрее numeric, decimal128 — в полтора раза.
+Попытки были. Та самая [ветка 2013 года](https://www.postgresql.org/message-id/flat/51B7B932.3000407%402ndquadrant.com) из хронологии в начале статьи предлагала добавить DECIMAL32/64/128 поверх gcc-шных `_Decimal*` с неявным приведением к numeric. Была [более поздняя ветка Decimal64/Decimal128](https://www.postgresql.org/message-id/CAFWGqnsuyOKdOwsNLVtDU1LLjS=66xmxxxS8Chnng_zSB5_uCg@mail.gmail.com) и [расширение pgdecimal2](https://pgxn.org/dist/pgdecimal2/) поверх библиотеки decNumber; по замерам автора арифметика decimal64 выходит примерно вдвое быстрее numeric, decimal128 — в полтора раза.
 
 Заменой numeric это не стало по трём причинам:
 
@@ -467,4 +481,5 @@ select (1e16::float8 - 1e16::float8 + 1.0)::text;   -- 1
 - [Документация: TOAST и хранение varlena](https://www.postgresql.org/docs/current/storage-toast.html)
 - [Исходник `heaptuple.c`](https://github.com/postgres/postgres/blob/master/src/backend/access/common/heaptuple.c) — как строка разбирается на колонки и где ломается кэш смещений
 - [Формат decimal128](https://handwiki.org/wiki/Decimal128_floating-point_format) — когорты, обе схемы кодирования (BID и DPD), диапазоны
-- [Обсуждение IEEE 754:2008 decimal в pgsql-hackers](https://www.postgresql.org/message-id/51B7B932.3000407@2ndquadrant.com) и [расширение pgdecimal2](https://pgxn.org/dist/pgdecimal2/)
+- [Обсуждение IEEE 754:2008 decimal в pgsql-hackers](https://www.postgresql.org/message-id/flat/51B7B932.3000407%402ndquadrant.com) и [расширение pgdecimal2](https://pgxn.org/dist/pgdecimal2/)
+- [Архив pgsql-hackers](https://www.postgresql.org/list/pgsql-hackers/) — все ветки про numeric из хронологии в начале статьи
