@@ -25,10 +25,24 @@ GROUP BY по 20 колонкам, 1 млн строк:
 
 Прежде чем ругать тип, полезно знать, при каких обстоятельствах он родился. Хронология восстанавливается по git и по архивам pgsql-hackers довольно точно.
 
-**До 6.5 никакого точного десятичного типа не было вовсе.** В Postgres95 в `pg_type.h` из вещественных типов только `float4` и `float8` — ни `numeric`, ни `decimal`. В 6.4 слова `NUMERIC` и `DECIMAL` в грамматике уже были, но это была имитация: парсер превращал их в `int4` и ругался на всё, что туда не влезало.
+**До 6.5 никакого точного десятичного типа не было вовсе.** В Postgres95 в `pg_type.h` из вещественных типов только `float4` и `float8` — ни `numeric`, ни `decimal`. В 6.4 слова `NUMERIC` и `DECIMAL` в грамматике уже были, но это была имитация: парсер [подменял их на `integer`](https://github.com/postgres/postgres/blob/REL6_4_2/src/backend/parser/gram.y#L2951-L2963) и [ругался на всё, что туда не влезало](https://github.com/postgres/postgres/blob/REL6_4_2/src/backend/parser/gram.y#L2992-L3026):
 
 ```c
-/* src/backend/parser/gram.y, REL6_4_2 */
+/* src/backend/parser/gram.y, REL6_4_2, строки 2951-2962 */
+        | DECIMAL opt_decimal
+                {
+                    $$ = makeNode(TypeName);
+                    $$->name = xlateSqlType("integer");
+                    $$->typmod = -1;
+                }
+        | NUMERIC opt_numeric
+                {
+                    $$ = makeNode(TypeName);
+                    $$->name = xlateSqlType("integer");
+                    $$->typmod = -1;
+                }
+
+/* строки 2992-3003 */
 opt_numeric:  '(' Iconst ',' Iconst ')'
                 {
                     if ($2 != 9)
@@ -38,7 +52,7 @@ opt_numeric:  '(' Iconst ',' Iconst ')'
                 }
 ```
 
-То есть `NUMERIC(10,5)` был ошибкой, а `NUMERIC(9,0)` — молча целым числом. Сами разработчики называли это в переписке «brain-damaged».
+То есть `NUMERIC(10,5)` был ошибкой, а `NUMERIC(9,0)` — молча целым числом. Сами разработчики называли это в переписке «brain-damaged» — [Томас Локхарт, 18 декабря 1998](https://www.postgresql.org/message-id/3679FF70.FBDCB083%40alumni.caltech.edu), тред «Upgrades for 6.4.1»: «We've got DOUBLE PRECISION, DECIMAL, and NUMERIC (the latter two are brain-damaged though)». В том же треде, тем же вечером, появилось письмо Вика, с которого всё и началось.
 
 **Настоящий тип появился 30 декабря 1998 года**, коммит [`0e9d75c6ac`](https://github.com/postgres/postgres/commit/0e9d75c6ac97cfb370313b0aff803f9f464d0758) Яна Вика (Jan Wieck), 3611 строк в новом `numeric.c`. Вышел он в PostgreSQL 6.5 (июнь 1999). В `pg_type.h` он сразу записан как `-1`, то есть переменной длины, с описанием «arbitrary precision exact numeric data type».
 
