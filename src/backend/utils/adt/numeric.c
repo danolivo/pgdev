@@ -461,6 +461,28 @@ static const NumericVar const_ninf =
 static const int round_powers[4] = {0, 1000, 100, 10};
 #endif
 
+/* 10^i for sub-NBASE decimal shifts in the int128 fast-sum conversions */
+static const int32 pow10_int32[DEC_DIGITS] = {1, 10, 100, 1000};
+
+/* 10^i as int64, for the int64 lane of the fast-sum conversion */
+static const int64 pow10_int64[15] = {
+	INT64CONST(1),
+	INT64CONST(10),
+	INT64CONST(100),
+	INT64CONST(1000),
+	INT64CONST(10000),
+	INT64CONST(100000),
+	INT64CONST(1000000),
+	INT64CONST(10000000),
+	INT64CONST(100000000),
+	INT64CONST(1000000000),
+	INT64CONST(10000000000),
+	INT64CONST(100000000000),
+	INT64CONST(1000000000000),
+	INT64CONST(10000000000000),
+	INT64CONST(100000000000000)
+};
+
 
 /* ----------
  * Local functions
@@ -592,6 +614,10 @@ static bool numericvar_to_int64(const NumericVar *var, int64 *result);
 static void int64_to_numericvar(int64 val, NumericVar *var);
 static bool numericvar_to_uint64(const NumericVar *var, uint64 *result);
 static void int128_to_numericvar(INT128 val, NumericVar *var);
+static bool numericvar_to_int128_scaled(const NumericVar *var, int scale,
+										INT128 *result);
+static void int128_to_numericvar_scaled(INT128 val, int scale,
+										NumericVar *var);
 static double numericvar_to_double_no_overflow(const NumericVar *var);
 
 static Datum numeric_abbrev_convert(Datum original_datum, SortSupport ssup);
@@ -4921,6 +4947,22 @@ numeric_pg_lsn(PG_FUNCTION_ARGS)
 typedef struct NumericAggState
 {
 	bool		calcSumX2;		/* if true, calculate sumX2 */
+
+	/*
+	 * promoted: if false, the running sum lives in sumX128/fastScale (the
+	 * "fast" int128 representation); if true, it lives in sumX (the exact
+	 * digit-array accumulator).  States that must not use the fast
+	 * representation at all (calcSumX2 ones: their sum of squares does not
+	 * fit int128 for realistic inputs) are created with promoted = true, so
+	 * the digit-array path stays the single unconditional fallback for every
+	 * consumer.  Promotion is one-way and exact: it converts sumX128 *
+	 * 10^(-fastScale) into sumX, so results never depend on whether or when
+	 * it happened.
+	 */
+	bool		promoted;
+	INT128		sumX128;		/* running sum while !promoted */
+	int			fastScale;		/* decimal scale of sumX128 */
+
 	MemoryContext agg_context;	/* context we're calculating in */
 	int64		N;				/* count of processed numbers */
 	NumericSumAccum sumX;		/* sum of processed numbers */
@@ -4954,6 +4996,8 @@ makeNumericAggState(FunctionCallInfo fcinfo, bool calcSumX2)
 
 	state = palloc0_object(NumericAggState);
 	state->calcSumX2 = calcSumX2;
+	/* sumX2 users never enter the fast representation; see struct comment */
+	state->promoted = calcSumX2;
 	state->agg_context = agg_context;
 
 	MemoryContextSwitchTo(old_context);
@@ -4972,9 +5016,96 @@ makeNumericAggStateCurrentContext(bool calcSumX2)
 
 	state = palloc0_object(NumericAggState);
 	state->calcSumX2 = calcSumX2;
+	/* same rule as makeNumericAggState() */
+	state->promoted = calcSumX2;
 	state->agg_context = CurrentMemoryContext;
 
 	return state;
+}
+
+/*
+ * Convert the accumulated int128 fast sum into the digit-array accumulator
+ * and switch the state to the (permanent) promoted mode.
+ *
+ * The conversion is exact, so the aggregate result never depends on whether
+ * or when promotion happened.  Note that this only moves the sum itself:
+ * an input that failed to be accumulated the fast way must afterwards be
+ * processed by the regular digit-array path, including its N++.
+ */
+static void
+promote_numeric_agg_state(NumericAggState *state)
+{
+	NumericVar	tmp;
+	MemoryContext old_context;
+
+	Assert(!state->promoted);
+	Assert(!state->calcSumX2);
+
+	/* build the temporary var in the short-lived caller context */
+	init_var(&tmp);
+	int128_to_numericvar_scaled(state->sumX128, state->fastScale, &tmp);
+
+	/* ... but the accumulator's buffers must live in the agg context */
+	old_context = MemoryContextSwitchTo(state->agg_context);
+	accum_sum_add(&state->sumX, &tmp);
+	MemoryContextSwitchTo(old_context);
+
+	free_var(&tmp);
+
+	state->promoted = true;
+#ifdef USE_ASSERT_CHECKING
+	/* poison the fast fields; nothing may read them past this point */
+	state->sumX128 = int64_to_int128(PG_INT64_MIN);
+	state->fastScale = -1;
+#endif
+}
+
+/*
+ * Try to accumulate one finite input value into the int128 fast sum.
+ *
+ * Returns true on success.  Returns false if the value or the rescaled
+ * running sum does not fit the fast representation; the state is still a
+ * correct representation of the previously accumulated inputs then (a
+ * successful rescale of an exact sum is exact), and the caller is expected
+ * to promote and re-process the input on the digit-array path.
+ */
+static bool
+do_numeric_fast_add(NumericAggState *state, const NumericVar *X)
+{
+	INT128		c;
+
+	Assert(!state->promoted);
+	/* variance states are created promoted and must never get here */
+	Assert(!state->calcSumX2);
+
+	if (X->dscale > state->fastScale)
+	{
+		/*
+		 * Widen the accumulator scale to the new input's dscale, keeping the
+		 * invariant fastScale == max dscale of accumulated finite inputs
+		 * (which is what makes the finalised result's display scale match the
+		 * digit-array behaviour).
+		 */
+		int			k = X->dscale - state->fastScale;
+
+		if (k > INT128_POW10_MAX ||
+			int128_mul_pow10_overflow(&state->sumX128, k))
+			return false;
+		state->fastScale = X->dscale;
+	}
+
+	if (!numericvar_to_int128_scaled(X, state->fastScale, &c))
+		return false;
+
+	/*
+	 * Eligible coefficients are below 10^18, so int128 has room for on the
+	 * order of 10^20 of them: this check is effectively unreachable by row
+	 * count alone, and in practice fires only through the rescale above or
+	 * through numeric_avg_combine().  It is still load-bearing rather than
+	 * defensive -- promotion is what keeps the result exact -- so do not
+	 * "optimise" it away on the grounds that it never triggers.
+	 */
+	return !int128_add_int128_overflow(&state->sumX128, c);
 }
 
 /*
@@ -5013,6 +5144,22 @@ do_numeric_accum(NumericAggState *state, Numeric newval)
 	}
 	else if (X.dscale == state->maxScale)
 		state->maxScaleCount++;
+
+	/*
+	 * While the state is not promoted, try the int128 fast representation: no
+	 * allocations, no memory context switches, no digit arrays.  On the first
+	 * input that does not fit, promote the accumulated sum exactly and fall
+	 * through so this input takes the regular path below (including its N++).
+	 */
+	if (!state->promoted)
+	{
+		if (do_numeric_fast_add(state, &X))
+		{
+			state->N++;
+			return;
+		}
+		promote_numeric_agg_state(state);
+	}
 
 	/* if we need X^2, calculate that in short-lived context */
 	if (state->calcSumX2)
@@ -5099,6 +5246,50 @@ do_numeric_discard(NumericAggState *state, Numeric newval)
 		{
 			/* Correct new maxScale is uncertain, must fail */
 			return false;
+		}
+	}
+
+	/*
+	 * Fast-representation inverse: subtract the value from the int128 sum. A
+	 * subtraction can overflow even when both operands fit (opposite signs
+	 * near the range limits), so it must be checked; any failure promotes and
+	 * falls through to the digit-array path.  The dscale bookkeeping above is
+	 * shared and already done.
+	 *
+	 * Note that the value is re-converted against the *current* fastScale,
+	 * which a later input may have widened since this value was accumulated.
+	 * A wider scale means a larger shift, which can push the value outside
+	 * the int64 lane even though it was inside it on the way in.  That is
+	 * safe -- it promotes -- but it means a moving-window aggregate over
+	 * mixed-scale inputs generally leaves the fast representation at its
+	 * first eviction rather than keeping it for the whole scan.
+	 */
+	if (!state->promoted)
+	{
+		if (state->N == 1)
+		{
+			/*
+			 * Removing the last input: mirror the digit-array branch below
+			 * that calls accum_sum_reset() (which zeroes the accumulator's
+			 * dscale as well).  The maxScale bookkeeping for this case has
+			 * already been done by the shared code above.
+			 */
+			state->sumX128 = int64_to_int128(0);
+			state->fastScale = 0;
+			state->N = 0;
+			return true;
+		}
+		else
+		{
+			INT128		c;
+
+			if (numericvar_to_int128_scaled(&X, state->fastScale, &c) &&
+				!int128_sub_int128_overflow(&state->sumX128, c))
+			{
+				state->N--;
+				return true;
+			}
+			promote_numeric_agg_state(state);
 		}
 	}
 
@@ -5285,7 +5476,15 @@ numeric_avg_combine(PG_FUNCTION_ARGS)
 		state1->maxScale = state2->maxScale;
 		state1->maxScaleCount = state2->maxScaleCount;
 
-		accum_sum_copy(&state1->sumX, &state2->sumX);
+		/* clone state2's representation, whichever mode it is in */
+		state1->promoted = state2->promoted;
+		if (state2->promoted)
+			accum_sum_copy(&state1->sumX, &state2->sumX);
+		else
+		{
+			state1->sumX128 = state2->sumX128;
+			state1->fastScale = state2->fastScale;
+		}
 
 		MemoryContextSwitchTo(old_context);
 
@@ -5311,13 +5510,68 @@ numeric_avg_combine(PG_FUNCTION_ARGS)
 		else if (state2->maxScale == state1->maxScale)
 			state1->maxScaleCount += state2->maxScaleCount;
 
-		/* The rest of this needs to work in the aggregate context */
-		old_context = MemoryContextSwitchTo(agg_context);
+		/*
+		 * If both partial sums are in the fast representation, try to merge
+		 * them there: align the scales (rescaling an exact sum is exact, so a
+		 * later failure leaves a still-correct state1), then add.  Any
+		 * overflow demotes to the digit-array path below.
+		 */
+		if (!state1->promoted && !state2->promoted)
+		{
+			INT128		sum2 = state2->sumX128;
+			bool		ok = true;
 
-		/* Accumulate sums */
-		accum_sum_combine(&state1->sumX, &state2->sumX);
+			if (state2->fastScale > state1->fastScale)
+			{
+				int			k = state2->fastScale - state1->fastScale;
 
-		MemoryContextSwitchTo(old_context);
+				ok = (k <= INT128_POW10_MAX &&
+					  !int128_mul_pow10_overflow(&state1->sumX128, k));
+				if (ok)
+					state1->fastScale = state2->fastScale;
+			}
+			else if (state1->fastScale > state2->fastScale)
+			{
+				int			k = state1->fastScale - state2->fastScale;
+
+				/* rescale a local copy; state2 must not be modified */
+				ok = (k <= INT128_POW10_MAX &&
+					  !int128_mul_pow10_overflow(&sum2, k));
+			}
+
+			if (ok && !int128_add_int128_overflow(&state1->sumX128, sum2))
+				PG_RETURN_POINTER(state1);
+		}
+
+		/* At least one side needs the digit-array path: promote state1 */
+		if (!state1->promoted)
+			promote_numeric_agg_state(state1);
+
+		if (state2->promoted)
+		{
+			/* The rest of this needs to work in the aggregate context */
+			old_context = MemoryContextSwitchTo(agg_context);
+
+			/* Accumulate sums */
+			accum_sum_combine(&state1->sumX, &state2->sumX);
+
+			MemoryContextSwitchTo(old_context);
+		}
+		else
+		{
+			/* materialise state2's int128 sum and add it in */
+			NumericVar	tmp;
+
+			init_var(&tmp);
+			int128_to_numericvar_scaled(state2->sumX128, state2->fastScale,
+										&tmp);
+
+			old_context = MemoryContextSwitchTo(agg_context);
+			accum_sum_add(&state1->sumX, &tmp);
+			MemoryContextSwitchTo(old_context);
+
+			free_var(&tmp);
+		}
 	}
 	PG_RETURN_POINTER(state1);
 }
@@ -5345,12 +5599,34 @@ numeric_avg_serialize(PG_FUNCTION_ARGS)
 
 	pq_begintypsend(&buf);
 
+	/*
+	 * mode byte: 0 = digit-array sum follows (the historical layout), 1 =
+	 * int128 fast sum follows.  This state only ever crosses same-binary
+	 * parallel-worker boundaries, so the format is free to change; the mode
+	 * byte lets a promoted worker and a non-promoted one coexist within one
+	 * Finalize node.
+	 */
+	pq_sendbyte(&buf, state->promoted ? 0 : 1);
+
 	/* N */
 	pq_sendint64(&buf, state->N);
 
-	/* sumX */
-	accum_sum_final(&state->sumX, &tmp_var);
-	numericvar_serialize(&buf, &tmp_var);
+	if (state->promoted)
+	{
+		/* sumX */
+		accum_sum_final(&state->sumX, &tmp_var);
+		numericvar_serialize(&buf, &tmp_var);
+	}
+	else
+	{
+		/* only sum/avg states can still be in the fast representation */
+		Assert(!state->calcSumX2);
+
+		/* sumX128, high half then low half, then its scale */
+		pq_sendint64(&buf, PG_INT128_HI_INT64(state->sumX128));
+		pq_sendint64(&buf, (int64) PG_INT128_LO_UINT64(state->sumX128));
+		pq_sendint32(&buf, state->fastScale);
+	}
 
 	/* maxScale */
 	pq_sendint32(&buf, state->maxScale);
@@ -5403,12 +5679,45 @@ numeric_avg_deserialize(PG_FUNCTION_ARGS)
 
 	result = makeNumericAggStateCurrentContext(false);
 
+	/* mode byte: see numeric_avg_serialize */
+	switch (pq_getmsgbyte(&buf))
+	{
+		case 0:
+			result->promoted = true;
+			break;
+		case 1:
+			result->promoted = false;
+			break;
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+					 errmsg("invalid numeric aggregate state mode")));
+	}
+
 	/* N */
 	result->N = pq_getmsgint64(&buf);
 
-	/* sumX */
-	numericvar_deserialize(&buf, &tmp_var);
-	accum_sum_add(&(result->sumX), &tmp_var);
+	if (result->promoted)
+	{
+		/* sumX */
+		numericvar_deserialize(&buf, &tmp_var);
+		accum_sum_add(&(result->sumX), &tmp_var);
+	}
+	else
+	{
+		int64		hi;
+		uint64		lo;
+
+		/* sumX128 and its scale */
+		hi = pq_getmsgint64(&buf);
+		lo = (uint64) pq_getmsgint64(&buf);
+		result->sumX128 = make_int128(hi, lo);
+		result->fastScale = pq_getmsgint(&buf, 4);
+		if (result->fastScale < 0 || result->fastScale > NUMERIC_DSCALE_MAX)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+					 errmsg("invalid numeric aggregate state scale")));
+	}
 
 	/* maxScale */
 	result->maxScale = pq_getmsgint(&buf, 4);
@@ -6141,7 +6450,11 @@ numeric_avg(PG_FUNCTION_ARGS)
 	N_datum = NumericGetDatum(int64_to_numeric(state->N));
 
 	init_var(&sumX_var);
-	accum_sum_final(&state->sumX, &sumX_var);
+	if (!state->promoted)
+		int128_to_numericvar_scaled(state->sumX128, state->fastScale,
+									&sumX_var);
+	else
+		accum_sum_final(&state->sumX, &sumX_var);
 	sumX_datum = NumericGetDatum(make_result(&sumX_var));
 	free_var(&sumX_var);
 
@@ -6173,7 +6486,11 @@ numeric_sum(PG_FUNCTION_ARGS)
 		PG_RETURN_NUMERIC(make_result(&const_ninf));
 
 	init_var(&sumX_var);
-	accum_sum_final(&state->sumX, &sumX_var);
+	if (!state->promoted)
+		int128_to_numericvar_scaled(state->sumX128, state->fastScale,
+									&sumX_var);
+	else
+		accum_sum_final(&state->sumX, &sumX_var);
 	result = make_result(&sumX_var);
 	free_var(&sumX_var);
 
@@ -8161,6 +8478,220 @@ int128_to_numericvar(INT128 val, NumericVar *var)
 	var->digits = ptr;
 	var->ndigits = ndigits;
 	var->weight = ndigits - 1;
+}
+
+/*
+ * Convert a finite NumericVar into an int128 coefficient at decimal scale
+ * 'scale', so that the value equals result * 10^(-scale).
+ *
+ * Returns false, leaving *result untouched, whenever the value is not
+ * eligible for the fast representation.  Callers treat false as "use the
+ * digit-array representation instead", so a rejection is always safe, and
+ * because promotion is exact it is also invisible in the aggregate result.
+ * Eligibility therefore costs nothing but speed, which is why the test below
+ * is deliberately conservative.
+ *
+ * Only values whose coefficient fits int64 -- at most four stored digits --
+ * are eligible.  The wider ones could be converted with a checked 128-bit
+ * multiply-add per stored digit, but that loses to the digit-array
+ * accumulator it would replace: a numeric(32,2) column, whose values take
+ * nine stored digits, measures about 20% slower that way.  The asymmetry that
+ * makes this matter is that a value which *fails* the conversion promotes the
+ * state once and is thereafter out of the hot path, while a value which keeps
+ * succeeding pays the per-digit cost on every row for the life of the group.
+ * Widening eligibility would only pay if 128-bit multiplication got much
+ * cheaper relative to accum_sum_add(), so measure before restoring it.
+ *
+ * No allocation is performed; the var's digits are read in place, so a
+ * zero-copy view from init_var_from_num() works fine.
+ */
+static bool
+numericvar_to_int128_scaled(const NumericVar *var, int scale, INT128 *result)
+{
+	int64		acc = 0;
+	int			shift;
+
+	Assert(var->sign == NUMERIC_POS || var->sign == NUMERIC_NEG);
+	Assert(scale >= 0);
+
+	/* a zero stores no digits and converts exactly at any scale */
+	if (var->ndigits == 0)
+	{
+		*result = int64_to_int128(0);
+		return true;
+	}
+
+	/* never scale down below the value's own display scale */
+	if (scale < var->dscale)
+		return false;
+
+	/*
+	 * Reject anything wider than the int64 lane.  The two bounds together make
+	 * every operation below overflow-free by construction, so none of the
+	 * checked 128-bit primitives are needed: four stored digits are at most
+	 * 10^16 - 1, and the second bound holds the subsequent scaling to 10^18.
+	 * The weight needs no separate cap, since a large weight inflates shift
+	 * and is caught by the second bound.
+	 */
+	if (var->ndigits > 4)
+		return false;
+
+	/* the ndigits == 0 case returned above; the bound below relies on it */
+	Assert(var->ndigits >= 1);
+
+	shift = scale - (var->ndigits - var->weight - 1) * DEC_DIGITS;
+
+	/*
+	 * 18 is the int64 lane's own bound and the only one this function needs:
+	 * a large weight inflates shift and is caught here too.  Note that with
+	 * ndigits >= 1 it also caps shift at 14, which is what keeps the
+	 * pow10_int64[] subscript below in range.
+	 */
+	if (var->ndigits * DEC_DIGITS + (shift > 0 ? shift : 0) > 18)
+		return false;
+
+	Assert(shift <= 0 || shift < lengthof(pow10_int64));
+
+	for (int i = 0; i < var->ndigits; i++)
+		acc = acc * NBASE + var->digits[i];
+
+	if (shift > 0)
+		acc *= pow10_int64[shift];
+	else if (shift < 0)
+	{
+		/*
+		 * A negative shift is the common shape, not the corner: a
+		 * numeric(15,2) value stores its fraction inside one base-NBASE
+		 * digit, overshooting dscale by two decimal positions.  Those
+		 * overshoot positions must be zeroes for the dscale invariant to
+		 * hold, but we refuse to trust the datum for exactness and check;
+		 * a nonzero remainder makes the value ineligible rather than
+		 * silently losing digits.  Constant divisors per case, so the
+		 * compiler strength-reduces the divisions into multiplications.
+		 */
+		switch (shift)
+		{
+			case -1:
+				if (acc % 10 != 0)
+					return false;
+				acc /= 10;
+				break;
+			case -2:
+				if (acc % 100 != 0)
+					return false;
+				acc /= 100;
+				break;
+			case -3:
+				if (acc % 1000 != 0)
+					return false;
+				acc /= 1000;
+				break;
+			default:
+				/* stored digits beyond dscale + DEC_DIGITS - 1 */
+				return false;
+		}
+	}
+
+	/* |acc| < 10^18, so negating in int64 cannot overflow */
+	if (var->sign == NUMERIC_NEG)
+		acc = -acc;
+
+	*result = int64_to_int128(acc);
+	return true;
+}
+
+/*
+ * Convert an int128 coefficient at decimal scale 'scale' into a NumericVar,
+ * the exact inverse of numericvar_to_int128_scaled().
+ *
+ * The resulting var's dscale is 'scale'.  When scale is not a multiple of
+ * DEC_DIGITS, the lowest base-NBASE digit straddles the decimal point; we
+ * peel it off with a division by the appropriate power of ten, which is
+ * exact for every int128 value (multiplying the coefficient up instead
+ * could overflow near the range limits).
+ */
+static void
+int128_to_numericvar_scaled(INT128 val, int scale, NumericVar *var)
+{
+	int			pad = (DEC_DIGITS - (scale % DEC_DIGITS)) % DEC_DIGITS;
+	int			frac_ndigits = (scale + pad) / DEC_DIGITS;
+	NumericDigit *ptr;
+	int			ndigits;
+	int32		dig;
+	int			sign = int128_sign(val);
+
+	Assert(scale >= 0);
+
+	/*
+	 * int128 spans at most 39 decimal digits; the straddling digit can add
+	 * one more base-NBASE digit, so 11 digits always suffice.
+	 */
+	alloc_var(var, (39 + DEC_DIGITS - 1) / DEC_DIGITS + 1);
+	var->sign = sign < 0 ? NUMERIC_NEG : NUMERIC_POS;
+	var->dscale = scale;
+	if (sign == 0)
+	{
+		var->ndigits = 0;
+		var->weight = 0;
+		return;
+	}
+	ptr = var->digits + var->ndigits;
+	ndigits = 0;
+
+	/*
+	 * Int64 lane: group sums usually still fit int64, and 64-bit divisions
+	 * are several times cheaper than 128-bit ones.  This matters because
+	 * finalisation runs once per group, which dominates at high group
+	 * counts with few rows per group.
+	 */
+	if (int128_compare(val, int64_to_int128(int128_to_int64(val))) == 0)
+	{
+		int64		v64 = int128_to_int64(val);
+		uint64		u = (v64 < 0) ? 0 - (uint64) v64 : (uint64) v64;
+
+		if (pad > 0)
+		{
+			uint32		divisor = (uint32) pow10_int32[DEC_DIGITS - pad];
+
+			/*
+			 * Take DEC_DIGITS - pad decimal digits into the lowest
+			 * base-NBASE digit and shift them up by 'pad' zero positions.
+			 */
+			ptr--;
+			ndigits++;
+			*ptr = (NumericDigit) ((u % divisor) * pow10_int32[pad]);
+			u /= divisor;
+		}
+		while (u != 0)
+		{
+			ptr--;
+			ndigits++;
+			*ptr = (NumericDigit) (u % NBASE);
+			u /= NBASE;
+		}
+	}
+	else
+	{
+		if (pad > 0)
+		{
+			/* as above, but on the full 128-bit value */
+			int128_div_mod_int32(&val, pow10_int32[DEC_DIGITS - pad], &dig);
+			ptr--;
+			ndigits++;
+			*ptr = (NumericDigit) (abs(dig) * pow10_int32[pad]);
+		}
+		while (!int128_is_zero(val))
+		{
+			int128_div_mod_int32(&val, NBASE, &dig);
+			ptr--;
+			ndigits++;
+			*ptr = (NumericDigit) abs(dig);
+		}
+	}
+
+	var->digits = ptr;
+	var->ndigits = ndigits;
+	var->weight = ndigits - 1 - frac_ndigits;
 }
 
 /*
