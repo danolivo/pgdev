@@ -1,0 +1,18 @@
+session 1/6 (base) done
+session 2/6 (head) done
+session 3/6 (base) done
+session 4/6 (head) done
+session 5/6 (base) done
+session 6/6 (head) done
+
+query                                 base med  head med  base min  head min    dmed%    dmin%
+----------------------------------------------------------------------------------------------
+A2  1k groups (positive control)        1731.7     874.8    1675.0     865.0    -49.5    -48.4
+A5  5M groups, all unique               3726.3    3589.6    3573.3    3422.8     -3.7     -4.2
+B4  sum(v), 5M unique groups            3729.7    3616.9    3570.2    3539.3     -3.0     -0.9
+C4  200-digit numeric (fallback)        2186.8    1348.0    2082.3    1303.7    -38.4    -37.4
+C5  toasted numeric                     1158.6    1164.5    1112.2    1120.3     +0.5     +0.7
+C6  int8 control (no numeric)            642.0     637.3     588.7     606.3     -0.7     +3.0
+D2  DISTINCT, 5M unique                 3772.0    3646.0    3607.9    3445.8     -3.3     -4.5
+D4  ORDER BY numeric, 5M rows            750.4     752.4     715.4     730.8     +0.3     +2.1
+D5  filter = (numeric_eq)                624.8     532.8     603.2     513.3    -14.7    -14.9
