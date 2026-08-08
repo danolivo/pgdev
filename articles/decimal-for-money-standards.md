@@ -1072,6 +1072,21 @@ double. **Колонка типа `numeric` сама по себе не озна
 ровно от того, что делает `numeric` медленным: от произвольной точности, от varlena и от
 специальных значений.
 
+**И чем за это платят.** [ClickHouse честно документирует](https://clickhouse.com/docs/sql-reference/data-types/decimal),
+что у широких фиксированных типов проверки переполнения нет вовсе:
+
+> «During calculations on Decimal, integer overflows might happen. Excessive digits in a
+> fraction are discarded (not rounded). Excessive digits in integer part will lead to an
+> exception.»
+>
+> «**Overflow check is not implemented for Decimal128 and Decimal256. In case of overflow
+> incorrect result is returned, no exception is thrown.**»
+
+То есть у `Decimal32`/`Decimal64` переполнение целой части даёт исключение, а у
+`Decimal128`/`Decimal256` — молча неверный результат. Для сравнения: у PostgreSQL `numeric`
+выход за формат — всегда ошибка (`value overflows numeric format`). Это ровно та часть
+цены фиксированной ширины, о которой в спорах «decimal против копеек» обычно не вспоминают.
+
 **Колоночные форматы — то же самое.** [Parquet](https://raw.githubusercontent.com/apache/parquet-format/master/LogicalTypes.md)
 допускает `BYTE_ARRAY` с неограниченной точностью, но даже там значение — это
 `unscaledValue` в дополнительном коде, а `precision is required` всегда. Семантики
