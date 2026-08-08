@@ -556,6 +556,57 @@ udiv:   subq  $8, %rsp
 
 > Performance can be impacted by using too large decimals when not required. In particular, decimal values with a width above 19 are slow, as arithmetic involving the INT128 type is much more expensive than operations involving the INT32 or INT64 types. It is therefore recommended to stick with a WIDTH of 18 or below, unless there is a good reason for why this is insufficient.
 
+Раз уж мы всю статью говорим про цену universality, стоит посмотреть, как «несколько ступенек» устроены изнутри. Это один логический тип: физическое представление выводится из объявленной ширины прямо в `LogicalType::GetInternalType()`:
+
+```c
+/* duckdb/src/common/types.cpp */
+auto width = DecimalType::GetWidth(*this);
+if      (width <= Decimal::MAX_WIDTH_INT16)  return PhysicalType::INT16;   /* ≤ 4  */
+else if (width <= Decimal::MAX_WIDTH_INT32)  return PhysicalType::INT32;   /* ≤ 9  */
+else if (width <= Decimal::MAX_WIDTH_INT64)  return PhysicalType::INT64;   /* ≤ 18 */
+else if (width <= Decimal::MAX_WIDTH_INT128) return PhysicalType::INT128;  /* ≤ 38 */
+```
+
+Пользователю ступень не показывают — `typeof` возвращает `DECIMAL(18,2)`. Но и «тихого переключения» в рантайме нет: представление выбирается **один раз на этапе связывания**, когда планировщик подбирает конкретную реализацию оператора. Дальше в цикле работает мономорфная функция над `int64` или `int128`, без единого ветвления.
+
+И вот тут самое интересное — DuckDB сознательно **не** повышает ступень, если может остаться в дешёвой (`BindDecimalMultiply`):
+
+```c
+if (result_width > Decimal::MAX_WIDTH_INT64 && max_width <= Decimal::MAX_WIDTH_INT64 &&
+    result_scale < Decimal::MAX_WIDTH_INT64) {
+    bind_data->check_overflow = true;
+    result_width = Decimal::MAX_WIDTH_INT64;
+}
+```
+
+Если оба операнда влезли в int64, а точная ширина результата — нет, ширину обрезают обратно до 18 и включают проверку переполнения вместо честного перехода в int128. Проверил на DuckDB 1.5.5:
+
+```
+dec(18,2) * dec(18,2)  →  DECIMAL(18,4)   ← а не 36,4, хотя 36 < 38
+dec(19,2) * dec(19,2)  →  DECIMAL(38,4)   ← здесь max_width уже 19, правило не сработало
+```
+
+Риск не теоретический:
+
+```sql
+select cast(100000000000000000 as decimal(18,0)) * cast(10 as decimal(18,0));
+-- Out of Range Error: Overflow in multiplication of DECIMAL(18)
+```
+
+Тот же расчёт в `decimal(38,0)` проходит. Формально корректный запрос падает на конкретных данных, потому что движок выбрал скорость.
+
+Два наблюдения оттуда же, прямо бьющие в наши причины пятую и седьмую. Во-первых, **деление в DuckDB возвращает `DOUBLE`**: `typeof(dec(18,2) / dec(18,2))` — это `DOUBLE`, и `1/3` даёт `0.3333333333333333`. Задачу выбора масштаба результата, которую PostgreSQL решает функцией `select_div_scale`, DuckDB не решил, а **отменил**: точного десятичного деления в нём нет. Во-вторых, аккумулятор суммы делает ровно одно повышение и упирается:
+
+```
+typeof(sum(dec(18,0)))  →  DECIMAL(38,0)      ← int64 → int128, и всё
+typeof(sum(dec(38,0)))  →  DECIMAL(38,0)      ← дальше некуда
+
+select sum(x) from s;  -- всего тысяча строк по 38 девяток
+-- Out of Range Error: Overflow in HUGEINT addition
+```
+
+`NumericSumAccum` в PostgreSQL растёт столько, сколько надо. Тысяча строк его не смущает.
+
 **ClickHouse** в [документации по Decimal](https://clickhouse.com/docs/sql-reference/data-types/decimal) говорит то же самое почти теми же словами:
 
 > Because modern CPUs do not support 128-bit and 256-bit integers natively, operations on Decimal128 and Decimal256 are emulated. Thus, Decimal128 and Decimal256 work significantly slower than Decimal32/Decimal64.
@@ -734,11 +785,13 @@ rather than a varlena might speed things up quite a bit in some cases». Про�
 
 **Второе: не нужно угадывать точность заранее — и не нужно мигрировать, когда угадали неверно.** Любой decimal фиксированной ширины требует объявить `p` и `s` в DDL и попасть. numeric позволяет промахнуться и выжить, и это не абстракция — оба примера из предыдущего раздела (сумма миллиона 38-значных значений → 44 цифры; три умножения операндов со scale 18 → scale 54) в `decimal(38)` просто падают. У Iceberg расширение точности — миграция схемы («Widen precision only»), у numeric — не событие вовсе.
 
-**Третье, и недооценённое: он не врёт молча.** Вот цена скорости, которую соседи платят, а вспоминают о ней редко. [ClickHouse, дословно](https://clickhouse.com/docs/sql-reference/data-types/decimal):
+**Третье, и недооценённое: у него нет развилки «проверять или успевать».** Фиксированная ширина ставит вендора перед выбором, и выбирают по-разному. [ClickHouse, дословно](https://clickhouse.com/docs/sql-reference/data-types/decimal):
 
 > Overflow check is not implemented for Decimal128 and Decimal256. **In case of overflow incorrect result is returned, no exception is thrown.**
 
-То есть быстрый фиксированный тип при переполнении отдаёт неверное число и молчит. У numeric переполнение — ошибка. Для отчётности разница между «упало» и «посчитало неправильно» — не техническая.
+То есть переполнение широкого типа даёт неверное число и молчит. DuckDB, наоборот, проверяет и падает с внятной ошибкой — но платит за это тем, что ужимает ширину результата умножения обратно в int64, лишь бы остаться в быстрой ступени (см. разбор в разделе про соседей). Обе стратегии — следствие одного и того же: ширина зафиксирована, а результат в неё может не поместиться.
+
+У numeric этой развилки нет вовсе: место под результат берётся по факту, переполнить формат почти невозможно, а если получилось — это ошибка, а не тихий неверный ответ. Для отчётности разница между «упало» и «посчитало неправильно» — не техническая.
 
 **Четвёртое: он единственный, кто просто работает за пределами int128** — см. предыдущий раздел.
 
