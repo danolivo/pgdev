@@ -621,6 +621,103 @@ select (1e16::float8 - 1e16::float8 + 1.0)::text;   -- 1
 
 ---
 
+## Так в чём же ниша numeric?
+
+Раз уж мы дошли до сюда, стоит ответить на вопрос, который напрашивается: если numeric
+такой дорогой, а весь остальной мир обходится 38 цифрами, зачем PostgreSQL держит 131072?
+
+Сначала — что *не* является ответом.
+
+**Астрономия — миф.** В [обзоре Дэвида Бейли по высокоточной арифметике в математической
+физике](https://www.mdpi.com/2227-7390/3/2/337) вся высокая точность делается двоичными
+библиотеками: double-double (~31 цифра), quad-double (~62), дальше MPFR и GMP. Тип СУБД
+там не участвует. Криптография — то же самое: GMP и `bytea`, а не numeric.
+
+**Биржевая торговля — тоже нет.** FIX
+[гарантирует «up to fifteen significant digits»](https://fiximate.fixtrading.org/en/FIX.Latest/fix_datatypes.html)
+для `Price`, `Qty` и `Amt`, а регулятор ограничивает сверху:
+[SEC Rule 612](https://www.sec.gov/divisions/marketreg/subpenny612faq.htm) запрещает
+котировать акции дороже доллара с шагом мельче цента, дешевле доллара — мельче одной сотой
+цента. Крипто-биржи щедрее ровно вдвое: `price_increment` у Coinbase и `baseAssetPrecision`
+у Binance — восемь знаков. Трейдингу numeric нужен не ради диапазона, а ради отсутствия
+двоичного округления.
+
+И самим финансам столько не нужно. Каулишо [посчитал по обследованию 51 организации](https://speleotrove.com/decimal/decifaq1.html):
+«Data are typically stored with 18 digits of precision with 6 digits after the decimal
+point», «typically a precision of 25-30 digits is used». Собственно, и число 34 в
+decimal128 выбрано не от потребностей: кодировка DPD требует длины вида 3k+1, а снизу
+подпирает ISO COBOL 2002 с его требованием 32-значных промежуточных результатов — 31 не
+проходит, следующий кандидат 34.
+
+А теперь то, что ответом является.
+
+**Первое: EVM-блокчейны.** `uint256` требует **78 значащих цифр** — вдвое больше, чем даёт
+`decimal(38)`, и на одну больше, чем `BIGNUMERIC` в BigQuery. И это не экзотика: The Graph
+[отображает `BigInt` прямо в `numeric`](https://raw.githubusercontent.com/graphprotocol/graph-node/master/store/postgres/src/relational.rs)
+(`ColumnType::BigInt => "numeric"`), то есть каждый субграф в мире хранит балансы именно
+так; Blockscout заводит [`value numeric(100)`](https://github.com/blockscout/blockscout/blob/master/apps/explorer/priv/repo/migrations/20180117221923_create_transactions.exs).
+А те, у кого потолок 38, честно расписываются в поражении: Google Cloud Blockchain
+Analytics [отдаёт значение дважды](https://docs.cloud.google.com/blockchain-analytics/docs/uint256) —
+«An UINT128 NUMERIC column **with potential loss of precision**» плюс строкой; Dune ушла с
+PostgreSQL на Trino и тут же [допилила движок нативными UINT256](https://docs.dune.com/query-engine/datatypes);
+у Elasticsearch [issue про это открыт с 2019 года](https://github.com/elastic/elasticsearch/issues/38242).
+В промежуточных вычислениях бывает и больше: произведение двух `uint256` — до 156 цифр.
+
+PostgreSQL здесь — единственная мейнстрим-СУБД, которая справляется без единой строчки
+кода. Не потому что кто-то предвидел Ethereum в 1998 году, а потому что произвольная
+точность оказалась правильным решением. numeric выиграл лотерею, в которую не покупал
+билет.
+
+**Второе, и куда более массовое: сама арифметика.** Разрядность вылезает за 38 без всякого
+домена.
+
+```sql
+-- миллион строк по 38 девяток
+select length(sum(x)::text)
+from (select repeat('9',38)::numeric as x from generate_series(1,1000000)) t;
+-- 44
+
+select scale(1.000000000000000001::numeric
+           * 1.000000000000000001
+           * 1.000000000000000001);
+-- 54
+```
+
+В первом случае каждое значение помещается в 38 цифр, а сумма — уже нет: `NumericSumAccum`
+расширяется по мере надобности. Во втором три сомножителя, все примерно равные единице,
+дают масштаб 54. Никакого «домена, которому нужно 54 знака», тут нет — есть `GROUP BY` по
+большой таблице и три умножения. Крайний случай приводит тот же Каулишо: точное `R^365`
+для годовой ставки по дневной [требует 2191 цифру](https://speleotrove.com/memowiki/files/cowlis2003-DFP-algorism.pdf).
+
+**Так умирает numeric или нет?** Точный десятичный тип — точно нет: ISO 20022 закончил
+период сосуществования с MT [22 ноября 2025](https://www.swift.com/standards/iso-20022/iso-20022-faqs/implementation),
+Банк России идёт туда же к 2029-му, C23 внёс `_Decimal32/64/128` в стандарт языка.
+Умирает конкретная конструкция — **произвольная точность переменной длины**. Её не копирует
+никто: 38 цифр у Snowflake, Redshift, SQL Server, Spark, DuckDB, Iceberg; Arrow фиксирует
+ровно четыре ширины и в 2024 году [добавил более узкие](https://arrow.apache.org/blog/2024/10/28/18.0.0-release/),
+а не более широкие. Прямее всех высказался CedarDB, наследник Umbra,
+[в документации](https://cedardb.com/docs/references/datatypes/numeric/):
+
+> PostgreSQL offers a maximum precision of 131072 and scale of 16383, where CedarDB
+> restricts precision and scale to a maximum of 38, **for performance reasons**.
+
+Проблема, стало быть, не в существовании numeric, а в его **монополии**. У DuckDB четыре
+ступеньки (INT16/32/64/128), у Redshift две, у CedarDB две, у Arrow четыре. У PostgreSQL
+одна — и она рассчитана на 131072 цифры, даже когда в колонке лежит `numeric(15,2)`.
+
+Забавно, что против второй ступеньки никто и не возражал. Том Лейн ещё в 2001-м:
+«I don't have any objection in principle to an additional datatype "small numeric"». Роберт
+Хаас в 2017-м [сформулировал ровно тот аргумент](https://postgrespro.com/list/thread-id/1876527),
+к которому мы пришли в этой статье: «the fact that the datatype could be pass-by-value
+rather than a varlena might speed things up quite a bit in some cases». Просто каждый раз
+разговор заканчивался словами «пусть кто-нибудь напишет расширение» — расширение писали
+трижды ([pgDecimal](https://github.com/okbob/pgDecimal),
+[pgdecimal2](https://github.com/vitesse-ftian/pgdecimal),
+[fixeddecimal](https://github.com/2ndQuadrant/fixeddecimal)), и все три мертвы. Последнее
+обсуждение в hackers — 13 ноября 2018 года.
+
+---
+
 ## Что с этим делать сегодня
 
 Ничего из перечисленного не означает, что numeric надо избегать. Двоичный float в качестве замены не годится по причинам из предыдущего раздела, а десятичного в ядре PostgreSQL пока нет. Но раз мы теперь знаем, где именно numeric дорог, можно не платить там, где не нужно.

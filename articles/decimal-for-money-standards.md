@@ -1005,7 +1005,425 @@ double. **Колонка типа `numeric` сама по себе не озна
 
 ---
 
-## 8. Выводы
+## 8. Судьба numeric: что умирает, а что нет
+
+### 8.1. Точный десятичный тип не умирает — он расширяется
+
+- Период сосуществования MT и MX в SWIFT **закончился 22 ноября 2025 года**
+  ([Swift, ISO 20022 FAQ](https://www.swift.com/standards/iso-20022/iso-20022-faqs/implementation)):
+  «The coexistence period ended on 22 November 2025». Банк России идёт следом, полный
+  переход платёжной системы — 2029 год (см. §3.3).
+- **C23 внёс `_Decimal32/64/128` в стандарт языка C**
+  ([cppreference, C23](https://en.cppreference.com/c/23)) — правда, опционально, через
+  макрос `__STDC_IEC_60559_DFP__`; GCC поддерживает частично, Clang и MSVC — нет
+  ([RFC в LLVM всё ещё открыт](https://discourse.llvm.org/t/rfc-decimal-floating-point-support-iso-iec-ts-18661-2-and-c23/62152)).
+- `DECFLOAT` из SQL:2016 реализован не только в Db2, но и в **Firebird 4.0**
+  ([README.floating_point_types.md](https://raw.githubusercontent.com/FirebirdSQL/firebird/master/doc/sql.extensions/README.floating_point_types.md)):
+  «DECFLOAT(16) - 64 bit Decimal64», «DECFLOAT(34) - 128 bit Decimal128».
+- Точный десятичный тип есть во всех проверенных аналитических движках и во всех
+  колоночных форматах. Ни один не отказался от него.
+
+### 8.2. Умирает конкретная конструкция: произвольная точность переменной длины
+
+Потолок **38 цифр (int128)** стал де-факто универсальной константой:
+
+| Система | Потолок | Представление |
+|---|---|---|
+| [Snowflake](https://docs.snowflake.com/en/sql-reference/data-types-numeric) | 38 | адаптивная ширина по фактическому диапазону |
+| [Redshift](https://docs.aws.amazon.com/redshift/latest/dg/r_Numeric_types201.html) | 38 | int64 до 19 цифр, int128 до 38 |
+| [SQL Server / Synapse](https://learn.microsoft.com/en-us/sql/t-sql/data-types/decimal-and-numeric-transact-sql) | 38 | 5/9/13/17 байт |
+| [Databricks / Spark](https://docs.databricks.com/aws/en/sql/language-manual/data-types/decimal-type) | 38 | long fast-path ≤18 цифр, BigDecimal дальше |
+| [DuckDB](https://duckdb.org/docs/current/sql/data_types/numeric.html) | 38 | INT16/32/64/128 |
+| [Iceberg](https://raw.githubusercontent.com/apache/iceberg/main/format/spec.md) | 38 | «precision must be 38 or less» |
+| [ClickHouse](https://clickhouse.com/docs/sql-reference/data-types/decimal) | 76 | int32/64/128/256 |
+| [BigQuery](https://raw.githubusercontent.com/google/zetasql/master/docs/data-types.md) | 38 / ~76.8 | int128 с разным scale |
+
+[Redshift прямо предупреждает](https://docs.aws.amazon.com/redshift/latest/dg/r_Numeric_types201.html):
+
+> «Do not arbitrarily assign maximum precision to DECIMAL columns unless you are certain
+> that your application requires that precision. 128-bit values use twice as much disk
+> space as 64-bit values and can slow down query execution time.»
+
+**Apache Arrow** фиксирует ровно четыре ширины
+([Schema.fbs](https://raw.githubusercontent.com/apache/arrow/main/format/Schema.fbs)):
+
+> «Exact decimal value represented as an integer value in two's complement. Currently
+> 32-bit (4-byte), 64-bit (8-byte), 128-bit (16-byte) and 256-bit (32-byte) integers are
+> used.» / «The accepted widths are 32, 64, 128 and 256.»
+
+Причём эволюция идёт **в сторону сужения**: Arrow 18.0.0 (октябрь 2024)
+[добавил Decimal32 и Decimal64](https://arrow.apache.org/blog/2024/10/28/18.0.0-release/),
+а не более широкие типы.
+
+**Самый показательный источник — CedarDB**, коммерческий наследник Umbra, движок,
+спроектированный в 2020-х. Он явно и письменно противопоставляет себя PostgreSQL
+([документация по numeric](https://cedardb.com/docs/references/datatypes/numeric/)):
+
+> «PostgreSQL offers a maximum precision of 131072 and scale of 16383, where **CedarDB
+> restricts precision and scale to a maximum of 38, for performance reasons.**»
+>
+> «Operations on 16 Byte types are expensive to compute. We recommend using a precision of
+> 18 or less when possible for your application.»
+>
+> «PostgreSQL allows NaN, +Infinity, and -Infinity as special numeric values» — «CedarDB
+> forbids entering these values as numeric data types.»
+
+Команда, которая целенаправленно делает быстрый PostgreSQL-совместимый движок, отказалась
+ровно от того, что делает `numeric` медленным: от произвольной точности, от varlena и от
+специальных значений.
+
+**Колоночные форматы — то же самое.** [Parquet](https://raw.githubusercontent.com/apache/parquet-format/master/LogicalTypes.md)
+допускает `BYTE_ARRAY` с неограниченной точностью, но даже там значение — это
+`unscaledValue` в дополнительном коде, а `precision is required` всегда. Семантики
+«произвольная точность как контракт типа» нет нигде.
+
+### 8.3. Честные контрпримеры
+
+Чтобы вывод не выглядел натянутым, вот что играет против него:
+
+- **`shopspring/decimal`** — самая популярная Go-библиотека для денег — это `big.Int` +
+  `int32` экспонента ([pkg.go.dev](https://pkg.go.dev/github.com/shopspring/decimal)), то
+  есть буквально модель PostgreSQL `numeric`. И предложение внести decimal128 в stdlib Go
+  [было отклонено](https://github.com/golang/go/issues/12332).
+- **H2** реализовал стандартный `DECFLOAT` поверх `BigDecimal`, а не поверх IEEE
+  decimal128 ([issue #2254](https://github.com/h2database/h2database/issues/2254)).
+- **Snowflake** хранит `NUMBER` с адаптивной шириной, а не строго фиксированной.
+
+Общий знаменатель: **произвольная длина как деталь физического кодирования встречается;
+произвольная точность как контракт типа — нет.**
+
+### 8.4. В самом PostgreSQL: развилка пройдена в 2001-м и с тех пор не пересматривалась
+
+Хронология попыток добавить рядом с `numeric` тип фиксированной ширины:
+
+| Год | Кто | Что | Итог |
+|---|---|---|---|
+| 2001 | Tom Lane | [«I don't have any objection in principle to an additional datatype "small numeric"»](https://www.postgresql.org/message-id/3077.987145046%40sss.pgh.pa.us) — но в том же письме предложил вместо этого переписать numeric на base-10000 | Сделали base-10000; ветка «small numeric» не тронута |
+| 2013 | Craig Ringer | [DECIMAL32/64/128 поверх gcc `_Decimal*`](https://www.postgresql.org/message-id/51B7B932.3000407@2ndquadrant.com) | Патча не было |
+| 2015–2018 | Feng Tian | [Decimal64/Decimal128 на decNumber](https://www.postgresql.org/message-id/CAFWGqnsuyOKdOwsNLVtDU1LLjS%3D66xmxxxS8Chnng_zSB5_uCg%40mail.gmail.com) | Отклонено, рекомендовано расширением; лицензия decNumber (GPL/ICU) добила |
+| 2016 | Tobia Conforto | [MONEY(s) / FIXED(s) на int64 со scale](https://postgrespro.com/list/thread-id/2286891) | Merlin Moncure: «would be a good idea for an extension» |
+
+Ключевые реплики из треда 2015–2018 (полный тред:
+[postgrespro.com/list/thread-id/1876527](https://postgrespro.com/list/thread-id/1876527)):
+
+> **Robert Haas, 19.06.2017:** «I've never been very happy with the performance of numeric,
+> so I guess I'm a bit more optimistic about the chances of doing better. … **the fact that
+> the datatype could be pass-by-value rather than a varlena might speed things up quite a
+> bit in some cases.**»
+>
+> **David Rowley, 13.11.2018:** «Maybe we can get DECFLOAT into core around PostgreSQL 32
+> or so :-)»
+>
+> **Tom Lane, 13.11.2018:** «Yeah. I think putting this in core is a long way off. Maybe
+> somebody will write an extension instead.»
+
+**Расширение написали трижды — и все три мертвы:**
+
+| Расширение | Что | Состояние |
+|---|---|---|
+| [okbob/pgDecimal](https://github.com/okbob/pgDecimal) (Павел Стехуле) | decimal32/64 на gcc `_Decimal*` | 3 коммита, 1 звезда, README: «initial», «not complete» |
+| [vitesse-ftian/pgdecimal](https://github.com/vitesse-ftian/pgdecimal) (Feng Tian) | decimal64/128 на decNumber | последний релиз 25.09.2015, 10 звёзд |
+| [2ndQuadrant/fixeddecimal](https://github.com/2ndQuadrant/fixeddecimal) | int64 с неявным scale, «vastly increased performance» | заброшено, 36 звёзд, заявлена поддержка PG 9.5+ |
+
+Целевой поиск по архивам pgsql-hackers за 2019–2026 годы по запросам «fixed-width
+numeric», «small numeric», «numeric64», «decimal64», «DECFLOAT» **не дал ни одного нового
+треда**. Последнее содержательное обсуждение — 13 ноября 2018 года. Тема мертва в hackers
+больше семи лет.
+
+Единственное живое направление — **ускорение самого `numeric`**: работа Дина Рашида по
+расширению int128 в `numeric.c` (2025, PostgreSQL 19). То есть сообщество вкладывается в
+то, чтобы `numeric` стал быстрее, а не в то, чтобы его заменить.
+
+---
+
+## 9. Кому вообще нужно больше 38 цифр
+
+Раз весь остальной мир остановился на 38, стоит спросить прямо: а что PostgreSQL делает с
+оставшимися 131 034 цифрами? Ответ оказался неожиданным.
+
+### 9.1. Мифы, которые надо отбросить
+
+**Астрономия и физика — миф.** В обзоре Дэвида Бейли
+[«High-Precision Arithmetic in Mathematical Physics»](https://www.mdpi.com/2227-7390/3/2/337)
+(Mathematics, 2015) вся высокая точность делается **двоичной** арифметикой в библиотеках:
+double-double (~31 цифра), quad-double (~62), дальше QD, ARPREC, MPFR, GMP. До 500 цифр
+нужно для неустойчивых периодических орбит в модели Лоренца — но это `long double` и MPFR,
+а не тип СУБД. PostgreSQL в этой цепочке участвует максимум как хранилище `double
+precision`.
+
+**Криптография — тоже мимо.** [GMP](https://gmplib.org/) — «no practical limit to the
+precision except the ones implied by the available memory». RSA-4096 — это 1234 десятичные
+цифры, и хранят их как `bytea`/DER, а не как `numeric`.
+
+**Биржевая торговля — нет, и это важно для вашего вопроса.** FIX
+([FIX Latest, datatypes](https://fiximate.fixtrading.org/en/FIX.Latest/fix_datatypes.html))
+гарантирует «up to **fifteen** significant digits» для `float`, `Price`, `Qty` и `Amt`.
+Регулятор ограничивает сверху: [SEC Rule 612](https://www.sec.gov/divisions/marketreg/subpenny612faq.htm)
+запрещает котировать акции дороже $1 с шагом меньше $0,01, а дешевле $1 — меньше $0,0001,
+то есть **четыре знака**. Крипто-биржи щедрее, но ненамного: `price_increment` у Coinbase и
+`baseAssetPrecision` у Binance — **8 знаков**. Даже цена с 8 знаками, умноженная на
+абсурдно большой объём, не выходит за 30 цифр. **Биржам `decimal(38)` хватает с запасом.**
+Аргумент за `numeric` в трейдинге — это отсутствие двоичного округления, а не диапазон.
+
+**Гиперинфляция — не подтверждается.** В Зимбабве за три года срезали
+[25 нулей](https://en.wikipedia.org/wiki/Zimbabwean_dollar_(1980%E2%80%932009)) тремя
+деноминациями (2006, 2008, 2009), максимальный номинал — 10¹⁴. Деноминация и есть
+встроенный механизм борьбы с разрядностью: государство обнуляет счётчик раньше, чем
+упрётся тип данных. Открытых свидетельств системы, сломавшейся из-за переполнения
+числового типа, найти не удалось.
+
+### 9.2. Реальный массовый домен ровно один: EVM-блокчейны
+
+`uint256` в Solidity ([docs.soliditylang.org](https://docs.soliditylang.org/en/latest/types.html))
+и балансы ERC-20 в wei ([EIP-20](https://eips.ethereum.org/EIPS/eip-20)) требуют
+**78 значащих цифр**:
+
+```
+2^256 − 1 = 115792089237316195423570985008687907853269984665640564039457584007913129639935
+```
+
+Это вдвое больше 38 — и на одну цифру больше, чем даёт даже BigQuery `BIGNUMERIC`
+(≈76,8 цифры, то есть по сути int256 со scale 38).
+
+Что делают в реальности:
+
+- **The Graph** объявляет `BigInt` как тип «Used for Ethereum's uint32, int64, uint64, …,
+  uint256 types» ([docs](https://thegraph.com/docs/en/subgraphs/developing/creating/ql-schema/)),
+  а в graph-node это отображается прямо в PostgreSQL
+  ([`store/postgres/src/relational.rs`](https://raw.githubusercontent.com/graphprotocol/graph-node/master/store/postgres/src/relational.rs)):
+
+  ```rust
+  ColumnType::BigDecimal => "numeric",
+  ColumnType::BigInt     => "numeric",
+  ```
+
+  То есть каждый субграф в мире хранит балансы в `numeric` без ограничения точности.
+- **Blockscout** —
+  [миграция создания таблицы транзакций](https://github.com/blockscout/blockscout/blob/master/apps/explorer/priv/repo/migrations/20180117221923_create_transactions.exs):
+  `add(:value, :numeric, precision: 100)`, то же для `gas_price`, `r`, `s`. Сотня цифр,
+  сознательно с запасом.
+- **Google Cloud Blockchain Analytics** — прямое признание поражения
+  ([docs](https://docs.cloud.google.com/blockchain-analytics/docs/uint256)):
+
+  > «Blockchain Analytics does not support UINT256 NUMERIC columns… Blockchain Analytics
+  > datasets presents UINT256 values in two separate columns: An UINT128 NUMERIC column
+  > **with potential loss of precision**. A STRING column containing the full decimal value
+  > in string form.»
+
+- **Dune Analytics** ушла с PostgreSQL на Trino ради масштаба — и немедленно уперлась в
+  `decimal(38)`, так что пришлось допиливать движок нативными `UINT256`/`INT256`
+  ([docs](https://docs.dune.com/query-engine/datatypes),
+  [блог](https://dune.com/blog/introducing-dune-sql): «Full wei-level precision calculations
+  via UINT256 and INT256 data types»).
+- **Elasticsearch** не смогла: [issue от 2019 года](https://github.com/elastic/elasticsearch/issues/38242)
+  до сих пор открыт — «all of the Ethereum token values (which are 2^256 −1) were indexed
+  as text».
+- **ClickHouse** `Decimal256` покрывает 76 цифр, то есть даже не весь `int256`, и до сих
+  пор недоделан ([issue #47569](https://github.com/ClickHouse/ClickHouse/issues/47569)).
+
+А в промежуточных вычислениях нужно и больше. Uniswap V3 держит отдельную библиотеку
+[FullMath](https://docs.uniswap.org/contracts/v3/reference/core/libraries/FullMath) —
+«allows multiplication and division where an intermediate value overflows 256 bits». Когда
+ту же формулу воспроизводят в SQL для аналитики, произведение двух `uint256` — это до
+**156 цифр**.
+
+Вывод, который стоит проговорить: PostgreSQL здесь — единственная мейнстрим-СУБД, которая
+справляется без единой строчки кода и без потери точности. Не потому что кто-то предвидел
+Ethereum, а потому что произвольная точность оказалась правильным инженерным решением.
+`numeric` выиграл лотерею, в которую не покупал билет.
+
+### 9.3. И самый массовый случай — вообще без домена
+
+Есть категория, где большая разрядность нужна не потому, что этого требует предметная
+область, а потому, что так устроена арифметика.
+
+**Аккумулятор суммы растёт.** Комментарий к `NumericSumAccum` в `numeric.c`: «When a new
+value has a larger ndigits or weight than the accumulator currently does, the accumulator
+is enlarged to accommodate the new value». Проверено на PostgreSQL 16:
+
+```sql
+-- миллион строк по 38 девяток
+SELECT length(sum(x)::text)
+FROM (SELECT repeat('9',38)::numeric AS x FROM generate_series(1,1000000)) t;
+-- 44   ← в decimal(38) этот запрос упал бы
+```
+
+Каждое отдельное значение помещается в 38 цифр, а сумма — уже нет. Никакого «домена,
+которому нужно 44 цифры», тут нет; есть `GROUP BY` по большой таблице.
+
+**Масштаб при умножении складывается:**
+
+```sql
+SELECT scale(1.000000000000000001::numeric
+           * 1.000000000000000001
+           * 1.000000000000000001);   -- 54
+```
+
+Три сомножителя, все примерно равные единице, со scale 18 — и результат уже за пределом
+`decimal(38)`.
+
+**Крайний случай — от самого Каулишо.** В статье
+[«Decimal Floating-Point: Algorism for Computers»](https://speleotrove.com/memowiki/files/cowlis2003-DFP-algorism.pdf)
+(IEEE ARITH-16, 2003):
+
+> «the exact calculation of the yearly rate in a non-leap year is R^365. To calculate this
+> to give an exact result needs **2191 digits**, whereas a much shorter result which is
+> correct to within one unit in the last place (ulp) will almost always be sufficient.»
+
+Точное возведение дневной ставки в 365-ю степень требует 2191 цифру. Никакой `decimal(38)`,
+никакой `Decimal256`, никакой IEEE `decimal128` этого не сделает.
+
+### 9.4. Заодно: откуда взялись 38 и 34
+
+Полезно знать, что оба числа — артефакты представления, а не результат анализа
+потребностей.
+
+**38** — это то, сколько десятичных цифр влезает в знаковый int128 (2¹²⁷ ≈ 1,7·10³⁸).
+У Oracle своя история: [документация 21c](https://docs.oracle.com/en/database/oracle/oracle-database/21/sqlrf/Data-Types.html)
+говорит «Oracle guarantees the portability of numbers with precision of up to 20 base-100
+digits, which is equivalent to 39 or 40 decimal digits depending on the position of the
+decimal point» — то есть следствие 22-байтового формата в base-100.
+
+**34 в decimal128** — пересечение двух ограничений. Кодировка DPD требует длины вида
+3k+1 ([Cowlishaw, Decimal Arithmetic Encodings](https://speleotrove.com/decimal/decbits.pdf):
+«each format has a coefficient whose length is a multiple of three, plus one»), а снизу
+подпирает COBOL: ISO COBOL 2002 требует 32-значных промежуточных результатов, поэтому
+вариант с 31 цифрой был отвергнут как «unsuitable for implementing the new COBOL standard»
+(та же статья 2003 года). 31 < 32, следующий кандидат вида 3k+1 — 34.
+
+А сколько реально нужно финансам, Каулишо тоже посчитал
+([Decimal Arithmetic FAQ](https://speleotrove.com/decimal/decifaq1.html)): «Data are
+typically stored with 18 digits of precision with 6 digits after the decimal point» и
+«Typically a precision of 25-30 digits is used, though the ISO COBOL 2002 standard requires
+32-digit decimal floating-point for intermediate results».
+
+**То есть 15–18 цифр на хранение и 25–32 на промежуточные результаты. 34 и 38 — это уже
+запас.**
+
+---
+
+## 10. Отдельно: 1С
+
+Вопрос практический — раз 1С один из крупнейших потребителей PostgreSQL, стоит проверить,
+не собирается ли она уходить от `numeric`. **Признаков нет; данные указывают в
+противоположную сторону.**
+
+### 10.1. `numeric` зафиксирован в документации 1С как контракт
+
+Официальная таблица соответствия типов — ИТС, [«Особенности хранения составных типов
+данных»](https://its.1c.ru/db/metod8dev/content/1828/hdoc):
+
+| Колонка | MS SQL | PostgreSQL | DB2 | Oracle |
+|---|---|---|---|---|
+| `_N` (число) | `NUMERIC(n,k)` | **`numeric(n,k)`** | `dec(n,k)` | `NUMBER(n,k)` |
+| `_S` (строка) | `NCHAR(n)` | **`mchar(n)`** | `graphic(n)` | `CHAR(n+1)` |
+
+Обратите внимание на асимметрию во второй строке. **Для строк стоковый `varchar` 1С не
+устроил — они написали собственный тип `mchar`/`mvarchar`. Для чисел взяли стоковый
+`numeric` как есть.** Аналога «mnumeric» не существует.
+
+Ограничение платформы — 38 знаков, «в DB2 максимум 31»
+([ИТС](https://its.1c.ru/db/metod8dev/content/2665/hdoc); чистые цитаты воспроизведены в
+[документации SonarQube BSL Plugin](https://docs.checkbsl.org/checks/query/CastToNumber/)).
+То есть платформа сама живёт внутри той же границы 38, что и весь остальной мир.
+
+### 10.2. В патче 1С к PostgreSQL нет ни строчки про numeric
+
+Полный текст патча опубликован Postgres Professional:
+[`patches/postgresql/9.6/1c_FULL_96-0.23`](https://github.com/postgrespro/pgwininstall/blob/master/patches/postgresql/9.6/1c_FULL_96-0.23),
+9173 строки. Проверено механически — `grep -i numeric` даёт **ноль совпадений**. Патч
+трогает ровно три области:
+
+1. **Три contrib-модуля с нуля:** `mchar` (регистронезависимые строки через libICU, авторы
+   в README — Олег Бартунов и Фёдор Сигаев), `fulleq` («operator == which returns true when
+   operands are equal or both are nulls»), `fasttrun` («truncates the temporary table and
+   doesn't grow pg_class size»).
+2. **Планировщик:** `allpaths.c`, `indxpath.c`, `joinrels.c`, `pathkeys.c`, `createplan.c`,
+   `planner.c`, `setrefs.c`, `prepunion.c`, `pathnode.c` + новый файл `appendorpath.c`
+   (969 строк, шапка: «support Append plan for ORed clauses / Teodor Sigaev»).
+3. **Одна косметическая правка в `gram.y`** — снять привязку `like_escape` к `pg_catalog`,
+   чтобы `mchar` мог подставить свою реализацию.
+
+`numeric.c`, `heaptuple.c`, `hashfunc.c`, оценка селективности числовых типов — не тронуты.
+
+Более того, **`fulleq` демонстративно не покрывает `numeric`**. Список типов в Makefile:
+
+```
+ARGTYPE = bool bytea char name int8 int2 int2vector int4 text \
+	oid xid cid oidvector float4 float8 abstime reltime macaddr \
+	inet cidr varchar date time timestamp timestamptz \
+	interval timetz
+```
+
+`isfulleq_numeric` отсутствует. Для ресурсов регистров 1С обходится обычным `=` и обычным
+хэшем.
+
+> ⚠️ Проверен патч для PostgreSQL 9.6. Свежие патчи (PG 16/17) 1С публикует только в
+> составе бинарных сборок; косвенное подтверждение непрерывности — статья
+> [«Сборка PostgreSQL 17 с патчами от 1С»](https://infostart.ru/1c/articles/2501686/),
+> где описан тот же набор из трёх contrib-модулей. За десять лет новых не появилось.
+
+### 10.3. Все оптимизации под 1С у всех вендоров идут мимо типов данных
+
+- **Postgres Pro Enterprise для 1С** ([продуктовая страница](https://postgrespro.ru/products/postgrespro/enterprise-1c)):
+  временные таблицы, планировщик, блокировки, кэш, каталог. Релиз
+  [17.5.1](https://postgrespro.ru/blog/news/5972046): Background freezer, параллельный
+  автовакуум, in-memory catalog для временных таблиц. Релиз
+  [18.4.1](https://habr.com/ru/companies/postgrespro/news/1056088/): временные таблицы на
+  Hot Standby, `enable_join_predicate_pushdown`, селективность MCV. **`numeric` не
+  упоминается нигде.**
+- **Tantor Special Edition 1C** ([страница продукта](https://tantorlabs.ru/tantor-se-1c)):
+  join predicate pushdown, RLS, нормализация имён временных таблиц, ускорение закрытия
+  месяца, `pg_stat_advisor`. Numeric не упоминается.
+- **Доклады PGConf.Russia [2024](https://pgconf.ru/2024/talks) и
+  [2025](https://pgconf.ru/pgconf-2025/talks)** по 1С — про планировщик и временные
+  таблицы. В [разборе доклада Антона Дорошкевича про закрытие месяца](https://habr.com/ru/articles/896662/)
+  узкое место названо прямо: «планировщик неизменно использует Nested Loop в запросах,
+  генерируемых 1С», помог патч Фёдора Сигаева на оценку селективности, ускорение 5–7,7×.
+  Типы данных не упоминаются.
+
+### 10.4. Платформа движется в сторону большей точности, а не меньшей
+
+[Новое в платформе 8.5.4](https://v8.1c.ru/platforma/news/novoe-v-platforme-8-5-4/):
+
+> «Мы **повысили точность** простых арифметических операций при выполнении запросов к СУБД.
+> Это изменение реализовано для СУБД Microsoft SQL Server и PostgreSQL и ее производных.»
+
+Там же — нагрузочное тестирование «1С:ERP» на **30 000 одновременных пользователей** в
+единой базе на PostgreSQL с патчем от 1С.
+
+От типа, от которого собираются уходить, не требуют большей точности.
+
+### 10.5. Экономика зацементировала выбор
+
+Под 1С выпускаются **отдельные коммерческие редакции СУБД** — у Postgres Professional и у
+Tantor Labs (последняя [продаётся через dist.1c.ru](https://dist.1c.ru/products/item/subd-tantor-special-edition-1-c/)).
+По [опросу Postgres Professional](https://www.cnews.ru/news/line/2026-05-18_postgres_professional_predstavila),
+«свыше 40% респондентов используют для работы ERP-решение «1C»» (это доля среди ERP у
+респондентов, а не доля 1С в инсталляциях PostgreSQL — публичной цифры для второго нет).
+
+Сменить физический тип хранения ресурсов регистров означало бы реструктуризацию всех
+«горячих» таблиц во всех инсталляциях. Цена несопоставима с выигрышем.
+
+### 10.6. Что это значит для задачи «numeric фиксированной длины для 1С»
+
+Данные складываются в довольно определённую картину:
+
+- **Замены `numeric` не будет** — ни от 1С, ни от вендоров СУБД. Значит работать надо с
+  тем `numeric`, который есть, а не проектировать ему смену.
+- **Ускорение `numeric` — единственное живое направление** и в upstream (Дин Рашид), и,
+  судя по всему, единственное реалистичное здесь.
+- **Аргумент «pass-by-value вместо varlena» уже был озвучен в сообществе** — Робертом
+  Хаасом в 2017 году, и по существу не оспорен. Но три написанных расширения умерли, а
+  тема в hackers мертва с ноября 2018-го. Это надо учитывать, оценивая шансы нового захода.
+- **Граница 38 цифр, на которую ориентируется весь остальной мир, совпадает с
+  ограничением самой платформы 1С.** Это аргумент в пользу того, что фиксированная ширина
+  для 1С-профиля данных вообще возможна — но и напоминание, что за пределами 1С
+  у `numeric` есть потребители, которым нужны 78 и 156 цифр (см. §9.2).
+
+---
+
+## 11. Выводы
 
 1. **Формального стандарта «для денег используйте NUMERIC» не существует.** В ISO SQL нет
    даже типа MONEY. Утверждать обратное — ошибка.
@@ -1029,10 +1447,23 @@ double. **Колонка типа `numeric` сама по себе не озна
    граница системы, а не про «правильно/неправильно».
 6. **Отдельно и важно:** тип колонки не определяет тип арифметики. Odoo хранит в `numeric`
    и считает в `double`. Проверять надо оба слоя.
+7. **Точный десятичный тип не умирает — умирает конкретно варианта «произвольная точность
+   переменной длины».** 38 цифр (int128) стали универсальным потолком, а CedarDB, движок
+   2020-х, письменно объясняет отказ от модели PostgreSQL «for performance reasons».
+   В самом PostgreSQL развилка была пройдена в 2001 году и с 2018-го не обсуждалась.
+8. **Сфера применения `numeric` не «финансы», а «всё, где нужна точность за пределами
+   int128 или заранее неизвестный масштаб».** Финансам хватает 15–18 цифр на хранение и
+   25–32 на промежуточные результаты; биржам — 15 по спецификации FIX. Реальный массовый
+   потребитель произвольной точности — EVM-блокчейны (78 цифр на `uint256`, до 156 в
+   промежуточных вычислениях) и сама арифметика агрегатов, где сумма и произведение
+   выводят разрядность за 38 без всякого домена.
+9. **1С от `numeric` не уходит и не собирается.** За ~18 лет патча к PostgreSQL — ноль
+   строк про numeric, при том что для строк 1С написала собственный тип. Платформа 8.5.4
+   наоборот повысила точность арифметики в запросах к СУБД.
 
 ---
 
-## 9. Что осталось непроверенным
+## 12. Что осталось непроверенным
 
 - **Нормативный текст ISO/IEC 9075-2** — платный, проверен только по публичному SQL-92,
   вторичным источникам и грамматике SQL:2016.
@@ -1054,3 +1485,18 @@ double. **Колонка типа `numeric` сама по себе не озна
 - **Инструкции IRS по округлению до целого доллара** — страница не открылась.
 - **Многоязычный поиск** (`polyglot-search`) в этой сессии не подключился; русскоязычные
   источники искались встроенным поиском и прямыми URL.
+- **Размеры BigQuery NUMERIC/BIGNUMERIC в байтах (16/32)** — страница с таблицей размеров
+  рендерится скриптом; ширина выведена из диапазонов, а они однозначно указывают на int128.
+- **Свежие патчи 1С (PG 16/17)** — проверен только патч для 9.6; для новых версий есть лишь
+  косвенное подтверждение через описание сборки.
+- **Типичная разрядность денежных реквизитов в типовых конфигурациях 1С** (гипотеза
+  «Число(15,2)») — авторитетного открытого источника нет. Реальный DDL, который удалось
+  увидеть, показывает `NUMERIC(16,0)` для ресурса регистра и `NUMERIC(1,0)` для флага.
+- **Почему в 1С именно 38 знаков** — официального объяснения нет.
+- **Доля 1С в российских инсталляциях PostgreSQL** — публичной цифры нет; есть только
+  «свыше 40% ERP-респондентов Postgres Professional».
+- **Требования к разрядности в актуарных расчётах** — публичных спецификаций не найдено.
+- **Приложение A спецификации Iceberg** (требования к сериализации decimal) — документ
+  обрезается при выборке.
+- Таблица поддержки `DECFLOAT` на modern-sql.com читается ненадёжно и **не использована**;
+  реализации подтверждены по документации Db2, Firebird и трекеру H2.
