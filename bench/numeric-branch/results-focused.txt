@@ -1,0 +1,22 @@
+session  1/10  v0   done
+session  2/10  v1   done
+session  3/10  v2   done
+session  4/10  v3   done
+session  5/10  v0b  done
+session  6/10  v0b  done
+session  7/10  v3   done
+session  8/10  v2   done
+session  9/10  v1   done
+session 10/10  v0   done
+
+Minimum of 12 samples per build (2 sessions x 6 reps, run back-to-back).
+v0 = fd2b898 upstream base.  v0b = independent rebuild of v0 = noise floor.
+
+id    case                                                 v0 min    v0b%     v1%     v2%     v3%
+-------------------------------------------------------------------------------------------------
+F1    sum(numeric(10,2)), 1 group -- int64 lane, BEST       551.4    -1.4    +3.9    +4.4    +3.2
+Traceback (most recent call last):
+  File "/home/user/bench2/run/driver_focus.py", line 55, in <module>
+    rows.append(dict(id=qid,label=label,v0=m0,**{t:min(d[t]) for t in BUILDS},
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: dict() got multiple values for keyword argument 'v0'
