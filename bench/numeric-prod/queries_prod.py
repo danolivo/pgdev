@@ -53,6 +53,10 @@ QUERIES = [
  ("B13","sum with NaN/+-Inf mixed in","sum","corner",SER,"SELECT sum(v) FROM t_spec;"),
  ("B14","moving sum, 100-row frame (inverse transition)","sum","corner",SER,
   "SELECT count(*) FROM (SELECT sum(v) OVER (ROWS BETWEEN 100 PRECEDING AND CURRENT ROW) FROM t_nar) s;"),
+ ("B16","sum(16-digit): widest value still in the int64 lane","sum","boundary",SER,
+  "SELECT sum(v) FROM t_d4;"),
+ ("B17","sum(17-digit): first value past the gate -- old code's slow lane","sum","boundary",SER,
+  "SELECT sum(v) FROM t_d5;"),
  ("B15","sum over sorted GroupAggregate (no hashing)","sum","isolation",SRT,
   "SELECT count(*) FROM (SELECT g1k, sum(v) FROM t_g GROUP BY g1k) s;"),
 
