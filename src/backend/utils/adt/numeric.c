@@ -3034,11 +3034,20 @@ hash_numeric_extended(PG_FUNCTION_ARGS)
 Datum
 numeric_add(PG_FUNCTION_ARGS)
 {
-	Numeric		num1 = PG_GETARG_NUMERIC(0);
-	Numeric		num2 = PG_GETARG_NUMERIC(1);
+	NumericLocalBuf buf1;
+	NumericLocalBuf buf2;
+	bool		free1;
+	bool		free2;
+	Numeric		num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
+	Numeric		num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
 	Numeric		res;
 
 	res = numeric_add_safe(num1, num2, NULL);
+
+	if (unlikely(free1))
+		pfree(num1);
+	if (unlikely(free2))
+		pfree(num2);
 
 	PG_RETURN_NUMERIC(res);
 }
@@ -3109,11 +3118,20 @@ numeric_add_safe(Numeric num1, Numeric num2, Node *escontext)
 Datum
 numeric_sub(PG_FUNCTION_ARGS)
 {
-	Numeric		num1 = PG_GETARG_NUMERIC(0);
-	Numeric		num2 = PG_GETARG_NUMERIC(1);
+	NumericLocalBuf buf1;
+	NumericLocalBuf buf2;
+	bool		free1;
+	bool		free2;
+	Numeric		num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
+	Numeric		num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
 	Numeric		res;
 
 	res = numeric_sub_safe(num1, num2, NULL);
+
+	if (unlikely(free1))
+		pfree(num1);
+	if (unlikely(free2))
+		pfree(num2);
 
 	PG_RETURN_NUMERIC(res);
 }
@@ -3185,11 +3203,20 @@ numeric_sub_safe(Numeric num1, Numeric num2, Node *escontext)
 Datum
 numeric_mul(PG_FUNCTION_ARGS)
 {
-	Numeric		num1 = PG_GETARG_NUMERIC(0);
-	Numeric		num2 = PG_GETARG_NUMERIC(1);
+	NumericLocalBuf buf1;
+	NumericLocalBuf buf2;
+	bool		free1;
+	bool		free2;
+	Numeric		num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
+	Numeric		num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
 	Numeric		res;
 
 	res = numeric_mul_safe(num1, num2, fcinfo->context);
+
+	if (unlikely(free1))
+		pfree(num1);
+	if (unlikely(free2))
+		pfree(num2);
 
 	if (unlikely(SOFT_ERROR_OCCURRED(fcinfo->context)))
 		PG_RETURN_NULL();
@@ -3307,11 +3334,20 @@ numeric_mul_safe(Numeric num1, Numeric num2, Node *escontext)
 Datum
 numeric_div(PG_FUNCTION_ARGS)
 {
-	Numeric		num1 = PG_GETARG_NUMERIC(0);
-	Numeric		num2 = PG_GETARG_NUMERIC(1);
+	NumericLocalBuf buf1;
+	NumericLocalBuf buf2;
+	bool		free1;
+	bool		free2;
+	Numeric		num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
+	Numeric		num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
 	Numeric		res;
 
 	res = numeric_div_safe(num1, num2, NULL);
+
+	if (unlikely(free1))
+		pfree(num1);
+	if (unlikely(free2))
+		pfree(num2);
 
 	PG_RETURN_NUMERIC(res);
 }
@@ -5155,7 +5191,17 @@ numeric_accum(PG_FUNCTION_ARGS)
 		state = makeNumericAggState(fcinfo, true);
 
 	if (!PG_ARGISNULL(1))
-		do_numeric_accum(state, PG_GETARG_NUMERIC(1));
+	{
+		NumericLocalBuf buf;
+		bool		needfree;
+		Numeric		newval = numeric_unpack_local(PG_GETARG_DATUM(1), &buf,
+												  &needfree);
+
+		do_numeric_accum(state, newval);
+
+		if (unlikely(needfree))
+			pfree(newval);
+	}
 
 	PG_RETURN_POINTER(state);
 }
@@ -5247,7 +5293,17 @@ numeric_avg_accum(PG_FUNCTION_ARGS)
 		state = makeNumericAggState(fcinfo, false);
 
 	if (!PG_ARGISNULL(1))
-		do_numeric_accum(state, PG_GETARG_NUMERIC(1));
+	{
+		NumericLocalBuf buf;
+		bool		needfree;
+		Numeric		newval = numeric_unpack_local(PG_GETARG_DATUM(1), &buf,
+												  &needfree);
+
+		do_numeric_accum(state, newval);
+
+		if (unlikely(needfree))
+			pfree(newval);
+	}
 
 	PG_RETURN_POINTER(state);
 }
@@ -5567,8 +5623,17 @@ numeric_accum_inv(PG_FUNCTION_ARGS)
 
 	if (!PG_ARGISNULL(1))
 	{
+		NumericLocalBuf buf;
+		bool		needfree;
+		Numeric		newval = numeric_unpack_local(PG_GETARG_DATUM(1), &buf,
+												  &needfree);
+		bool		ok = do_numeric_discard(state, newval);
+
+		if (unlikely(needfree))
+			pfree(newval);
+
 		/* If we fail to perform the inverse transition, return NULL */
-		if (!do_numeric_discard(state, PG_GETARG_NUMERIC(1)))
+		if (!ok)
 			PG_RETURN_NULL();
 	}
 
