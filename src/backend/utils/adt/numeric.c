@@ -2525,13 +2525,41 @@ numeric_cmp(PG_FUNCTION_ARGS)
 Datum
 numeric_eq(PG_FUNCTION_ARGS)
 {
+	struct varlena *att1 = (struct varlena *) PG_GETARG_POINTER(0);
+	struct varlena *att2 = (struct varlena *) PG_GETARG_POINTER(1);
 	NumericLocalBuf buf1;
 	NumericLocalBuf buf2;
 	bool		free1;
 	bool		free2;
-	Numeric		num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
-	Numeric		num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
+	Numeric		num1;
+	Numeric		num2;
 	bool		result;
+
+	/*
+	 * Identical stored representations always denote equal values, so for
+	 * equality -- unlike ordering -- we can start with a memcmp.  Values of
+	 * the same column share a display scale and store the same digits, so this
+	 * hits for nearly every comparison done by hash aggregation and hash
+	 * joins, and answers without unpacking either input.  Values that compare
+	 * equal with different scales, and compressed or out-of-line values, fall
+	 * through to the general case.
+	 *
+	 * Do not be tempted to reuse this for ordering: 1.5 and 1.50 are equal but
+	 * differ bytewise, so a non-zero memcmp implies nothing about which of two
+	 * numerics is the larger.
+	 */
+	if (likely(!VARATT_IS_COMPRESSED(att1) && !VARATT_IS_EXTERNAL(att1) &&
+			   !VARATT_IS_COMPRESSED(att2) && !VARATT_IS_EXTERNAL(att2)))
+	{
+		Size		len = VARSIZE_ANY_EXHDR(att1);
+
+		if (len == VARSIZE_ANY_EXHDR(att2) &&
+			memcmp(VARDATA_ANY(att1), VARDATA_ANY(att2), len) == 0)
+			PG_RETURN_BOOL(true);
+	}
+
+	num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
+	num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
 
 	result = cmp_numerics(num1, num2) == 0;
 
