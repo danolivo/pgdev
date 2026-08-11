@@ -497,21 +497,34 @@ static void dump_var(const char *str, NumericVar *var);
 /* ----------
  * Unpacking a numeric into a local buffer.
  *
- * Numerics reaching the comparison and hashing functions normally come
- * straight out of a tuple, where they are stored with a one-byte varlena
- * header.  DatumGetNumeric() then palloc's a copy with the four-byte header
- * that the NUMERIC_* accessors require, which is a large share of the cost of
- * these functions: they are hot, tiny, and otherwise allocation-free.  Since
- * they never let the value outlive the call, they can unpack into a buffer on
- * the caller's stack instead.  Only compressed and out-of-line values still
- * take the DatumGetNumeric() path.
+ * Numerics reaching the comparison and hashing functions normally come straight
+ * out of a tuple, where they are stored with a one-byte varlena header.  Two
+ * separate things then stand between that datum and the NUMERIC_* accessors,
+ * and it is worth being explicit about both, because each on its own would
+ * force a conversion:
+ *
+ * 1. Field offsets.  NUMERIC_HEADER_SIZE() and NUMERIC_DIGITS() are defined in
+ *	  terms of VARHDRSZ, so every field of a short-header value sits three bytes
+ *	  earlier than the accessors expect.  Casting the datum and reading through
+ *	  them does not yield a misaligned value; it yields the wrong bytes.
+ *
+ * 2. Alignment.  heap_fill_tuple() stores a convertible varlena in short form
+ *	  with no alignment padding at all, so the payload begins at an arbitrary
+ *	  byte offset.  Even accessors taught about the short layout would be doing
+ *	  unaligned 16-bit reads of n_header and of the digit array.
+ *
+ * DatumGetNumeric() resolves both by palloc'ing a four-byte-header copy, and
+ * that allocation is a large share of the cost of these functions: they are
+ * hot, tiny and otherwise allocation-free.  Since none of them lets the value
+ * outlive the call, the same copy can go into a buffer on the caller's stack.
+ * Only compressed and out-of-line values still need DatumGetNumeric().
  *
  * The buffer is sized from the varlena short-header limit rather than from a
  * digit count, so that every value which can arrive with a one-byte header
- * fits.  That matters: a buffer too small to cover the whole short-header
- * range would leave a band of widths that are cheap to detect but still have
- * to be palloc'd, and those pay for the rejected fast path on top of the work
- * they did before.  Sizing to the limit removes the band by construction.
+ * fits.  A buffer too small to cover the whole short-header range would leave a
+ * band of widths that are cheap to detect but still have to be palloc'd, and
+ * those pay for the rejected fast path on top of the work they did before.
+ * Sizing to the limit removes that band by construction.
  * ----------
  */
 #define NUMERIC_LOCAL_DATASZ	(VARATT_SHORT_MAX - VARHDRSZ_SHORT)
@@ -523,10 +536,10 @@ typedef union NumericLocalBuf
 } NumericLocalBuf;
 
 /*
- * The fast path below is only reached when the payload fits, so shrinking this
- * buffer would not corrupt anything -- it would silently send a band of widths
- * back to palloc, which is the regression this sizing exists to avoid.  Assert
- * the property rather than leave it to be rediscovered by measurement.
+ * Shrinking this buffer would not corrupt anything -- the copy below is guarded
+ * -- but it would silently send a band of widths back to palloc, which is the
+ * regression the sizing above exists to avoid.  Assert the property rather than
+ * leave it to be rediscovered by measurement.
  */
 StaticAssertDecl(sizeof(NumericLocalBuf) >= VARHDRSZ + NUMERIC_LOCAL_DATASZ,
 				 "NumericLocalBuf cannot hold every short-header numeric");
@@ -547,13 +560,20 @@ numeric_unpack_local(Datum X, NumericLocalBuf *buf, bool *needfree)
 		Size		data_size = VARSIZE_SHORT(attr) - VARHDRSZ_SHORT;
 
 		/*
-		 * The buffer covers the largest payload a short header can describe --
-		 * VARSIZE_SHORT() returns a seven-bit field -- so this test cannot
-		 * fail.  Keep it regardless.  It is what tells the compiler a bound on
-		 * the copy length, and without that bound the copy becomes a call to
-		 * the general memcpy, which measured 2 to 10% slower on the
-		 * money-shaped values this code exists to speed up.  A branch the
-		 * predictor gets right every time is the cheaper of the two.
+		 * The buffer is sized to the largest payload a short header can
+		 * describe and VARSIZE_SHORT() returns a seven-bit field, so this test
+		 * cannot fail in practice.  Keep it anyway, for two reasons.
+		 *
+		 * The first is that it is the only thing bounding a memcpy whose length
+		 * comes from on-disk data.  The reasoning that makes it unfailable spans
+		 * three constants in two files; that is too thin a thread to hang an
+		 * unchecked write to a fixed stack buffer on, in a function this deep
+		 * inside the executor.
+		 *
+		 * The second is that it gives the compiler a bound on the copy, which
+		 * some compilers use to expand it inline rather than call memcpy.  Which
+		 * of the two is faster is platform-dependent and not worth encoding
+		 * here; the branch is predicted correctly every time either way.
 		 */
 		if (likely(data_size <= sizeof(buf->data) - VARHDRSZ))
 		{
@@ -2536,17 +2556,30 @@ numeric_eq(PG_FUNCTION_ARGS)
 	bool		result;
 
 	/*
-	 * Identical stored representations always denote equal values, so for
-	 * equality -- unlike ordering -- we can start with a memcmp.  Values of
-	 * the same column share a display scale and store the same digits, so this
-	 * hits for nearly every comparison done by hash aggregation and hash
-	 * joins, and answers without unpacking either input.  Values that compare
-	 * equal with different scales, and compressed or out-of-line values, fall
-	 * through to the general case.
+	 * Equality -- unlike ordering -- can be answered from the bytes alone,
+	 * without unpacking either input.
 	 *
-	 * Do not be tempted to reuse this for ordering: 1.5 and 1.50 are equal but
-	 * differ bytewise, so a non-zero memcmp implies nothing about which of two
-	 * numerics is the larger.
+	 * Why that is sound: everything past the varlena header is the numeric's own
+	 * header word (sign and dscale and, in the long format, weight) followed by
+	 * the digit array.  Equal length plus equal bytes therefore means equal
+	 * sign, weight, dscale and digits, which is the whole of the value.  It
+	 * holds for the special values too, since NaN and the infinities are encoded
+	 * in those same header bits.  A short-format and a long-format encoding of
+	 * one value have different VARSIZE_ANY_EXHDR and so never reach the memcmp.
+	 *
+	 * The converse does not hold, which is what confines this to equality: 1.5
+	 * and 1.50 are equal values with different bytes, so a non-zero memcmp says
+	 * nothing at all -- neither that the values differ, nor which is larger.
+	 *
+	 * Values of one column share a display scale and store the same digits, so
+	 * this fires for nearly every comparison hash aggregation and hash joins
+	 * perform.  Values equal at different scales, and compressed or out-of-line
+	 * values, fall through to the general case.
+	 *
+	 * Testing the toast flags on datums that have not been detoasted looks
+	 * unsafe and is not: both macros examine only the first byte of the varlena
+	 * header.  Do not "fix" this into PG_GETARG_NUMERIC, which would reintroduce
+	 * the detoast this shortcut exists to avoid.
 	 */
 	if (likely(!VARATT_IS_COMPRESSED(att1) && !VARATT_IS_EXTERNAL(att1) &&
 			   !VARATT_IS_COMPRESSED(att2) && !VARATT_IS_EXTERNAL(att2)))
