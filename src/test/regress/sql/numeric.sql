@@ -1582,3 +1582,34 @@ SELECT pg_lsn(18446744073709551615::numeric);
 SELECT pg_lsn(-1::numeric);
 SELECT pg_lsn(18446744073709551616::numeric);
 SELECT pg_lsn('NaN'::numeric);
+
+--
+-- Hashing and comparison of numerics wide enough to be stored out of line.
+--
+-- The stack-unpacking fast path in numeric_unpack_local() only handles values
+-- that arrive with a one-byte varlena header; compressed and out-of-line values
+-- fall back to DatumGetNumeric().  Nothing else in this file reaches that arm,
+-- so a break in it would go unnoticed.  Force it by making the values wide
+-- enough to be toasted, then hash, group, sort and compare them.
+--
+CREATE TABLE num_toast_test (id int, v numeric);
+ALTER TABLE num_toast_test ALTER COLUMN v SET STORAGE EXTERNAL;
+INSERT INTO num_toast_test
+  SELECT i, (repeat('9', 4000) || i::text)::numeric FROM generate_series(1, 3) i;
+INSERT INTO num_toast_test SELECT 4, v FROM num_toast_test WHERE id = 1;
+
+-- equality and ordering must agree with each other on out-of-line values
+SELECT a.id, b.id, a.v = b.v, a.v < b.v, numeric_cmp(a.v, b.v)
+FROM num_toast_test a, num_toast_test b
+WHERE a.id <= 2 AND b.id <= 2
+ORDER BY a.id, b.id;
+
+-- hashing: the duplicate pair must land in one group, the distinct ones apart
+SELECT count(*) AS groups, count(DISTINCT v) AS distinct_values
+FROM num_toast_test;
+
+-- sortsupport, and a sum over the fallback path
+SELECT id FROM num_toast_test ORDER BY v, id;
+SELECT length(sum(v)::text) AS sum_digits FROM num_toast_test;
+
+DROP TABLE num_toast_test;
