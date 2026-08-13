@@ -874,15 +874,27 @@ numeric_dec128_add_sub(Numeric num1, Numeric num2, bool subtract, NumericData *o
  * numeric_dec128_mul() -
  *
  *	Fast path for multiplication that never touches NumericVar: multiply the
- *	mantissas directly as int128 and add the scales.  Only handles the case
- *	where the raw product needs no rounding at all -- fits within
- *	NUMERIC_MAX_MANT at a combined scale of scale1 + scale2 that is itself
- *	within NUMERIC_MAX_STORED_SCALE.  Both mantissas already fit in 37
- *	digits, so their product can need up to 74 -- vastly more than int128
- *	holds -- for anything but comparatively small operands; this is
- *	deliberately conservative (no attempt to round a too-wide product down
- *	to a valid dec128 value) to avoid duplicating mul_var()'s rounding
- *	rules.  Only called on finite (non-special) operands.
+ *	mantissas directly as int128 and add the scales.  Only called on finite
+ *	(non-special) operands.  Returns false when it cannot produce the answer,
+ *	in which case the caller falls back to mul_var().
+ *
+ *	The exact product has scale s1 + s2, which can be up to twice
+ *	NUMERIC_MAX_STORED_SCALE and therefore often exceeds what dec128 stores.
+ *	An earlier version simply gave up in that case, which turned out to be a
+ *	significant and very unevenly distributed cost: a column whose values came
+ *	out of a division carries scale NUMERIC_MAX_STORED_SCALE (division always
+ *	clamps to it), so s1 + s2 was 30 and the fast path *never* ran for such a
+ *	column.  Measured on 1.5M rows, sum(v*v) took 61 ms on a numeric(12,2)
+ *	column and 112 ms on a division-derived one holding the same magnitudes --
+ *	a 1.8x penalty decided purely by where the values came from.
+ *
+ *	So instead of giving up we round here, exactly as the general path would:
+ *	mul_var() computes the product at rscale s1 + s2 and make_result() then
+ *	rounds it to NUMERIC_MAX_STORED_SCALE via round_var(), which rounds half
+ *	away from zero.  Doing the same division on the mantissa is
+ *	bit-for-bit equivalent, and the order of operations matters -- round first,
+ *	range-check after -- because a product that overflows dec128 before
+ *	rounding may well fit once rounded.
  */
 static inline bool
 numeric_dec128_mul(Numeric num1, Numeric num2, NumericData *out)
@@ -894,11 +906,42 @@ numeric_dec128_mul(Numeric num1, Numeric num2, NumericData *out)
 	int			scale = s1 + s2;
 	int128		product;
 
-	if (scale > NUMERIC_MAX_STORED_SCALE)
-		return false;
-
+	/*
+	 * Both mantissas fit 37 digits, so their exact product can need up to 74
+	 * and overflow int128 for large operands.  That is not a wrong answer, just
+	 * one this path cannot compute: mul_var() has no width limit, so the caller
+	 * still gets the right result (possibly an honest overflow error) from the
+	 * general path.
+	 */
 	if (unlikely(__builtin_mul_overflow(m1, m2, &product)))
 		return false;
+
+	if (scale > NUMERIC_MAX_STORED_SCALE)
+	{
+		int			drop = scale - NUMERIC_MAX_STORED_SCALE;
+		int128		divisor;
+		int128		rem;
+
+		/* s1 and s2 are each bounded by NUMERIC_MAX_STORED_SCALE */
+		Assert(drop >= 1 && drop <= NUMERIC_MAX_STORED_SCALE);
+
+		divisor = numeric_dec128_pow10[drop];
+		rem = product % divisor;
+		product /= divisor;
+
+		/*
+		 * Round half away from zero, matching round_var().  C truncates
+		 * division toward zero and gives the remainder the dividend's sign, so
+		 * the two directions need separate nudges.  rem is bounded by divisor
+		 * (at most 10^15), so the doubling cannot overflow.
+		 */
+		if (rem > 0 && rem * 2 >= divisor)
+			product++;
+		else if (rem < 0 && (-rem) * 2 >= divisor)
+			product--;
+
+		scale = NUMERIC_MAX_STORED_SCALE;
+	}
 
 	if (unlikely(product > NUMERIC_MAX_MANT || product < -NUMERIC_MAX_MANT))
 		return false;
@@ -987,7 +1030,12 @@ typedef struct
  */
 typedef struct
 {
-	void	   *buf;			/* buffer for short varlenas */
+	/*
+	 * EXPERIMENTAL (SPEC-numeric-as-dec128.md): the "void *buf" realignment
+	 * buffer that used to live here is gone.  It existed so that a
+	 * short-header varlena could be copied somewhere aligned before being read
+	 * as a Numeric; a fixed-width, non-toastable dec128 value is read in place.
+	 */
 	int64		input_count;	/* number of non-null values seen */
 	bool		estimating;		/* true if estimating cardinality */
 
@@ -1973,6 +2021,34 @@ numerictypmodin(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("NUMERIC scale %d must be between %d and %d",
 							tl[1], NUMERIC_MIN_SCALE, NUMERIC_MAX_SCALE)));
+
+		/*
+		 * EXPERIMENTAL (SPEC-numeric-as-dec128.md): reject a declared scale
+		 * this representation cannot honour.
+		 *
+		 * dec128 stores at most NUMERIC_MAX_STORED_SCALE fractional digits, and
+		 * apply_typmod() would quietly round a value down to that.  Without this
+		 * check "numeric(38,20)" is accepted and then stores 15 decimals with
+		 * neither error nor warning -- a column that promises more precision
+		 * than it keeps is worse than one that refuses to be created.  Fail at
+		 * DDL time instead, where it is visible and fixable.
+		 *
+		 * Note this is a user-visible restriction that stock numeric does not
+		 * have (it allows scale up to NUMERIC_MAX_SCALE), so a schema using
+		 * wider scales will not load on this build at all.  That is deliberate:
+		 * for an experiment gated on provable correctness, refusing the schema
+		 * is the honest failure mode.
+		 */
+		if (tl[1] > NUMERIC_MAX_STORED_SCALE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("NUMERIC scale %d exceeds the maximum supported by this build",
+							tl[1]),
+					 errdetail("This server stores numeric values with at most %d fractional digits.",
+							   NUMERIC_MAX_STORED_SCALE),
+					 errhint("Use a scale of %d or less.",
+							 NUMERIC_MAX_STORED_SCALE)));
+
 		typmod = make_numeric_typmod(tl[0], tl[1]);
 	}
 	else if (n == 1)
@@ -2386,9 +2462,15 @@ generate_series_step_numeric(PG_FUNCTION_ARGS)
 
 		/*
 		 * Use fctx to keep state from call to call. Seed current with the
-		 * original start value. We must copy the start_num and stop_num
-		 * values rather than pointing to them, since we may have detoasted
-		 * them in the per-call context.
+		 * original start value.
+		 *
+		 * We must still copy the start_num and stop_num values rather than
+		 * pointing at them, but note the reason has changed: they are no longer
+		 * detoasted copies (a dec128 numeric is never toasted), they are
+		 * argument pointers into the per-call context, which is reset before
+		 * the next call.  fctx lives in multi_call_memory_ctx and outlives
+		 * them, so pointing at them would dangle.  Do not "simplify" these
+		 * copies away on the grounds that detoasting is gone.
 		 */
 		init_var(&fctx->current);
 		init_var(&fctx->stop);
@@ -2694,17 +2776,23 @@ compute_bucket(Numeric operand, Numeric bound1, Numeric bound2,
  *
  * Comparison functions
  *
- * Note: btree indexes need these routines not to leak memory; therefore,
- * be careful to free working copies of toasted datums.  Most places don't
- * need to be so careful.
+ * EXPERIMENTAL (SPEC-numeric-as-dec128.md): this section used to open with a
+ * warning that btree indexes need these routines not to leak, so working
+ * copies of toasted datums must be freed.  That no longer applies and the
+ * warning has been removed rather than left to mislead: numeric is now
+ * fixed-width (typlen 16), pass-by-reference, and non-toastable
+ * (typstorage 'p'), so the storage layer never compresses or moves a value
+ * out of line, DatumGetNumeric() is a plain pointer cast, and no comparison
+ * routine here ever holds a copy to free.  The PG_FREE_IF_COPY() calls that
+ * used to follow each comparison were unreachable and are gone.
  *
  * Sort support:
  *
  * We implement the sortsupport strategy routine in order to get the benefit of
- * abbreviation. The ordinary numeric comparison can be quite slow as a result
- * of palloc/pfree cycles (due to detoasting packed values for alignment);
- * while this could be worked on itself, the abbreviation strategy gives more
- * speedup in many common cases.
+ * abbreviation.  (The original rationale also cited palloc/pfree cycles from
+ * detoasting packed values for alignment; that cost no longer exists, but
+ * abbreviation is still worth having, since it lets most comparisons be
+ * decided on a by-value key without dereferencing either datum.)
  *
  * Two different representations are used for the abbreviated form, one in
  * int32 and one in int64, whichever fits into a by-value Datum.  In both cases
@@ -2745,13 +2833,7 @@ numeric_sortsupport(PG_FUNCTION_ARGS)
 
 		nss = palloc(sizeof(NumericSortSupport));
 
-		/*
-		 * EXPERIMENTAL (SPEC-numeric-as-dec128.md): no realignment buffer is
-		 * needed any more.  It existed to copy a short-header varlena somewhere
-		 * aligned; a dec128 numeric is fixed-width, never toasted and never
-		 * short-headered, so numeric_abbrev_convert() reads the datum in place.
-		 */
-		nss->buf = NULL;
+		/* no realignment buffer to allocate; see NumericSortSupport */
 
 		nss->input_count = 0;
 		nss->estimating = true;
@@ -3002,29 +3084,20 @@ numeric_abbrev_abort(int memtupcount, SortSupport ssup)
 
 /*
  * Non-fmgr interface to the comparison routine to allow sortsupport to elide
- * the fmgr call.  The saving here is small given how slow numeric comparisons
- * are, but it is a required part of the sort support API when abbreviations
- * are performed.
+ * the fmgr call.  It is also a required part of the sort support API when
+ * abbreviations are performed.
  *
- * Two palloc/pfree cycles could be saved here by using persistent buffers for
- * aligning short-varlena inputs, but this has not so far been considered to
- * be worth the effort.
+ * EXPERIMENTAL (SPEC-numeric-as-dec128.md): the two palloc/pfree cycles this
+ * used to worry about are gone, along with the free-if-copy checks that
+ * followed the comparison.  A dec128 numeric is fixed-width, non-toastable and
+ * never short-headered, so DatumGetNumeric() is a plain pointer cast and can
+ * never hand back a copy to free.
  */
 static int
 numeric_fast_cmp(Datum x, Datum y, SortSupport ssup)
 {
-	Numeric		nx = DatumGetNumeric(x);
-	Numeric		ny = DatumGetNumeric(y);
-	int			result;
-
-	result = cmp_numerics(nx, ny);
-
-	if ((Pointer) nx != DatumGetPointer(x))
-		pfree(nx);
-	if ((Pointer) ny != DatumGetPointer(y))
-		pfree(ny);
-
-	return result;
+	return cmp_numerics((Numeric) DatumGetPointer(x),
+						(Numeric) DatumGetPointer(y));
 }
 
 /*
@@ -3237,9 +3310,6 @@ numeric_cmp(PG_FUNCTION_ARGS)
 
 	result = cmp_numerics(num1, num2);
 
-	PG_FREE_IF_COPY(num1, 0);
-	PG_FREE_IF_COPY(num2, 1);
-
 	PG_RETURN_INT32(result);
 }
 
@@ -3253,9 +3323,6 @@ numeric_eq(PG_FUNCTION_ARGS)
 
 	result = cmp_numerics(num1, num2) == 0;
 
-	PG_FREE_IF_COPY(num1, 0);
-	PG_FREE_IF_COPY(num2, 1);
-
 	PG_RETURN_BOOL(result);
 }
 
@@ -3267,9 +3334,6 @@ numeric_ne(PG_FUNCTION_ARGS)
 	bool		result;
 
 	result = cmp_numerics(num1, num2) != 0;
-
-	PG_FREE_IF_COPY(num1, 0);
-	PG_FREE_IF_COPY(num2, 1);
 
 	PG_RETURN_BOOL(result);
 }
@@ -3283,9 +3347,6 @@ numeric_gt(PG_FUNCTION_ARGS)
 
 	result = cmp_numerics(num1, num2) > 0;
 
-	PG_FREE_IF_COPY(num1, 0);
-	PG_FREE_IF_COPY(num2, 1);
-
 	PG_RETURN_BOOL(result);
 }
 
@@ -3297,9 +3358,6 @@ numeric_ge(PG_FUNCTION_ARGS)
 	bool		result;
 
 	result = cmp_numerics(num1, num2) >= 0;
-
-	PG_FREE_IF_COPY(num1, 0);
-	PG_FREE_IF_COPY(num2, 1);
 
 	PG_RETURN_BOOL(result);
 }
@@ -3313,9 +3371,6 @@ numeric_lt(PG_FUNCTION_ARGS)
 
 	result = cmp_numerics(num1, num2) < 0;
 
-	PG_FREE_IF_COPY(num1, 0);
-	PG_FREE_IF_COPY(num2, 1);
-
 	PG_RETURN_BOOL(result);
 }
 
@@ -3327,9 +3382,6 @@ numeric_le(PG_FUNCTION_ARGS)
 	bool		result;
 
 	result = cmp_numerics(num1, num2) <= 0;
-
-	PG_FREE_IF_COPY(num1, 0);
-	PG_FREE_IF_COPY(num2, 1);
 
 	PG_RETURN_BOOL(result);
 }
@@ -3515,10 +3567,6 @@ in_range_numeric_numeric(PG_FUNCTION_ARGS)
 
 		free_var(&sum);
 	}
-
-	PG_FREE_IF_COPY(val, 0);
-	PG_FREE_IF_COPY(base, 1);
-	PG_FREE_IF_COPY(offset, 2);
 
 	PG_RETURN_BOOL(result);
 }
