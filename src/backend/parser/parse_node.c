@@ -422,8 +422,25 @@ make_const(ParseState *pstate, A_Const *aconst)
 					cancel_parser_errposition_callback(&pcbstate);
 
 					typeid = NUMERICOID;
-					typelen = -1;	/* variable len */
-					typebyval = false;
+
+					/*
+					 * EXPERIMENTAL (SPEC-numeric-as-dec128.md): numeric is
+					 * now a fixed 16-byte, non-toastable, pass-by-reference
+					 * type, not the classic varlena.  Don't hardcode the old
+					 * "variable len" assumption here -- a Const's own
+					 * constlen/constbyval fields are what _copyConst() uses
+					 * to datumCopy() this value on every parse-tree copy
+					 * (planning, plan caching, rule rewriting, ...), so
+					 * getting this wrong makes every copy of a numeric
+					 * literal treat the packed dec128 bytes as a varlena
+					 * datum and corrupt it.
+					 */
+					{
+						int16		typlen16;
+
+						get_typlenbyval(typeid, &typlen16, &typebyval);
+						typelen = typlen16;
+					}
 				}
 				break;
 			}

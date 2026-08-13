@@ -334,6 +334,8 @@ main(int argc, char *argv[])
 		   _("64-bit integers"));
 	printf(_("Float8 argument passing:              %s\n"),
 		   (ControlFile->float8ByVal ? _("by value") : _("by reference")));
+	printf(_("Numeric dec128 format (EXPERIMENTAL):  %s\n"),
+		   (ControlFile->numericDec128Format ? _("yes") : _("no")));
 	printf(_("Data page checksum version:           %u\n"),
 		   ControlFile->data_checksum_version);
 	printf(_("Default char data signedness:         %s\n"),

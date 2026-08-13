@@ -347,11 +347,19 @@
 
 { oid => '1700', array_type_oid => '1231',
   descr => '\'numeric(precision, scale)\' arbitrary precision number',
-  typname => 'numeric', typlen => '-1', typbyval => 'f', typcategory => 'N',
+  # EXPERIMENTAL (SPEC-numeric-as-dec128.md): fixed 16-byte scaled-integer
+  # representation instead of a variable-length digit array.  typlen 16,
+  # typalign 'd' (8-byte, so the two int64 halves in NumericData never need
+  # a misaligned load), typstorage 'p' (plain: fixed-length values are never
+  # varlena and never TOASTed).  typbyval stays 'f': 16 bytes doesn't fit a
+  # Datum on any current platform.  Not disk-format compatible with a
+  # cluster initialized by an unpatched binary -- this is a one-off
+  # benchmarking build, not a supported on-disk format change.
+  typname => 'numeric', typlen => '16', typbyval => 'f', typcategory => 'N',
   typinput => 'numeric_in', typoutput => 'numeric_out',
   typreceive => 'numeric_recv', typsend => 'numeric_send',
   typmodin => 'numerictypmodin', typmodout => 'numerictypmodout',
-  typalign => 'i', typstorage => 'm' },
+  typalign => 'd', typstorage => 'p' },
 
 { oid => '1790', array_type_oid => '2201',
   descr => 'reference to cursor (portal name)',
@@ -474,7 +482,10 @@
   typname => 'numrange', typlen => '-1', typbyval => 'f', typtype => 'r',
   typcategory => 'R', typinput => 'range_in', typoutput => 'range_out',
   typreceive => 'range_recv', typsend => 'range_send',
-  typanalyze => 'range_typanalyze', typalign => 'i', typstorage => 'x' },
+  # EXPERIMENTAL (SPEC-numeric-as-dec128.md): numeric's typalign changed
+  # from 'i' to 'd' (see its own pg_type.dat entry); numrange's typalign
+  # must track its subtype's, per the consistency check in type_sanity.sql.
+  typanalyze => 'range_typanalyze', typalign => 'd', typstorage => 'x' },
 { oid => '3908', array_type_oid => '3909',
   descr => 'range of timestamps without time zone',
   typname => 'tsrange', typlen => '-1', typbyval => 'f', typtype => 'r',
@@ -510,7 +521,9 @@
   typcategory => 'R', typinput => 'multirange_in',
   typoutput => 'multirange_out', typreceive => 'multirange_recv',
   typsend => 'multirange_send', typanalyze => 'multirange_typanalyze',
-  typalign => 'i', typstorage => 'x' },
+  # EXPERIMENTAL (SPEC-numeric-as-dec128.md): same alignment fix as
+  # numrange above -- this multirange's bounds are ultimately numeric.
+  typalign => 'd', typstorage => 'x' },
 { oid => '4533', array_type_oid => '6152',
   descr => 'multirange of timestamps without time zone',
   typname => 'tsmultirange', typlen => '-1', typbyval => 'f', typtype => 'm',

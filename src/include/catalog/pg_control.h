@@ -21,8 +21,15 @@
 #include "port/pg_crc32c.h"
 
 
-/* Version identifier for this pg_control format */
-#define PG_CONTROL_VERSION	1800
+/*
+ * Version identifier for this pg_control format.
+ *
+ * EXPERIMENTAL (SPEC-numeric-as-dec128.md): bumped from upstream's 1800
+ * so that a pg_control written by a stock build is rejected outright (a
+ * version mismatch, not a field-by-field check) rather than silently
+ * misread as if numericDec128Format below were present and true.
+ */
+#define PG_CONTROL_VERSION	1801
 
 /* Nonce key length, see below */
 #define MOCK_AUTH_NONCE_LEN		32
@@ -217,6 +224,21 @@ typedef struct ControlFileData
 	uint32		loblksize;		/* chunk size in pg_largeobject */
 
 	bool		float8ByVal;	/* float8, int8, etc pass-by-value? */
+
+	/*
+	 * EXPERIMENTAL (SPEC-numeric-as-dec128.md): this build stores numeric as
+	 * a fixed 16-byte packed dec128 value instead of the classic
+	 * variable-length varlena format.  Old data directories initialized by
+	 * a stock (or differently-patched) build must never be opened by this
+	 * binary, and vice versa -- silently doing so would misinterpret
+	 * on-disk numeric bytes and corrupt data without any visible error.
+	 * Modeled on float8ByVal above: always true in this build, checked at
+	 * startup in CheckControlFile(), and left unconditionally true because
+	 * this experimental build has no compile-time choice of representation
+	 * (see SPEC-numeric-as-dec128.md sec. 9 -- this isn't meant to become a
+	 * configurable build flag).
+	 */
+	bool		numericDec128Format;
 
 	/* Are data pages protected by checksums? Zero if no checksum version */
 	uint32		data_checksum_version;

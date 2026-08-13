@@ -105,159 +105,456 @@ typedef int16 NumericDigit;
 #define NBASE_SQR	(NBASE * NBASE)
 
 /*
- * The Numeric type as stored on disk.
+ * The Numeric type as stored on disk and in memory.
  *
- * If the high bits of the first word of a NumericChoice (n_header, or
- * n_short.n_header, or n_long.n_sign_dscale) are NUMERIC_SHORT, then the
- * numeric follows the NumericShort format; if they are NUMERIC_POS or
- * NUMERIC_NEG, it follows the NumericLong format. If they are NUMERIC_SPECIAL,
- * the value is a NaN or Infinity.  We currently always store SPECIAL values
- * using just two bytes (i.e. only n_header), but previous releases used only
- * the NumericLong format, so we might find 4-byte NaNs (though not infinities)
- * on disk if a database has been migrated using pg_upgrade.  In either case,
- * the low-order bits of a special value's header are reserved and currently
- * should always be set to zero.
+ * EXPERIMENTAL REPRESENTATION -- see SPEC-numeric-as-dec128.md.  This is a
+ * one-off benchmarking build, not a supported storage format change.
  *
- * In the NumericShort format, the remaining 14 bits of the header word
- * (n_short.n_header) are allocated as follows: 1 for sign (positive or
- * negative), 6 for dynamic scale, and 7 for weight.  In practice, most
- * commonly-encountered values can be represented this way.
+ * A value is a scaled integer: mantissa / 10^scale.  The mantissa is a
+ * signed 123-bit integer and the scale is a 4-bit field (0..15), packed
+ * together into a fixed 16-byte struct with no varlena header at all
+ * (pg_type.typlen = 16, typstorage = 'p').  The struct is kept as two int64
+ * halves rather than a bare 128-bit field because a Datum is only
+ * guaranteed 8-byte aligned, and dereferencing a misaligned native 128-bit
+ * integer is undefined behaviour; two aligned 64-bit loads and a shift are
+ * always correct.
  *
- * In the NumericLong format, the remaining 14 bits of the header word
- * (n_long.n_sign_dscale) represent the display scale; and the weight is
- * stored separately in n_weight.
+ * NaN, +Infinity and -Infinity are encoded as mantissa magnitudes just
+ * above the largest representable 37-digit value (NUMERIC_MAX_MANT):
+ * mantissa == NUMERIC_MAX_MANT+1 is NaN (NaN carries no sign, so only the
+ * positive form is used), mantissa == NUMERIC_MAX_MANT+2 is +Infinity, and
+ * mantissa == -(NUMERIC_MAX_MANT+2) is -Infinity.  This mirrors the classic
+ * format's use of otherwise-impossible header bit patterns for specials:
+ * the mantissa range between 10^37 and 2^123 is never produced by ordinary
+ * arithmetic, so a handful of values in it are free to repurpose.  The scale
+ * field is unused (zero) for special values.
  *
- * NOTE: by convention, values in the packed form have been stripped of
- * all leading and trailing zero digits (where a "digit" is of base NBASE).
- * In particular, if the value is zero, there will be no digits at all!
- * The weight is arbitrary in that case, but we normally set it to zero.
+ * There is no digit array: NUMERIC_DIGITS()/NUMERIC_NDIGITS()/NUMERIC_WEIGHT
+ * have no counterpart here.  Every function that used to inspect or patch
+ * the packed header directly now goes through NumericVar via
+ * numeric_dec128_to_var()/numeric_var_to_dec128() (the two "points of
+ * coupling" the spec calls out), except for abs/negate/compare/hash, which
+ * operate on the scaled-integer mantissa directly since that is at least as
+ * cheap as unpacking and repacking would be.
  */
 
-struct NumericShort
-{
-	uint16		n_header;		/* Sign + display scale + weight */
-	NumericDigit n_data[FLEXIBLE_ARRAY_MEMBER]; /* Digits */
-};
-
-struct NumericLong
-{
-	uint16		n_sign_dscale;	/* Sign + display scale */
-	int16		n_weight;		/* Weight of 1st digit	*/
-	NumericDigit n_data[FLEXIBLE_ARRAY_MEMBER]; /* Digits */
-};
-
-union NumericChoice
-{
-	uint16		n_header;		/* Header word */
-	struct NumericLong n_long;	/* Long form (4-byte header) */
-	struct NumericShort n_short;	/* Short form (2-byte header) */
-};
+#ifndef HAVE_INT128
+#error "the numeric-as-dec128 representation requires a native 128-bit integer type"
+#endif
 
 struct NumericData
 {
-	int32		vl_len_;		/* varlena header (do not touch directly!) */
-	union NumericChoice choice; /* choice of format */
+	int64		n_hi;			/* high 64 bits of the packed value */
+	uint64		n_lo;			/* low 64 bits; low 4 bits hold the scale */
 };
 
+/*
+ * utils/numeric.h only forward-declares "struct NumericData" (the type's
+ * contents are private to this file) and typedefs the pointer type
+ * "Numeric" from it; it never typedefs the bare struct name.  Do that here,
+ * locally, so the rest of this file can write "NumericData" instead of
+ * "struct NumericData" everywhere -- writing the bare (undeclared-as-a-type)
+ * name without this would silently parse as an implicit int under GCC's
+ * K&R compatibility fallback rather than fail outright, which is exactly
+ * the kind of "compiles but is nonsense" bug this whole patch is trying not
+ * to introduce.
+ */
+typedef struct NumericData NumericData;
 
 /*
- * Interpretation of high bits.
+ * utils/numeric.h can't see this struct's fields (it's forward-declared
+ * there only), so DatumGetNumericCopy() has its own NUMERIC_DATUM_SIZE
+ * constant mirroring this size.  Catch the two drifting apart.
  */
+StaticAssertDecl(sizeof(NumericData) == 16,
+				  "NUMERIC_DATUM_SIZE in numeric.h must match sizeof(NumericData)");
 
+/*
+ * Sentinel tags used for a NumericVar's "sign" field.  These are opaque
+ * integer tags at the NumericVar level; they no longer double as literal
+ * on-disk header bits (there is no header), but the names and values are
+ * kept unchanged since dozens of call sites compare against them.
+ */
 #define NUMERIC_SIGN_MASK	0xC000
 #define NUMERIC_POS			0x0000
 #define NUMERIC_NEG			0x4000
-#define NUMERIC_SHORT		0x8000
 #define NUMERIC_SPECIAL		0xC000
+#define NUMERIC_NAN			0xC000
+#define NUMERIC_PINF		0xD000
+#define NUMERIC_NINF		0xF000
 
-#define NUMERIC_FLAGBITS(n) ((n)->choice.n_header & NUMERIC_SIGN_MASK)
-#define NUMERIC_IS_SHORT(n)		(NUMERIC_FLAGBITS(n) == NUMERIC_SHORT)
-#define NUMERIC_IS_SPECIAL(n)	(NUMERIC_FLAGBITS(n) == NUMERIC_SPECIAL)
+#define NUMERIC_SCALE_BITS			4
+#define NUMERIC_SCALE_MASK			((uint64) 0xf)
+#define NUMERIC_MAX_STORED_SCALE	15
+#define NUMERIC_MAX_MANT_DIGITS		37
 
-#define NUMERIC_HDRSZ	(VARHDRSZ + sizeof(uint16) + sizeof(int16))
-#define NUMERIC_HDRSZ_SHORT (VARHDRSZ + sizeof(uint16))
+/* 10^18, the largest power of ten an int64 literal can carry */
+#define NUMERIC_POW10_P18	((int128) INT64CONST(1000000000000000000))
+/* 10^37, needs 123 bits; 2^123 = 1.06e37, so it just fits in a native int128 */
+#define NUMERIC_POW10_MAX	(NUMERIC_POW10_P18 * NUMERIC_POW10_P18 * 10)
+
+/* widest mantissa the encoding holds, and the special-value sentinels above it */
+#define NUMERIC_MAX_MANT	(NUMERIC_POW10_MAX - 1)
+#define NUMERIC_NAN_MANT	(NUMERIC_MAX_MANT + 1)
+#define NUMERIC_PINF_MANT	(NUMERIC_MAX_MANT + 2)
+#define NUMERIC_NINF_MANT	(-(NUMERIC_MAX_MANT + 2))
 
 /*
- * If the flag bits are NUMERIC_SHORT or NUMERIC_SPECIAL, we want the short
- * header; otherwise, we want the long one.  Instead of testing against each
- * value, we can just look at the high bit, for a slight efficiency gain.
+ * Unpack/pack the two 64-bit halves into/from the mantissa and scale.
  */
-#define NUMERIC_HEADER_IS_SHORT(n)	(((n)->choice.n_header & 0x8000) != 0)
-#define NUMERIC_HEADER_SIZE(n) \
-	(VARHDRSZ + sizeof(uint16) + \
-	 (NUMERIC_HEADER_IS_SHORT(n) ? 0 : sizeof(int16)))
+static inline int128
+numeric_packed(const NumericData *n)
+{
+	return ((int128) n->n_hi << 64) | (int128) n->n_lo;
+}
+
+static inline int
+numeric_pack_scale(const NumericData *n)
+{
+	return (int) (n->n_lo & NUMERIC_SCALE_MASK);
+}
+
+static inline int128
+numeric_pack_mant(const NumericData *n)
+{
+	return numeric_packed(n) >> NUMERIC_SCALE_BITS;
+}
+
+static inline void
+numeric_pack_store(NumericData *n, int128 mant, int scale)
+{
+	int128		packed;
+
+	/*
+	 * A scale outside [0, NUMERIC_MAX_STORED_SCALE] would OR straight into the
+	 * mantissa's low bits below and corrupt the value with no error.  Every
+	 * write to a numeric goes through here, so assert the invariant rather
+	 * than trusting each caller to have maintained it.  (Special values pass
+	 * a mantissa above NUMERIC_MAX_MANT with scale 0, which is fine.)
+	 */
+	Assert(scale >= 0 && scale <= NUMERIC_MAX_STORED_SCALE);
+
+	packed = ((int128) mant << NUMERIC_SCALE_BITS) |
+		(int128) (unsigned int) scale;
+
+	n->n_hi = (int64) (packed >> 64);
+	n->n_lo = (uint64) packed;
+}
 
 /*
- * Definitions for special values (NaN, positive infinity, negative infinity).
+ * Is this a special (NaN or infinity) value?
  *
- * The two bits after the NUMERIC_SPECIAL bits are 00 for NaN, 01 for positive
- * infinity, 11 for negative infinity.  (This makes the sign bit match where
- * it is in a short-format value, though we make no use of that at present.)
- * We could mask off the remaining bits before testing the active bits, but
- * currently those bits must be zeroes, so masking would just add cycles.
+ * Spelled as an inline function rather than a macro so that the 128-bit load
+ * and shift behind numeric_pack_mant() happens once per test.  As a macro
+ * naming its argument twice, this evaluated it twice, and PostgreSQL builds
+ * with -fno-strict-aliasing, which limits how much of that the compiler is
+ * allowed to fold away.
  */
-#define NUMERIC_EXT_SIGN_MASK	0xF000	/* high bits plus NaN/Inf flag bits */
-#define NUMERIC_NAN				0xC000
-#define NUMERIC_PINF			0xD000
-#define NUMERIC_NINF			0xF000
-#define NUMERIC_INF_SIGN_MASK	0x2000
+static inline bool
+numeric_is_special_val(const NumericData *n)
+{
+	int128		mant = numeric_pack_mant(n);
 
-#define NUMERIC_EXT_FLAGBITS(n)	((n)->choice.n_header & NUMERIC_EXT_SIGN_MASK)
-#define NUMERIC_IS_NAN(n)		((n)->choice.n_header == NUMERIC_NAN)
-#define NUMERIC_IS_PINF(n)		((n)->choice.n_header == NUMERIC_PINF)
-#define NUMERIC_IS_NINF(n)		((n)->choice.n_header == NUMERIC_NINF)
-#define NUMERIC_IS_INF(n) \
-	(((n)->choice.n_header & ~NUMERIC_INF_SIGN_MASK) == NUMERIC_PINF)
+	return mant > NUMERIC_MAX_MANT || mant < -NUMERIC_MAX_MANT;
+}
+
+#define NUMERIC_IS_SPECIAL(n)	numeric_is_special_val(n)
+#define NUMERIC_IS_NAN(n)	(numeric_pack_mant(n) == NUMERIC_NAN_MANT)
+#define NUMERIC_IS_PINF(n)	(numeric_pack_mant(n) == NUMERIC_PINF_MANT)
+#define NUMERIC_IS_NINF(n)	(numeric_pack_mant(n) == NUMERIC_NINF_MANT)
+#define NUMERIC_IS_INF(n)	(NUMERIC_IS_PINF(n) || NUMERIC_IS_NINF(n))
 
 /*
- * Short format definitions.
+ * Sign and display scale of a *finite* value.  (Never called on a special
+ * value; the classic format's comment to that effect still applies.)
  */
-
-#define NUMERIC_SHORT_SIGN_MASK			0x2000
-#define NUMERIC_SHORT_DSCALE_MASK		0x1F80
-#define NUMERIC_SHORT_DSCALE_SHIFT		7
-#define NUMERIC_SHORT_DSCALE_MAX		\
-	(NUMERIC_SHORT_DSCALE_MASK >> NUMERIC_SHORT_DSCALE_SHIFT)
-#define NUMERIC_SHORT_WEIGHT_SIGN_MASK	0x0040
-#define NUMERIC_SHORT_WEIGHT_MASK		0x003F
-#define NUMERIC_SHORT_WEIGHT_MAX		NUMERIC_SHORT_WEIGHT_MASK
-#define NUMERIC_SHORT_WEIGHT_MIN		(-(NUMERIC_SHORT_WEIGHT_MASK+1))
+#define NUMERIC_SIGN(n)		(numeric_pack_mant(n) < 0 ? NUMERIC_NEG : NUMERIC_POS)
+#define NUMERIC_DSCALE(n)	(numeric_pack_scale(n))
 
 /*
- * Extract sign, display scale, weight.  These macros extract field values
- * suitable for the NumericVar format from the Numeric (on-disk) format.
- *
- * Note that we don't trouble to ensure that dscale and weight read as zero
- * for an infinity; however, that doesn't matter since we never convert
- * "special" numerics to NumericVar form.  Only the constants defined below
- * (const_nan, etc) ever represent a non-finite value as a NumericVar.
+ * These three constants are NumericVar-level bounds carried over unchanged
+ * from the classic packed format.  They don't describe the physical dec128
+ * struct at all -- NUMERIC_DSCALE_MASK/MAX is a generic ceiling arithmetic
+ * clamps display scale to before ever reaching a pack/unpack boundary, and
+ * NUMERIC_WEIGHT_MAX bounds int16 n_weight, a field the classic long format
+ * had and NumericVar still has (var->weight is a plain int, unaffected by
+ * the storage-format change).  Both stay put; only the packed struct they
+ * used to also describe went away.
  */
-
 #define NUMERIC_DSCALE_MASK			0x3FFF
 #define NUMERIC_DSCALE_MAX			NUMERIC_DSCALE_MASK
+#define NUMERIC_WEIGHT_MAX			PG_INT16_MAX
 
-#define NUMERIC_SIGN(n) \
-	(NUMERIC_IS_SHORT(n) ? \
-		(((n)->choice.n_short.n_header & NUMERIC_SHORT_SIGN_MASK) ? \
-		 NUMERIC_NEG : NUMERIC_POS) : \
-		(NUMERIC_IS_SPECIAL(n) ? \
-		 NUMERIC_EXT_FLAGBITS(n) : NUMERIC_FLAGBITS(n)))
-#define NUMERIC_DSCALE(n)	(NUMERIC_HEADER_IS_SHORT((n)) ? \
-	((n)->choice.n_short.n_header & NUMERIC_SHORT_DSCALE_MASK) \
-		>> NUMERIC_SHORT_DSCALE_SHIFT \
-	: ((n)->choice.n_long.n_sign_dscale & NUMERIC_DSCALE_MASK))
-#define NUMERIC_WEIGHT(n)	(NUMERIC_HEADER_IS_SHORT((n)) ? \
-	(((n)->choice.n_short.n_header & NUMERIC_SHORT_WEIGHT_SIGN_MASK ? \
-		~NUMERIC_SHORT_WEIGHT_MASK : 0) \
-	 | ((n)->choice.n_short.n_header & NUMERIC_SHORT_WEIGHT_MASK)) \
-	: ((n)->choice.n_long.n_weight))
+/* powers of ten, used by the mantissa-level compare/scale helpers below */
+static const int128 numeric_dec128_pow10[NUMERIC_MAX_MANT_DIGITS + 1] = {
+	1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000,
+	1000000000, 10000000000, 100000000000, 1000000000000,
+	10000000000000, 100000000000000, 1000000000000000,
+	10000000000000000, 100000000000000000, NUMERIC_POW10_P18,
+	NUMERIC_POW10_P18 * 10, NUMERIC_POW10_P18 * 100,
+	NUMERIC_POW10_P18 * 1000, NUMERIC_POW10_P18 * 10000,
+	NUMERIC_POW10_P18 * 100000, NUMERIC_POW10_P18 * 1000000,
+	NUMERIC_POW10_P18 * 10000000, NUMERIC_POW10_P18 * 100000000,
+	NUMERIC_POW10_P18 * 1000000000, NUMERIC_POW10_P18 * 10000000000,
+	NUMERIC_POW10_P18 * 100000000000, NUMERIC_POW10_P18 * 1000000000000,
+	NUMERIC_POW10_P18 * 10000000000000, NUMERIC_POW10_P18 * 100000000000000,
+	NUMERIC_POW10_P18 * 1000000000000000,
+	NUMERIC_POW10_P18 * 10000000000000000,
+	NUMERIC_POW10_P18 * 100000000000000000,
+	NUMERIC_POW10_P18 * NUMERIC_POW10_P18,
+	NUMERIC_POW10_P18 * NUMERIC_POW10_P18 * 10
+};
 
 /*
- * Maximum weight of a stored Numeric value (based on the use of int16 for the
- * weight in NumericLong).  Note that intermediate values held in NumericVar
- * and NumericSumAccum variables may have much larger weights.
+ * Multiply by 10^n, reporting overflow rather than wrapping.  Ported from
+ * dec128_try_scale_up() in the dec64-prototype extension.
  */
-#define NUMERIC_WEIGHT_MAX			PG_INT16_MAX
+static inline bool
+numeric_dec128_try_scale_up(int128 mant, int n, int128 *result)
+{
+	Assert(n >= 0);
+
+	if (unlikely(n > NUMERIC_MAX_MANT_DIGITS))
+		return false;
+
+	return !__builtin_mul_overflow(mant, numeric_dec128_pow10[n], result);
+}
+
+/*
+ * Compare two finite values by aligning to a common scale and comparing
+ * mantissas, without unpacking either side into a NumericVar.  Ported from
+ * dec128_compare() in the dec64-prototype extension: when raising the
+ * smaller side to the larger scale would overflow, the answer follows from
+ * the sign alone, since a value that outgrows the encoding at the other's
+ * scale is larger in magnitude than anything the other side can hold.
+ */
+static int
+numeric_dec128_compare(Numeric num1, Numeric num2)
+{
+	int			s1 = numeric_pack_scale(num1);
+	int			s2 = numeric_pack_scale(num2);
+	int128		m1 = numeric_pack_mant(num1);
+	int128		m2 = numeric_pack_mant(num2);
+	int128		scaled;
+
+	if (likely(s1 == s2))
+		return (m1 > m2) ? 1 : ((m1 < m2) ? -1 : 0);
+
+	if (s1 < s2)
+	{
+		if (unlikely(!numeric_dec128_try_scale_up(m1, s2 - s1, &scaled)))
+			return (m1 > 0) ? 1 : -1;
+		m1 = scaled;
+	}
+	else
+	{
+		if (unlikely(!numeric_dec128_try_scale_up(m2, s1 - s2, &scaled)))
+			return (m2 > 0) ? -1 : 1;
+		m2 = scaled;
+	}
+
+	return (m1 > m2) ? 1 : ((m1 < m2) ? -1 : 0);
+}
+
+/*
+ * Reduce a finite value to canonical form by dropping fractional trailing
+ * zeros, so that equal values hash alike: 1.5 and 1.50 must hash the same.
+ * Ported from dec128_canonical() in the dec64-prototype extension.
+ */
+static void
+numeric_dec128_canonical(Numeric num, NumericData *out)
+{
+	int128		mant = numeric_pack_mant(num);
+	int			scale = numeric_pack_scale(num);
+	int			step;
+
+	if (mant == 0)
+	{
+		numeric_pack_store(out, 0, 0);
+		return;
+	}
+
+	/*
+	 * Strip trailing fractional zeroes in descending power-of-two chunks
+	 * rather than one digit at a time.  128-bit division is expensive and
+	 * scale is bounded by NUMERIC_MAX_STORED_SCALE, so this needs at most
+	 * four divisions where the naive loop needed fifteen.  hash_numeric() is
+	 * on the hash-join and hash-aggregate path, so this is worth the extra
+	 * two lines.
+	 */
+	for (step = 8; step > 0; step >>= 1)
+	{
+		while (scale >= step && (mant % numeric_dec128_pow10[step]) == 0)
+		{
+			mant /= numeric_dec128_pow10[step];
+			scale -= step;
+		}
+	}
+
+	numeric_pack_store(out, mant, scale);
+}
+
+/*
+ * numeric_dec128_out() -
+ *
+ *	Render a finite dec128 value as decimal text, straight from the mantissa.
+ *	Result is palloc'd.  Caller must not call this on a special value.
+ *
+ *	numeric_out() used to reach this same string by way of
+ *	init_var_from_num() + get_str_from_var(), which built the decimal
+ *	representation, threw it away in favour of the NBASE limbs, and then built
+ *	it a second time from those limbs.  Text output is on the path of every
+ *	client-visible query returning a numeric, so the round trip is worth
+ *	skipping.  The output must stay byte-identical to get_str_from_var(),
+ *	including its padding of the fraction to exactly dscale digits.
+ */
+static char *
+numeric_dec128_out(Numeric num)
+{
+	int128		mant = numeric_pack_mant(num);
+	int			scale = numeric_pack_scale(num);
+	bool		neg = (mant < 0);
+	uint128		u;
+	/* sign, up to NUMERIC_MAX_MANT_DIGITS digits, decimal point, NUL */
+	char		buf[NUMERIC_MAX_MANT_DIGITS + 4];
+	char	   *cur = buf + sizeof(buf);
+	int			i;
+
+	Assert(!NUMERIC_IS_SPECIAL(num));
+	Assert(scale >= 0 && scale <= NUMERIC_MAX_STORED_SCALE);
+	Assert(mant >= -NUMERIC_MAX_MANT && mant <= NUMERIC_MAX_MANT);
+
+	u = neg ? (uint128) (-mant) : (uint128) mant;
+
+	*(--cur) = '\0';
+
+	for (i = 0; i < scale; i++)
+	{
+		*(--cur) = (char) ('0' + (int) (u % 10));
+		u /= 10;
+	}
+
+	if (scale > 0)
+		*(--cur) = '.';
+
+	/* the integer part, or a lone "0" for a value below 1 */
+	if (u == 0)
+		*(--cur) = '0';
+	else
+	{
+		while (u > 0)
+		{
+			*(--cur) = (char) ('0' + (int) (u % 10));
+			u /= 10;
+		}
+	}
+
+	/*
+	 * A zero mantissa is never negative in this encoding, so this can't emit
+	 * "-0" where get_str_from_var() would have emitted "0".
+	 */
+	if (neg)
+		*(--cur) = '-';
+
+	Assert(cur >= buf);
+
+	return pstrdup(cur);
+}
+
+/*
+ * numeric_dec128_add_sub() -
+ *
+ *	Fast path for add/subtract that never touches NumericVar: align both
+ *	operands' mantissas to a common scale (the larger of the two -- both are
+ *	already within [0, NUMERIC_MAX_STORED_SCALE], so the common scale is
+ *	too) and add or subtract directly as int128.  Only called on finite
+ *	(non-special) operands.
+ *
+ *	Returns false if the fast path can't handle it: either aligning the
+ *	narrower-scaled operand up would overflow int128, or the sum's magnitude
+ *	exceeds what dec128 can hold.  The caller then falls back to the
+ *	NumericVar path, which knows how to produce the right error.  Scale
+ *	overflow is not a possibility here, since addition and subtraction never
+ *	push the scale beyond max(scale1, scale2).
+ *
+ *	Note the sum itself cannot overflow int128 once both operands are aligned:
+ *	each is bounded by NUMERIC_MAX_MANT (~10^37) and int128 holds ~1.7*10^38,
+ *	so it is the NUMERIC_MAX_MANT range check, not the add, that rejects
+ *	out-of-range results.
+ */
+static inline bool
+numeric_dec128_add_sub(Numeric num1, Numeric num2, bool subtract, NumericData *out)
+{
+	int			s1 = numeric_pack_scale(num1);
+	int			s2 = numeric_pack_scale(num2);
+	int128		m1 = numeric_pack_mant(num1);
+	int128		m2 = numeric_pack_mant(num2);
+	int			scale;
+	int128		sum;
+
+	if (subtract)
+		m2 = -m2;
+
+	if (s1 < s2)
+	{
+		if (unlikely(!numeric_dec128_try_scale_up(m1, s2 - s1, &m1)))
+			return false;
+		scale = s2;
+	}
+	else if (s2 < s1)
+	{
+		if (unlikely(!numeric_dec128_try_scale_up(m2, s1 - s2, &m2)))
+			return false;
+		scale = s1;
+	}
+	else
+		scale = s1;
+
+	sum = m1 + m2;
+
+	if (unlikely(sum > NUMERIC_MAX_MANT || sum < -NUMERIC_MAX_MANT))
+		return false;
+
+	numeric_pack_store(out, sum, scale);
+	return true;
+}
+
+/*
+ * numeric_dec128_mul() -
+ *
+ *	Fast path for multiplication that never touches NumericVar: multiply the
+ *	mantissas directly as int128 and add the scales.  Only handles the case
+ *	where the raw product needs no rounding at all -- fits within
+ *	NUMERIC_MAX_MANT at a combined scale of scale1 + scale2 that is itself
+ *	within NUMERIC_MAX_STORED_SCALE.  Both mantissas already fit in 37
+ *	digits, so their product can need up to 74 -- vastly more than int128
+ *	holds -- for anything but comparatively small operands; this is
+ *	deliberately conservative (no attempt to round a too-wide product down
+ *	to a valid dec128 value) to avoid duplicating mul_var()'s rounding
+ *	rules.  Only called on finite (non-special) operands.
+ */
+static inline bool
+numeric_dec128_mul(Numeric num1, Numeric num2, NumericData *out)
+{
+	int			s1 = numeric_pack_scale(num1);
+	int			s2 = numeric_pack_scale(num2);
+	int128		m1 = numeric_pack_mant(num1);
+	int128		m2 = numeric_pack_mant(num2);
+	int			scale = s1 + s2;
+	int128		product;
+
+	if (scale > NUMERIC_MAX_STORED_SCALE)
+		return false;
+
+	if (unlikely(__builtin_mul_overflow(m1, m2, &product)))
+		return false;
+
+	if (unlikely(product > NUMERIC_MAX_MANT || product < -NUMERIC_MAX_MANT))
+		return false;
+
+	numeric_pack_store(out, product, scale);
+	return true;
+}
 
 /* ----------
  * NumericVar is the format we use for arithmetic.  The digit-array part
@@ -493,14 +790,12 @@ static void dump_var(const char *str, NumericVar *var);
 
 #define init_var(v)		memset(v, 0, sizeof(NumericVar))
 
-#define NUMERIC_DIGITS(num) (NUMERIC_HEADER_IS_SHORT(num) ? \
-	(num)->choice.n_short.n_data : (num)->choice.n_long.n_data)
-#define NUMERIC_NDIGITS(num) \
-	((VARSIZE(num) - NUMERIC_HEADER_SIZE(num)) / sizeof(NumericDigit))
-#define NUMERIC_CAN_BE_SHORT(scale,weight) \
-	((scale) <= NUMERIC_SHORT_DSCALE_MAX && \
-	(weight) <= NUMERIC_SHORT_WEIGHT_MAX && \
-	(weight) >= NUMERIC_SHORT_WEIGHT_MIN)
+/*
+ * NUMERIC_DIGITS/NUMERIC_NDIGITS/NUMERIC_CAN_BE_SHORT have no counterpart:
+ * dec128 has no digit array and no short/long header choice.  Every former
+ * caller now goes through NumericVar (numeric_dec128_to_var()) or operates
+ * on the mantissa directly (numeric_dec128_compare(), numeric_dec128_canonical()).
+ */
 
 static void alloc_var(NumericVar *var, int ndigits);
 static void free_var(NumericVar *var);
@@ -516,6 +811,9 @@ static bool set_var_from_non_decimal_integer_str(const char *str,
 												 Node *escontext);
 static void set_var_from_num(Numeric num, NumericVar *dest);
 static void init_var_from_num(Numeric num, NumericVar *dest);
+static void numeric_dec128_to_var(Numeric num, NumericVar *dest);
+static void numeric_var_to_dec128(const NumericVar *var, NumericData *out,
+								  bool *have_error);
 static void set_var_from_var(const NumericVar *value, NumericVar *dest);
 static char *get_str_from_var(const NumericVar *var);
 static char *get_str_from_var_sci(const NumericVar *var, int rscale);
@@ -816,8 +1114,6 @@ Datum
 numeric_out(PG_FUNCTION_ARGS)
 {
 	Numeric		num = PG_GETARG_NUMERIC(0);
-	NumericVar	x;
-	char	   *str;
 
 	/*
 	 * Handle NaN and infinities
@@ -832,14 +1128,7 @@ numeric_out(PG_FUNCTION_ARGS)
 			PG_RETURN_CSTRING(pstrdup("NaN"));
 	}
 
-	/*
-	 * Get the number in the variable format.
-	 */
-	init_var_from_num(num, &x);
-
-	str = get_str_from_var(&x);
-
-	PG_RETURN_CSTRING(str);
+	PG_RETURN_CSTRING(numeric_dec128_out(num));
 }
 
 /*
@@ -952,35 +1241,18 @@ numeric_typmod_scale(int32 typmod)
 int32
 numeric_maximum_size(int32 typmod)
 {
-	int			precision;
-	int			numeric_digits;
-
 	if (!is_valid_numeric_typmod(typmod))
 		return -1;
 
-	/* precision (ie, max # of digits) is in upper bits of typmod */
-	precision = numeric_typmod_precision(typmod);
-
 	/*
-	 * This formula computes the maximum number of NumericDigits we could need
-	 * in order to store the specified number of decimal digits. Because the
-	 * weight is stored as a number of NumericDigits rather than a number of
-	 * decimal digits, it's possible that the first NumericDigit will contain
-	 * only a single decimal digit.  Thus, the first two decimal digits can
-	 * require two NumericDigits to store, but it isn't until we reach
-	 * DEC_DIGITS + 2 decimal digits that we potentially need a third
-	 * NumericDigit.
+	 * EXPERIMENTAL (SPEC-numeric-as-dec128.md): a dec128-backed numeric is a
+	 * fixed 16-byte scaled integer, so its size no longer depends on the
+	 * declared precision/scale at all.  (pg_type.typlen is 16, not -1, so
+	 * get_typavgwidth() shouldn't even reach this function for numeric
+	 * anymore -- it's kept working regardless, in case something still
+	 * calls it directly by name.)
 	 */
-	numeric_digits = (precision + 2 * (DEC_DIGITS - 1)) / DEC_DIGITS;
-
-	/*
-	 * In most cases, the size of a numeric will be smaller than the value
-	 * computed below, because the varlena header will typically get toasted
-	 * down to a single byte before being stored on disk, and it may also be
-	 * possible to use a short numeric header.  But our job here is to compute
-	 * the worst case.
-	 */
-	return NUMERIC_HDRSZ + (numeric_digits * sizeof(NumericDigit));
+	return sizeof(NumericData);
 }
 
 /*
@@ -1167,9 +1439,44 @@ numeric_send(PG_FUNCTION_ARGS)
 	StringInfoData buf;
 	int			i;
 
-	init_var_from_num(num, &x);
-
 	pq_begintypsend(&buf);
+
+	/*
+	 * EXPERIMENTAL (SPEC-numeric-as-dec128.md): init_var_from_num() /
+	 * numeric_dec128_to_var() must never be called on a special value (see
+	 * the Assert there) -- unlike the historical varlena-backed version,
+	 * which could trivially hand back an empty-digits NumericVar for NaN or
+	 * Infinity without doing any real conversion.  Every other caller
+	 * already guards this with NUMERIC_IS_SPECIAL() (e.g. numeric_out()
+	 * above); this function was left as "don't touch, it'll just work" per
+	 * the spec's sec. 3.4 rationale, but that rationale only covers finite
+	 * values.  Without this check, sending a NaN/Infinity numeric in binary
+	 * silently reinterprets its sentinel mantissa as a huge finite value
+	 * (e.g. NaN's sentinel renders as 10^37), which numeric_recv() then
+	 * rejects as an overflow -- or worse, could round-trip as a bogus
+	 * finite number.  Reproduce with: COPY a NaN/Infinity numeric out and
+	 * back in WITH (FORMAT binary).
+	 */
+	if (NUMERIC_IS_SPECIAL(num))
+	{
+		int16		sign;
+
+		if (NUMERIC_IS_PINF(num))
+			sign = NUMERIC_PINF;
+		else if (NUMERIC_IS_NINF(num))
+			sign = NUMERIC_NINF;
+		else
+			sign = NUMERIC_NAN;
+
+		pq_sendint16(&buf, 0);	/* ndigits */
+		pq_sendint16(&buf, 0);	/* weight */
+		pq_sendint16(&buf, sign);
+		pq_sendint16(&buf, 0);	/* dscale */
+
+		PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
+	}
+
+	init_var_from_num(num, &x);
 
 	pq_sendint16(&buf, x.ndigits);
 	pq_sendint16(&buf, x.weight);
@@ -1248,11 +1555,6 @@ numeric		(PG_FUNCTION_ARGS)
 	Numeric		num = PG_GETARG_NUMERIC(0);
 	int32		typmod = PG_GETARG_INT32(1);
 	Numeric		new;
-	int			precision;
-	int			scale;
-	int			ddigits;
-	int			maxdigits;
-	int			dscale;
 	NumericVar	var;
 
 	/*
@@ -1273,41 +1575,15 @@ numeric		(PG_FUNCTION_ARGS)
 		PG_RETURN_NUMERIC(duplicate_numeric(num));
 
 	/*
-	 * Get the precision and scale out of the typmod value
-	 */
-	precision = numeric_typmod_precision(typmod);
-	scale = numeric_typmod_scale(typmod);
-	maxdigits = precision - scale;
-
-	/* The target display scale is non-negative */
-	dscale = Max(scale, 0);
-
-	/*
-	 * If the number is certainly in bounds and due to the target scale no
-	 * rounding could be necessary, just make a copy of the input and modify
-	 * its scale fields, unless the larger scale forces us to abandon the
-	 * short representation.  (Note we assume the existing dscale is
-	 * honest...)
-	 */
-	ddigits = (NUMERIC_WEIGHT(num) + 1) * DEC_DIGITS;
-	if (ddigits <= maxdigits && scale >= NUMERIC_DSCALE(num)
-		&& (NUMERIC_CAN_BE_SHORT(dscale, NUMERIC_WEIGHT(num))
-			|| !NUMERIC_IS_SHORT(num)))
-	{
-		new = duplicate_numeric(num);
-		if (NUMERIC_IS_SHORT(num))
-			new->choice.n_short.n_header =
-				(num->choice.n_short.n_header & ~NUMERIC_SHORT_DSCALE_MASK)
-				| (dscale << NUMERIC_SHORT_DSCALE_SHIFT);
-		else
-			new->choice.n_long.n_sign_dscale = NUMERIC_SIGN(new) |
-				((uint16) dscale & NUMERIC_DSCALE_MASK);
-		PG_RETURN_NUMERIC(new);
-	}
-
-	/*
-	 * We really need to fiddle with things - unpack the number into a
-	 * variable and let apply_typmod() do it.
+	 * Unpack the number into a variable and let apply_typmod() do it.
+	 *
+	 * The classic packed format could sometimes patch its header in place
+	 * and skip the unpack/repack entirely when the value was already known
+	 * to be in bounds.  dec128 has no header to patch -- only a scaled
+	 * integer -- so that shortcut has no counterpart here; every call goes
+	 * through NumericVar.  (A dec128-native version of this fast path,
+	 * rescaling the mantissa directly, is a candidate for the later
+	 * acceleration pass, not this correctness pass.)
 	 */
 	init_var(&var);
 
@@ -1393,24 +1669,21 @@ Datum
 numeric_abs(PG_FUNCTION_ARGS)
 {
 	Numeric		num = PG_GETARG_NUMERIC(0);
-	Numeric		res;
+	Numeric		res = (Numeric) palloc(sizeof(NumericData));
+	int128		mant = numeric_pack_mant(num);
 
 	/*
-	 * Do it the easy way directly on the packed format
+	 * Do it the easy way directly on the packed format: abs() of a scaled
+	 * integer is just abs() of the mantissa.  This changes -Inf to Inf and
+	 * doesn't affect NaN, so the special sentinels need no separate case
+	 * except that NaN's sentinel is already non-negative.
 	 */
-	res = duplicate_numeric(num);
+	if (NUMERIC_IS_NINF(num))
+		mant = NUMERIC_PINF_MANT;
+	else if (mant < 0)
+		mant = -mant;
 
-	if (NUMERIC_IS_SHORT(num))
-		res->choice.n_short.n_header =
-			num->choice.n_short.n_header & ~NUMERIC_SHORT_SIGN_MASK;
-	else if (NUMERIC_IS_SPECIAL(num))
-	{
-		/* This changes -Inf to Inf, and doesn't affect NaN */
-		res->choice.n_short.n_header =
-			num->choice.n_short.n_header & ~NUMERIC_INF_SIGN_MASK;
-	}
-	else
-		res->choice.n_long.n_sign_dscale = NUMERIC_POS | NUMERIC_DSCALE(num);
+	numeric_pack_store(res, mant, numeric_pack_scale(num));
 
 	PG_RETURN_NUMERIC(res);
 }
@@ -1420,39 +1693,22 @@ Datum
 numeric_uminus(PG_FUNCTION_ARGS)
 {
 	Numeric		num = PG_GETARG_NUMERIC(0);
-	Numeric		res;
+	Numeric		res = (Numeric) palloc(sizeof(NumericData));
+	int128		mant = numeric_pack_mant(num);
 
 	/*
-	 * Do it the easy way directly on the packed format
+	 * Do it the easy way directly on the packed format: negate the
+	 * mantissa.  Flip the sign if it's Inf or -Inf; NaN is unaffected; zero
+	 * is its own negation, so no separate case is needed for it.
 	 */
-	res = duplicate_numeric(num);
+	if (NUMERIC_IS_PINF(num))
+		mant = NUMERIC_NINF_MANT;
+	else if (NUMERIC_IS_NINF(num))
+		mant = NUMERIC_PINF_MANT;
+	else if (!NUMERIC_IS_NAN(num))
+		mant = -mant;
 
-	if (NUMERIC_IS_SPECIAL(num))
-	{
-		/* Flip the sign, if it's Inf or -Inf */
-		if (!NUMERIC_IS_NAN(num))
-			res->choice.n_short.n_header =
-				num->choice.n_short.n_header ^ NUMERIC_INF_SIGN_MASK;
-	}
-
-	/*
-	 * The packed format is known to be totally zero digit trimmed always. So
-	 * once we've eliminated specials, we can identify a zero by the fact that
-	 * there are no digits at all. Do nothing to a zero.
-	 */
-	else if (NUMERIC_NDIGITS(num) != 0)
-	{
-		/* Else, flip the sign */
-		if (NUMERIC_IS_SHORT(num))
-			res->choice.n_short.n_header =
-				num->choice.n_short.n_header ^ NUMERIC_SHORT_SIGN_MASK;
-		else if (NUMERIC_SIGN(num) == NUMERIC_POS)
-			res->choice.n_long.n_sign_dscale =
-				NUMERIC_NEG | NUMERIC_DSCALE(num);
-		else
-			res->choice.n_long.n_sign_dscale =
-				NUMERIC_POS | NUMERIC_DSCALE(num);
-	}
+	numeric_pack_store(res, mant, numeric_pack_scale(num));
 
 	PG_RETURN_NUMERIC(res);
 }
@@ -1477,6 +1733,8 @@ numeric_uplus(PG_FUNCTION_ARGS)
 static int
 numeric_sign_internal(Numeric num)
 {
+	int128		mant;
+
 	if (NUMERIC_IS_SPECIAL(num))
 	{
 		Assert(!NUMERIC_IS_NAN(num));
@@ -1487,17 +1745,9 @@ numeric_sign_internal(Numeric num)
 			return -1;
 	}
 
-	/*
-	 * The packed format is known to be totally zero digit trimmed always. So
-	 * once we've eliminated specials, we can identify a zero by the fact that
-	 * there are no digits at all.
-	 */
-	else if (NUMERIC_NDIGITS(num) == 0)
-		return 0;
-	else if (NUMERIC_SIGN(num) == NUMERIC_NEG)
-		return -1;
-	else
-		return 1;
+	/* Otherwise the sign of a scaled integer is just the sign of the mantissa */
+	mant = numeric_pack_mant(num);
+	return (mant > 0) - (mant < 0);
 }
 
 /*
@@ -2665,10 +2915,7 @@ cmp_numerics(Numeric num1, Numeric num2)
 	}
 	else
 	{
-		result = cmp_var_common(NUMERIC_DIGITS(num1), NUMERIC_NDIGITS(num1),
-								NUMERIC_WEIGHT(num1), NUMERIC_SIGN(num1),
-								NUMERIC_DIGITS(num2), NUMERIC_NDIGITS(num2),
-								NUMERIC_WEIGHT(num2), NUMERIC_SIGN(num2));
+		result = numeric_dec128_compare(num1, num2);
 	}
 
 	return result;
@@ -2816,76 +3063,21 @@ Datum
 hash_numeric(PG_FUNCTION_ARGS)
 {
 	Numeric		key = PG_GETARG_NUMERIC(0);
-	Datum		digit_hash;
-	Datum		result;
-	int			weight;
-	int			start_offset;
-	int			end_offset;
-	int			i;
-	int			hash_len;
-	NumericDigit *digits;
+	NumericData canon;
 
 	/* If it's NaN or infinity, don't try to hash the rest of the fields */
 	if (NUMERIC_IS_SPECIAL(key))
 		PG_RETURN_UINT32(0);
 
-	weight = NUMERIC_WEIGHT(key);
-	start_offset = 0;
-	end_offset = 0;
-
 	/*
-	 * Omit any leading or trailing zeros from the input to the hash. The
-	 * numeric implementation *should* guarantee that leading and trailing
-	 * zeros are suppressed, but we're paranoid. Note that we measure the
-	 * starting and ending offsets in units of NumericDigits, not bytes.
+	 * Reduce to canonical (trailing-zero-stripped) form first: two numerics
+	 * can compare equal with different scales (1.5 = 1.50) and must hash the
+	 * same.  The canonical mantissa's sign is included in the hashed bytes;
+	 * that's fine, since a sign difference implies inequality anyway.
 	 */
-	digits = NUMERIC_DIGITS(key);
-	for (i = 0; i < NUMERIC_NDIGITS(key); i++)
-	{
-		if (digits[i] != (NumericDigit) 0)
-			break;
+	numeric_dec128_canonical(key, &canon);
 
-		start_offset++;
-
-		/*
-		 * The weight is effectively the # of digits before the decimal point,
-		 * so decrement it for each leading zero we skip.
-		 */
-		weight--;
-	}
-
-	/*
-	 * If there are no non-zero digits, then the value of the number is zero,
-	 * regardless of any other fields.
-	 */
-	if (NUMERIC_NDIGITS(key) == start_offset)
-		PG_RETURN_UINT32(-1);
-
-	for (i = NUMERIC_NDIGITS(key) - 1; i >= 0; i--)
-	{
-		if (digits[i] != (NumericDigit) 0)
-			break;
-
-		end_offset++;
-	}
-
-	/* If we get here, there should be at least one non-zero digit */
-	Assert(start_offset + end_offset < NUMERIC_NDIGITS(key));
-
-	/*
-	 * Note that we don't hash on the Numeric's scale, since two numerics can
-	 * compare equal but have different scales. We also don't hash on the
-	 * sign, although we could: since a sign difference implies inequality,
-	 * this shouldn't affect correctness.
-	 */
-	hash_len = NUMERIC_NDIGITS(key) - start_offset - end_offset;
-	digit_hash = hash_any((unsigned char *) (NUMERIC_DIGITS(key) + start_offset),
-						  hash_len * sizeof(NumericDigit));
-
-	/* Mix in the weight, via XOR */
-	result = digit_hash ^ weight;
-
-	PG_RETURN_DATUM(result);
+	PG_RETURN_DATUM(hash_any((unsigned char *) &canon, sizeof(NumericData)));
 }
 
 /*
@@ -2897,56 +3089,16 @@ hash_numeric_extended(PG_FUNCTION_ARGS)
 {
 	Numeric		key = PG_GETARG_NUMERIC(0);
 	uint64		seed = PG_GETARG_INT64(1);
-	Datum		digit_hash;
-	Datum		result;
-	int			weight;
-	int			start_offset;
-	int			end_offset;
-	int			i;
-	int			hash_len;
-	NumericDigit *digits;
+	NumericData canon;
 
 	/* If it's NaN or infinity, don't try to hash the rest of the fields */
 	if (NUMERIC_IS_SPECIAL(key))
 		PG_RETURN_UINT64(seed);
 
-	weight = NUMERIC_WEIGHT(key);
-	start_offset = 0;
-	end_offset = 0;
+	numeric_dec128_canonical(key, &canon);
 
-	digits = NUMERIC_DIGITS(key);
-	for (i = 0; i < NUMERIC_NDIGITS(key); i++)
-	{
-		if (digits[i] != (NumericDigit) 0)
-			break;
-
-		start_offset++;
-
-		weight--;
-	}
-
-	if (NUMERIC_NDIGITS(key) == start_offset)
-		PG_RETURN_UINT64(seed - 1);
-
-	for (i = NUMERIC_NDIGITS(key) - 1; i >= 0; i--)
-	{
-		if (digits[i] != (NumericDigit) 0)
-			break;
-
-		end_offset++;
-	}
-
-	Assert(start_offset + end_offset < NUMERIC_NDIGITS(key));
-
-	hash_len = NUMERIC_NDIGITS(key) - start_offset - end_offset;
-	digit_hash = hash_any_extended((unsigned char *) (NUMERIC_DIGITS(key)
-													  + start_offset),
-								   hash_len * sizeof(NumericDigit),
-								   seed);
-
-	result = UInt64GetDatum(DatumGetUInt64(digit_hash) ^ weight);
-
-	PG_RETURN_DATUM(result);
+	PG_RETURN_DATUM(hash_any_extended((unsigned char *) &canon,
+									  sizeof(NumericData), seed));
 }
 
 
@@ -3016,6 +3168,32 @@ numeric_add_opt_error(Numeric num1, Numeric num2, bool *have_error)
 			return make_result(&const_pinf);
 		Assert(NUMERIC_IS_NINF(num2));
 		return make_result(&const_ninf);
+	}
+
+	/*
+	 * Fast path (SPEC-numeric-as-dec128.md sec. 6 step 7): try direct
+	 * mantissa arithmetic first, without going anywhere near NumericVar.
+	 * Falls back to the general path below for anything it can't handle
+	 * (mainly: aligning the scales, or the result, would leave dec128's
+	 * 37-digit range).
+	 *
+	 * Compute into a local and copy out only on success, so that the fallback
+	 * costs no allocation at all.  An earlier version palloc'd up front and
+	 * pfree'd on the way out, which put an AllocSetAlloc/AllocSetFree pair --
+	 * for a payload no bigger than its own chunk header -- in front of every
+	 * slow-path operation.
+	 */
+	{
+		NumericData fast;
+
+		if (numeric_dec128_add_sub(num1, num2, false, &fast))
+		{
+			res = (Numeric) palloc(sizeof(NumericData));
+			*res = fast;
+			if (have_error)
+				*have_error = false;
+			return res;
+		}
 	}
 
 	/*
@@ -3094,6 +3272,20 @@ numeric_sub_opt_error(Numeric num1, Numeric num2, bool *have_error)
 			return make_result(&const_ninf);
 		Assert(NUMERIC_IS_NINF(num2));
 		return make_result(&const_pinf);
+	}
+
+	/* Fast path -- see the matching comment in numeric_add_opt_error() */
+	{
+		NumericData fast;
+
+		if (numeric_dec128_add_sub(num1, num2, true, &fast))
+		{
+			res = (Numeric) palloc(sizeof(NumericData));
+			*res = fast;
+			if (have_error)
+				*have_error = false;
+			return res;
+		}
 	}
 
 	/*
@@ -3217,6 +3409,25 @@ numeric_mul_opt_error(Numeric num1, Numeric num2, bool *have_error)
 	 * correctly rounded (rounding in mul_var() using a truncated product
 	 * would not guarantee this).
 	 */
+
+	/*
+	 * Fast path (SPEC-numeric-as-dec128.md sec. 6 step 7): direct mantissa
+	 * multiply, only when the exact product needs no rounding at all.  See
+	 * numeric_dec128_mul()'s comment for why this is deliberately narrow.
+	 */
+	{
+		NumericData fast;
+
+		if (numeric_dec128_mul(num1, num2, &fast))
+		{
+			res = (Numeric) palloc(sizeof(NumericData));
+			*res = fast;
+			if (have_error)
+				*have_error = false;
+			return res;
+		}
+	}
+
 	init_var_from_num(num1, &arg1);
 	init_var_from_num(num2, &arg2);
 
@@ -3344,8 +3555,17 @@ numeric_div_opt_error(Numeric num1, Numeric num2, bool *have_error)
 
 	/*
 	 * Select scale for division result
+	 *
+	 * EXPERIMENTAL (SPEC-numeric-as-dec128.md): select_div_scale() aims for
+	 * NUMERIC_MIN_SIG_DIGITS (16) significant digits, which very commonly
+	 * exceeds dec128's NUMERIC_MAX_STORED_SCALE (15) -- e.g. plain 2/1 asks
+	 * for rscale 16.  Uncapped, nearly every division would overflow the
+	 * packed format instead of just losing a bit of precision.  This is the
+	 * documented "division scale diverges from stock numeric" regression
+	 * (SPEC-numeric-as-dec128.md sec. 3.3): clamp rather than error.
 	 */
 	rscale = select_div_scale(&arg1, &arg2);
+	rscale = Min(rscale, NUMERIC_MAX_STORED_SCALE);
 
 	/*
 	 * If "have_error" is provided, check for division by zero here
@@ -6390,7 +6610,17 @@ numeric_stddev_internal(NumericAggState *state,
 			mul_var(&vN, &vNminus1, &vNminus1, 0);	/* N * (N - 1) */
 		else
 			mul_var(&vN, &vN, &vNminus1, 0);	/* N * N */
+
+		/*
+		 * EXPERIMENTAL (SPEC-numeric-as-dec128.md): same clamp as
+		 * numeric_div_opt_error() -- this rscale feeds both div_var() below
+		 * and the sqrt_var() a few lines down, and the result of either is
+		 * packed straight into dec128 by make_result().  Per the spec's
+		 * risk table, unclamped this made stddev/variance overflow on
+		 * ordinary inputs instead of just losing precision.
+		 */
 		rscale = select_div_scale(&vsumX2, &vNminus1);
+		rscale = Min(rscale, NUMERIC_MAX_STORED_SCALE);
 		div_var(&vsumX2, &vNminus1, &vsumX, rscale, true, true);	/* variance */
 		if (!variance)
 			sqrt_var(&vsumX, &vsumX, rscale);	/* stddev */
@@ -6976,39 +7206,27 @@ int2int4_sum(PG_FUNCTION_ARGS)
 static void
 dump_numeric(const char *str, Numeric num)
 {
-	NumericDigit *digits = NUMERIC_DIGITS(num);
-	int			ndigits;
-	int			i;
-
-	ndigits = NUMERIC_NDIGITS(num);
-
-	printf("%s: NUMERIC w=%d d=%d ", str,
-		   NUMERIC_WEIGHT(num), NUMERIC_DSCALE(num));
-	switch (NUMERIC_SIGN(num))
+	/*
+	 * EXPERIMENTAL (SPEC-numeric-as-dec128.md): there's no digit array or
+	 * header to walk anymore, just a scaled 128-bit integer; print that
+	 * directly instead of the classic NumericDigit dump.
+	 */
+	if (NUMERIC_IS_NAN(num))
+		printf("%s: NUMERIC NaN\n", str);
+	else if (NUMERIC_IS_PINF(num))
+		printf("%s: NUMERIC Infinity\n", str);
+	else if (NUMERIC_IS_NINF(num))
+		printf("%s: NUMERIC -Infinity\n", str);
+	else
 	{
-		case NUMERIC_POS:
-			printf("POS");
-			break;
-		case NUMERIC_NEG:
-			printf("NEG");
-			break;
-		case NUMERIC_NAN:
-			printf("NaN");
-			break;
-		case NUMERIC_PINF:
-			printf("Infinity");
-			break;
-		case NUMERIC_NINF:
-			printf("-Infinity");
-			break;
-		default:
-			printf("SIGN=0x%x", NUMERIC_SIGN(num));
-			break;
+		/*
+		 * No portable printf specifier for a 128-bit integer is assumed
+		 * here; print the two 64-bit halves instead (both have standard PG
+		 * format macros), which is all a developer needs to eyeball this.
+		 */
+		printf("%s: NUMERIC scale=%d hi=" INT64_FORMAT " lo=" UINT64_FORMAT "\n",
+			   str, numeric_pack_scale(num), num->n_hi, num->n_lo);
 	}
-
-	for (i = 0; i < ndigits; i++)
-		printf(" %0*d", DEC_DIGITS, digits[i]);
-	printf("\n");
 }
 
 
@@ -7530,6 +7748,123 @@ invalid_syntax:
 }
 
 
+/* NBASE limbs needed to hold the widest mantissa the encoding allows */
+#define NUMERIC_MAX_MANT_LIMBS \
+	((NUMERIC_MAX_MANT_DIGITS + DEC_DIGITS - 1) / DEC_DIGITS)
+
+/*
+ * numeric_dec128_to_var() -
+ *
+ *	Point of coupling #1 (SPEC-numeric-as-dec128.md sec. 3.4): decode a
+ *	packed dec128 value into a NumericVar.  Caller must not call this on a
+ *	special value.
+ *
+ *	This converts straight from the scaled-integer mantissa to base-NBASE
+ *	limbs.  An earlier version rendered the mantissa to decimal text and
+ *	reparsed it with set_var_from_str().  That was correct, but it put two
+ *	string conversions and two pallocs on the hottest path in the type: every
+ *	caller of init_var_from_num(), which includes do_numeric_accum() and
+ *	therefore sum() and avg().  It made this build slower than stock numeric
+ *	for everything the mantissa-level fast paths don't catch, which defeats
+ *	the point of the experiment.
+ *
+ *	Why the obvious approach doesn't work is worth recording, since it is what
+ *	drove the text detour in the first place: you cannot pre-multiply the
+ *	whole mantissa up to a limb boundary.  Aligning a scale that isn't a
+ *	multiple of DEC_DIGITS means shifting by up to DEC_DIGITS - 1 further
+ *	decimal digits, and a near-37-digit mantissa times 10^3 overflows int128.
+ *	Splitting the value into integer and fractional parts first sidesteps
+ *	that: the fractional part is bounded by 10^NUMERIC_MAX_STORED_SCALE, so
+ *	padding *it* to a limb boundary stays under 10^18 and fits an int64 with
+ *	room to spare.
+ */
+static void
+numeric_dec128_to_var(Numeric num, NumericVar *dest)
+{
+	int128		mant = numeric_pack_mant(num);
+	int			scale = numeric_pack_scale(num);
+	bool		neg = (mant < 0);
+	uint128		umant;
+	uint128		ipart;
+	uint64		fpart;
+	int			nint_limbs = 0;
+	int			nfrac_limbs;
+	int			pad;
+	NumericDigit int_limbs[NUMERIC_MAX_MANT_LIMBS];
+	NumericDigit *dptr;
+	int			i;
+
+	Assert(!NUMERIC_IS_SPECIAL(num));
+	Assert(scale >= 0 && scale <= NUMERIC_MAX_STORED_SCALE);
+
+	/*
+	 * The encoding bounds |mant| well inside int128's range, so negating it
+	 * below cannot overflow.  (Negating INT128_MIN would be undefined, but
+	 * that is not a representable mantissa.)
+	 */
+	Assert(mant >= -NUMERIC_MAX_MANT && mant <= NUMERIC_MAX_MANT);
+	umant = neg ? (uint128) (-mant) : (uint128) mant;
+
+	init_var(dest);
+	dest->dscale = scale;
+
+	if (umant == 0)
+	{
+		/* strip_var()'s canonical zero, but preserving the display scale */
+		dest->ndigits = 0;
+		dest->weight = 0;
+		dest->sign = NUMERIC_POS;
+		return;
+	}
+
+	dest->sign = neg ? NUMERIC_NEG : NUMERIC_POS;
+
+	ipart = umant / (uint128) numeric_dec128_pow10[scale];
+	fpart = (uint64) (umant % (uint128) numeric_dec128_pow10[scale]);
+
+	/*
+	 * Pad the fraction on the right so it fills a whole number of limbs.  See
+	 * the function comment for why this multiply is safe here and would not
+	 * have been on the undivided mantissa.
+	 */
+	nfrac_limbs = (scale + DEC_DIGITS - 1) / DEC_DIGITS;
+	pad = nfrac_limbs * DEC_DIGITS - scale;
+	fpart *= (uint64) numeric_dec128_pow10[pad];
+
+	/* Integer limbs, least significant first; the top one is never zero */
+	while (ipart != 0)
+	{
+		Assert(nint_limbs < NUMERIC_MAX_MANT_LIMBS);
+		int_limbs[nint_limbs++] = (NumericDigit) (ipart % NBASE);
+		ipart /= NBASE;
+	}
+
+	alloc_var(dest, nint_limbs + nfrac_limbs);
+
+	/*
+	 * A value below 1 has no integer limbs at all, and its first digit is the
+	 * leading fractional limb, whose weight is -1.
+	 */
+	dest->weight = nint_limbs - 1;
+
+	dptr = dest->digits;
+	for (i = nint_limbs - 1; i >= 0; i--)
+		*dptr++ = int_limbs[i];
+	for (i = nfrac_limbs - 1; i >= 0; i--)
+	{
+		dptr[i] = (NumericDigit) (fpart % NBASE);
+		fpart /= NBASE;
+	}
+
+	/*
+	 * Leading zero limbs are normal here (0.00001234 at scale 8 produces
+	 * limbs 0000,1234), and trailing zero limbs come from padding; strip_var()
+	 * handles both and fixes up weight.  dscale is left alone -- it records
+	 * the display scale, not the number of stored digits.
+	 */
+	strip_var(dest);
+}
+
 /*
  * set_var_from_num() -
  *
@@ -7538,43 +7873,25 @@ invalid_syntax:
 static void
 set_var_from_num(Numeric num, NumericVar *dest)
 {
-	int			ndigits;
-
-	ndigits = NUMERIC_NDIGITS(num);
-
-	alloc_var(dest, ndigits);
-
-	dest->weight = NUMERIC_WEIGHT(num);
-	dest->sign = NUMERIC_SIGN(num);
-	dest->dscale = NUMERIC_DSCALE(num);
-
-	memcpy(dest->digits, NUMERIC_DIGITS(num), ndigits * sizeof(NumericDigit));
+	numeric_dec128_to_var(num, dest);
 }
 
 
 /*
  * init_var_from_num() -
  *
- *	Initialize a variable from packed db format. The digits array is not
- *	copied, which saves some cycles when the resulting var is not modified.
- *	Also, there's no need to call free_var(), as long as you don't assign any
- *	other value to it (with set_var_* functions, or by using the var as the
- *	destination of a function like add_var())
+ *	Initialize a variable from packed db format.
  *
- *	CAUTION: Do not modify the digits buffer of a var initialized with this
- *	function, e.g by calling round_var() or trunc_var(), as the changes will
- *	propagate to the original Numeric! It's OK to use it as the destination
- *	argument of one of the calculational functions, though.
+ *	NOTE: unlike the classic packed format, dec128 has no digit array to
+ *	point into, so (unlike the historical version of this function) this
+ *	always allocates a fresh digit buffer.  It is therefore safe -- indeed
+ *	necessary -- to free_var() the result once it is no longer needed, same
+ *	as any other NumericVar obtained from set_var_from_num().
  */
 static void
 init_var_from_num(Numeric num, NumericVar *dest)
 {
-	dest->ndigits = NUMERIC_NDIGITS(num);
-	dest->weight = NUMERIC_WEIGHT(num);
-	dest->sign = NUMERIC_SIGN(num);
-	dest->dscale = NUMERIC_DSCALE(num);
-	dest->digits = NUMERIC_DIGITS(num);
-	dest->buf = NULL;			/* digits array is not palloc'd */
+	numeric_dec128_to_var(num, dest);
 }
 
 
@@ -7883,15 +8200,169 @@ duplicate_numeric(Numeric num)
 {
 	Numeric		res;
 
-	res = (Numeric) palloc(VARSIZE(num));
-	memcpy(res, num, VARSIZE(num));
+	res = (Numeric) palloc(sizeof(NumericData));
+	memcpy(res, num, sizeof(NumericData));
 	return res;
+}
+
+/*
+ * numeric_var_to_dec128() -
+ *
+ *	Point of coupling #2 (SPEC-numeric-as-dec128.md sec. 3.4): pack a
+ *	NumericVar into a dec128 value.  Renders the variable to decimal text
+ *	with the existing get_str_from_var() (the same routine numeric_out()
+ *	uses, which always pads to exactly var->dscale fractional digits) and
+ *	reparses that text digit-by-digit, mirroring dec128_in()'s parser in the
+ *	dec64-prototype extension.  Going through text avoids the overflow trap
+ *	of a limb-boundary-padding multiply (aligning a scale that isn't a
+ *	multiple of DEC_DIGITS can require shifting a near-37-digit mantissa by
+ *	up to 3 more decimal digits, which does not fit in int128); a direct
+ *	digit-limb fast path is left for the later acceleration pass.
+ *
+ *	A scale greater than NUMERIC_MAX_STORED_SCALE (15) is *not* treated as
+ *	an overflow: it is rounded away, the same way apply_typmod() rounds a
+ *	value down to a target typmod's scale.  This matches the documented
+ *	"division scale diverges from stock numeric" regression
+ *	(SPEC-numeric-as-dec128.md sec. 3.3) -- callers like numeric_div(),
+ *	the variance/stddev finalizers, and float8-to-numeric conversion
+ *	routinely produce more fractional digits than dec128 can store, and
+ *	should lose precision gracefully rather than fail outright.
+ *
+ *	On genuine overflow (more than 37 significant digits, even after that
+ *	rounding): if have_error is non-NULL, sets *have_error and leaves *out
+ *	untouched; otherwise raises ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE, matching
+ *	the historical int16-header-overflow behaviour this replaces.
+ *
+ *	Like numeric_dec128_to_var(), this used to go through decimal text --
+ *	get_str_from_var() followed by a digit-by-digit reparse -- and for the same
+ *	reason: a limb-boundary alignment multiply can overflow int128.  Here the
+ *	fix is to round the variable down to the target scale *first*, with the
+ *	existing round_var(), which bounds the leftover misalignment to at most
+ *	DEC_DIGITS - 1 digits.  After that the conversion is a plain Horner loop
+ *	over the limbs with overflow checks.
+ */
+static void
+numeric_var_to_dec128(const NumericVar *var, NumericData *out, bool *have_error)
+{
+	int128		mant = 0;
+	int			sign = var->sign;
+	int			ts;
+	int			stored_scale;
+	int			cur_scale;
+	int			i;
+	bool		overflow = false;
+	NumericVar	rounded;
+	bool		have_rounded = false;
+
+	Assert(sign == NUMERIC_POS || sign == NUMERIC_NEG);
+
+	ts = Min(var->dscale, NUMERIC_MAX_STORED_SCALE);
+
+	/*
+	 * Round away anything we can't keep.  Two separate reasons to get here:
+	 * the display scale exceeds what dec128 stores (the documented division
+	 * regression), or the variable physically carries more fractional digits
+	 * than its own dscale advertises.  The latter shouldn't happen -- dscale
+	 * is documented never to be less than the number of stored digits -- but
+	 * handling it costs one comparison and keeps the Horner loop below from
+	 * having to cope with an unbounded misalignment.
+	 */
+	stored_scale = DEC_DIGITS * (var->ndigits - 1 - var->weight);
+	if (var->dscale > ts || stored_scale > ts)
+	{
+		init_var(&rounded);
+		set_var_from_var(var, &rounded);
+		round_var(&rounded, ts);
+		have_rounded = true;
+		var = &rounded;
+	}
+
+	/*
+	 * Accumulate the limbs.  The digits are all non-negative, so this builds
+	 * the magnitude; the sign is applied at the very end.
+	 */
+	for (i = 0; i < var->ndigits; i++)
+	{
+		if (unlikely(__builtin_mul_overflow(mant, (int128) NBASE, &mant)) ||
+			unlikely(__builtin_add_overflow(mant, (int128) var->digits[i],
+											&mant)))
+		{
+			overflow = true;
+			break;
+		}
+	}
+
+	/*
+	 * mant now represents the value scaled by 10^cur_scale.  Note this can be
+	 * negative, for a value whose limbs all sit above the decimal point.
+	 */
+	cur_scale = DEC_DIGITS * (var->ndigits - 1 - var->weight);
+
+	if (unlikely(overflow))
+	{
+		/* nothing more to do; fall through to the error path below */
+	}
+	else if (mant == 0)
+	{
+		/* zero at any scale is just zero; skip the alignment arithmetic */
+	}
+	else if (cur_scale < ts)
+	{
+		if (unlikely(!numeric_dec128_try_scale_up(mant, ts - cur_scale, &mant)))
+			overflow = true;
+	}
+	else if (cur_scale > ts)
+	{
+		int128		divisor;
+		int128		rem;
+
+		/*
+		 * Only the tail of a partially-filled limb can be left over here,
+		 * because we rounded to ts above -- so this drop is at most
+		 * DEC_DIGITS - 1 digits and those digits are zeroes.  Round half away
+		 * from zero regardless, to match round_var() rather than silently
+		 * truncating if that assumption ever stops holding.
+		 */
+		Assert(cur_scale - ts < DEC_DIGITS);
+		divisor = numeric_dec128_pow10[cur_scale - ts];
+		rem = mant % divisor;
+		mant /= divisor;
+		if (rem > 0 && rem * 2 >= divisor)
+			mant++;
+		else if (rem < 0 && (-rem) * 2 >= divisor)
+			mant--;
+	}
+
+	if (!overflow &&
+		(mant > NUMERIC_MAX_MANT || mant < -NUMERIC_MAX_MANT))
+		overflow = true;
+
+	/*
+	 * Release the working copy before the error path, so that an ereport()
+	 * here doesn't strand it until the surrounding context is reset.
+	 */
+	if (have_rounded)
+		free_var(&rounded);
+
+	if (unlikely(overflow))
+	{
+		if (have_error)
+		{
+			*have_error = true;
+			return;
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("value overflows numeric format")));
+	}
+
+	numeric_pack_store(out, sign == NUMERIC_NEG ? -mant : mant, ts);
 }
 
 /*
  * make_result_opt_error() -
  *
- *	Create the packed db numeric format in palloc()'d memory from
+ *	Create the packed dec128 numeric format in palloc()'d memory from
  *	a variable.  This will handle NaN and Infinity cases.
  *
  *	If "have_error" isn't NULL, on overflow *have_error is set to true and
@@ -7901,14 +8372,12 @@ static Numeric
 make_result_opt_error(const NumericVar *var, bool *have_error)
 {
 	Numeric		result;
-	NumericDigit *digits = var->digits;
-	int			weight = var->weight;
 	int			sign = var->sign;
-	int			n;
-	Size		len;
 
 	if (have_error)
 		*have_error = false;
+
+	result = (Numeric) palloc(sizeof(NumericData));
 
 	if ((sign & NUMERIC_SIGN_MASK) == NUMERIC_SPECIAL)
 	{
@@ -7917,84 +8386,36 @@ make_result_opt_error(const NumericVar *var, bool *have_error)
 		 * but it seems worthwhile to expend a few cycles to ensure that we
 		 * never write any nonzero reserved bits to disk.
 		 */
-		if (!(sign == NUMERIC_NAN ||
-			  sign == NUMERIC_PINF ||
-			  sign == NUMERIC_NINF))
+		int128		mant;
+
+		if (sign == NUMERIC_NAN)
+			mant = NUMERIC_NAN_MANT;
+		else if (sign == NUMERIC_PINF)
+			mant = NUMERIC_PINF_MANT;
+		else if (sign == NUMERIC_NINF)
+			mant = NUMERIC_NINF_MANT;
+		else
+		{
 			elog(ERROR, "invalid numeric sign value 0x%x", sign);
+			mant = 0;			/* keep compiler quiet */
+		}
 
-		result = (Numeric) palloc(NUMERIC_HDRSZ_SHORT);
-
-		SET_VARSIZE(result, NUMERIC_HDRSZ_SHORT);
-		result->choice.n_header = sign;
-		/* the header word is all we need */
+		numeric_pack_store(result, mant, 0);
 
 		dump_numeric("make_result()", result);
 		return result;
 	}
 
-	n = var->ndigits;
-
-	/* truncate leading zeroes */
-	while (n > 0 && *digits == 0)
-	{
-		digits++;
-		weight--;
-		n--;
-	}
-	/* truncate trailing zeroes */
-	while (n > 0 && digits[n - 1] == 0)
-		n--;
-
-	/* If zero result, force to weight=0 and positive sign */
-	if (n == 0)
-	{
-		weight = 0;
-		sign = NUMERIC_POS;
-	}
-
-	/* Build the result */
-	if (NUMERIC_CAN_BE_SHORT(var->dscale, weight))
-	{
-		len = NUMERIC_HDRSZ_SHORT + n * sizeof(NumericDigit);
-		result = (Numeric) palloc(len);
-		SET_VARSIZE(result, len);
-		result->choice.n_short.n_header =
-			(sign == NUMERIC_NEG ? (NUMERIC_SHORT | NUMERIC_SHORT_SIGN_MASK)
-			 : NUMERIC_SHORT)
-			| (var->dscale << NUMERIC_SHORT_DSCALE_SHIFT)
-			| (weight < 0 ? NUMERIC_SHORT_WEIGHT_SIGN_MASK : 0)
-			| (weight & NUMERIC_SHORT_WEIGHT_MASK);
-	}
-	else
-	{
-		len = NUMERIC_HDRSZ + n * sizeof(NumericDigit);
-		result = (Numeric) palloc(len);
-		SET_VARSIZE(result, len);
-		result->choice.n_long.n_sign_dscale =
-			sign | (var->dscale & NUMERIC_DSCALE_MASK);
-		result->choice.n_long.n_weight = weight;
-	}
-
-	Assert(NUMERIC_NDIGITS(result) == n);
-	if (n > 0)
-		memcpy(NUMERIC_DIGITS(result), digits, n * sizeof(NumericDigit));
-
-	/* Check for overflow of int16 fields */
-	if (NUMERIC_WEIGHT(result) != weight ||
-		NUMERIC_DSCALE(result) != var->dscale)
-	{
-		if (have_error)
-		{
-			*have_error = true;
-			return NULL;
-		}
-		else
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-					 errmsg("value overflows numeric format")));
-		}
-	}
+	/*
+	 * numeric_var_to_dec128() renders through get_str_from_var(), the same
+	 * routine numeric_out() uses, so it handles zero (however many, or few,
+	 * zero digits var happens to carry -- the rendered text is "0" or
+	 * "0.000..." either way) and the sign-of-zero-is-positive convention
+	 * without a separate case here.
+	 */
+	numeric_var_to_dec128(var, result, have_error);
+	if (have_error && *have_error)
+		return NULL;
 
 	dump_numeric("make_result()", result);
 	return result;

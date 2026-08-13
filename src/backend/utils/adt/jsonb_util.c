@@ -1843,7 +1843,15 @@ convertJsonbScalar(StringInfo buffer, JEntry *header, JsonbValue *scalarVal)
 			break;
 
 		case jbvNumeric:
-			numlen = VARSIZE_ANY(scalarVal->val.numeric);
+
+			/*
+			 * EXPERIMENTAL (SPEC-numeric-as-dec128.md): numeric is now a
+			 * fixed-size, non-toastable type, so there's no varlena header
+			 * to size this from; VARSIZE_ANY() would misread the packed
+			 * dec128 bytes as a bogus length.  Use the type's known fixed
+			 * size instead.
+			 */
+			numlen = NUMERIC_DATUM_SIZE;
 			padlen = padBufferToInt(buffer);
 
 			appendToBuffer(buffer, scalarVal->val.numeric, numlen);

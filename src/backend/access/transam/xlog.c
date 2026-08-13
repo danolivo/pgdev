@@ -4268,6 +4268,13 @@ WriteControlFile(void)
 	ControlFile->float8ByVal = FLOAT8PASSBYVAL;
 
 	/*
+	 * EXPERIMENTAL (SPEC-numeric-as-dec128.md): this build always stores
+	 * numeric as a packed dec128 value; see the field's declaration in
+	 * pg_control.h.
+	 */
+	ControlFile->numericDec128Format = true;
+
+	/*
 	 * Initialize the default 'char' signedness.
 	 *
 	 * The signedness of the char type is implementation-defined. For instance
@@ -4543,6 +4550,24 @@ ReadControlFile(void)
 						   " but the server was compiled without USE_FLOAT8_BYVAL."),
 				 errhint("It looks like you need to recompile or initdb.")));
 #endif
+
+	/*
+	 * EXPERIMENTAL (SPEC-numeric-as-dec128.md): this build always requires
+	 * numericDec128Format, since it has no compile-time choice of numeric
+	 * representation.  A cluster initialized by a stock build should
+	 * already fail the pg_control_version check above, before this is ever
+	 * reached; this is a second, explicit line of defense in case the
+	 * struct layout happens to line up (e.g. two different dec128-patched
+	 * builds with mismatched assumptions).
+	 */
+	if (ControlFile->numericDec128Format != true)
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("database files are incompatible with server"),
+				 errdetail("The database cluster was not initialized with the"
+						   " experimental dec128 numeric format, but the server"
+						   " was compiled to require it."),
+				 errhint("It looks like you need to recompile or initdb.")));
 
 	wal_segment_size = ControlFile->xlog_seg_size;
 

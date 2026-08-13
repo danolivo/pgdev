@@ -55,18 +55,38 @@ typedef struct NumericData *Numeric;
 
 /*
  * fmgr interface macros
+ *
+ * EXPERIMENTAL (SPEC-numeric-as-dec128.md): numeric is now a fixed 16-byte,
+ * non-toastable type (typlen = 16, typstorage = 'p'), so there is no
+ * varlena header to detoast.  DatumGetNumeric() used to call
+ * PG_DETOAST_DATUM(); doing so now would be wrong, since PG_DETOAST_DATUM()
+ * inspects varlena header bits that a fixed-length datum doesn't have.
+ * DatumGetNumericCopy() keeps its copying behaviour (some callers rely on
+ * getting an independent copy), just without going through toast.
  */
 
 static inline Numeric
 DatumGetNumeric(Datum X)
 {
-	return (Numeric) PG_DETOAST_DATUM(X);
+	return (Numeric) DatumGetPointer(X);
 }
+
+/*
+ * NumericData's fields are private to numeric.c (struct NumericData is only
+ * forward-declared here), so DatumGetNumericCopy() can't use sizeof(*src)
+ * directly; NUMERIC_DATUM_SIZE mirrors the 16-byte size fixed by the dec128
+ * struct definition in numeric.c, which asserts the two stay in sync.
+ */
+#define NUMERIC_DATUM_SIZE	16
 
 static inline Numeric
 DatumGetNumericCopy(Datum X)
 {
-	return (Numeric) PG_DETOAST_DATUM_COPY(X);
+	Numeric		src = (Numeric) DatumGetPointer(X);
+	Numeric		dst = (Numeric) palloc(NUMERIC_DATUM_SIZE);
+
+	memcpy(dst, src, NUMERIC_DATUM_SIZE);
+	return dst;
 }
 
 static inline Datum

@@ -73,6 +73,7 @@
 #include "utils/formatting.h"
 #include "utils/json.h"
 #include "utils/jsonpath.h"
+#include "utils/numeric.h"
 
 
 static Datum jsonPathFromCstring(char *in, int len, struct Node *escontext);
@@ -276,8 +277,15 @@ flattenJsonPathParseItem(StringInfo buf, int *result, struct Node *escontext,
 			appendStringInfoChar(buf, '\0');
 			break;
 		case jpiNumeric:
+
+			/*
+			 * EXPERIMENTAL (SPEC-numeric-as-dec128.md): numeric is now a
+			 * fixed-size, non-toastable type -- VARSIZE() would misread the
+			 * packed dec128 bytes as a bogus varlena length.  Serialize the
+			 * type's known fixed size instead.
+			 */
 			appendBinaryStringInfo(buf, item->value.numeric,
-								   VARSIZE(item->value.numeric));
+								   NUMERIC_DATUM_SIZE);
 			break;
 		case jpiBool:
 			appendBinaryStringInfo(buf, &item->value.boolean,
