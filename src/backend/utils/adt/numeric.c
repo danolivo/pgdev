@@ -9132,6 +9132,8 @@ numeric_var_to_dec128(const NumericVar *var, NumericData *out, bool *have_error)
 	int			ts;
 	int			stored_scale;
 	int			cur_scale;
+	int			pad;
+	int			nfull;
 	int			i;
 	bool		overflow = false;
 	NumericVar	rounded;
@@ -9161,10 +9163,29 @@ numeric_var_to_dec128(const NumericVar *var, NumericData *out, bool *have_error)
 	}
 
 	/*
-	 * Accumulate the limbs.  The digits are all non-negative, so this builds
-	 * the magnitude; the sign is applied at the very end.
+	 * The limbs are a base-NBASE number scaled by 10^cur_scale, and we want the
+	 * mantissa at scale ts.  Those differ by at most DEC_DIGITS - 1 digits
+	 * after the rounding above, and the difference lives entirely in the low
+	 * digits of the *last* limb.
+	 *
+	 * Do not accumulate all the limbs first and divide afterwards.  The
+	 * intermediate would be the value scaled by 10^cur_scale rather than
+	 * 10^ts, and for a full-width mantissa at a scale that isn't a multiple of
+	 * DEC_DIGITS those extra digits push it past int128 -- rejecting a value
+	 * that fits perfectly well once it is aligned.
+	 *
+	 * So absorb the alignment into the accumulation: run the Horner loop over
+	 * the limbs that are entirely within ts, then fold the last limb in at the
+	 * width that lands exactly on ts.  Every intermediate is then bounded by
+	 * the final value, and the only overflow reported is a real one.
 	 */
-	for (i = 0; i < var->ndigits; i++)
+	cur_scale = DEC_DIGITS * (var->ndigits - 1 - var->weight);
+	pad = (cur_scale > ts) ? cur_scale - ts : 0;
+	Assert(pad < DEC_DIGITS);
+	nfull = var->ndigits - (pad > 0 ? 1 : 0);
+
+	/* digits are all non-negative, so this builds the magnitude */
+	for (i = 0; i < nfull; i++)
 	{
 		if (unlikely(__builtin_mul_overflow(mant, (int128) NBASE, &mant)) ||
 			unlikely(__builtin_add_overflow(mant, (int128) var->digits[i],
@@ -9175,11 +9196,26 @@ numeric_var_to_dec128(const NumericVar *var, NumericData *out, bool *have_error)
 		}
 	}
 
-	/*
-	 * mant now represents the value scaled by 10^cur_scale.  Note this can be
-	 * negative, for a value whose limbs all sit above the decimal point.
-	 */
-	cur_scale = DEC_DIGITS * (var->ndigits - 1 - var->weight);
+	if (!overflow && pad > 0)
+	{
+		int128		p10 = numeric_dec128_pow10[pad];
+		int128		last = (int128) var->digits[var->ndigits - 1];
+		int128		rem = last % p10;
+
+		/*
+		 * Round half away from zero on the digits being dropped.  After
+		 * round_var() they are zeroes, so this normally does nothing; keep it
+		 * so that a caller whose dscale understates its stored digits still
+		 * gets round_var()'s answer rather than a silent truncation.
+		 */
+		if (unlikely(__builtin_mul_overflow(mant,
+										   numeric_dec128_pow10[DEC_DIGITS - pad],
+										   &mant)) ||
+			unlikely(__builtin_add_overflow(mant, last / p10, &mant)))
+			overflow = true;
+		else if (rem * 2 >= p10)
+			mant++;
+	}
 
 	if (unlikely(overflow))
 	{
@@ -9193,27 +9229,6 @@ numeric_var_to_dec128(const NumericVar *var, NumericData *out, bool *have_error)
 	{
 		if (unlikely(!numeric_dec128_try_scale_up(mant, ts - cur_scale, &mant)))
 			overflow = true;
-	}
-	else if (cur_scale > ts)
-	{
-		int128		divisor;
-		int128		rem;
-
-		/*
-		 * Only the tail of a partially-filled limb can be left over here,
-		 * because we rounded to ts above -- so this drop is at most
-		 * DEC_DIGITS - 1 digits and those digits are zeroes.  Round half away
-		 * from zero regardless, to match round_var() rather than silently
-		 * truncating if that assumption ever stops holding.
-		 */
-		Assert(cur_scale - ts < DEC_DIGITS);
-		divisor = numeric_dec128_pow10[cur_scale - ts];
-		rem = mant % divisor;
-		mant /= divisor;
-		if (rem > 0 && rem * 2 >= divisor)
-			mant++;
-		else if (rem < 0 && (-rem) * 2 >= divisor)
-			mant--;
 	}
 
 	if (!overflow &&
