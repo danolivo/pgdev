@@ -33,6 +33,7 @@
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "port/pg_bitutils.h"	/* pg_leftmost_one_pos64() */
 #include "nodes/supportnodes.h"
 #include "optimizer/optimizer.h"
 #include "utils/array.h"
@@ -306,6 +307,40 @@ static const int128 numeric_dec128_pow10[NUMERIC_MAX_MANT_DIGITS + 1] = {
 };
 
 /*
+ * Powers of ten that fit a uint64.  Used wherever a value is known to have
+ * dropped below 2^64, so that the division can be done in 64-bit arithmetic:
+ * neither x86-64 nor AArch64 has a 128-bit divide instruction, so a
+ * uint128 division by a *variable* divisor compiles to a libgcc __udivti3
+ * call costing tens of cycles, while a uint64 division by one of these
+ * constants is strength-reduced by the compiler into a multiply.
+ */
+static const uint64 numeric_dec128_pow10_u64[20] = {
+	UINT64CONST(1),
+	UINT64CONST(10),
+	UINT64CONST(100),
+	UINT64CONST(1000),
+	UINT64CONST(10000),
+	UINT64CONST(100000),
+	UINT64CONST(1000000),
+	UINT64CONST(10000000),
+	UINT64CONST(100000000),
+	UINT64CONST(1000000000),
+	UINT64CONST(10000000000),
+	UINT64CONST(100000000000),
+	UINT64CONST(1000000000000),
+	UINT64CONST(10000000000000),
+	UINT64CONST(100000000000000),
+	UINT64CONST(1000000000000000),
+	UINT64CONST(10000000000000000),
+	UINT64CONST(100000000000000000),
+	UINT64CONST(1000000000000000000),
+	UINT64CONST(10000000000000000000)
+};
+
+/* leading NBASE limbs an abbreviated key can possibly consult */
+#define NUMERIC_ABBREV_LIMBS	4
+
+/*
  * Multiply by 10^n, reporting overflow rather than wrapping.  Ported from
  * dec128_try_scale_up() in the dec64-prototype extension.
  */
@@ -366,7 +401,8 @@ numeric_dec128_canonical(Numeric num, NumericData *out)
 {
 	int128		mant = numeric_pack_mant(num);
 	int			scale = numeric_pack_scale(num);
-	int			step;
+	bool		neg = (mant < 0);
+	uint128		mag;
 
 	if (mant == 0)
 	{
@@ -374,41 +410,110 @@ numeric_dec128_canonical(Numeric num, NumericData *out)
 		return;
 	}
 
+	/* negate in unsigned arithmetic; see numeric_dec128_int128_to_var() */
+	mag = neg ? (~(uint128) mant) + 1 : (uint128) mant;
+
 	/*
 	 * Strip trailing fractional zeroes in descending power-of-two chunks
-	 * rather than one digit at a time.  128-bit division is expensive and
-	 * scale is bounded by NUMERIC_MAX_STORED_SCALE, so this needs at most
-	 * four divisions where the naive loop needed fifteen.  hash_numeric() is
-	 * on the hash-join and hash-aggregate path, so this is worth the extra
-	 * two lines.
+	 * rather than one digit at a time, on the magnitude, and in 64-bit
+	 * arithmetic whenever the value fits.
+	 *
+	 * All three details are about avoiding division instructions.  Constant
+	 * divisors let the compiler strength-reduce a division into a multiply, but
+	 * it only does so reliably for *unsigned* operands that fit a machine
+	 * register -- signed 128-bit division by a constant still emits a libgcc
+	 * __divti3 call, and so does the unsigned 128-bit form.  hash_numeric()
+	 * runs once per row per side of a hash join or hash aggregate, so the
+	 * difference between a multiply and a function call matters here.
 	 */
-	for (step = 8; step > 0; step >>= 1)
-	{
-		while (scale >= step && (mant % numeric_dec128_pow10[step]) == 0)
-		{
-			mant /= numeric_dec128_pow10[step];
-			scale -= step;
-		}
+#define STRIP_TRAILING_ZEROES(var, pow, n) \
+	while (scale >= (n) && ((var) % (pow)) == 0) \
+	{ \
+		(var) /= (pow); \
+		scale -= (n); \
 	}
 
-	numeric_pack_store(out, mant, scale);
+	if (likely((mag >> 64) == 0))
+	{
+		uint64		u = (uint64) mag;
+
+		STRIP_TRAILING_ZEROES(u, UINT64CONST(100000000), 8);
+		STRIP_TRAILING_ZEROES(u, UINT64CONST(10000), 4);
+		STRIP_TRAILING_ZEROES(u, UINT64CONST(100), 2);
+		STRIP_TRAILING_ZEROES(u, UINT64CONST(10), 1);
+
+		mag = (uint128) u;
+	}
+	else
+	{
+		/* wide values are rare; take the library calls rather than duplicate */
+		STRIP_TRAILING_ZEROES(mag, (uint128) UINT64CONST(100000000), 8);
+		STRIP_TRAILING_ZEROES(mag, (uint128) UINT64CONST(10000), 4);
+		STRIP_TRAILING_ZEROES(mag, (uint128) UINT64CONST(100), 2);
+		STRIP_TRAILING_ZEROES(mag, (uint128) UINT64CONST(10), 1);
+	}
+
+#undef STRIP_TRAILING_ZEROES
+
+	numeric_pack_store(out, neg ? -(int128) mag : (int128) mag, scale);
 }
 
 /*
  * numeric_dec128_ndigits() -
  *
- *	Number of decimal digits in a non-negative int128, i.e. the smallest d
+ *	Number of decimal digits in a non-negative uint128, i.e. the smallest d
  *	with mag < 10^d.  Zero counts as one digit, matching how the digit string
  *	"0" is rendered.
+ *
+ *	Derived from the bit length rather than by trial division: log10(2) is
+ *	about 0.30103, so (bits * 77) >> 8 estimates the digit count to within one,
+ *	and a single comparison corrects it.  The previous version looped up to
+ *	NUMERIC_MAX_MANT_DIGITS times comparing 128-bit values, and
+ *	numeric_dec128_div_rscale() calls this twice for every division.
  */
 static inline int
 numeric_dec128_ndigits(uint128 mag)
 {
-	int			d = 1;
+	uint64		hi = (uint64) (mag >> 64);
+	int			bits;
+	int			d;
 
-	while (d < NUMERIC_MAX_MANT_DIGITS &&
-		   mag >= (uint128) numeric_dec128_pow10[d])
-		d++;
+	/*
+	 * Only legal mantissas reach here, which bounds the estimate below and
+	 * keeps every numeric_dec128_pow10[] subscript in range.
+	 */
+	Assert(mag <= (uint128) NUMERIC_MAX_MANT);
+
+	if (mag == 0)
+		return 1;
+
+	/* bit length; pg_leftmost_one_pos64() gives the 0-based highest set bit */
+	if (hi != 0)
+		bits = 65 + pg_leftmost_one_pos64(hi);
+	else
+		bits = 1 + pg_leftmost_one_pos64((uint64) mag);
+
+	/*
+	 * 1233/4096 approximates log10(2) from above, so this never underestimates
+	 * and overestimates by at most one; one comparison corrects it downwards.
+	 *
+	 * Note the pre-correction estimate can be NUMERIC_MAX_MANT_DIGITS + 1: a
+	 * 37-nine mantissa is 123 bits, and (123 * 1233 >> 12) + 1 is 38.  That is
+	 * why the subscript below is d - 1 and not d -- numeric_dec128_pow10[] runs
+	 * to NUMERIC_MAX_MANT_DIGITS inclusive, so d - 1 is always in range, while
+	 * d would not be.  Since mag is bounded by NUMERIC_MAX_MANT, i.e. strictly
+	 * below 10^NUMERIC_MAX_MANT_DIGITS, the correction always fires in that
+	 * case and the returned value is back in range.
+	 */
+	d = ((bits * 1233) >> 12) + 1;
+	Assert(d >= 1 && d <= NUMERIC_MAX_MANT_DIGITS + 1);
+
+	if (d > 1 && mag < (uint128) numeric_dec128_pow10[d - 1])
+		d--;
+
+	Assert(d >= 1 && d <= NUMERIC_MAX_MANT_DIGITS);
+	Assert(d == 1 || mag >= (uint128) numeric_dec128_pow10[d - 1]);
+
 	return d;
 }
 
@@ -531,6 +636,27 @@ numeric_dec128_scaled_div(uint128 a, uint128 b, int shift, uint128 *result)
 	if (likely(!__builtin_mul_overflow(a, (uint128) numeric_dec128_pow10[shift],
 									   &num)))
 	{
+		/*
+		 * Prefer 64-bit division when both operands fit.  A uint128 division by
+		 * a runtime divisor is a libgcc __udivti3 call; the 64-bit form is a
+		 * single hardware instruction.  Money-sized operands land here even
+		 * after the scale shift.
+		 */
+		if ((num >> 64) == 0 && (b >> 64) == 0)
+		{
+			uint64		n64 = (uint64) num;
+			uint64		b64 = (uint64) b;
+			uint64		q64 = n64 / b64;
+			uint64		r64 = n64 % b64;
+
+			/* r64 < b64 <= UINT64_MAX, so the doubling is done in uint128 */
+			if ((uint128) r64 * 2 >= (uint128) b64)
+				q64++;
+
+			*result = (uint128) q64;
+			return true;
+		}
+
 		q = num / b;
 		r = num % b;
 
@@ -1039,6 +1165,8 @@ static void init_var_from_num(Numeric num, NumericVar *dest);
 static void numeric_dec128_to_var(Numeric num, NumericVar *dest);
 static void numeric_dec128_int128_to_var(int128 val, int scale,
 										 NumericVar *dest);
+static Datum numeric_abbrev_convert_dec128(Numeric value,
+										   NumericSortSupport *nss);
 static void numeric_var_to_dec128(const NumericVar *var, NumericData *out,
 								  bool *have_error);
 static void set_var_from_var(const NumericVar *value, NumericVar *dest);
@@ -2618,10 +2746,12 @@ numeric_sortsupport(PG_FUNCTION_ARGS)
 		nss = palloc(sizeof(NumericSortSupport));
 
 		/*
-		 * palloc a buffer for handling unaligned packed values in addition to
-		 * the support struct
+		 * EXPERIMENTAL (SPEC-numeric-as-dec128.md): no realignment buffer is
+		 * needed any more.  It existed to copy a short-header varlena somewhere
+		 * aligned; a dec128 numeric is fixed-width, never toasted and never
+		 * short-headered, so numeric_abbrev_convert() reads the datum in place.
 		 */
-		nss->buf = palloc(VARATT_SHORT_MAX + VARHDRSZ + 1);
+		nss->buf = NULL;
 
 		nss->input_count = 0;
 		nss->estimating = true;
@@ -2641,37 +2771,34 @@ numeric_sortsupport(PG_FUNCTION_ARGS)
 }
 
 /*
- * Abbreviate a numeric datum, handling NaNs and detoasting
- * (must not leak memory!)
+ * Abbreviate a numeric datum, handling NaNs (must not leak memory!)
+ *
+ * EXPERIMENTAL (SPEC-numeric-as-dec128.md): this used to begin with
+ * PG_DETOAST_DATUM_PACKED() and a VARATT_IS_SHORT() realignment dance.  Both
+ * are not merely unnecessary now that numeric is fixed-width, non-toastable
+ * and never short-headered -- they were actively unsafe, because they
+ * reinterpret the first byte of the packed value as a varlena header.  A
+ * mantissa with bit 60 set makes VARATT_IS_SHORT() read true, whereupon
+ * VARSIZE_SHORT() - VARHDRSZ_SHORT underflows to (size_t) -1 and the memcpy
+ * ran off the end of the datum: "ORDER BY" over values of 19 or more
+ * significant digits crashed the backend outright.  Smaller values have a zero
+ * high half, which read as a not-short header, which is the only reason this
+ * went unnoticed.  (Same class of bug as the jsonb_util.c and jsonpath.c
+ * fixes; this was the third and last site.)
+ *
+ * Reading the datum in place also removes the whole realignment buffer and,
+ * for finite values, the NumericVar round trip: the scaled-integer mantissa is
+ * a better source for an abbreviated key than a digit array, and needs no
+ * allocation to obtain.
  */
 static Datum
 numeric_abbrev_convert(Datum original_datum, SortSupport ssup)
 {
 	NumericSortSupport *nss = ssup->ssup_extra;
-	void	   *original_varatt = PG_DETOAST_DATUM_PACKED(original_datum);
-	Numeric		value;
+	Numeric		value = (Numeric) DatumGetPointer(original_datum);
 	Datum		result;
 
 	nss->input_count += 1;
-
-	/*
-	 * This is to handle packed datums without needing a palloc/pfree cycle;
-	 * we keep and reuse a buffer large enough to handle any short datum.
-	 */
-	if (VARATT_IS_SHORT(original_varatt))
-	{
-		void	   *buf = nss->buf;
-		Size		sz = VARSIZE_SHORT(original_varatt) - VARHDRSZ_SHORT;
-
-		Assert(sz <= VARATT_SHORT_MAX - VARHDRSZ_SHORT);
-
-		SET_VARSIZE(buf, VARHDRSZ + sz);
-		memcpy(VARDATA(buf), VARDATA_SHORT(original_varatt), sz);
-
-		value = (Numeric) buf;
-	}
-	else
-		value = (Numeric) original_varatt;
 
 	if (NUMERIC_IS_SPECIAL(value))
 	{
@@ -2683,19 +2810,129 @@ numeric_abbrev_convert(Datum original_datum, SortSupport ssup)
 			result = NUMERIC_ABBREV_NAN;
 	}
 	else
-	{
-		NumericVar	var;
-
-		init_var_from_num(value, &var);
-
-		result = numeric_abbrev_convert_var(&var, nss);
-	}
-
-	/* should happen only for external/compressed toasts */
-	if ((Pointer) original_varatt != DatumGetPointer(original_datum))
-		pfree(original_varatt);
+		result = numeric_abbrev_convert_dec128(value, nss);
 
 	return result;
+}
+
+/*
+ * Build an abbreviated key for a finite dec128 value.
+ *
+ * The abbreviated key formats (see numeric_abbrev_convert_var() below) consult
+ * only a value's sign, its base-NBASE weight, and its leading few NBASE limbs.
+ * All of those follow from the scaled-integer mantissa arithmetically, so we
+ * extract them here and hand them to the existing key builder rather than
+ * unpacking a whole NumericVar -- and rather than duplicating the bit packing,
+ * which is fiddly, order-critical, and has two variants.
+ *
+ * For a value mant * 10^-scale whose magnitude has d decimal digits, the
+ * leading decimal digit sits at decimal exponent (d - 1 - scale), so the
+ * leading limb has weight floor((d - 1 - scale) / DEC_DIGITS) and holds
+ * ((d - 1 - scale) mod DEC_DIGITS) + 1 significant digits.  Knowing that, we
+ * take just enough leading decimal digits to fill NUMERIC_ABBREV_LIMBS limbs,
+ * which is at most 16 -- comfortably inside a uint64, so every division after
+ * the first is 64-bit and gets strength-reduced.
+ *
+ * Getting this wrong would silently corrupt sort order rather than fail
+ * visibly, so an assert-enabled build cross-checks the extracted weight and
+ * limbs against a real unpack.
+ */
+static Datum
+numeric_abbrev_convert_dec128(Numeric value, NumericSortSupport *nss)
+{
+	int128		mant = numeric_pack_mant(value);
+	int			scale = numeric_pack_scale(value);
+	uint128		mag;
+	NumericDigit limbs[NUMERIC_ABBREV_LIMBS] = {0};
+	NumericVar	var;
+	int			i;
+
+	Assert(!NUMERIC_IS_SPECIAL(value));
+
+	/* negate in unsigned arithmetic; see numeric_dec128_int128_to_var() */
+	mag = (mant < 0) ? (~(uint128) mant) + 1 : (uint128) mant;
+
+	/*
+	 * A stack NumericVar with buf == NULL: the key builders only read the
+	 * fields set here and never allocate or free, so this must not be passed
+	 * to anything else.
+	 */
+	var.buf = NULL;
+	var.digits = limbs;
+	var.dscale = scale;
+	var.sign = (mant < 0) ? NUMERIC_NEG : NUMERIC_POS;
+
+	if (mag == 0)
+	{
+		/* strip_var()'s canonical zero; the builders special-case ndigits 0 */
+		var.ndigits = 0;
+		var.weight = 0;
+		var.sign = NUMERIC_POS;
+	}
+	else
+	{
+		int			d = numeric_dec128_ndigits(mag);
+		int			e = d - 1 - scale;
+		int			lead;
+		int			want;
+		int			take;
+		int			drop;
+		uint64		u;
+
+		/* floor division, which is what a negative exponent needs */
+		var.weight = (e >= 0) ? e / DEC_DIGITS
+			: -(((-e) + DEC_DIGITS - 1) / DEC_DIGITS);
+
+		lead = e - DEC_DIGITS * var.weight + 1;
+		Assert(lead >= 1 && lead <= DEC_DIGITS);
+
+		want = lead + DEC_DIGITS * (NUMERIC_ABBREV_LIMBS - 1);
+		take = Min(d, want);
+		drop = d - take;
+
+		/*
+		 * One 128-bit division at most, and only when the value has more
+		 * digits than the key can use.  Afterwards u holds `take` decimal
+		 * digits, hence at most 16, so the rest is 64-bit work.
+		 */
+		u = (uint64) (drop > 0
+					  ? mag / (uint128) numeric_dec128_pow10[drop]
+					  : mag);
+
+		/* right-pad so the digits land on the limb boundaries */
+		u *= numeric_dec128_pow10_u64[want - take];
+
+		for (i = NUMERIC_ABBREV_LIMBS - 1; i > 0; i--)
+		{
+			limbs[i] = (NumericDigit) (u % NBASE);
+			u /= NBASE;
+		}
+		limbs[0] = (NumericDigit) u;
+		Assert(limbs[0] > 0 && limbs[0] < NBASE);
+
+		var.ndigits = NUMERIC_ABBREV_LIMBS;
+	}
+
+#ifdef USE_ASSERT_CHECKING
+	{
+		NumericVar	chk;
+
+		init_var_from_num(value, &chk);
+		Assert(chk.sign == var.sign);
+		if (chk.ndigits == 0)
+			Assert(var.ndigits == 0);
+		else
+		{
+			Assert(var.weight == chk.weight);
+			for (i = 0; i < NUMERIC_ABBREV_LIMBS; i++)
+				Assert(limbs[i] ==
+					   (i < chk.ndigits ? chk.digits[i] : (NumericDigit) 0));
+		}
+		free_var(&chk);
+	}
+#endif
+
+	return numeric_abbrev_convert_var(&var, nss);
 }
 
 /*
@@ -8347,6 +8584,47 @@ numeric_dec128_int128_to_var(int128 val, int scale, NumericVar *dest)
 
 	dest->sign = neg ? NUMERIC_NEG : NUMERIC_POS;
 
+	nfrac_limbs = (scale + DEC_DIGITS - 1) / DEC_DIGITS;
+	pad = nfrac_limbs * DEC_DIGITS - scale;
+
+	/*
+	 * Fast path: if the whole coefficient, aligned up to a limb boundary, fits
+	 * a uint64, extract every limb in 64-bit arithmetic.  This is worth a
+	 * separate path because dividing a uint128 by a *variable* power of ten
+	 * compiles to a libgcc __udivti3 call, whereas these divisions are by the
+	 * compile-time constant NBASE and get strength-reduced into multiplies.
+	 * Anything up to 16 significant digits lands here, which covers ordinary
+	 * money and measurement columns; only genuinely wide values fall through.
+	 */
+	if (umant <= (uint128) (PG_UINT64_MAX / numeric_dec128_pow10_u64[pad]))
+	{
+		uint64		u = (uint64) umant * numeric_dec128_pow10_u64[pad];
+		int			n = 0;
+
+		while (u != 0)
+		{
+			Assert(n < NUMERIC_MAX_INT128_LIMBS);
+			int_limbs[n++] = (NumericDigit) (u % NBASE);
+			u /= NBASE;
+		}
+
+		alloc_var(dest, n);
+
+		/*
+		 * n counts limbs from the least significant end, and nfrac_limbs of
+		 * them are fractional, so the leading limb's weight follows directly.
+		 * It goes negative for a value below 1, which is correct.
+		 */
+		dest->weight = n - 1 - nfrac_limbs;
+
+		dptr = dest->digits;
+		for (i = n - 1; i >= 0; i--)
+			*dptr++ = int_limbs[i];
+
+		strip_var(dest);
+		return;
+	}
+
 	ipart = umant / (uint128) numeric_dec128_pow10[scale];
 	fpart = (uint64) (umant % (uint128) numeric_dec128_pow10[scale]);
 
@@ -8355,16 +8633,28 @@ numeric_dec128_int128_to_var(int128 val, int scale, NumericVar *dest)
 	 * the function comment for why this multiply is safe here and would not
 	 * have been on the undivided mantissa.
 	 */
-	nfrac_limbs = (scale + DEC_DIGITS - 1) / DEC_DIGITS;
-	pad = nfrac_limbs * DEC_DIGITS - scale;
-	fpart *= (uint64) numeric_dec128_pow10[pad];
+	fpart *= numeric_dec128_pow10_u64[pad];
 
-	/* Integer limbs, least significant first; the top one is never zero */
-	while (ipart != 0)
+	/*
+	 * Integer limbs, least significant first; the top one is never zero.  Drop
+	 * into 64-bit arithmetic as soon as the remaining value fits, for the same
+	 * strength-reduction reason as the fast path above.
+	 */
+	while ((ipart >> 64) != 0)
 	{
 		Assert(nint_limbs < NUMERIC_MAX_INT128_LIMBS);
 		int_limbs[nint_limbs++] = (NumericDigit) (ipart % NBASE);
 		ipart /= NBASE;
+	}
+	{
+		uint64		u = (uint64) ipart;
+
+		while (u != 0)
+		{
+			Assert(nint_limbs < NUMERIC_MAX_INT128_LIMBS);
+			int_limbs[nint_limbs++] = (NumericDigit) (u % NBASE);
+			u /= NBASE;
+		}
 	}
 
 	alloc_var(dest, nint_limbs + nfrac_limbs);
