@@ -112,7 +112,7 @@ typedef int16 NumericDigit;
  * one-off benchmarking build, not a supported storage format change.
  *
  * A value is a scaled integer: mantissa / 10^scale.  The mantissa is a
- * signed 123-bit integer and the scale is a 4-bit field (0..15), packed
+ * signed 122-bit integer and the scale is a 5-bit field (0..31), packed
  * together into a fixed 16-byte struct with no varlena header at all
  * (pg_type.typlen = 16, typstorage = 'p').  The struct is kept as two int64
  * halves rather than a bare 128-bit field because a Datum is only
@@ -121,12 +121,12 @@ typedef int16 NumericDigit;
  * always correct.
  *
  * NaN, +Infinity and -Infinity are encoded as mantissa magnitudes just
- * above the largest representable 37-digit value (NUMERIC_MAX_MANT):
+ * above the largest representable 36-digit value (NUMERIC_MAX_MANT):
  * mantissa == NUMERIC_MAX_MANT+1 is NaN (NaN carries no sign, so only the
  * positive form is used), mantissa == NUMERIC_MAX_MANT+2 is +Infinity, and
  * mantissa == -(NUMERIC_MAX_MANT+2) is -Infinity.  This mirrors the classic
  * format's use of otherwise-impossible header bit patterns for specials:
- * the mantissa range between 10^37 and 2^123 is never produced by ordinary
+ * the mantissa range between 10^36 and 2^122 is never produced by ordinary
  * arithmetic, so a handful of values in it are free to repurpose.  The scale
  * field is unused (zero) for special values.
  *
@@ -184,15 +184,38 @@ StaticAssertDecl(sizeof(NumericData) == 16,
 #define NUMERIC_PINF		0xD000
 #define NUMERIC_NINF		0xF000
 
-#define NUMERIC_SCALE_BITS			4
-#define NUMERIC_SCALE_MASK			((uint64) 0xf)
-#define NUMERIC_MAX_STORED_SCALE	15
-#define NUMERIC_MAX_MANT_DIGITS		37
+/*
+ * Split of the 128 bits between scale and mantissa.
+ *
+ * The first cut of this used 4 scale bits, giving scale 0..15 and a 37-digit
+ * mantissa, on the assumption that money-like scales were what mattered.  Real
+ * 1C schemas disproved that: erp_v and cherkizovo declare numeric(22,20),
+ * numeric(25,20), numeric(31,20) and numeric(19,17), with a maximum scale of 20
+ * and a maximum precision of 36.  A 15-digit ceiling cannot store those columns
+ * at all, so the ceiling had to move rather than be reported.
+ *
+ * 5 bits gives scale 0..31, which covers that schema (and numeric(36,30), which
+ * the brin tests use), at the cost of one significant digit: the mantissa keeps
+ * bits 5..127, so its magnitude is bounded by 2^122 = 5.3e36 and 36 decimal
+ * digits fit where 37 no longer do.
+ *
+ * Going wider than 31 is not just a constant change.  numeric_dec128_..._to_var()
+ * splits the value into integer and fractional parts to keep the limb-boundary
+ * padding multiply from overflowing, and that relies on the fraction staying
+ * small: at scale <= 31 the fraction is below 10^31 and the padding multiply
+ * (at most 10^3) stays below 10^34, comfortably inside int128.  Beyond that the
+ * fraction can reach the full 36-digit mantissa and the padding multiply would
+ * overflow, so the padding would have to move into the limb extraction itself.
+ */
+#define NUMERIC_SCALE_BITS			5
+#define NUMERIC_SCALE_MASK			((uint64) 0x1f)
+#define NUMERIC_MAX_STORED_SCALE	31
+#define NUMERIC_MAX_MANT_DIGITS		36
 
 /* 10^18, the largest power of ten an int64 literal can carry */
 #define NUMERIC_POW10_P18	((int128) INT64CONST(1000000000000000000))
-/* 10^37, needs 123 bits; 2^123 = 1.06e37, so it just fits in a native int128 */
-#define NUMERIC_POW10_MAX	(NUMERIC_POW10_P18 * NUMERIC_POW10_P18 * 10)
+/* 10^36, needs 120 bits; the mantissa has 122 available, so this fits */
+#define NUMERIC_POW10_MAX	(NUMERIC_POW10_P18 * NUMERIC_POW10_P18)
 
 /* widest mantissa the encoding holds, and the special-value sentinels above it */
 #define NUMERIC_MAX_MANT	(NUMERIC_POW10_MAX - 1)
@@ -302,9 +325,11 @@ static const int128 numeric_dec128_pow10[NUMERIC_MAX_MANT_DIGITS + 1] = {
 	NUMERIC_POW10_P18 * 1000000000000000,
 	NUMERIC_POW10_P18 * 10000000000000000,
 	NUMERIC_POW10_P18 * 100000000000000000,
-	NUMERIC_POW10_P18 * NUMERIC_POW10_P18,
-	NUMERIC_POW10_P18 * NUMERIC_POW10_P18 * 10
+	NUMERIC_POW10_P18 * NUMERIC_POW10_P18
 };
+
+StaticAssertDecl(lengthof(numeric_dec128_pow10) == NUMERIC_MAX_MANT_DIGITS + 1,
+				 "numeric_dec128_pow10[] must run from 10^0 to 10^NUMERIC_MAX_MANT_DIGITS");
 
 /*
  * Powers of ten that fit a uint64.  Used wherever a value is known to have
@@ -498,7 +523,7 @@ numeric_dec128_ndigits(uint128 mag)
 	 * and overestimates by at most one; one comparison corrects it downwards.
 	 *
 	 * Note the pre-correction estimate can be NUMERIC_MAX_MANT_DIGITS + 1: a
-	 * 37-nine mantissa is 123 bits, and (123 * 1233 >> 12) + 1 is 38.  That is
+	 * 36-nine mantissa is 120 bits, and (120 * 1233 >> 12) + 1 is 37.  That is
 	 * why the subscript below is d - 1 and not d -- numeric_dec128_pow10[] runs
 	 * to NUMERIC_MAX_MANT_DIGITS inclusive, so d - 1 is always in range, while
 	 * d would not be.  Since mag is bounded by NUMERIC_MAX_MANT, i.e. strictly
@@ -627,10 +652,10 @@ numeric_dec128_scaled_div(uint128 a, uint128 b, int shift, uint128 *result)
 
 	/*
 	 * Fast path: if the shifted numerator still fits, one division does the
-	 * whole job.  Money-sized mantissas are nowhere near 10^37, so this is
-	 * what almost every real division takes; the digit-at-a-time loop below
-	 * exists for operands that genuinely fill the type.  Without the fast
-	 * path the loop runs up to 37 128-bit divisions per row, which is slower
+	 * whole job.  Money-sized mantissas are nowhere near the type's ceiling,
+	 * so this is what almost every real division takes; the digit-at-a-time
+	 * loop below exists for operands that genuinely fill the type.  Without
+	 * the fast path the loop runs one 128-bit division per digit, which is slower
 	 * than stock numeric rather than faster.
 	 */
 	if (likely(!__builtin_mul_overflow(a, (uint128) numeric_dec128_pow10[shift],
@@ -676,7 +701,7 @@ numeric_dec128_scaled_div(uint128 a, uint128 b, int shift, uint128 *result)
 		if (unlikely(__builtin_mul_overflow(q, (uint128) 10, &q)))
 			return false;
 
-		/* r < b <= 10^37, so r * 10 stays inside the unsigned range */
+		/* r < b <= NUMERIC_MAX_MANT, so r * 10 stays in the unsigned range */
 		r *= 10;
 		q += r / b;
 		r %= b;
@@ -829,7 +854,7 @@ numeric_dec128_out(Numeric num)
  *	push the scale beyond max(scale1, scale2).
  *
  *	Note the sum itself cannot overflow int128 once both operands are aligned:
- *	each is bounded by NUMERIC_MAX_MANT (~10^37) and int128 holds ~1.7*10^38,
+ *	each is bounded by NUMERIC_MAX_MANT (10^36 - 1) and int128 holds 1.7*10^38,
  *	so it is the NUMERIC_MAX_MANT range check, not the add, that rejects
  *	out-of-range results.
  */
@@ -907,7 +932,7 @@ numeric_dec128_mul(Numeric num1, Numeric num2, NumericData *out)
 	int128		product;
 
 	/*
-	 * Both mantissas fit 37 digits, so their exact product can need up to 74
+	 * Both mantissas fit 36 digits, so their exact product can need up to 72
 	 * and overflow int128 for large operands.  That is not a wrong answer, just
 	 * one this path cannot compute: mul_var() has no width limit, so the caller
 	 * still gets the right result (possibly an honest overflow error) from the
@@ -1855,7 +1880,7 @@ numeric_send(PG_FUNCTION_ARGS)
 	 * the spec's sec. 3.4 rationale, but that rationale only covers finite
 	 * values.  Without this check, sending a NaN/Infinity numeric in binary
 	 * silently reinterprets its sentinel mantissa as a huge finite value
-	 * (e.g. NaN's sentinel renders as 10^37), which numeric_recv() then
+	 * (e.g. NaN's sentinel renders as 10^36), which numeric_recv() then
 	 * rejects as an overflow -- or worse, could round-trip as a bogus
 	 * finite number.  Reproduce with: COPY a NaN/Infinity numeric out and
 	 * back in WITH (FORMAT binary).
@@ -3687,7 +3712,7 @@ numeric_add_opt_error(Numeric num1, Numeric num2, bool *have_error)
 	 * mantissa arithmetic first, without going anywhere near NumericVar.
 	 * Falls back to the general path below for anything it can't handle
 	 * (mainly: aligning the scales, or the result, would leave dec128's
-	 * 37-digit range).
+	 * 36-digit range).
 	 *
 	 * Compute into a local and copy out only on success, so that the fallback
 	 * costs no allocation at all.  An earlier version palloc'd up front and
@@ -4090,7 +4115,7 @@ numeric_div_opt_error(Numeric num1, Numeric num2, bool *have_error)
 	 *
 	 * EXPERIMENTAL (SPEC-numeric-as-dec128.md): select_div_scale() aims for
 	 * NUMERIC_MIN_SIG_DIGITS (16) significant digits, which very commonly
-	 * exceeds dec128's NUMERIC_MAX_STORED_SCALE (15) -- e.g. plain 2/1 asks
+	 * exceeds dec128's NUMERIC_MAX_STORED_SCALE -- e.g. plain 2/1 asks
 	 * for rscale 16.  Uncapped, nearly every division would overflow the
 	 * packed format instead of just losing a bit of precision.  This is the
 	 * documented "division scale diverges from stock numeric" regression
@@ -8602,7 +8627,7 @@ numeric_dec128_int128_to_var(int128 val, int scale, NumericVar *dest)
 	bool		neg = (val < 0);
 	uint128		umant;
 	uint128		ipart;
-	uint64		fpart;
+	uint128		fpart;
 	int			nint_limbs = 0;
 	int			nfrac_limbs;
 	int			pad;
@@ -8674,14 +8699,20 @@ numeric_dec128_int128_to_var(int128 val, int scale, NumericVar *dest)
 	}
 
 	ipart = umant / (uint128) numeric_dec128_pow10[scale];
-	fpart = (uint64) (umant % (uint128) numeric_dec128_pow10[scale]);
+	fpart = umant % (uint128) numeric_dec128_pow10[scale];
 
 	/*
-	 * Pad the fraction on the right so it fills a whole number of limbs.  See
-	 * the function comment for why this multiply is safe here and would not
-	 * have been on the undivided mantissa.
+	 * Pad the fraction on the right so it fills a whole number of limbs.
+	 *
+	 * This is where the scale ceiling earns its keep: the fraction is below
+	 * 10^NUMERIC_MAX_STORED_SCALE, i.e. 10^31, and pad is at most DEC_DIGITS-1,
+	 * so the product stays below 10^34 -- well inside int128's 1.7e38.  On the
+	 * undivided mantissa the same multiply would overflow, which is what the
+	 * integer/fraction split exists to avoid.  Raising the ceiling much further
+	 * would break this bound; see the NUMERIC_SCALE_BITS comment.
 	 */
-	fpart *= numeric_dec128_pow10_u64[pad];
+	Assert(fpart < (uint128) numeric_dec128_pow10[NUMERIC_MAX_STORED_SCALE]);
+	fpart *= (uint128) numeric_dec128_pow10[pad];
 
 	/*
 	 * Integer limbs, least significant first; the top one is never zero.  Drop
@@ -8716,10 +8747,25 @@ numeric_dec128_int128_to_var(int128 val, int scale, NumericVar *dest)
 	dptr = dest->digits;
 	for (i = nint_limbs - 1; i >= 0; i--)
 		*dptr++ = int_limbs[i];
-	for (i = nfrac_limbs - 1; i >= 0; i--)
+
+	/*
+	 * Fractional limbs, least significant first.  Drop into 64-bit arithmetic
+	 * once the remainder fits, as above: at scale <= 18 that is immediately, and
+	 * only the wider scales pay for a few 128-bit divisions.
+	 */
+	for (i = nfrac_limbs - 1; i >= 0 && (fpart >> 64) != 0; i--)
 	{
 		dptr[i] = (NumericDigit) (fpart % NBASE);
 		fpart /= NBASE;
+	}
+	{
+		uint64		u = (uint64) fpart;
+
+		for (; i >= 0; i--)
+		{
+			dptr[i] = (NumericDigit) (u % NBASE);
+			u /= NBASE;
+		}
 	}
 
 	/*
@@ -9092,35 +9138,28 @@ duplicate_numeric(Numeric num)
  * numeric_var_to_dec128() -
  *
  *	Point of coupling #2 (SPEC-numeric-as-dec128.md sec. 3.4): pack a
- *	NumericVar into a dec128 value.  Renders the variable to decimal text
- *	with the existing get_str_from_var() (the same routine numeric_out()
- *	uses, which always pads to exactly var->dscale fractional digits) and
- *	reparses that text digit-by-digit, mirroring dec128_in()'s parser in the
- *	dec64-prototype extension.  Going through text avoids the overflow trap
- *	of a limb-boundary-padding multiply (aligning a scale that isn't a
- *	multiple of DEC_DIGITS can require shifting a near-37-digit mantissa by
- *	up to 3 more decimal digits, which does not fit in int128); a direct
- *	digit-limb fast path is left for the later acceleration pass.
+ *	NumericVar into a dec128 value.
  *
- *	A scale greater than NUMERIC_MAX_STORED_SCALE (15) is *not* treated as
- *	an overflow: it is rounded away, the same way apply_typmod() rounds a
- *	value down to a target typmod's scale.  This matches the documented
- *	"division scale diverges from stock numeric" regression
+ *	A scale greater than NUMERIC_MAX_STORED_SCALE is *not* treated as an
+ *	overflow: it is rounded away, the same way apply_typmod() rounds a value
+ *	down to a target typmod's scale.  This matches the documented "division
+ *	scale diverges from stock numeric" regression
  *	(SPEC-numeric-as-dec128.md sec. 3.3) -- callers like numeric_div(),
  *	the variance/stddev finalizers, and float8-to-numeric conversion
  *	routinely produce more fractional digits than dec128 can store, and
  *	should lose precision gracefully rather than fail outright.
  *
- *	On genuine overflow (more than 37 significant digits, even after that
- *	rounding): if have_error is non-NULL, sets *have_error and leaves *out
- *	untouched; otherwise raises ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE, matching
- *	the historical int16-header-overflow behaviour this replaces.
+ *	On genuine overflow (more than NUMERIC_MAX_MANT_DIGITS significant digits,
+ *	even after that rounding): if have_error is non-NULL, sets *have_error and
+ *	leaves *out untouched; otherwise raises
+ *	ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE, matching the historical
+ *	int16-header-overflow behaviour this replaces.
  *
  *	Like numeric_dec128_to_var(), this used to go through decimal text --
- *	get_str_from_var() followed by a digit-by-digit reparse -- and for the same
- *	reason: a limb-boundary alignment multiply can overflow int128.  Here the
- *	fix is to round the variable down to the target scale *first*, with the
- *	existing round_var(), which bounds the leftover misalignment to at most
+ *	get_str_from_var() followed by a digit-by-digit reparse -- because a
+ *	limb-boundary alignment multiply can overflow int128.  Here the fix is to
+ *	round the variable down to the target scale *first*, with the existing
+ *	round_var(), which bounds the leftover misalignment to at most
  *	DEC_DIGITS - 1 digits.  After that the conversion is a plain Horner loop
  *	over the limbs with overflow checks.
  */
@@ -9172,7 +9211,9 @@ numeric_var_to_dec128(const NumericVar *var, NumericData *out, bool *have_error)
 	 * intermediate would be the value scaled by 10^cur_scale rather than
 	 * 10^ts, and for a full-width mantissa at a scale that isn't a multiple of
 	 * DEC_DIGITS those extra digits push it past int128 -- rejecting a value
-	 * that fits perfectly well once it is aligned.
+	 * that fits perfectly well once it is aligned.  (Found by the oracle in
+	 * bench/oracle-dec128.py on 4063147810458078638.18691032124052166, which
+	 * is 36 digits at scale 17: it pads to scale 20, i.e. 39 digits.)
 	 *
 	 * So absorb the alignment into the accumulation: run the Horner loop over
 	 * the limbs that are entirely within ts, then fold the last limb in at the
