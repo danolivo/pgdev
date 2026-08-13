@@ -395,6 +395,231 @@ numeric_dec128_canonical(Numeric num, NumericData *out)
 }
 
 /*
+ * numeric_dec128_ndigits() -
+ *
+ *	Number of decimal digits in a non-negative int128, i.e. the smallest d
+ *	with mag < 10^d.  Zero counts as one digit, matching how the digit string
+ *	"0" is rendered.
+ */
+static inline int
+numeric_dec128_ndigits(uint128 mag)
+{
+	int			d = 1;
+
+	while (d < NUMERIC_MAX_MANT_DIGITS &&
+		   mag >= (uint128) numeric_dec128_pow10[d])
+		d++;
+	return d;
+}
+
+/*
+ * numeric_dec128_div_rscale() -
+ *
+ *	Reproduce select_div_scale()'s result scale directly from two packed
+ *	operands, without unpacking either into a NumericVar.
+ *
+ *	This exists so the division fast path is *behaviour-preserving*: the
+ *	scale of a numeric division result is data-dependent (see
+ *	select_div_scale()), and this build already diverges from stock numeric by
+ *	clamping it to NUMERIC_MAX_STORED_SCALE.  Adding a second, different rule
+ *	here -- for instance always returning the maximum scale, as the dec128
+ *	extension prototype does -- would change results that the Phase 3
+ *	differential run has already validated.  So we mirror select_div_scale()
+ *	exactly, clamp exactly as numeric_div_opt_error() does, and the fast path
+ *	is then indistinguishable from the slow one apart from speed.
+ *
+ *	select_div_scale() needs, for each input, the base-NBASE weight of its
+ *	leading nonzero limb and that limb's value.  Both follow from the mantissa
+ *	without building any digit array.  For a value mant * 10^-scale whose
+ *	magnitude has d decimal digits, the leading decimal digit sits at decimal
+ *	exponent (d - 1 - scale), so the leading NBASE limb has weight
+ *		w = floor((d - 1 - scale) / DEC_DIGITS)
+ *	and that limb's value is
+ *		floor(|mant| / 10^(scale + DEC_DIGITS*w))
+ *	where a negative exponent means a multiply instead.  The limb is by
+ *	definition below NBASE, so neither direction can overflow.
+ */
+static inline int
+numeric_dec128_div_rscale(Numeric num1, Numeric num2)
+{
+	int			rscale;
+	int			qweight;
+	int			w[2];
+	int			firstdigit[2];
+	Numeric		nums[2];
+	int			i;
+
+	nums[0] = num1;
+	nums[1] = num2;
+
+	for (i = 0; i < 2; i++)
+	{
+		int128		mant = numeric_pack_mant(nums[i]);
+		int			scale = numeric_pack_scale(nums[i]);
+		uint128		mag = (mant < 0) ? (uint128) (-mant) : (uint128) mant;
+		int			d;
+		int			e;
+
+		/* select_div_scale() uses weight 0 and first digit 0 for a zero */
+		if (mag == 0)
+		{
+			w[i] = 0;
+			firstdigit[i] = 0;
+			continue;
+		}
+
+		d = numeric_dec128_ndigits(mag);
+
+		/* floor division, valid for a negative numerator too */
+		e = d - 1 - scale;
+		w[i] = (e >= 0) ? (e / DEC_DIGITS)
+			: -(((-e) + DEC_DIGITS - 1) / DEC_DIGITS);
+
+		e = scale + DEC_DIGITS * w[i];
+		if (e >= 0)
+			firstdigit[i] = (int) (mag / (uint128) numeric_dec128_pow10[e]);
+		else
+			firstdigit[i] = (int) (mag * (uint128) numeric_dec128_pow10[-e]);
+
+		Assert(firstdigit[i] > 0 && firstdigit[i] < NBASE);
+	}
+
+	qweight = w[0] - w[1];
+	if (firstdigit[0] <= firstdigit[1])
+		qweight--;
+
+	rscale = NUMERIC_MIN_SIG_DIGITS - qweight * DEC_DIGITS;
+	rscale = Max(rscale, numeric_pack_scale(num1));
+	rscale = Max(rscale, numeric_pack_scale(num2));
+	rscale = Max(rscale, NUMERIC_MIN_DISPLAY_SCALE);
+	rscale = Min(rscale, NUMERIC_MAX_DISPLAY_SCALE);
+
+	/* the clamp numeric_div_opt_error() applies; see its comment */
+	return Min(rscale, NUMERIC_MAX_STORED_SCALE);
+}
+
+/*
+ * numeric_dec128_scaled_div() -
+ *
+ *	Compute round(a * 10^shift / b) for non-negative a and positive b, with
+ *	round-half-away-from-zero.  Ported from dec128_scaled_div() in the
+ *	dec64-prototype extension; returns false on overflow instead of raising,
+ *	so the caller can fall back.
+ */
+static inline bool
+numeric_dec128_scaled_div(uint128 a, uint128 b, int shift, uint128 *result)
+{
+	uint128		num;
+	uint128		q;
+	uint128		r;
+	int			i;
+
+	Assert(b > 0);
+	Assert(shift >= 0);
+
+	if (unlikely(shift > NUMERIC_MAX_MANT_DIGITS))
+		return false;
+
+	/*
+	 * Fast path: if the shifted numerator still fits, one division does the
+	 * whole job.  Money-sized mantissas are nowhere near 10^37, so this is
+	 * what almost every real division takes; the digit-at-a-time loop below
+	 * exists for operands that genuinely fill the type.  Without the fast
+	 * path the loop runs up to 37 128-bit divisions per row, which is slower
+	 * than stock numeric rather than faster.
+	 */
+	if (likely(!__builtin_mul_overflow(a, (uint128) numeric_dec128_pow10[shift],
+									   &num)))
+	{
+		q = num / b;
+		r = num % b;
+
+		/* r < b, so r * 2 cannot overflow */
+		if (r * 2 >= b)
+			q++;
+
+		*result = q;
+		return true;
+	}
+
+	q = a / b;
+	r = a % b;
+
+	for (i = 0; i < shift; i++)
+	{
+		if (unlikely(__builtin_mul_overflow(q, (uint128) 10, &q)))
+			return false;
+
+		/* r < b <= 10^37, so r * 10 stays inside the unsigned range */
+		r *= 10;
+		q += r / b;
+		r %= b;
+	}
+
+	if (r * 2 >= b)
+	{
+		if (unlikely(__builtin_add_overflow(q, (uint128) 1, &q)))
+			return false;
+	}
+
+	*result = q;
+	return true;
+}
+
+/*
+ * numeric_dec128_div() -
+ *
+ *	Fast path for division, entirely on mantissas.  Only called on finite
+ *	operands.  Returns false if it cannot produce the answer, in which case
+ *	the caller must take the NumericVar path; a zero divisor is *not* handled
+ *	here, since raising the error is the caller's job.
+ *
+ *	Result scale matches numeric_div_opt_error()'s exactly -- see
+ *	numeric_dec128_div_rscale().
+ */
+static inline bool
+numeric_dec128_div(Numeric num1, Numeric num2, NumericData *out)
+{
+	int128		m1 = numeric_pack_mant(num1);
+	int128		m2 = numeric_pack_mant(num2);
+	int			s1 = numeric_pack_scale(num1);
+	int			s2 = numeric_pack_scale(num2);
+	bool		neg = ((m1 < 0) != (m2 < 0));
+	uint128		ua;
+	uint128		ub;
+	uint128		q;
+	int			rscale;
+	int			shift;
+
+	if (unlikely(m2 == 0))
+		return false;			/* caller raises division_by_zero */
+
+	rscale = numeric_dec128_div_rscale(num1, num2);
+
+	/*
+	 * We want round(m1*10^-s1 / (m2*10^-s2) * 10^rscale), i.e.
+	 * round(m1 * 10^(rscale + s2 - s1) / m2).  The shift is non-negative
+	 * because rscale is at least max(s1, s2) >= s1 (select_div_scale() takes
+	 * the max of both input scales), so no truncating pre-division is needed.
+	 */
+	shift = rscale + s2 - s1;
+	if (unlikely(shift < 0))
+		return false;			/* can't happen; be safe rather than wrong */
+
+	ua = (m1 < 0) ? (uint128) (-m1) : (uint128) m1;
+	ub = (m2 < 0) ? (uint128) (-m2) : (uint128) m2;
+
+	if (unlikely(!numeric_dec128_scaled_div(ua, ub, shift, &q)))
+		return false;
+
+	if (unlikely(q > (uint128) NUMERIC_MAX_MANT))
+		return false;
+
+	numeric_pack_store(out, neg ? -(int128) q : (int128) q, rscale);
+	return true;
+}
+
+/*
  * numeric_dec128_out() -
  *
  *	Render a finite dec128 value as decimal text, straight from the mantissa.
@@ -812,6 +1037,8 @@ static bool set_var_from_non_decimal_integer_str(const char *str,
 static void set_var_from_num(Numeric num, NumericVar *dest);
 static void init_var_from_num(Numeric num, NumericVar *dest);
 static void numeric_dec128_to_var(Numeric num, NumericVar *dest);
+static void numeric_dec128_int128_to_var(int128 val, int scale,
+										 NumericVar *dest);
 static void numeric_var_to_dec128(const NumericVar *var, NumericData *out,
 								  bool *have_error);
 static void set_var_from_var(const NumericVar *value, NumericVar *dest);
@@ -3546,6 +3773,26 @@ numeric_div_opt_error(Numeric num1, Numeric num2, bool *have_error)
 	}
 
 	/*
+	 * Fast path: long division on the mantissas, at the same result scale the
+	 * general path below would pick.  Skipped for a zero divisor so that the
+	 * error still comes from div_var(), keeping one code path responsible for
+	 * it.
+	 */
+	if (numeric_pack_mant(num2) != 0)
+	{
+		NumericData fast;
+
+		if (numeric_dec128_div(num1, num2, &fast))
+		{
+			res = (Numeric) palloc(sizeof(NumericData));
+			*res = fast;
+			if (have_error)
+				*have_error = false;
+			return res;
+		}
+	}
+
+	/*
 	 * Unpack the arguments
 	 */
 	init_var_from_num(num1, &arg1);
@@ -5133,6 +5380,41 @@ numeric_pg_lsn(PG_FUNCTION_ARGS)
 typedef struct NumericAggState
 {
 	bool		calcSumX2;		/* if true, calculate sumX2 */
+
+	/*
+	 * EXPERIMENTAL (SPEC-numeric-as-dec128.md): int128 fast sum, adapted from
+	 * 0003-Use-an-int128-fast-sum-in-sum-numeric-and-avg-numeri.patch.
+	 *
+	 * While fastSum the running sum lives in sumX128 at decimal scale
+	 * fastScale; once promoted (fastSum cleared) it lives in the sumX
+	 * digit-array accumulator.  Promotion is one-way and exact, so results
+	 * never depend on whether or when it happened.
+	 *
+	 * The dec128 representation makes this much cheaper than it is upstream: a
+	 * stored numeric *is* an int128 coefficient plus a scale, so accumulating
+	 * one needs no NumericVar and no digit array at all -- which is the whole
+	 * point, because init_var_from_num() in do_numeric_accum() is precisely
+	 * what made sum() and avg() 15% slower than stock in the Phase 4 run.
+	 *
+	 * The flag is deliberately spelled positively, so that *zero* means the
+	 * digit-array representation.  Several code paths build a NumericAggState
+	 * by palloc0() or memset() and then populate sumX/sumX2 by hand --
+	 * numeric_deserialize(), numeric_avg_deserialize() and
+	 * numeric_poly_stddev_internal() all do -- and with the sense reversed
+	 * every one of those silently claimed to hold an int128 sum it had never
+	 * filled in, which reads back as zero rather than failing.  Defaulting to
+	 * the safe representation makes that class of mistake unreachable instead
+	 * of merely fixed.
+	 *
+	 * States that must never use the fast form at all (calcSumX2 ones -- a sum
+	 * of squares does not fit int128 for realistic input) are created with
+	 * fastSum = false, so the digit-array path stays the single unconditional
+	 * fallback for every consumer.
+	 */
+	bool		fastSum;
+	int128		sumX128;		/* running sum while fastSum */
+	int			fastScale;		/* decimal scale of sumX128 */
+
 	MemoryContext agg_context;	/* context we're calculating in */
 	int64		N;				/* count of processed numbers */
 	NumericSumAccum sumX;		/* sum of processed numbers */
@@ -5166,6 +5448,8 @@ makeNumericAggState(FunctionCallInfo fcinfo, bool calcSumX2)
 
 	state = (NumericAggState *) palloc0(sizeof(NumericAggState));
 	state->calcSumX2 = calcSumX2;
+	/* sumX2 users never enter the fast representation; see struct comment */
+	state->fastSum = !calcSumX2;
 	state->agg_context = agg_context;
 
 	MemoryContextSwitchTo(old_context);
@@ -5184,9 +5468,98 @@ makeNumericAggStateCurrentContext(bool calcSumX2)
 
 	state = (NumericAggState *) palloc0(sizeof(NumericAggState));
 	state->calcSumX2 = calcSumX2;
+	/* same rule as makeNumericAggState() */
+	state->fastSum = !calcSumX2;
 	state->agg_context = CurrentMemoryContext;
 
 	return state;
+}
+
+/*
+ * Convert the int128 fast sum into the digit-array accumulator and switch the
+ * state permanently to promoted mode.
+ *
+ * Exact, so the aggregate result never depends on whether or when this ran.
+ * Only the sum moves: an input that failed to accumulate the fast way must
+ * still be processed by the digit-array path afterwards, including its N++.
+ */
+static void
+promote_numeric_agg_state(NumericAggState *state)
+{
+	NumericVar	tmp;
+	MemoryContext old_context;
+
+	Assert(state->fastSum);
+	Assert(!state->calcSumX2);
+
+	/* build the temporary var in the short-lived caller context ... */
+	init_var(&tmp);
+	numeric_dec128_int128_to_var(state->sumX128, state->fastScale, &tmp);
+
+	/* ... but the accumulator's own buffers must live in the agg context */
+	old_context = MemoryContextSwitchTo(state->agg_context);
+	accum_sum_add(&state->sumX, &tmp);
+	MemoryContextSwitchTo(old_context);
+
+	free_var(&tmp);
+
+	state->fastSum = false;
+#ifdef USE_ASSERT_CHECKING
+	/* poison the fast fields; nothing may read them past this point */
+	state->sumX128 = 0;
+	state->fastScale = -1;
+#endif
+}
+
+/*
+ * Try to add one packed finite value into the int128 fast sum.
+ *
+ * Returns false if it doesn't fit, in which case the state still correctly
+ * represents everything accumulated so far (rescaling an exact sum is exact),
+ * and the caller promotes and reprocesses this input on the digit-array path.
+ *
+ * Note there is no NumericVar anywhere in here: mant and scale come straight
+ * out of the packed datum.  That is the entire reason this is faster than the
+ * upstream version of the same idea.
+ */
+static inline bool
+numeric_dec128_fast_add(NumericAggState *state, int128 mant, int scale,
+						bool subtract)
+{
+	int128		c = subtract ? -mant : mant;
+	int128		sum;
+
+	Assert(state->fastSum);
+	Assert(!state->calcSumX2);
+	Assert(scale >= 0 && scale <= NUMERIC_MAX_STORED_SCALE);
+
+	if (scale > state->fastScale)
+	{
+		/*
+		 * Widen the accumulator to the new input's scale, maintaining the
+		 * invariant that fastScale is the widest scale accumulated so far --
+		 * which is what makes the finalised display scale agree with the
+		 * digit-array path.
+		 */
+		if (unlikely(!numeric_dec128_try_scale_up(state->sumX128,
+												  scale - state->fastScale,
+												  &state->sumX128)))
+			return false;
+		state->fastScale = scale;
+	}
+	else if (scale < state->fastScale)
+	{
+		/* bring the input up to the accumulator's scale */
+		if (unlikely(!numeric_dec128_try_scale_up(c, state->fastScale - scale,
+												  &c)))
+			return false;
+	}
+
+	if (unlikely(__builtin_add_overflow(state->sumX128, c, &sum)))
+		return false;
+
+	state->sumX128 = sum;
+	return true;
 }
 
 /*
@@ -5198,6 +5571,7 @@ do_numeric_accum(NumericAggState *state, Numeric newval)
 	NumericVar	X;
 	NumericVar	X2;
 	MemoryContext old_context;
+	int			newdscale;
 
 	/* Count NaN/infinity inputs separately from all else */
 	if (NUMERIC_IS_SPECIAL(newval))
@@ -5211,20 +5585,43 @@ do_numeric_accum(NumericAggState *state, Numeric newval)
 		return;
 	}
 
-	/* load processed number in short-lived context */
-	init_var_from_num(newval, &X);
+	/*
+	 * The display scale is readable straight from the packed datum, so the
+	 * bookkeeping below no longer needs the value unpacked.
+	 */
+	newdscale = numeric_pack_scale(newval);
 
 	/*
 	 * Track the highest input dscale that we've seen, to support inverse
 	 * transitions (see do_numeric_discard).
 	 */
-	if (X.dscale > state->maxScale)
+	if (newdscale > state->maxScale)
 	{
-		state->maxScale = X.dscale;
+		state->maxScale = newdscale;
 		state->maxScaleCount = 1;
 	}
-	else if (X.dscale == state->maxScale)
+	else if (newdscale == state->maxScale)
 		state->maxScaleCount++;
+
+	/*
+	 * Fast path: accumulate directly into the int128 sum -- no unpack, no
+	 * allocation, no memory context switch.  On the first input that doesn't
+	 * fit, promote the accumulated sum exactly and fall through so this input
+	 * takes the regular path (including its N++).
+	 */
+	if (state->fastSum)
+	{
+		if (likely(numeric_dec128_fast_add(state, numeric_pack_mant(newval),
+										   newdscale, false)))
+		{
+			state->N++;
+			return;
+		}
+		promote_numeric_agg_state(state);
+	}
+
+	/* load processed number in short-lived context */
+	init_var_from_num(newval, &X);
 
 	/* if we need X^2, calculate that in short-lived context */
 	if (state->calcSumX2)
@@ -5281,17 +5678,17 @@ do_numeric_discard(NumericAggState *state, Numeric newval)
 		return true;
 	}
 
-	/* load processed number in short-lived context */
-	init_var_from_num(newval, &X);
-
 	/*
 	 * state->sumX's dscale is the maximum dscale of any of the inputs.
 	 * Removing the last input with that dscale would require us to recompute
 	 * the maximum dscale of the *remaining* inputs, which we cannot do unless
 	 * no more non-NaN inputs remain at all.  So we report a failure instead,
 	 * and force the aggregation to be redone from scratch.
+	 *
+	 * The dscale test reads the packed datum directly, so this can decide to
+	 * fail before doing any unpacking work.
 	 */
-	if (X.dscale == state->maxScale)
+	if (numeric_pack_scale(newval) == state->maxScale)
 	{
 		if (state->maxScaleCount > 1 || state->maxScale == 0)
 		{
@@ -5313,6 +5710,38 @@ do_numeric_discard(NumericAggState *state, Numeric newval)
 			return false;
 		}
 	}
+
+	/*
+	 * Fast-representation inverse.  A subtraction can overflow even when both
+	 * operands fit (opposite signs near the range limits), so it is checked
+	 * like the forward case; any failure promotes and falls through.
+	 */
+	if (state->fastSum)
+	{
+		if (state->N == 1)
+		{
+			/*
+			 * Removing the last input: mirror the accum_sum_reset() in the
+			 * digit-array branch below, which zeroes the accumulator's scale
+			 * too.  The maxScale bookkeeping above is shared and already done.
+			 */
+			state->sumX128 = 0;
+			state->fastScale = 0;
+			state->N = 0;
+			return true;
+		}
+
+		if (likely(numeric_dec128_fast_add(state, numeric_pack_mant(newval),
+										   numeric_pack_scale(newval), true)))
+		{
+			state->N--;
+			return true;
+		}
+		promote_numeric_agg_state(state);
+	}
+
+	/* load processed number in short-lived context */
+	init_var_from_num(newval, &X);
 
 	/* if we need X^2, calculate that in short-lived context */
 	if (state->calcSumX2)
@@ -5497,7 +5926,15 @@ numeric_avg_combine(PG_FUNCTION_ARGS)
 		state1->maxScale = state2->maxScale;
 		state1->maxScaleCount = state2->maxScaleCount;
 
-		accum_sum_copy(&state1->sumX, &state2->sumX);
+		/* clone state2's representation, whichever mode it is in */
+		state1->fastSum = state2->fastSum;
+		if (!state2->fastSum)
+			accum_sum_copy(&state1->sumX, &state2->sumX);
+		else
+		{
+			state1->sumX128 = state2->sumX128;
+			state1->fastScale = state2->fastScale;
+		}
 
 		MemoryContextSwitchTo(old_context);
 
@@ -5523,13 +5960,54 @@ numeric_avg_combine(PG_FUNCTION_ARGS)
 		else if (state2->maxScale == state1->maxScale)
 			state1->maxScaleCount += state2->maxScaleCount;
 
-		/* The rest of this needs to work in the aggregate context */
-		old_context = MemoryContextSwitchTo(agg_context);
+		/*
+		 * If both partial sums are still in the fast representation, merge
+		 * them there.  Rescaling an exact sum is exact, so a later overflow
+		 * leaves state1 still correct and we simply demote below.
+		 */
+		if (state1->fastSum && state2->fastSum)
+		{
+			int128		saved = state1->sumX128;
+			int			savedScale = state1->fastScale;
 
-		/* Accumulate sums */
-		accum_sum_combine(&state1->sumX, &state2->sumX);
+			if (numeric_dec128_fast_add(state1, state2->sumX128,
+										state2->fastScale, false))
+				PG_RETURN_POINTER(state1);
 
-		MemoryContextSwitchTo(old_context);
+			/* restore, since a partial rescale may have modified state1 */
+			state1->sumX128 = saved;
+			state1->fastScale = savedScale;
+		}
+
+		/* At least one side needs the digit-array path: promote state1 */
+		if (state1->fastSum)
+			promote_numeric_agg_state(state1);
+
+		if (!state2->fastSum)
+		{
+			/* The rest of this needs to work in the aggregate context */
+			old_context = MemoryContextSwitchTo(agg_context);
+
+			/* Accumulate sums */
+			accum_sum_combine(&state1->sumX, &state2->sumX);
+
+			MemoryContextSwitchTo(old_context);
+		}
+		else
+		{
+			/* materialise state2's int128 sum and add it in */
+			NumericVar	tmp;
+
+			init_var(&tmp);
+			numeric_dec128_int128_to_var(state2->sumX128, state2->fastScale,
+										 &tmp);
+
+			old_context = MemoryContextSwitchTo(agg_context);
+			accum_sum_add(&state1->sumX, &tmp);
+			MemoryContextSwitchTo(old_context);
+
+			free_var(&tmp);
+		}
 	}
 	PG_RETURN_POINTER(state1);
 }
@@ -5552,6 +6030,20 @@ numeric_avg_serialize(PG_FUNCTION_ARGS)
 		elog(ERROR, "aggregate function called in non-aggregate context");
 
 	state = (NumericAggState *) PG_GETARG_POINTER(0);
+
+	/*
+	 * Materialise the fast sum before serialising, so the wire format stays
+	 * byte-for-byte what it always was and numeric_avg_deserialize() needs no
+	 * changes at all.  Upstream's version of this patch instead adds a mode
+	 * byte and ships the int128 directly, because folding here costs a carry
+	 * propagation and a digit repack.  We accept that cost: it is paid once per
+	 * group per worker rather than per row, and it keeps the parallel protocol
+	 * out of the diff.  The consequence is that the fast representation's
+	 * benefit stops at the worker boundary -- worth revisiting if parallel
+	 * aggregation turns out to matter for the decision.
+	 */
+	if (state->fastSum)
+		promote_numeric_agg_state(state);
 
 	init_var(&tmp_var);
 
@@ -5614,6 +6106,16 @@ numeric_avg_deserialize(PG_FUNCTION_ARGS)
 						   VARSIZE_ANY_EXHDR(sstate));
 
 	result = makeNumericAggStateCurrentContext(false);
+
+	/*
+	 * The serialised form always carries a digit-array sum (see
+	 * numeric_avg_serialize(), which promotes before writing), and we restore
+	 * it into sumX below.  Clear fastSum, which the constructor would otherwise
+	 * have set for a non-sumX2 state: leaving it set would make the finalisers
+	 * read sumX128 -- never written here, so zero -- and silently return the
+	 * wrong sum instead of failing.
+	 */
+	result->fastSum = false;
 
 	/* N */
 	result->N = pq_getmsgint64(&buf);
@@ -5727,7 +6229,17 @@ numeric_deserialize(PG_FUNCTION_ARGS)
 	initReadOnlyStringInfo(&buf, VARDATA_ANY(sstate),
 						   VARSIZE_ANY_EXHDR(sstate));
 
+	/*
+	 * Note this passes calcSumX2 = false even though the state being restored
+	 * *does* carry a sum of squares: the flag only drives whether the
+	 * transition function computes one, and deserialisation fills sumX2 in
+	 * directly below.  So clear fastSum explicitly rather than relying on the
+	 * constructor's calcSumX2 rule -- the fast int128 representation has no
+	 * sumX2 counterpart, and numeric_stddev_internal() reads state->sumX
+	 * unconditionally.
+	 */
 	result = makeNumericAggStateCurrentContext(false);
+	result->fastSum = false;
 
 	/* N */
 	result->N = pq_getmsgint64(&buf);
@@ -6491,7 +7003,11 @@ numeric_avg(PG_FUNCTION_ARGS)
 	N_datum = NumericGetDatum(int64_to_numeric(state->N));
 
 	init_var(&sumX_var);
-	accum_sum_final(&state->sumX, &sumX_var);
+	if (state->fastSum)
+		numeric_dec128_int128_to_var(state->sumX128, state->fastScale,
+									 &sumX_var);
+	else
+		accum_sum_final(&state->sumX, &sumX_var);
 	sumX_datum = NumericGetDatum(make_result(&sumX_var));
 	free_var(&sumX_var);
 
@@ -6523,7 +7039,11 @@ numeric_sum(PG_FUNCTION_ARGS)
 		PG_RETURN_NUMERIC(make_result(&const_ninf));
 
 	init_var(&sumX_var);
-	accum_sum_final(&state->sumX, &sumX_var);
+	if (state->fastSum)
+		numeric_dec128_int128_to_var(state->sumX128, state->fastScale,
+									 &sumX_var);
+	else
+		accum_sum_final(&state->sumX, &sumX_var);
 	result = make_result(&sumX_var);
 	free_var(&sumX_var);
 
@@ -6584,6 +7104,12 @@ numeric_stddev_internal(NumericAggState *state,
 	init_var(&vN);
 	init_var(&vsumX);
 	init_var(&vsumX2);
+
+	/*
+	 * A state that tracks sumX2 is created already promoted (see
+	 * NumericAggState), so the fast representation can never reach here.
+	 */
+	Assert(!state->fastSum);
 
 	int64_to_numericvar(state->N, &vN);
 	accum_sum_final(&(state->sumX), &vsumX);
@@ -7748,62 +8274,64 @@ invalid_syntax:
 }
 
 
-/* NBASE limbs needed to hold the widest mantissa the encoding allows */
-#define NUMERIC_MAX_MANT_LIMBS \
-	((NUMERIC_MAX_MANT_DIGITS + DEC_DIGITS - 1) / DEC_DIGITS)
+/*
+ * NBASE limbs needed to hold any int128 coefficient.  An int128 spans at most
+ * 39 decimal digits; the fractional part is padded up to a limb boundary
+ * separately, so this only has to cover the integer part.
+ */
+#define NUMERIC_MAX_INT128_LIMBS	((39 + DEC_DIGITS - 1) / DEC_DIGITS)
 
 /*
- * numeric_dec128_to_var() -
+ * numeric_dec128_int128_to_var() -
  *
- *	Point of coupling #1 (SPEC-numeric-as-dec128.md sec. 3.4): decode a
- *	packed dec128 value into a NumericVar.  Caller must not call this on a
- *	special value.
+ *	Convert an arbitrary int128 coefficient at decimal scale 'scale' into a
+ *	NumericVar, i.e. build the variable whose value is val * 10^(-scale).
  *
- *	This converts straight from the scaled-integer mantissa to base-NBASE
- *	limbs.  An earlier version rendered the mantissa to decimal text and
+ *	This is the general form of the dec128 unpack, and the workhorse behind
+ *	both numeric_dec128_to_var() and the int128 fast-sum accumulator.  It has
+ *	to accept the whole int128 range rather than just legal mantissas, because
+ *	the accumulator hands it running totals that may exceed NUMERIC_MAX_MANT --
+ *	that overflow is exactly what makes the aggregate state promote.
+ *
+ *	It converts straight from the scaled integer to base-NBASE limbs.  An
+ *	earlier version of the unpack rendered the mantissa to decimal text and
  *	reparsed it with set_var_from_str().  That was correct, but it put two
  *	string conversions and two pallocs on the hottest path in the type: every
  *	caller of init_var_from_num(), which includes do_numeric_accum() and
  *	therefore sum() and avg().  It made this build slower than stock numeric
- *	for everything the mantissa-level fast paths don't catch, which defeats
- *	the point of the experiment.
+ *	for everything the mantissa-level fast paths don't catch, which defeats the
+ *	point of the experiment.
  *
  *	Why the obvious approach doesn't work is worth recording, since it is what
- *	drove the text detour in the first place: you cannot pre-multiply the
- *	whole mantissa up to a limb boundary.  Aligning a scale that isn't a
- *	multiple of DEC_DIGITS means shifting by up to DEC_DIGITS - 1 further
- *	decimal digits, and a near-37-digit mantissa times 10^3 overflows int128.
- *	Splitting the value into integer and fractional parts first sidesteps
- *	that: the fractional part is bounded by 10^NUMERIC_MAX_STORED_SCALE, so
- *	padding *it* to a limb boundary stays under 10^18 and fits an int64 with
- *	room to spare.
+ *	drove the text detour in the first place: you cannot pre-multiply the whole
+ *	coefficient up to a limb boundary.  Aligning a scale that isn't a multiple
+ *	of DEC_DIGITS means shifting by up to DEC_DIGITS - 1 further decimal
+ *	digits, and a near-39-digit value times 10^3 overflows int128.  Splitting
+ *	into integer and fractional parts first sidesteps that: the fractional part
+ *	is bounded by 10^NUMERIC_MAX_STORED_SCALE, so padding *it* to a limb
+ *	boundary stays under 10^18 and fits an int64 with room to spare.
  */
 static void
-numeric_dec128_to_var(Numeric num, NumericVar *dest)
+numeric_dec128_int128_to_var(int128 val, int scale, NumericVar *dest)
 {
-	int128		mant = numeric_pack_mant(num);
-	int			scale = numeric_pack_scale(num);
-	bool		neg = (mant < 0);
+	bool		neg = (val < 0);
 	uint128		umant;
 	uint128		ipart;
 	uint64		fpart;
 	int			nint_limbs = 0;
 	int			nfrac_limbs;
 	int			pad;
-	NumericDigit int_limbs[NUMERIC_MAX_MANT_LIMBS];
+	NumericDigit int_limbs[NUMERIC_MAX_INT128_LIMBS];
 	NumericDigit *dptr;
 	int			i;
 
-	Assert(!NUMERIC_IS_SPECIAL(num));
 	Assert(scale >= 0 && scale <= NUMERIC_MAX_STORED_SCALE);
 
 	/*
-	 * The encoding bounds |mant| well inside int128's range, so negating it
-	 * below cannot overflow.  (Negating INT128_MIN would be undefined, but
-	 * that is not a representable mantissa.)
+	 * Negate in unsigned arithmetic: -val would be undefined for INT128_MIN,
+	 * which is reachable here since callers may pass any int128.
 	 */
-	Assert(mant >= -NUMERIC_MAX_MANT && mant <= NUMERIC_MAX_MANT);
-	umant = neg ? (uint128) (-mant) : (uint128) mant;
+	umant = neg ? (~(uint128) val) + 1 : (uint128) val;
 
 	init_var(dest);
 	dest->dscale = scale;
@@ -7834,7 +8362,7 @@ numeric_dec128_to_var(Numeric num, NumericVar *dest)
 	/* Integer limbs, least significant first; the top one is never zero */
 	while (ipart != 0)
 	{
-		Assert(nint_limbs < NUMERIC_MAX_MANT_LIMBS);
+		Assert(nint_limbs < NUMERIC_MAX_INT128_LIMBS);
 		int_limbs[nint_limbs++] = (NumericDigit) (ipart % NBASE);
 		ipart /= NBASE;
 	}
@@ -7863,6 +8391,23 @@ numeric_dec128_to_var(Numeric num, NumericVar *dest)
 	 * the display scale, not the number of stored digits.
 	 */
 	strip_var(dest);
+}
+
+/*
+ * numeric_dec128_to_var() -
+ *
+ *	Point of coupling #1 (SPEC-numeric-as-dec128.md sec. 3.4): decode a packed
+ *	dec128 value into a NumericVar.  Caller must not call this on a special
+ *	value -- the sentinel mantissas above NUMERIC_MAX_MANT are not numbers, and
+ *	converting one would silently produce a huge finite value.
+ */
+static void
+numeric_dec128_to_var(Numeric num, NumericVar *dest)
+{
+	Assert(!NUMERIC_IS_SPECIAL(num));
+
+	numeric_dec128_int128_to_var(numeric_pack_mant(num),
+								 numeric_pack_scale(num), dest);
 }
 
 /*
