@@ -322,3 +322,154 @@ WARNING:  aggregate attribute "Finalfunc_extra" not recognized
 WARNING:  aggregate attribute "Finalfunc_modify" not recognized
 WARNING:  aggregate attribute "Parallel" not recognized
 ERROR:  aggregate stype must be specified
+-- planner support functions
+-- (this one does nothing useful; we only check the catalog plumbing here)
+CREATE FUNCTION dummy_support(internal) RETURNS internal
+    LANGUAGE internal AS $$numeric_support$$;
+CREATE AGGREGATE sup_agg(int8)
+(
+	stype = int8,
+	sfunc = int8pl,
+	support = dummy_support
+);
+SELECT prosupport FROM pg_proc WHERE oid = 'sup_agg(int8)'::regprocedure;
+  prosupport   
+---------------
+ dummy_support
+(1 row)
+
+-- a normal dependency is recorded, so the support function is protected
+DROP FUNCTION dummy_support(internal);
+ERROR:  cannot drop function dummy_support(internal) because other objects depend on it
+DETAIL:  function sup_agg(bigint) depends on function dummy_support(internal)
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+-- ALTER AGGREGATE can replace it
+CREATE FUNCTION dummy_support2(internal) RETURNS internal
+    LANGUAGE internal AS $$numeric_support$$;
+ALTER AGGREGATE sup_agg(int8) SUPPORT dummy_support2;
+SELECT prosupport FROM pg_proc WHERE oid = 'sup_agg(int8)'::regprocedure;
+   prosupport   
+----------------
+ dummy_support2
+(1 row)
+
+-- the old support function is no longer depended on
+DROP FUNCTION dummy_support(internal);
+-- CREATE OR REPLACE without SUPPORT removes it, as for plain functions
+CREATE OR REPLACE AGGREGATE sup_agg(int8)
+(
+	stype = int8,
+	sfunc = int8pl
+);
+SELECT prosupport FROM pg_proc WHERE oid = 'sup_agg(int8)'::regprocedure;
+ prosupport 
+------------
+ -
+(1 row)
+
+DROP FUNCTION dummy_support2(internal);
+-- invalid: support function must take and return internal
+CREATE AGGREGATE bad_sup_agg(int8)
+(
+	stype = int8,
+	sfunc = int8pl,
+	support = int8pl
+);
+ERROR:  function int8pl(internal) does not exist
+-- invalid: ALTER FUNCTION still rejects aggregates
+ALTER FUNCTION sup_agg(int8) SUPPORT pg_catalog.numeric_support;
+ERROR:  "sup_agg" is an aggregate function
+-- invalid: ALTER AGGREGATE rejects non-aggregates
+ALTER AGGREGATE int8pl(int8, int8) SUPPORT pg_catalog.numeric_support;
+ERROR:  function int8pl(bigint, bigint) is not an aggregate
+-- invalid: ALTER ROUTINE reaches aggregates by name, but rejects them as
+-- it does for every other alterable property
+ALTER ROUTINE sup_agg(int8) SUPPORT pg_catalog.numeric_support;
+ERROR:  "sup_agg" is an aggregate function
+DROP AGGREGATE sup_agg(int8);
+-- the support function must not double as a component function, since both
+-- roles would record the same dependency
+CREATE FUNCTION dummy_sfunc(internal) RETURNS internal
+    LANGUAGE internal AS $$numeric_support$$;
+CREATE FUNCTION dummy_ffunc(internal) RETURNS numeric
+    LANGUAGE internal AS $$numeric_avg$$;
+CREATE AGGREGATE bad_dep_agg(*)
+(
+	stype = internal,
+	sfunc = dummy_sfunc,
+	finalfunc = dummy_ffunc,
+	support = dummy_sfunc
+);
+ERROR:  aggregate bad_dep_agg cannot use function dummy_sfunc(internal) as its support function
+DETAIL:  The function is already used in the aggregate's own definition.
+-- same collision, reached through ALTER
+CREATE AGGREGATE dep_agg(*)
+(
+	stype = internal,
+	sfunc = dummy_sfunc,
+	finalfunc = dummy_ffunc
+);
+ALTER AGGREGATE dep_agg(*) SUPPORT dummy_sfunc;
+ERROR:  aggregate dep_agg cannot use function dummy_sfunc(internal) as its support function
+DETAIL:  The function is already used in the aggregate's own definition.
+DROP AGGREGATE dep_agg(*);
+DROP FUNCTION dummy_sfunc(internal);
+DROP FUNCTION dummy_ffunc(internal);
+-- zero-argument and ordered-set aggregates, whose signatures ALTER AGGREGATE
+-- spells natively
+CREATE FUNCTION dummy_support4(internal) RETURNS internal
+    LANGUAGE internal AS $$numeric_support$$;
+CREATE AGGREGATE zeroarg_agg(*)
+(
+	stype = int8,
+	sfunc = int8inc,
+	initcond = '0',
+	support = dummy_support4
+);
+ALTER AGGREGATE zeroarg_agg(*) SUPPORT pg_catalog.numeric_support;
+CREATE AGGREGATE ordset_agg(float8 ORDER BY anyelement)
+(
+	stype = internal,
+	sfunc = ordered_set_transition,
+	finalfunc = percentile_disc_final,
+	finalfunc_extra = true,
+	support = dummy_support4
+);
+ALTER AGGREGATE ordset_agg(float8 ORDER BY anyelement)
+    SUPPORT pg_catalog.numeric_support;
+SELECT oid::regprocedure, prosupport FROM pg_proc
+WHERE proname IN ('zeroarg_agg', 'ordset_agg') ORDER BY 1;
+                   oid                   |   prosupport    
+-----------------------------------------+-----------------
+ zeroarg_agg()                           | numeric_support
+ ordset_agg(double precision,anyelement) | numeric_support
+(2 rows)
+
+DROP AGGREGATE zeroarg_agg(*);
+DROP AGGREGATE ordset_agg(float8 ORDER BY anyelement);
+DROP FUNCTION dummy_support4(internal);
+-- SUPPORT requires superuser, on both the CREATE and the ALTER path
+CREATE ROLE regress_agg_support_user;
+CREATE SCHEMA regress_agg_support AUTHORIZATION regress_agg_support_user;
+SET SESSION AUTHORIZATION regress_agg_support_user;
+CREATE AGGREGATE regress_agg_support.priv_agg(int8)
+(
+	stype = int8,
+	sfunc = int8pl,
+	support = pg_catalog.numeric_support
+);
+ERROR:  must be superuser to specify a support function
+-- the aggregate itself is fine; only SUPPORT is refused
+CREATE AGGREGATE regress_agg_support.priv_agg(int8)
+(
+	stype = int8,
+	sfunc = int8pl
+);
+-- and the owner still cannot set it afterwards
+ALTER AGGREGATE regress_agg_support.priv_agg(int8)
+    SUPPORT pg_catalog.numeric_support;
+ERROR:  must be superuser to specify a support function
+RESET SESSION AUTHORIZATION;
+DROP SCHEMA regress_agg_support CASCADE;
+NOTICE:  drop cascades to function regress_agg_support.priv_agg(bigint)
+DROP ROLE regress_agg_support_user;

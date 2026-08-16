@@ -82,6 +82,8 @@ DefineAggregate(ParseState *pstate,
 	char	   *initval = NULL;
 	char	   *minitval = NULL;
 	char	   *parallel = NULL;
+	DefElem    *supportItem = NULL;
+	Oid			prosupport = InvalidOid;
 	int			numArgs;
 	int			numDirectArgs = 0;
 	oidvector  *parameterTypes;
@@ -186,6 +188,8 @@ DefineAggregate(ParseState *pstate,
 			minitval = defGetString(defel);
 		else if (strcmp(defel->defname, "parallel") == 0)
 			parallel = defGetString(defel);
+		else if (strcmp(defel->defname, "support") == 0)
+			supportItem = defel;
 		else
 			ereport(WARNING,
 					(errcode(ERRCODE_SYNTAX_ERROR),
@@ -434,6 +438,10 @@ DefineAggregate(ParseState *pstate,
 					 errmsg("parameter \"parallel\" must be SAFE, RESTRICTED, or UNSAFE")));
 	}
 
+	/* interpret_func_support handles the privilege check */
+	if (supportItem)
+		prosupport = interpret_func_support(supportItem);
+
 	/*
 	 * Most of the argument-checking is done inside of AggregateCreate
 	 */
@@ -468,7 +476,8 @@ DefineAggregate(ParseState *pstate,
 						   mtransSpace, /* transition space */
 						   initval, /* initial condition */
 						   minitval,	/* initial condition */
-						   proparallel);	/* parallel safe? */
+						   proparallel, /* parallel safe? */
+						   prosupport); /* planner support function */
 }
 
 /*

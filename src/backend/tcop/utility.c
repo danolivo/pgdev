@@ -2759,6 +2759,9 @@ CreateCommandTag(Node *parsetree)
 				case OBJECT_ROUTINE:
 					tag = CMDTAG_ALTER_ROUTINE;
 					break;
+				case OBJECT_AGGREGATE:
+					tag = CMDTAG_ALTER_AGGREGATE;
+					break;
 				default:
 					tag = CMDTAG_UNKNOWN;
 			}

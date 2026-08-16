@@ -40,6 +40,7 @@ ALTER ROUTINE <replaceable>name</replaceable> [ ( [ [ <replaceable class="parame
     PARALLEL { UNSAFE | RESTRICTED | SAFE }
     COST <replaceable class="parameter">execution_cost</replaceable>
     ROWS <replaceable class="parameter">result_rows</replaceable>
+    SUPPORT <replaceable class="parameter">support_function</replaceable>
     SET <replaceable class="parameter">configuration_parameter</replaceable> { TO | = } { <replaceable class="parameter">value</replaceable> | DEFAULT }
     SET <replaceable class="parameter">configuration_parameter</replaceable> FROM CURRENT
     RESET <replaceable class="parameter">configuration_parameter</replaceable>
@@ -57,6 +58,7 @@ ALTER ROUTINE <replaceable>name</replaceable> [ ( [ [ <replaceable class="parame
    and <xref linkend="sql-alterprocedure"/> for the description of the
    parameters, more examples, and further details.
   </para>
+
  </refsect1>
 
  <refsect1>

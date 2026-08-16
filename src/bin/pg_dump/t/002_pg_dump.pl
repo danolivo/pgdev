@@ -2269,6 +2269,31 @@ my %tests = (
 		},
 	},
 
+	'CREATE AGGREGATE dump_test.newsum' => {
+		create_order => 28,
+		create_sql => 'CREATE AGGREGATE dump_test.newsum (int8) (
+						  sfunc = int8pl,
+						  stype = int8,
+						  support = pg_catalog.numeric_support
+					   );',
+		regexp => qr/^
+			\QCREATE AGGREGATE dump_test.newsum(bigint) (\E
+			\n\s+\QSFUNC = int8pl,\E
+			\n\s+\QSTYPE = bigint,\E
+			\n\s+\QSUPPORT = numeric_support\E
+			\n\);/xm,
+		like => {
+			%full_runs,
+			%dump_test_schema_runs,
+			exclude_test_table => 1,
+			section_pre_data => 1,
+		},
+		unlike => {
+			exclude_dump_test_schema => 1,
+			only_dump_measurement => 1,
+		},
+	},
+
 	'CREATE CONVERSION dump_test.test_conversion' => {
 		create_order => 78,
 		create_sql =>

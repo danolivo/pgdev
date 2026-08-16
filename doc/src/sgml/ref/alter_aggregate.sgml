@@ -25,6 +25,7 @@ ALTER AGGREGATE <replaceable>name</replaceable> ( <replaceable>aggregate_signatu
 ALTER AGGREGATE <replaceable>name</replaceable> ( <replaceable>aggregate_signature</replaceable> )
                 OWNER TO { <replaceable>new_owner</replaceable> | CURRENT_ROLE | CURRENT_USER | SESSION_USER }
 ALTER AGGREGATE <replaceable>name</replaceable> ( <replaceable>aggregate_signature</replaceable> ) SET SCHEMA <replaceable>new_schema</replaceable>
+ALTER AGGREGATE <replaceable>name</replaceable> ( <replaceable>aggregate_signature</replaceable> ) SUPPORT <replaceable>support_function</replaceable>
 
 <phrase>where <replaceable>aggregate_signature</replaceable> is:</phrase>
 
@@ -53,6 +54,8 @@ ALTER AGGREGATE <replaceable>name</replaceable> ( <replaceable>aggregate_signatu
    the owner doesn't do anything you couldn't do by dropping and recreating
    the aggregate function.  However, a superuser can alter ownership of any
    aggregate function anyway.)
+   To set the aggregate function's planner support function, you must be
+   superuser.
   </para>
  </refsect1>
 
@@ -130,6 +133,23 @@ ALTER AGGREGATE <replaceable>name</replaceable> ( <replaceable>aggregate_signatu
     <listitem>
      <para>
       The new schema for the aggregate function.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><literal>SUPPORT</literal> <replaceable class="parameter">support_function</replaceable></term>
+    <listitem>
+     <para>
+      Set or change the planner support function to use for this aggregate.
+      See <xref linkend="xfunc-optimization"/> for details.  You must be
+      superuser to use this option.
+     </para>
+
+     <para>
+      This option cannot be used to remove the support function altogether,
+      since it must name a new support function.  Use <command>CREATE OR
+      REPLACE AGGREGATE</command> if you need to do that.
      </para>
     </listitem>
    </varlistentry>

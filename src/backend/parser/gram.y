@@ -9164,11 +9164,14 @@ table_func_column_list:
 		;
 
 /*****************************************************************************
- * ALTER FUNCTION / ALTER PROCEDURE / ALTER ROUTINE
+ * ALTER FUNCTION / ALTER PROCEDURE / ALTER ROUTINE / ALTER AGGREGATE
  *
  * RENAME and OWNER subcommands are already provided by the generic
  * ALTER infrastructure, here we just specify alterations that can
  * only be applied to functions.
+ *
+ * For aggregates, SUPPORT is the only alterable property; the rest of an
+ * aggregate's definition belongs to CREATE AGGREGATE.
  *
  *****************************************************************************/
 AlterFunctionStmt:
@@ -9197,6 +9200,16 @@ AlterFunctionStmt:
 					n->objtype = OBJECT_ROUTINE;
 					n->func = $3;
 					n->actions = $4;
+					$$ = (Node *) n;
+				}
+			| ALTER AGGREGATE aggregate_with_argtypes SUPPORT any_name
+				{
+					AlterFunctionStmt *n = makeNode(AlterFunctionStmt);
+
+					n->objtype = OBJECT_AGGREGATE;
+					n->func = $3;
+					n->actions = list_make1(makeDefElem("support",
+														(Node *) $5, @4));
 					$$ = (Node *) n;
 				}
 		;

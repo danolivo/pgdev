@@ -4182,6 +4182,21 @@ supportfn(internal) returns internal
 </programlisting>
     It is attached to its target function by specifying
     the <literal>SUPPORT</literal> clause when creating the target function.
+    The target can be an ordinary function or a window function, using
+    <link linkend="sql-createfunction"><command>CREATE FUNCTION</command></link>,
+    or an aggregate, using the <literal>SUPPORT</literal> option of
+    <link linkend="sql-createaggregate"><command>CREATE AGGREGATE</command></link>.
+   </para>
+
+   <para>
+    Which requests a support function receives depends on how its target is
+    called, not only on what the target is.  In particular, any aggregate
+    can be invoked as a window function by writing <literal>OVER</literal>,
+    so the support function of an aggregate may receive the window-related
+    requests described below as well as
+    <literal>SupportRequestSimplifyAggref</literal>.  A support function
+    must therefore examine the request type it is given and return a NULL
+    pointer for anything it does not implement.
    </para>
 
    <para>
@@ -4214,6 +4229,28 @@ supportfn(internal) returns internal
     never call the target function in cases that the support function could
     simplify.  Ensure rigorous equivalence between the simplified
     expression and an actual execution of the target function.
+   </para>
+
+   <para>
+    <literal>SupportRequestSimplify</literal> is not used for aggregate
+    calls, which are represented differently in the parse tree.  The
+    equivalent for an aggregate is
+    the <literal>SupportRequestSimplifyAggref</literal> request type, which
+    receives the <structname>Aggref</structname> node and may return a
+    replacement node, typically another <structname>Aggref</structname>.
+    Core <productname>PostgreSQL</productname> uses this to
+    replace <literal>COUNT(<replaceable>x</replaceable>)</literal>
+    with <literal>COUNT(*)</literal> when <replaceable>x</replaceable> is
+    known non-null.  A support function implementing this request must
+    build a new node rather than modify the one it is given, and must
+    account for the parts of an <structname>Aggref</structname> that carry
+    meaning: notably <structfield>aggkind</structfield> (an ordered-set or
+    hypothetical-set aggregate needs its sort clause at run time),
+    <structfield>aggdistinct</structfield>,
+    <structfield>aggfilter</structfield>, any <literal>resjunk</literal>
+    arguments present only to feed the sort, and
+    <structfield>agglevelsup</structfield> for aggregates belonging to an
+    outer query level.
    </para>
 
    <para>

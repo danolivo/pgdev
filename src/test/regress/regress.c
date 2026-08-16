@@ -23,6 +23,7 @@
 #include "access/htup_details.h"
 #include "catalog/catalog.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_aggregate.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "commands/sequence.h"
@@ -820,6 +821,81 @@ test_support_func(PG_FUNCTION_ARGS)
 	}
 
 	PG_RETURN_POINTER(ret);
+}
+
+/*
+ * Support function for a user-defined aggregate.  The planner can only issue
+ * SupportRequestSimplifyAggref for an aggregate whose pg_proc entry names a
+ * support function, so this also serves to prove that CREATE/ALTER AGGREGATE
+ * ... SUPPORT wires that up.
+ */
+PG_FUNCTION_INFO_V1(test_agg_support_func);
+Datum
+test_agg_support_func(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	if (IsA(rawreq, SupportRequestSimplifyAggref))
+	{
+		/*
+		 * Assume that the target is an order-insensitive aggregate such as
+		 * my_max(); that's safe as long as we don't attach this to any other
+		 * aggregate.  For such an aggregate, sorting the input cannot change
+		 * the result, so a plain ORDER BY inside the call can be dropped.
+		 */
+		SupportRequestSimplifyAggref *req = (SupportRequestSimplifyAggref *) rawreq;
+		Aggref	   *aggref = req->aggref;
+		Aggref	   *newagg;
+		ListCell   *lc;
+
+		/*
+		 * Only plain aggregates.  For an ordered-set or hypothetical-set
+		 * aggregate the sort clause is what WITHIN GROUP means, and
+		 * ordered_set_startup() reads aggorder at execution time, so removing
+		 * it would break the aggregate rather than optimize it.
+		 */
+		if (aggref->aggkind != AGGKIND_NORMAL)
+			PG_RETURN_POINTER(NULL);
+
+		/* Nothing to do unless there is an ORDER BY to remove */
+		if (aggref->aggorder == NIL || aggref->aggdistinct != NIL)
+			PG_RETURN_POINTER(NULL);
+
+		/*
+		 * Punt if any argument is resjunk, ie. it is present only to feed the
+		 * ORDER BY.  Dropping the sort would leave it unused, and rebuilding
+		 * the argument list is more than this test needs.
+		 */
+		foreach(lc, aggref->args)
+		{
+			if (((TargetEntry *) lfirst(lc))->resjunk)
+				PG_RETURN_POINTER(NULL);
+		}
+
+		/*
+		 * The API requires a new node; we must not modify the original.  A
+		 * deep copy is wanted here, not the makeNode/memcpy shortcut some
+		 * in-core support functions use, because we go on to scribble on the
+		 * argument list.
+		 */
+		newagg = copyObject(aggref);
+		newagg->aggorder = NIL;
+
+		/*
+		 * The sort-group references on the arguments existed only to be
+		 * targets of that ORDER BY.  Left behind, they would make this call
+		 * unequal to an identical one written without ORDER BY, and
+		 * find_compatible_agg() would then evaluate the same aggregate twice.
+		 * Clearing them is safe precisely because aggorder and aggdistinct
+		 * are both gone.
+		 */
+		foreach(lc, newagg->args)
+			((TargetEntry *) lfirst(lc))->ressortgroupref = 0;
+
+		PG_RETURN_POINTER(newagg);
+	}
+
+	PG_RETURN_POINTER(NULL);
 }
 
 PG_FUNCTION_INFO_V1(test_inline_in_from_support_func);

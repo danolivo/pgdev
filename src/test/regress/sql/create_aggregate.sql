@@ -328,3 +328,142 @@ CREATE AGGREGATE case_agg(float8)
 	"Finalfunc_modify" = read_write,
 	"Parallel" = safe
 );
+
+-- planner support functions
+-- (this one does nothing useful; we only check the catalog plumbing here)
+CREATE FUNCTION dummy_support(internal) RETURNS internal
+    LANGUAGE internal AS $$numeric_support$$;
+
+CREATE AGGREGATE sup_agg(int8)
+(
+	stype = int8,
+	sfunc = int8pl,
+	support = dummy_support
+);
+
+SELECT prosupport FROM pg_proc WHERE oid = 'sup_agg(int8)'::regprocedure;
+
+-- a normal dependency is recorded, so the support function is protected
+DROP FUNCTION dummy_support(internal);
+
+-- ALTER AGGREGATE can replace it
+CREATE FUNCTION dummy_support2(internal) RETURNS internal
+    LANGUAGE internal AS $$numeric_support$$;
+ALTER AGGREGATE sup_agg(int8) SUPPORT dummy_support2;
+SELECT prosupport FROM pg_proc WHERE oid = 'sup_agg(int8)'::regprocedure;
+
+-- the old support function is no longer depended on
+DROP FUNCTION dummy_support(internal);
+
+-- CREATE OR REPLACE without SUPPORT removes it, as for plain functions
+CREATE OR REPLACE AGGREGATE sup_agg(int8)
+(
+	stype = int8,
+	sfunc = int8pl
+);
+SELECT prosupport FROM pg_proc WHERE oid = 'sup_agg(int8)'::regprocedure;
+DROP FUNCTION dummy_support2(internal);
+
+-- invalid: support function must take and return internal
+CREATE AGGREGATE bad_sup_agg(int8)
+(
+	stype = int8,
+	sfunc = int8pl,
+	support = int8pl
+);
+
+-- invalid: ALTER FUNCTION still rejects aggregates
+ALTER FUNCTION sup_agg(int8) SUPPORT pg_catalog.numeric_support;
+
+-- invalid: ALTER AGGREGATE rejects non-aggregates
+ALTER AGGREGATE int8pl(int8, int8) SUPPORT pg_catalog.numeric_support;
+
+-- invalid: ALTER ROUTINE reaches aggregates by name, but rejects them as
+-- it does for every other alterable property
+ALTER ROUTINE sup_agg(int8) SUPPORT pg_catalog.numeric_support;
+
+DROP AGGREGATE sup_agg(int8);
+
+-- the support function must not double as a component function, since both
+-- roles would record the same dependency
+CREATE FUNCTION dummy_sfunc(internal) RETURNS internal
+    LANGUAGE internal AS $$numeric_support$$;
+CREATE FUNCTION dummy_ffunc(internal) RETURNS numeric
+    LANGUAGE internal AS $$numeric_avg$$;
+
+CREATE AGGREGATE bad_dep_agg(*)
+(
+	stype = internal,
+	sfunc = dummy_sfunc,
+	finalfunc = dummy_ffunc,
+	support = dummy_sfunc
+);
+
+-- same collision, reached through ALTER
+CREATE AGGREGATE dep_agg(*)
+(
+	stype = internal,
+	sfunc = dummy_sfunc,
+	finalfunc = dummy_ffunc
+);
+ALTER AGGREGATE dep_agg(*) SUPPORT dummy_sfunc;
+DROP AGGREGATE dep_agg(*);
+DROP FUNCTION dummy_sfunc(internal);
+DROP FUNCTION dummy_ffunc(internal);
+
+-- zero-argument and ordered-set aggregates, whose signatures ALTER AGGREGATE
+-- spells natively
+CREATE FUNCTION dummy_support4(internal) RETURNS internal
+    LANGUAGE internal AS $$numeric_support$$;
+
+CREATE AGGREGATE zeroarg_agg(*)
+(
+	stype = int8,
+	sfunc = int8inc,
+	initcond = '0',
+	support = dummy_support4
+);
+ALTER AGGREGATE zeroarg_agg(*) SUPPORT pg_catalog.numeric_support;
+
+CREATE AGGREGATE ordset_agg(float8 ORDER BY anyelement)
+(
+	stype = internal,
+	sfunc = ordered_set_transition,
+	finalfunc = percentile_disc_final,
+	finalfunc_extra = true,
+	support = dummy_support4
+);
+ALTER AGGREGATE ordset_agg(float8 ORDER BY anyelement)
+    SUPPORT pg_catalog.numeric_support;
+
+SELECT oid::regprocedure, prosupport FROM pg_proc
+WHERE proname IN ('zeroarg_agg', 'ordset_agg') ORDER BY 1;
+
+DROP AGGREGATE zeroarg_agg(*);
+DROP AGGREGATE ordset_agg(float8 ORDER BY anyelement);
+DROP FUNCTION dummy_support4(internal);
+
+-- SUPPORT requires superuser, on both the CREATE and the ALTER path
+CREATE ROLE regress_agg_support_user;
+CREATE SCHEMA regress_agg_support AUTHORIZATION regress_agg_support_user;
+
+SET SESSION AUTHORIZATION regress_agg_support_user;
+CREATE AGGREGATE regress_agg_support.priv_agg(int8)
+(
+	stype = int8,
+	sfunc = int8pl,
+	support = pg_catalog.numeric_support
+);
+-- the aggregate itself is fine; only SUPPORT is refused
+CREATE AGGREGATE regress_agg_support.priv_agg(int8)
+(
+	stype = int8,
+	sfunc = int8pl
+);
+-- and the owner still cannot set it afterwards
+ALTER AGGREGATE regress_agg_support.priv_agg(int8)
+    SUPPORT pg_catalog.numeric_support;
+RESET SESSION AUTHORIZATION;
+
+DROP SCHEMA regress_agg_support CASCADE;
+DROP ROLE regress_agg_support_user;

@@ -270,6 +270,60 @@ EXPLAIN (COSTS OFF) SELECT * FROM foo_from_bar('f1', 'text_tbl', 'doh!');
 
 DROP FUNCTION foo_from_bar;
 
+--
+-- Test SupportRequestSimplifyAggref on a user-defined aggregate.  The
+-- planner only issues this request for an aggregate that names a support
+-- function, so this also exercises CREATE/ALTER AGGREGATE ... SUPPORT.
+--
+
+CREATE FUNCTION test_agg_support_func(internal)
+    RETURNS internal
+    AS :'regresslib', 'test_agg_support_func'
+    LANGUAGE C STRICT;
+
+-- An order-insensitive aggregate, so that dropping the sort is valid
+CREATE AGGREGATE my_max(int4) (SFUNC = int4larger, STYPE = int4,
+                               SUPPORT = test_agg_support_func);
+
+-- The ORDER BY is redundant here, so the support function removes it
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT my_max(unique1 ORDER BY unique1) FROM tenk1;
+
+-- DISTINCT is not something the support function will touch
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT my_max(DISTINCT unique1 ORDER BY unique1) FROM tenk1;
+
+-- Attaching the support function afterwards works too
+CREATE AGGREGATE my_max2(int4) (SFUNC = int4larger, STYPE = int4);
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT my_max2(unique1 ORDER BY unique1) FROM tenk1;
+
+ALTER AGGREGATE my_max2(int4) SUPPORT test_agg_support_func;
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT my_max2(unique1 ORDER BY unique1) FROM tenk1;
+
+-- An aggregate can also be called as a window function, so the same support
+-- function receives the window-related requests.  It doesn't implement them,
+-- returns NULL, and planning proceeds normally.
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT my_max(unique1) OVER () FROM tenk1;
+
+-- An ordered-set aggregate needs its sort clause at run time, so the support
+-- function must decline rather than remove it
+CREATE AGGREGATE my_pct(float8 ORDER BY anyelement)
+  (SFUNC = ordered_set_transition, STYPE = internal,
+   FINALFUNC = percentile_disc_final, FINALFUNC_EXTRA = true,
+   SUPPORT = test_agg_support_func);
+
+SELECT my_pct(0.5) WITHIN GROUP (ORDER BY unique1) FROM tenk1;
+
+DROP AGGREGATE my_pct(float8 ORDER BY anyelement);
+DROP AGGREGATE my_max(int4);
+DROP AGGREGATE my_max2(int4);
+DROP FUNCTION test_agg_support_func(internal);
+
 -- Test functions for control data
 SELECT count(*) > 0 AS ok FROM pg_control_checkpoint();
 SELECT count(*) > 0 AS ok FROM pg_control_init();

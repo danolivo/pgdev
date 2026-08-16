@@ -1235,12 +1235,12 @@ Keywords_for_list_of_owner_roles, "PUBLIC"
 /* ALTER ROUTINE options */
 #define Alter_routine_options \
 Alter_procedure_options, "COST", "IMMUTABLE", "LEAKPROOF", "NOT LEAKPROOF", \
-"PARALLEL", "ROWS", "STABLE", "VOLATILE"
+"PARALLEL", "ROWS", "STABLE", "SUPPORT", "VOLATILE"
 
 /* ALTER FUNCTION options */
 #define Alter_function_options \
 Alter_routine_options, "CALLED ON NULL INPUT", "RETURNS NULL ON NULL INPUT", \
-"STRICT", "SUPPORT"
+"STRICT"
 
 /* COPY options shared between FROM and TO */
 #define Copy_common_options \
@@ -2244,7 +2244,7 @@ match_previous_words(int pattern_id,
 	else if (Matches("ALTER", "AGGREGATE", MatchAny, MatchAny))
 	{
 		if (ends_with(prev_wd, ')'))
-			COMPLETE_WITH("OWNER TO", "RENAME TO", "SET SCHEMA");
+			COMPLETE_WITH("OWNER TO", "RENAME TO", "SET SCHEMA", "SUPPORT");
 		else
 			COMPLETE_WITH_FUNCTION_ARG(prev2_wd);
 	}

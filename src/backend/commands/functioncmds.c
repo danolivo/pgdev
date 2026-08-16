@@ -684,7 +684,12 @@ update_proconfig_value(ArrayType *a, List *set_items)
 	return a;
 }
 
-static Oid
+/*
+ * Interpret a SUPPORT clause, and return the OID of the named planner
+ * support function.  This is shared by CREATE/ALTER FUNCTION and
+ * CREATE/ALTER AGGREGATE; it also enforces the privilege check.
+ */
+Oid
 interpret_func_support(DefElem *defel)
 {
 	List	   *procName = defGetQualifiedName(defel);
@@ -1397,7 +1402,14 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 		aclcheck_error(ACLCHECK_NOT_OWNER, stmt->objtype,
 					   NameListToString(stmt->func->objname));
 
-	if (procForm->prokind == PROKIND_AGGREGATE)
+	/*
+	 * An aggregate's properties belong to CREATE AGGREGATE, except for the
+	 * planner support function, which has no other DDL home.  Only ALTER
+	 * AGGREGATE can set that, and its grammar admits no other action, as
+	 * asserted below.
+	 */
+	if (procForm->prokind == PROKIND_AGGREGATE &&
+		stmt->objtype != OBJECT_AGGREGATE)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("\"%s\" is an aggregate function",
@@ -1424,6 +1436,10 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 									 &parallel_item) == false)
 			elog(ERROR, "option \"%s\" not recognized", defel->defname);
 	}
+
+	/* SUPPORT is the only thing the grammar lets us do to an aggregate */
+	Assert(procForm->prokind != PROKIND_AGGREGATE ||
+		   (support_item != NULL && list_length(stmt->actions) == 1));
 
 	if (volatility_item)
 		procForm->provolatile = interpret_func_volatility(volatility_item);
@@ -1463,6 +1479,36 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 	{
 		/* interpret_func_support handles the privilege check */
 		Oid			newsupport = interpret_func_support(support_item);
+
+		/*
+		 * For an aggregate, the support function must not also be one of its
+		 * component functions; see CheckAggregateSupportFn.
+		 */
+		if (procForm->prokind == PROKIND_AGGREGATE)
+		{
+			HeapTuple	aggtup;
+			Form_pg_aggregate aggform;
+			Oid			componentfns[8];
+
+			aggtup = SearchSysCache1(AGGFNOID, ObjectIdGetDatum(funcOid));
+			if (!HeapTupleIsValid(aggtup))	/* should not happen */
+				elog(ERROR, "cache lookup failed for aggregate %u", funcOid);
+			aggform = (Form_pg_aggregate) GETSTRUCT(aggtup);
+
+			componentfns[0] = aggform->aggtransfn;
+			componentfns[1] = aggform->aggfinalfn;
+			componentfns[2] = aggform->aggcombinefn;
+			componentfns[3] = aggform->aggserialfn;
+			componentfns[4] = aggform->aggdeserialfn;
+			componentfns[5] = aggform->aggmtransfn;
+			componentfns[6] = aggform->aggminvtransfn;
+			componentfns[7] = aggform->aggmfinalfn;
+
+			CheckAggregateSupportFn(NameStr(procForm->proname), newsupport,
+									componentfns, lengthof(componentfns));
+
+			ReleaseSysCache(aggtup);
+		}
 
 		/* Add or replace dependency on support function */
 		if (OidIsValid(procForm->prosupport))

@@ -15365,6 +15365,7 @@ dumpAgg(Archive *fout, const AggInfo *agginfo)
 	const char *agginitval;
 	const char *aggminitval;
 	const char *proparallel;
+	const char *prosupport;
 	char		defaultfinalmodify;
 
 	/* Do nothing if not dumping schema */
@@ -15413,11 +15414,18 @@ dumpAgg(Archive *fout, const AggInfo *agginfo)
 		if (fout->remoteVersion >= 110000)
 			appendPQExpBufferStr(query,
 								 "aggfinalmodify,\n"
-								 "aggmfinalmodify\n");
+								 "aggmfinalmodify,\n");
 		else
 			appendPQExpBufferStr(query,
 								 "'0' AS aggfinalmodify,\n"
-								 "'0' AS aggmfinalmodify\n");
+								 "'0' AS aggmfinalmodify,\n");
+
+		if (fout->remoteVersion >= 200000)
+			appendPQExpBufferStr(query,
+								 "prosupport\n");
+		else
+			appendPQExpBufferStr(query,
+								 "'-' AS prosupport\n");
 
 		appendPQExpBufferStr(query,
 							 "FROM pg_catalog.pg_aggregate a, pg_catalog.pg_proc p "
@@ -15448,6 +15456,7 @@ dumpAgg(Archive *fout, const AggInfo *agginfo)
 	aggmfinalfn = PQgetvalue(res, 0, PQfnumber(res, "aggmfinalfn"));
 	aggfinalextra = (PQgetvalue(res, 0, PQfnumber(res, "aggfinalextra"))[0] == 't');
 	aggmfinalextra = (PQgetvalue(res, 0, PQfnumber(res, "aggmfinalextra"))[0] == 't');
+	prosupport = PQgetvalue(res, 0, PQfnumber(res, "prosupport"));
 	aggfinalmodify = PQgetvalue(res, 0, PQfnumber(res, "aggfinalmodify"))[0];
 	aggmfinalmodify = PQgetvalue(res, 0, PQfnumber(res, "aggmfinalmodify"))[0];
 	aggsortop = PQgetvalue(res, 0, PQfnumber(res, "aggsortop"));
@@ -15599,6 +15608,12 @@ dumpAgg(Archive *fout, const AggInfo *agginfo)
 		else if (proparallel[0] != PROPARALLEL_UNSAFE)
 			pg_fatal("unrecognized proparallel value for function \"%s\"",
 					 agginfo->aggfn.dobj.name);
+	}
+
+	if (strcmp(prosupport, "-") != 0)
+	{
+		/* We rely on regprocout to provide quoting and qualification */
+		appendPQExpBuffer(details, ",\n    SUPPORT = %s", prosupport);
 	}
 
 	appendPQExpBuffer(delq, "DROP AGGREGATE %s.%s;\n",

@@ -30,6 +30,7 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
@@ -74,7 +75,8 @@ AggregateCreate(const char *aggName,
 				int32 aggmTransSpace,
 				const char *agginitval,
 				const char *aggminitval,
-				char proparallel)
+				char proparallel,
+				Oid prosupport)
 {
 	Relation	aggdesc;
 	HeapTuple	tup;
@@ -608,6 +610,18 @@ AggregateCreate(const char *aggName,
 
 
 	/*
+	 * A support function must not double as one of the aggregate's own
+	 * component functions; see CheckAggregateSupportFn.
+	 */
+	{
+		Oid			componentfns[] = {transfn, finalfn, combinefn, serialfn,
+		deserialfn, mtransfn, minvtransfn, mfinalfn};
+
+		CheckAggregateSupportFn(aggName, prosupport,
+								componentfns, lengthof(componentfns));
+	}
+
+	/*
 	 * Everything looks okay.  Try to create the pg_proc entry for the
 	 * aggregate.  (This could fail if there's already a conflicting entry.)
 	 */
@@ -639,7 +653,7 @@ AggregateCreate(const char *aggName,
 							 PointerGetDatum(NULL), /* trftypes */
 							 NIL,	/* trfoids */
 							 PointerGetDatum(NULL), /* proconfig */
-							 InvalidOid,	/* no prosupport */
+							 prosupport,	/* planner support function */
 							 1, /* procost */
 							 0);	/* prorows */
 	procOid = myself.objectId;
@@ -809,6 +823,40 @@ AggregateCreate(const char *aggName,
 	record_object_address_dependencies(&myself, addrs, DEPENDENCY_NORMAL);
 	free_object_addresses(addrs);
 	return myself;
+}
+
+/*
+ * CheckAggregateSupportFn
+ *		Reject a planner support function that is also one of the aggregate's
+ *		own component functions.
+ *
+ * A component function and a support function each record a normal dependency
+ * from the aggregate's pg_proc row to the same pg_proc row, and nothing
+ * collapses the two.  changeDependencyFor() insists on finding exactly one
+ * matching row, so a later ALTER ... SUPPORT would fail with an internal
+ * error.  The combination is useless anyway: a support function is handed a
+ * request node, not transition state.
+ *
+ * This is only reachable for an aggregate whose transition type is internal,
+ * since that is what lets a component function have a support function's
+ * signature.
+ */
+void
+CheckAggregateSupportFn(const char *aggName, Oid supportfn,
+						const Oid *componentfns, int ncomponentfns)
+{
+	if (!OidIsValid(supportfn))
+		return;
+
+	for (int i = 0; i < ncomponentfns; i++)
+	{
+		if (componentfns[i] == supportfn)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+					 errmsg("aggregate %s cannot use function %s as its support function",
+							aggName, format_procedure(supportfn)),
+					 errdetail("The function is already used in the aggregate's own definition.")));
+	}
 }
 
 /*
