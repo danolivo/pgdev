@@ -1,0 +1,75 @@
+name: PR regression tests (REL_18_STABLE)
+
+on:
+  pull_request:
+    branches:
+      - REL_18_STABLE
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            gcc make bison flex \
+            libreadline-dev zlib1g-dev libssl-dev libicu-dev \
+            liblz4-dev libzstd-dev \
+            pkg-config \
+            perl libipc-run-perl \
+            python3
+
+      - name: Configure
+        run: |
+          ./configure \
+            --enable-cassert --enable-debug --enable-tap-tests \
+            --with-openssl --with-icu --with-lz4 --with-zstd
+
+      - name: Build
+        run: make -j$(nproc) world-bin
+
+      - name: Run check-world
+        run: make check-world
+
+      - name: Collect regression artifacts on failure
+        if: failure()
+        run: |
+          mkdir -p /tmp/regress-artifacts
+          find . \( -name regression.diffs -o -name regression.out \
+                    -o -name postmaster.log -o -name initdb.log \
+                    -o -path '*/tmp_check/log/*' \) \
+               -exec cp --parents {} /tmp/regress-artifacts/ \;
+
+      - name: Upload regression artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-artifacts
+          path: /tmp/regress-artifacts/
+          if-no-files-found: ignore
+
+      - name: Job summary
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "## ✅ check-world passed" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## ❌ check-world failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Download the **regression-artifacts** artifact for details." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            # Inline first diffs found, if any
+            for f in $(find . -name regression.diffs 2>/dev/null | head -5); do
+              echo "### ${f}" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              head -100 "$f" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+            done
+          fi

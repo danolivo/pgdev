@@ -161,6 +161,7 @@ CreateExecutorState(void)
 	estate->es_use_parallel_mode = false;
 	estate->es_parallel_workers_to_launch = 0;
 	estate->es_parallel_workers_launched = 0;
+	estate->es_tempbufs_flushed = false; /* Is the backend's temp buffers were flushed? */
 
 	estate->es_jit_flags = 0;
 	estate->es_jit = NULL;
