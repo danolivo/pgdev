@@ -41,6 +41,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
+#include "utils/sharedtuplestore.h"
 #include "utils/snapmgr.h"
 #include "utils/tuplesort.h"
 #include "utils/typcache.h"
@@ -3401,7 +3402,9 @@ static void
 show_repartition_info(RepartitionState *rstate, ExplainState *es)
 {
 	RepartitionInstrumentation total;
-	int			nparts = 0;
+	int			ncontributors = 0;
+	int			nparts;
+	int64		exchange_kb;
 	int			i;
 
 	if (!es->analyze)
@@ -3411,7 +3414,7 @@ show_repartition_info(RepartitionState *rstate, ExplainState *es)
 	if (rstate->rs_instrument)
 	{
 		total = *rstate->rs_instrument;
-		nparts++;
+		ncontributors++;
 	}
 	if (rstate->rs_shared_info)
 	{
@@ -3429,21 +3432,38 @@ show_repartition_info(RepartitionState *rstate, ExplainState *es)
 			INSTR_TIME_ADD(total.time_sink, w->time_sink);
 			INSTR_TIME_ADD(total.time_barrier, w->time_barrier);
 			INSTR_TIME_ADD(total.time_drain, w->time_drain);
-			nparts++;
+			ncontributors++;
 		}
 	}
 
-	if (nparts == 0)
+	if (ncontributors == 0)
 		return;
+
+	/*
+	 * Buffer memory the exchange itself needs, per participant: one write
+	 * buffer per partition plus the BufFile's own.  choose_repartition_count()
+	 * charges this against work_mem at plan time, but K is then frozen in the
+	 * plan, so a prepared statement can be executed with a work_mem that no
+	 * longer covers it.  Print it rather than leave the reader to multiply it
+	 * out.
+	 */
+	nparts = ((Repartition *) rstate->ps.plan)->npartitions;
+	exchange_kb = ((int64) nparts * (STS_CHUNK_PAGES + 1) * BLCKSZ + 1023) / 1024;
 
 	if (es->format == EXPLAIN_FORMAT_TEXT)
 	{
 		ExplainIndentText(es);
 		appendStringInfo(es->str,
-						 "Exchanged: " INT64_FORMAT " tuples  Payload: " INT64_FORMAT "kB  Claimed: %d\n",
+						 "Exchanged: " INT64_FORMAT " written / " INT64_FORMAT " read  Payload: " INT64_FORMAT "kB  Claimed: %d/%d\n",
 						 total.ntuples_written,
+						 total.ntuples_read,
 						 (total.bytes_payload + 1023) / 1024,
-						 total.nclaimed);
+						 total.nclaimed,
+						 nparts);
+		ExplainIndentText(es);
+		appendStringInfo(es->str,
+						 "Exchange Buffers: " INT64_FORMAT "kB per participant\n",
+						 exchange_kb);
 		if (es->timing)
 		{
 			ExplainIndentText(es);
@@ -3458,8 +3478,12 @@ show_repartition_info(RepartitionState *rstate, ExplainState *es)
 	{
 		ExplainPropertyInteger("Tuples Exchanged", NULL,
 							   total.ntuples_written, es);
+		ExplainPropertyInteger("Tuples Read", NULL, total.ntuples_read, es);
 		ExplainPropertyInteger("Payload Bytes", NULL, total.bytes_payload, es);
 		ExplainPropertyInteger("Partitions Claimed", NULL, total.nclaimed, es);
+		ExplainPropertyInteger("Partitions", NULL, nparts, es);
+		ExplainPropertyInteger("Exchange Buffer Bytes", NULL,
+							   exchange_kb * 1024, es);
 		if (es->timing)
 		{
 			ExplainPropertyFloat("Sink Time", "ms",
