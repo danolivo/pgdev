@@ -2512,6 +2512,7 @@ choose_repartition_count(int nparticipants, int tuple_width)
 	int			k_width;
 	Size		per_partition;
 	Size		budget;
+	double		tuple_sz;
 
 	per_partition = (Size) (STS_CHUNK_PAGES + 1) * BLCKSZ;
 	budget = get_hash_memory_limit();
@@ -2533,11 +2534,22 @@ choose_repartition_count(int nparticipants, int tuple_width)
 	 * about 4.6 ns per 144-byte one.  DuckDB bounds its radix bits by row
 	 * width for the same reason (ROW_WIDTH_THRESHOLD_ONE/TWO).  Give back one
 	 * bit past 64 bytes and two past 256.
+	 *
+	 * Compare against the size of the MinimalTuple that actually reaches the
+	 * buffer, not against the payload width, and use the same expression
+	 * cost_repartition() uses so the two cannot drift.  The header is not a
+	 * rounding error: for count(*) over an int4 key the planner's width is 12
+	 * and the exchange moves 32 bytes per tuple.  Note also that tuple_width
+	 * itself is only as good as the planner's estimate of the partial
+	 * aggregate's target, which for an internal transtype is the weakest
+	 * estimate it has -- measured error on this node runs from 0.8x to 2.7x.
 	 */
+	tuple_sz = MAXALIGN(tuple_width) + MAXALIGN(SizeofMinimalTupleHeader);
+
 	k_width = REPARTITION_MAX_PARTITIONS;
-	if (tuple_width > 256)
+	if (tuple_sz > 256)
 		k_width /= 4;
-	else if (tuple_width > 64)
+	else if (tuple_sz > 64)
 		k_width /= 2;
 	k = Min(k, Max(k_width, 1));
 
