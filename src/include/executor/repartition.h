@@ -65,6 +65,13 @@ typedef struct ParallelRepartitionState
 	pg_atomic_uint32 distributor;
 
 	/*
+	 * Checksum of the drain order, published by whichever participant computes
+	 * it first and checked by the others.  See repartition_order_partitions().
+	 * Zero means "nobody has published one yet".
+	 */
+	pg_atomic_uint32 order_checksum;
+
+	/*
 	 * Separates the sink phase from the drain phase.  Slots are reserved by
 	 * the leader before any worker exists; see ExecRepartitionInitializeDSM().
 	 */

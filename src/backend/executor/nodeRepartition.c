@@ -198,6 +198,22 @@ repartition_sink(RepartitionState *node)
 }
 
 /*
+ * Checksum of a drain order.  Never returns 0, which the shared slot uses to
+ * mean "not published yet".
+ */
+static uint32
+repartition_order_checksum(const int *order, int k)
+{
+	uint32		sum = 1;
+	int			i;
+
+	for (i = 0; i < k; i++)
+		sum = hash_combine(sum, (uint32) order[i]);
+
+	return sum == 0 ? 1 : sum;
+}
+
+/*
  * Order the partitions by descending size.
  *
  * Handing them out in index order lets the participant that happens to take
@@ -207,15 +223,27 @@ repartition_sink(RepartitionState *node)
  * against 2 - 1/P for an arbitrary order.
  *
  * Every participant computes this independently from the same shared array,
- * so the orders agree without any further synchronisation.
+ * so the orders agree without any further synchronisation -- provided the
+ * comparison really is a total order and really is fed the same input.  If it
+ * ever is not, the partitions are handed out by an index into disagreeing
+ * arrays: some are drained twice and others not at all, and the query returns
+ * a wrong answer with no error, no assertion and consistent-looking
+ * instrumentation (everything written is still read, and K partitions are
+ * still claimed).  That is the worst failure mode this node has, so the orders
+ * are compared rather than assumed: the first participant to arrive publishes
+ * a checksum, the rest check theirs against it.
  */
 static void
 repartition_order_partitions(RepartitionState *node)
 {
-	pg_atomic_uint64 *counts = RepartitionPartTuples(node->rs_shared);
+	pg_atomic_uint64 *counts;
 	int			k = node->rs_npartitions;
 	uint64	   *sizes;
 	int			i;
+
+	/* only ever reached on the parallel path, after the barrier */
+	Assert(node->rs_shared != NULL);
+	counts = RepartitionPartTuples(node->rs_shared);
 
 	if (node->rs_order != NULL)
 		pfree(node->rs_order);
@@ -227,7 +255,12 @@ repartition_order_partitions(RepartitionState *node)
 		sizes[i] = pg_atomic_read_u64(&counts[i]);
 	}
 
-	/* insertion sort; k is at most REPARTITION_MAX_PARTITIONS */
+	/*
+	 * Insertion sort; k is at most REPARTITION_MAX_PARTITIONS.  The comparison
+	 * is strict, so partitions of equal size keep their index order: that,
+	 * plus identical input, is what makes the result identical everywhere.
+	 * Do not relax it into >= without reading the comment above first.
+	 */
 	for (i = 1; i < k; i++)
 	{
 		int			part = node->rs_order[i];
@@ -242,6 +275,17 @@ repartition_order_partitions(RepartitionState *node)
 		node->rs_order[j + 1] = part;
 	}
 	pfree(sizes);
+
+	/* Publish, or check against, the order everyone else computed. */
+	{
+		uint32		mine = repartition_order_checksum(node->rs_order, k);
+		uint32		published = 0;
+
+		if (!pg_atomic_compare_exchange_u32(&node->rs_shared->order_checksum,
+											&published, mine) &&
+			published != mine)
+			elog(ERROR, "repartition participants disagree on partition order");
+	}
 }
 
 static void
@@ -621,6 +665,7 @@ ExecRepartitionInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 	pstate->nparticipants = nparticipants;
 	pstate->instrument_offset = instrument_offset;
 	pg_atomic_init_u32(&pstate->distributor, 0);
+	pg_atomic_init_u32(&pstate->order_checksum, 0);
 	for (i = 0; i < node->rs_npartitions; i++)
 		pg_atomic_init_u64(&RepartitionPartTuples(pstate)[i], 0);
 
@@ -757,6 +802,7 @@ ExecRepartitionReInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 	MemoryContextSwitchTo(oldcxt);
 
 	pg_atomic_write_u32(&pstate->distributor, 0);
+	pg_atomic_write_u32(&pstate->order_checksum, 0);
 	for (i = 0; i < node->rs_npartitions; i++)
 		pg_atomic_write_u64(&RepartitionPartTuples(pstate)[i], 0);
 	BarrierInit(&pstate->sink_barrier, 0);
