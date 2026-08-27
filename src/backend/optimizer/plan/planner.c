@@ -7258,6 +7258,7 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 	bool		can_sort = (extra->flags & GROUPING_CAN_USE_SORT) != 0;
 	List	   *havingQual = (List *) extra->havingQual;
 	AggClauseCosts *agg_final_costs = &extra->agg_final_costs;
+	bool		repartition_built = false;
 
 	if (can_sort)
 	{
@@ -7503,6 +7504,7 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 												 npartitions);
 
 		if (can_hash)
+		{
 			add_partial_path(grouped_rel, (Path *)
 							 create_agg_path(root,
 											 grouped_rel,
@@ -7514,6 +7516,8 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 											 havingQual,
 											 agg_final_costs,
 											 local_groups));
+			repartition_built = true;
+		}
 
 		/*
 		 * Also consider finalizing by sort.  Measurement says this is not a
@@ -7553,6 +7557,7 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 											 havingQual,
 											 agg_final_costs,
 											 local_groups));
+			repartition_built = true;
 		}
 
 		/*
@@ -7568,10 +7573,56 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 		{
 			ListCell   *lc2;
 
+			/*
+			 * Every path in the list is penalised by the same amount, which is
+			 * what keeps the list sorted by disabled_nodes and then by
+			 * total_cost -- the order add_path() requires and relies on for
+			 * the paths gather_grouping_paths() is about to add.  A penalty
+			 * applied to only some of them would have to re-sort the list.
+			 */
 			foreach(lc2, grouped_rel->pathlist)
 				((Path *) lfirst(lc2))->disabled_nodes++;
+
+#ifdef USE_ASSERT_CHECKING
+			{
+				Path	   *prev = NULL;
+
+				foreach(lc2, grouped_rel->pathlist)
+				{
+					Path	   *cur = (Path *) lfirst(lc2);
+
+					if (prev != NULL)
+						Assert(prev->disabled_nodes < cur->disabled_nodes ||
+							   (prev->disabled_nodes == cur->disabled_nodes &&
+								prev->total_cost <= cur->total_cost));
+					prev = cur;
+				}
+			}
+#endif
 		}
+
+		/*
+		 * The GUC only penalises the competition; it cannot conjure the
+		 * exchange into existence.  When the node could not be built -- no
+		 * hashable grouping, grouping sets, a parallel-unsafe target -- the
+		 * setting silently does nothing, and any test that trusts it to force
+		 * the shape is checking an ordinary plan.  Say so, so that at least
+		 * the developer who turned the GUC on can find out.  Tests must still
+		 * verify the plan shape themselves.
+		 */
 	}
+
+	/*
+	 * The GUC only penalises the competition; it cannot conjure the exchange
+	 * into existence.  When the node could not be built -- grouping sets, a
+	 * non-hashable grouping key, a parallel-unsafe target, a grouped rel that
+	 * is not an upper rel -- the setting silently does nothing, and a test
+	 * that trusts it to force the shape is checking an ordinary plan instead.
+	 * Say so.  Tests must still verify the plan shape themselves; this only
+	 * saves the developer who set the GUC from wondering.
+	 */
+	if (debug_parallel_repartition && !repartition_built)
+		elog(DEBUG1, "debug_parallel_repartition: no Parallel Repartition path was built");
 
 	/*
 	 * When partitionwise aggregate is used, we might have fully aggregated
