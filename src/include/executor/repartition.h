@@ -45,6 +45,24 @@ typedef struct SharedRepartitionInfo
  */
 #define REPARTITION_MAGIC		((uint32) 0x52505254)	/* "RPRT" */
 
+/*
+ * A redzone precedes every area inside the allocation, and one more closes it.
+ *
+ * It has to be reserved deliberately: relying on alignment padding to provide
+ * it does not work, because the areas here are all naturally MAXALIGNed --
+ * K * sizeof(pg_atomic_uint64) always is, and so is the fixed struct -- and
+ * measurement says the incidental padding is zero bytes at exactly the two
+ * boundaries that matter.  Without this, a length bug in one area writes into
+ * the head of the next with nothing in between to notice.
+ *
+ * Neither valgrind nor AddressSanitizer sees such a write on its own: to both
+ * of them the whole allocation is one live object from the first byte to the
+ * last.  Marking the redzones NOACCESS (a no-op unless built with
+ * USE_VALGRIND) is what gives valgrind something to catch, and the byte
+ * pattern is what an assert-enabled build without valgrind can check by hand.
+ */
+#define REPARTITION_REDZONE			MAXALIGN(sizeof(uint64))
+#define REPARTITION_REDZONE_BYTE	0x5A
 
 /*
  * Where everything lives inside the single allocation, decided once in
@@ -53,9 +71,9 @@ typedef struct SharedRepartitionInfo
  * accessors below read these fields instead and bounds-check themselves
  * against alloc_size.
  *
- *	 [ ParallelRepartitionState ][ counts[K] ]
- *	 [ SharedTuplestore x K ]
- *	 [ SharedRepartitionInfo -- only when instrumenting ]
+ *	 [ ParallelRepartitionState ][ rz ][ counts[K] ][ rz ]
+ *	 [ SharedTuplestore #0 ][ rz ] ... [ SharedTuplestore #K-1 ][ rz ]
+ *	 [ SharedRepartitionInfo -- only when instrumenting ][ rz ]
  *
  * Every area start is MAXALIGNed, which is what makes the int64s and the
  * atomics inside them addressable everywhere: MAXIMUM_ALIGNOF is by definition
@@ -68,7 +86,7 @@ typedef struct RepartitionLayout
 	Size		counts_offset;	/* per-partition tuple counters */
 	Size		sts_offset;		/* first SharedTuplestore */
 	Size		sts_size;		/* bytes one SharedTuplestore occupies */
-	Size		sts_stride;		/* bytes from one to the next */
+	Size		sts_stride;		/* bytes from one to the next, redzone included */
 	Size		instrument_offset;	/* 0 when not instrumenting */
 	Size		instrument_size;	/* 0 when not instrumenting */
 } RepartitionLayout;
@@ -146,7 +164,8 @@ RepartitionArea(ParallelRepartitionState *pstate, Size offset, Size len)
 	Assert(offset >= MAXALIGN(sizeof(ParallelRepartitionState)));
 	Assert(offset == MAXALIGN(offset));
 	Assert(len > 0);
-	Assert(offset + len <= pstate->layout.alloc_size);
+	/* the allocation ends with a redzone, which is nobody's area */
+	Assert(offset + len <= pstate->layout.alloc_size - REPARTITION_REDZONE);
 
 	return (char *) pstate + offset;
 }
@@ -181,7 +200,7 @@ RepartitionSTS(ParallelRepartitionState *pstate, int n)
 {
 	Assert(n >= 0 && n < pstate->npartitions);
 	Assert(pstate->layout.sts_size == MAXALIGN(sts_estimate(pstate->nparticipants)));
-	Assert(pstate->layout.sts_stride == pstate->layout.sts_size);
+	Assert(pstate->layout.sts_stride == pstate->layout.sts_size + REPARTITION_REDZONE);
 
 	return (SharedTuplestore *)
 		RepartitionArea(pstate,
@@ -225,6 +244,33 @@ RepartitionSharedInfo(ParallelRepartitionState *pstate)
 		   RepartitionSharedInfoSize(pstate->ninstrument));
 
 	return si;
+}
+
+/*
+ * Offsets of the areas inside the allocation, in order, with alloc_size last.
+ * A redzone of REPARTITION_REDZONE bytes sits immediately before each of them.
+ *
+ * starts[] must have room for npartitions + 3 entries: the counters, the K
+ * tuplestores, the instrumentation when there is any, and alloc_size.
+ */
+static inline int
+RepartitionAreaStarts(ParallelRepartitionState *pstate, Size *starts)
+{
+	int			n = 0;
+	int			i;
+
+	Assert(pstate->magic == REPARTITION_MAGIC);
+
+	starts[n++] = pstate->layout.counts_offset;
+	for (i = 0; i < pstate->npartitions; i++)
+		starts[n++] = pstate->layout.sts_offset +
+			pstate->layout.sts_stride * (Size) i;
+	if (pstate->layout.instrument_offset != 0)
+		starts[n++] = pstate->layout.instrument_offset;
+	starts[n++] = pstate->layout.alloc_size;
+
+	Assert(n == pstate->npartitions + 2 + (pstate->layout.instrument_offset != 0));
+	return n;
 }
 
 #endif							/* REPARTITION_H */

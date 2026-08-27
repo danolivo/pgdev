@@ -59,6 +59,7 @@
 #include "executor/repartition.h"
 #include "miscadmin.h"
 #include "utils/injection_point.h"
+#include "utils/memdebug.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
 
@@ -74,7 +75,10 @@ struct ParallelRepartitionState;
 
 static void repartition_sink(RepartitionState *node);
 static void repartition_end_read(RepartitionState *node, bool drained);
-
+#ifdef USE_ASSERT_CHECKING
+static void repartition_paint_guards(ParallelRepartitionState *pstate);
+static void repartition_check_guards(ParallelRepartitionState *pstate);
+#endif
 
 /*
  * Partition number for the tuple in slot.
@@ -413,6 +417,9 @@ repartition_end_read(RepartitionState *node, bool drained)
 			if (ndrained == (uint32) pstate->npartitions && nread != written)
 				elog(PANIC, "repartition exchanged " UINT64_FORMAT " tuples but returned " UINT64_FORMAT,
 					 written, nread);
+
+			if (ndrained == (uint32) pstate->npartitions)
+				repartition_check_guards(pstate);
 		}
 #endif
 
@@ -790,6 +797,10 @@ ExecShutdownRepartition(RepartitionState *node)
  * the result is then stored in the shared state and never recomputed.  See
  * RepartitionLayout in repartition.h for the picture.
  *
+ * A redzone precedes every area and one more closes the allocation.  They are
+ * reserved rather than borrowed from alignment padding, because there is no
+ * alignment padding to borrow: every area here is naturally MAXALIGNed, so the
+ * gaps between them are zero bytes wide.
  */
 static void
 repartition_layout(int npartitions, int nparticipants, int ninstrument,
@@ -805,17 +816,20 @@ repartition_layout(int npartitions, int nparticipants, int ninstrument,
 
 	size = MAXALIGN(sizeof(ParallelRepartitionState));
 
+	size = add_size(size, REPARTITION_REDZONE);
 	layout->counts_offset = size;
 	size = add_size(size, MAXALIGN(mul_size(npartitions,
 											sizeof(pg_atomic_uint64))));
 
 	layout->sts_size = MAXALIGN(sts_estimate(nparticipants));
-	layout->sts_stride = layout->sts_size;
+	layout->sts_stride = add_size(layout->sts_size, REPARTITION_REDZONE);
+	size = add_size(size, REPARTITION_REDZONE);
 	layout->sts_offset = size;
 	size = add_size(size, mul_size(layout->sts_stride, npartitions));
 
 	if (ninstrument > 0)
 	{
+		size = add_size(size, REPARTITION_REDZONE);
 		layout->instrument_offset = size;
 		layout->instrument_size = RepartitionSharedInfoSize(ninstrument);
 		size = add_size(size, MAXALIGN(layout->instrument_size));
@@ -826,6 +840,9 @@ repartition_layout(int npartitions, int nparticipants, int ninstrument,
 		layout->instrument_size = 0;
 	}
 
+	/* the closing redzone */
+	size = add_size(size, REPARTITION_REDZONE);
+
 	layout->alloc_size = size;
 
 	Assert(layout->counts_offset == MAXALIGN(layout->counts_offset));
@@ -834,6 +851,79 @@ repartition_layout(int npartitions, int nparticipants, int ninstrument,
 	Assert(layout->alloc_size == MAXALIGN(layout->alloc_size));
 	Assert(layout->alloc_size < MaxAllocSize);
 }
+
+/*
+ * The redzones.
+ *
+ * A write that runs off the end of one area into the next is invisible to both
+ * valgrind and AddressSanitizer: the allocation is one live object as far as
+ * they are concerned, and shm_toc hands it out whole.  So the areas are kept
+ * apart by hand.  Marking the gaps NOACCESS costs nothing without USE_VALGRIND
+ * and gives valgrind something real to catch when it is there; the byte
+ * pattern covers the assert-enabled builds that have no valgrind, which is
+ * most of them.
+ *
+ * Assert-only.  Nothing here is a substitute for getting the lengths right; it
+ * is a way of finding out that they are not, close to where it happened.
+ */
+#ifdef USE_ASSERT_CHECKING
+static void
+repartition_paint_guards(ParallelRepartitionState *pstate)
+{
+	char	   *base = (char *) pstate;
+	Size		starts[REPARTITION_MAX_PARTITIONS + 3];
+	int			nstarts;
+	int			i;
+
+	nstarts = RepartitionAreaStarts(pstate, starts);
+	for (i = 0; i < nstarts; i++)
+	{
+		char	   *rz = base + starts[i] - REPARTITION_REDZONE;
+
+		VALGRIND_MAKE_MEM_UNDEFINED(rz, REPARTITION_REDZONE);
+		memset(rz, REPARTITION_REDZONE_BYTE, REPARTITION_REDZONE);
+		VALGRIND_MAKE_MEM_NOACCESS(rz, REPARTITION_REDZONE);
+	}
+}
+
+/*
+ * Check them.  Safe to call from any participant at any time: nothing ever
+ * writes to a redzone, so there is no torn read to worry about.  The caller
+ * must know that the segment is still mapped -- see the comment in
+ * ExecShutdownRepartition() about the one place where that is not true.
+ */
+static void
+repartition_check_guards(ParallelRepartitionState *pstate)
+{
+	char	   *base = (char *) pstate;
+	Size		starts[REPARTITION_MAX_PARTITIONS + 3];
+	int			nstarts;
+	int			i;
+	Size		j;
+
+	if (pstate->magic != REPARTITION_MAGIC)
+		elog(PANIC, "repartition shared state corrupted: magic is %08X, expected %08X",
+			 pstate->magic, REPARTITION_MAGIC);
+
+	nstarts = RepartitionAreaStarts(pstate, starts);
+	for (i = 0; i < nstarts; i++)
+	{
+		char	   *rz = base + starts[i] - REPARTITION_REDZONE;
+
+		VALGRIND_MAKE_MEM_DEFINED(rz, REPARTITION_REDZONE);
+		for (j = 0; j < REPARTITION_REDZONE; j++)
+		{
+			if (rz[j] != (char) REPARTITION_REDZONE_BYTE)
+				elog(PANIC, "repartition shared state corrupted: redzone before offset %zu of %zu was written",
+					 starts[i], pstate->layout.alloc_size);
+		}
+		VALGRIND_MAKE_MEM_NOACCESS(rz, REPARTITION_REDZONE);
+	}
+}
+#else
+#define repartition_paint_guards(pstate)	((void) 0)
+#define repartition_check_guards(pstate)	((void) 0)
+#endif							/* USE_ASSERT_CHECKING */
 
 void
 ExecRepartitionEstimate(RepartitionState *node, ParallelContext *pcxt)
@@ -950,6 +1040,13 @@ ExecRepartitionInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 	}
 	MemoryContextSwitchTo(oldcxt);
 
+	/*
+	 * Everything that will ever be written to this allocation has now been
+	 * initialised, so anything outside the areas above is dead space from here
+	 * on.  Fill it and check it later; see repartition_paint_guards().
+	 */
+	repartition_paint_guards(pstate);
+
 	node->rs_shared = pstate;
 	node->rs_attached = true;
 	node->rs_post_launch_seen = false;
@@ -993,6 +1090,7 @@ ExecRepartitionPostLaunch(RepartitionState *node, ParallelContext *pcxt,
 		   pcxt->nworkers_launched <= pcxt->nworkers);
 	Assert(node->rs_shared->nparticipants == pcxt->nworkers + 1);
 	Assert(!node->rs_post_launch_seen);		/* exactly once per launch */
+	repartition_check_guards(node->rs_shared);
 
 	ncancel = pcxt->nworkers - pcxt->nworkers_launched;
 	if (!leader_participates)
@@ -1018,6 +1116,7 @@ ExecRepartitionReInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 		return;
 
 	Assert(!IsParallelWorker());
+	repartition_check_guards(pstate);
 
 	/*
 	 * sts_reinitialize() is not enough and is in fact unused in the tree: it
@@ -1078,6 +1177,7 @@ ExecRepartitionReInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 	node->rs_sink_started = false;
 	node->rs_reinit_count++;
 
+	repartition_paint_guards(pstate);
 }
 
 void
@@ -1103,6 +1203,7 @@ ExecRepartitionInitializeWorker(RepartitionState *node,
 	Assert(pstate->npartitions == node->rs_npartitions);
 	Assert(pstate->nparticipants > ParallelWorkerNumber + 1);
 	Assert(IsParallelWorker());
+	repartition_check_guards(pstate);
 
 	/* a relaunched worker re-attaches; do not leak the previous set */
 	MemoryContextReset(node->rs_spillCxt);
@@ -1149,6 +1250,7 @@ ExecRepartitionRetrieveInstrumentation(RepartitionState *node)
 		return;
 
 	Assert(!IsParallelWorker());
+	repartition_check_guards(node->rs_shared);
 
 	si = RepartitionSharedInfo(node->rs_shared);
 	if (si == NULL)
