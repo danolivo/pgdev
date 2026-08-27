@@ -514,10 +514,26 @@ ExecShutdownRepartition(RepartitionState *node)
  * ----------------------------------------------------------------
  */
 
+/*
+ * Size of the single DSM allocation this node needs, and, in *instrument_offset,
+ * where inside it the instrumentation array begins.
+ *
+ * The offset is returned rather than recomputed by a second function because
+ * the two have to agree exactly: a divergence would put the workers'
+ * instrumentation on top of the last tuplestore's control data, which no test
+ * would notice until something else started reading it.  It is stored in the
+ * struct as well, so that workers never recompute it at all.
+ *
+ * *instrument_offset is set to 0 when ninstrument is 0.
+ */
 static Size
-repartition_dsm_size(int npartitions, int nparticipants, int ninstrument)
+repartition_dsm_size(int npartitions, int nparticipants, int ninstrument,
+					 Size *instrument_offset)
 {
 	Size		size;
+
+	Assert(npartitions > 0 && nparticipants > 0);
+	Assert(instrument_offset != NULL);
 
 	size = MAXALIGN(sizeof(ParallelRepartitionState));
 	size = add_size(size, MAXALIGN(npartitions * sizeof(pg_atomic_uint64)));
@@ -525,27 +541,14 @@ repartition_dsm_size(int npartitions, int nparticipants, int ninstrument)
 								   npartitions));
 	if (ninstrument > 0)
 	{
+		*instrument_offset = size;
 		size = add_size(size, offsetof(SharedRepartitionInfo, instrument));
 		size = add_size(size, mul_size(ninstrument,
 									   sizeof(RepartitionInstrumentation)));
 	}
-	return size;
-}
+	else
+		*instrument_offset = 0;
 
-/*
- * Where in the allocation the instrumentation lives.  Kept in the struct so
- * that workers do not have to recompute it, and so that the whole node needs
- * exactly one shm_toc key.
- */
-static Size
-repartition_instrument_offset(int npartitions, int nparticipants)
-{
-	Size		size;
-
-	size = MAXALIGN(sizeof(ParallelRepartitionState));
-	size = add_size(size, MAXALIGN(npartitions * sizeof(pg_atomic_uint64)));
-	size = add_size(size, mul_size(MAXALIGN(sts_estimate(nparticipants)),
-								   npartitions));
 	return size;
 }
 
@@ -553,9 +556,11 @@ void
 ExecRepartitionEstimate(RepartitionState *node, ParallelContext *pcxt)
 {
 	Size		size;
+	Size		instrument_offset;
 
 	size = repartition_dsm_size(node->rs_npartitions, pcxt->nworkers + 1,
-								node->ps.instrument ? pcxt->nworkers : 0);
+								node->ps.instrument ? pcxt->nworkers : 0,
+								&instrument_offset);
 	shm_toc_estimate_chunk(&pcxt->estimator, size);
 	shm_toc_estimate_keys(&pcxt->estimator, 1);
 }
@@ -568,6 +573,7 @@ ExecRepartitionInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 	int			nparticipants = pcxt->nworkers + 1;
 	int			ninstrument;
 	Size		size;
+	Size		instrument_offset;
 	int			i;
 
 	/*
@@ -581,15 +587,14 @@ ExecRepartitionInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 
 	ninstrument = node->ps.instrument ? pcxt->nworkers : 0;
 	size = repartition_dsm_size(node->rs_npartitions, nparticipants,
-								ninstrument);
+								ninstrument, &instrument_offset);
 	pstate = shm_toc_allocate(pcxt->toc, size);
 	memset(pstate, 0, size);
 	shm_toc_insert(pcxt->toc, node->ps.plan->plan_node_id, pstate);
 
 	pstate->npartitions = node->rs_npartitions;
 	pstate->nparticipants = nparticipants;
-	pstate->instrument_offset = ninstrument > 0 ?
-		repartition_instrument_offset(node->rs_npartitions, nparticipants) : 0;
+	pstate->instrument_offset = instrument_offset;
 	pg_atomic_init_u32(&pstate->distributor, 0);
 	for (i = 0; i < node->rs_npartitions; i++)
 		pg_atomic_init_u64(&RepartitionPartTuples(pstate)[i], 0);

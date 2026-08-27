@@ -29,6 +29,14 @@ typedef struct SharedTuplestoreAccessor SharedTuplestoreAccessor;
  */
 #define SHARED_TUPLESTORE_SINGLE_PASS 0x01
 
+/*
+ * The size, in pages, of the write buffer each participant keeps per
+ * tuplestore, and the granularity at which those buffers are flushed.  Public
+ * because the cost model of a node that opens one store per partition has to
+ * charge for them; see choose_repartition_count().
+ */
+#define STS_CHUNK_PAGES 4
+
 extern size_t sts_estimate(int participants);
 
 extern SharedTuplestoreAccessor *sts_initialize(SharedTuplestore *sts,

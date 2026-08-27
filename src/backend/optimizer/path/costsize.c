@@ -106,6 +106,7 @@
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
+#include "utils/sharedtuplestore.h"
 #include "utils/spccache.h"
 #include "utils/tuplesort.h"
 
@@ -2482,12 +2483,6 @@ cost_merge_append(Path *path, PlannerInfo *root,
  * relation, so the materialization is all overhead --- any savings will
  * occur only on rescan, which is estimated in cost_rescan.
  */
-/*
- * Must match STS_CHUNK_PAGES in sharedtuplestore.c: the size, in pages, of the
- * write buffer each participant keeps per partition, and the granularity at
- * which those buffers are flushed.
- */
-#define REPARTITION_CHUNK_PAGES		4
 #define REPARTITION_MAX_PARTITIONS	64
 
 /* Fixed costs of the exchange, in planner cost units. */
@@ -2501,7 +2496,7 @@ cost_merge_append(Path *path, PlannerInfo *root,
  * Oversubscribe relative to the participant count so that work stealing can
  * balance, and so that the algorithm does not depend on how many workers
  * actually start.  Cap by memory: during the sink phase each participant holds
- * one write buffer per partition (REPARTITION_CHUNK_PAGES pages) plus the
+ * one write buffer per partition (STS_CHUNK_PAGES pages) plus the
  * BufFile's own BLCKSZ buffer, and that has to be charged against the same
  * budget the Agg above uses for its hash table.
  *
@@ -2518,7 +2513,7 @@ choose_repartition_count(int nparticipants, int tuple_width)
 	Size		per_partition;
 	Size		budget;
 
-	per_partition = (Size) (REPARTITION_CHUNK_PAGES + 1) * BLCKSZ;
+	per_partition = (Size) (STS_CHUNK_PAGES + 1) * BLCKSZ;
 	budget = get_hash_memory_limit();
 
 	/* leave half the budget to the finalize aggregate above us */
@@ -2564,7 +2559,7 @@ choose_repartition_count(int nparticipants, int tuple_width)
  *
  * The floor on npages matters more than it looks: sts_end_write() always
  * flushes a full chunk, so every non-empty partition costs
- * REPARTITION_CHUNK_PAGES pages per participant regardless of how little data
+ * STS_CHUNK_PAGES pages per participant regardless of how little data
  * it holds.  That term is what stops the planner from choosing an exchange
  * when there is hardly anything to exchange.
  */
@@ -2581,7 +2576,7 @@ cost_repartition(Path *path, int disabled_nodes,
 
 	tuple_sz = MAXALIGN(width) + MAXALIGN(SizeofMinimalTupleHeader);
 	npages = ceil(tuples * tuple_sz / BLCKSZ);
-	npages = Max(npages, (double) npartitions * REPARTITION_CHUNK_PAGES);
+	npages = Max(npages, (double) npartitions * STS_CHUNK_PAGES);
 
 	/* hash the key columns */
 	startup_cost += tuples * numCols * cpu_operator_cost;

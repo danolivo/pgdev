@@ -34,7 +34,6 @@
  * at approximately the same rate as it allocates new chunks of memory to
  * insert them into.
  */
-#define STS_CHUNK_PAGES 4
 #define STS_CHUNK_HEADER_SIZE offsetof(SharedTuplestoreChunk, data)
 #define STS_CHUNK_DATA_SIZE (STS_CHUNK_PAGES * BLCKSZ - STS_CHUNK_HEADER_SIZE)
 
