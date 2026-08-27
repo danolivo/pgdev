@@ -294,17 +294,23 @@ sts_end_parallel_scan(SharedTuplestoreAccessor *accessor)
 /*
  * Delete every file backing this tuplestore.
  *
- * Only legal when the caller knows that nobody will read from the store again.
- * sts_end_parallel_scan() cannot do this itself because in general it would
- * need a reference count of live scanners; a caller that gives one whole store
- * to exactly one reader, as the Repartition node does, has that guarantee by
- * construction and can free the space as soon as the store is drained.
+ * Only legal when nobody will read from the store again.  sts_end_parallel_scan()
+ * cannot do this itself because in general it would need a reference count of
+ * live scanners: another participant may be between two chunks of the same
+ * store, and deleting under it loses its remaining tuples silently.  A caller
+ * that gives one whole store to exactly one reader, as the Repartition node
+ * does, has that guarantee by construction and can free the space as soon as
+ * the store is drained -- and says so by passing SHARED_TUPLESTORE_SINGLE_READER
+ * to sts_initialize().  The flag is what makes that promise checkable; the
+ * asserts below only cover this accessor, which is the one case that was never
+ * in doubt.
  */
 void
 sts_delete_files(SharedTuplestoreAccessor *accessor)
 {
 	int			i;
 
+	Assert((accessor->sts->flags & SHARED_TUPLESTORE_SINGLE_READER) != 0);
 	Assert(accessor->read_file == NULL);
 	Assert(accessor->write_file == NULL);
 
