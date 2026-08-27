@@ -30,6 +30,13 @@ typedef struct SharedTuplestoreAccessor SharedTuplestoreAccessor;
 #define SHARED_TUPLESTORE_SINGLE_PASS 0x01
 
 /*
+ * The store will be read by at most one participant, which may therefore
+ * delete the files as soon as it is done with them.  Required by
+ * sts_delete_files(); see the comment there.
+ */
+#define SHARED_TUPLESTORE_SINGLE_READER 0x02
+
+/*
  * The size, in pages, of the write buffer each participant keeps per
  * tuplestore, and the granularity at which those buffers are flushed.  Public
  * because the cost model of a node that opens one store per partition has to
