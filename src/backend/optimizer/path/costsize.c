@@ -2483,8 +2483,6 @@ cost_merge_append(Path *path, PlannerInfo *root,
  * relation, so the materialization is all overhead --- any savings will
  * occur only on rescan, which is estimated in cost_rescan.
  */
-#define REPARTITION_MAX_PARTITIONS	64
-
 /* Fixed costs of the exchange, in planner cost units. */
 #define REPARTITION_SETUP_COST				100.0
 #define REPARTITION_PARTITION_SETUP_COST	10.0
