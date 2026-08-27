@@ -2319,6 +2319,13 @@ typedef struct RepartitionState
 	int			rs_curpart;		/* partition being drained, or -1 */
 	bool		rs_attached;	/* still counted by the sink barrier? */
 	bool		rs_post_launch_seen;	/* ExecRepartitionPostLaunch() ran? */
+	/*
+	 * Set once this participant has written into the exchange, cleared
+	 * whenever the shared state is made fresh.  A sink phase that starts with
+	 * this already set means the exchange was never reset between two passes;
+	 * see ExecRepartition().
+	 */
+	bool		rs_shared_written;
 	TupleTableSlot *rs_slot;
 	MemoryContext rs_spillCxt;	/* holds STS accessors and their buffers */
 	int		   *rs_order;		/* partitions in descending size order */
