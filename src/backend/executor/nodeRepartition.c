@@ -377,6 +377,21 @@ ExecRepartition(PlanState *pstate)
 				if (!IsParallelWorker() && !node->rs_post_launch_seen)
 					elog(ERROR, "repartition node reached without post-launch fixup");
 
+				/*
+				 * ExecReScanRepartition() puts us back into RS_SINK, but the
+				 * shared state -- the distributor, the barrier, the files --
+				 * is reset by ExecRepartitionReInitializeDSM(), which
+				 * ExecParallelReinitialize() drives separately.  A rescan that
+				 * did not go through it would write into stores that have
+				 * already been read and deleted: no error, and a silently
+				 * short answer.  The planner cannot build such a plan today
+				 * (a parallel-aware node cannot be the inner side of a nested
+				 * loop, and the path is only ever built for an upper rel), so
+				 * this is a tripwire for the day one of those changes.
+				 */
+				if ((int32) (node->rs_rescan_count - node->rs_reinit_count) > 0)
+					elog(ERROR, "repartition node rescanned without reinitialising its shared state");
+
 				INSTR_TIME_SET_CURRENT(start);
 				repartition_sink(node);
 
@@ -552,6 +567,7 @@ ExecReScanRepartition(RepartitionState *node)
 	repartition_end_read(node, false);
 	node->rs_phase = RS_SINK;
 	node->rs_curpart = -1;
+	node->rs_rescan_count++;
 
 	if (node->ps.lefttree->chgParam == NULL)
 		ExecReScan(node->ps.lefttree);
@@ -784,7 +800,19 @@ ExecRepartitionReInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 
 	SharedFileSetDeleteAll(&pstate->fileset);
 
+	/*
+	 * The accessors and their buffers all live in rs_spillCxt, and we are
+	 * about to build a new set: reset the context rather than abandon the old
+	 * ones in it.  They are worth K * (accessor + STS_CHUNK_PAGES * BLCKSZ)
+	 * per rescan, which at K = 64 is megabytes per iteration.  Parallel hash
+	 * join does the same with its own spillCxt.  Must come after
+	 * repartition_end_read(), which still reads rs_accessors.
+	 */
+	MemoryContextReset(node->rs_spillCxt);
+
 	oldcxt = MemoryContextSwitchTo(node->rs_spillCxt);
+	node->rs_accessors = palloc(node->rs_npartitions *
+								sizeof(SharedTuplestoreAccessor *));
 	for (i = 0; i < node->rs_npartitions; i++)
 	{
 		char		name[32];
@@ -812,6 +840,7 @@ ExecRepartitionReInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 
 	/* the workers are launched again, so the fixup has to run again */
 	node->rs_post_launch_seen = false;
+	node->rs_reinit_count++;
 }
 
 void
@@ -823,6 +852,9 @@ ExecRepartitionInitializeWorker(RepartitionState *node,
 	int			i;
 
 	pstate = shm_toc_lookup(pwcxt->toc, node->ps.plan->plan_node_id, false);
+
+	/* a relaunched worker re-attaches; do not leak the previous set */
+	MemoryContextReset(node->rs_spillCxt);
 
 	oldcxt = MemoryContextSwitchTo(node->rs_spillCxt);
 	node->rs_accessors = palloc(pstate->npartitions *
