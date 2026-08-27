@@ -177,6 +177,14 @@ repartition_sink(RepartitionState *node)
 		if (shouldFree)
 			pfree(tuple);
 
+		/*
+		 * "repartition-sink-done" below only covers a clean end of the write
+		 * phase.  The interesting failures -- temp_file_limit, ENOSPC -- all
+		 * happen here, with some partitions written and the barrier not yet
+		 * reached, so give a test a way to stand exactly there.
+		 */
+		if (nwritten == 1000)
+			INJECTION_POINT("repartition-sink-midway", NULL);
 	}
 
 	INJECTION_POINT("repartition-sink-done", NULL);
@@ -723,7 +731,8 @@ ExecRepartitionInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 											   nparticipants,
 											   ParallelWorkerNumber + 1,
 											   0,	/* no per-tuple metadata */
-											   SHARED_TUPLESTORE_SINGLE_PASS,
+											   SHARED_TUPLESTORE_SINGLE_PASS |
+											   SHARED_TUPLESTORE_SINGLE_READER,
 											   &pstate->fileset,
 											   name);
 	}
@@ -823,7 +832,8 @@ ExecRepartitionReInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 											   pstate->nparticipants,
 											   ParallelWorkerNumber + 1,
 											   0,
-											   SHARED_TUPLESTORE_SINGLE_PASS,
+											   SHARED_TUPLESTORE_SINGLE_PASS |
+											   SHARED_TUPLESTORE_SINGLE_READER,
 											   &pstate->fileset,
 											   name);
 	}
