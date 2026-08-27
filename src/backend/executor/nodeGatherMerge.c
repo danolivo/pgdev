@@ -477,6 +477,17 @@ gather_merge_init(GatherMergeState *gm_state)
 	 * tuple (or a "done" indication), then re-read from remaining workers,
 	 * this time using wait mode.  Add all live readers (those producing at
 	 * least one tuple) to the heap.
+	 *
+	 * The order matters, and not only for latency.  The leader's own source
+	 * (i == 0) runs the subplan in this backend, so taking it in the nowait
+	 * pass is what guarantees the leader executes the plan below before it can
+	 * block on a worker's queue.  A parallel-aware node down there may make
+	 * every participant wait for every other one -- Repartition has a barrier
+	 * between its write and read phases -- and such a node relies on the
+	 * leader arriving.  Blocking on a worker queue before running the local
+	 * plan would leave the workers waiting at the barrier for a leader that is
+	 * waiting for them: no error, no timeout.  Keep the local source in the
+	 * first pass.
 	 */
 reread:
 	for (i = 0; i <= nreaders; i++)

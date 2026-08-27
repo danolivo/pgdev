@@ -1058,6 +1058,14 @@ typedef struct Memoize
 	Bitmapset  *keyparamids;
 } Memoize;
 
+/*
+ * Hard ceiling on the number of exchange partitions.  The planner picks K, the
+ * executor sizes shared memory and one temporary file per partition per
+ * participant from it, and both assert against this bound; keep it here so
+ * neither side can raise it on its own.
+ */
+#define REPARTITION_MAX_PARTITIONS	64
+
 /* ----------------
  *		repartition node
  *

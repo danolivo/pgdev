@@ -2319,6 +2319,9 @@ typedef struct RepartitionState
 	int			rs_curpart;		/* partition being drained, or -1 */
 	bool		rs_attached;	/* still counted by the sink barrier? */
 	bool		rs_post_launch_seen;	/* ExecRepartitionPostLaunch() ran? */
+	bool		rs_sink_started;	/* began writing, not yet past the barrier */
+	int64		rs_nread_part;	/* tuples read from the current partition */
+
 	/*
 	 * Set once this participant has written into the exchange, cleared
 	 * whenever the shared state is made fresh.  A sink phase that starts with
