@@ -27,6 +27,16 @@
  * running towards the barrier or gone.  That is why a materialising exchange
  * is used here rather than a pipelined one.
  *
+ * That argument assumes the leader reaches this node at all.  Under Gather it
+ * does: gather_readnext() polls the worker queues without blocking whenever
+ * the leader participates, so the leader always falls through to executing the
+ * plan locally.  Under Gather Merge it holds for a narrower reason -- the
+ * first pass of gather_merge_init() reads every source, the leader's own
+ * included, in nowait mode, and only then blocks on the worker queues.  If
+ * that order is ever reversed, every participant here waits on the barrier for
+ * a leader that is waiting on their tuple queues.  There is a matching comment
+ * in gather_merge_init(); this dependency is not expressible as an assertion.
+ *
  * Hash independence.  TupleHashTableHash() already ends with murmurhash32(),
  * and the Agg above us uses the low bits of that value for its simplehash
  * bucket index and the high bits for its spill partition number.  If this node
@@ -60,8 +70,11 @@
 #define REPARTITION_MULT		UINT64CONST(0x9E3779B97F4A7C15)
 #define REPARTITION_SALT		((uint32) 0x5bf03635)
 
+struct ParallelRepartitionState;
+
 static void repartition_sink(RepartitionState *node);
 static void repartition_end_read(RepartitionState *node, bool drained);
+
 
 /*
  * Partition number for the tuple in slot.
@@ -129,8 +142,20 @@ repartition_claim_next(RepartitionState *node)
 	uint32		idx;
 
 	idx = pg_atomic_fetch_add_u32(&node->rs_shared->distributor, 1);
+
+	/*
+	 * Each participant stops asking as soon as it is told there is nothing
+	 * left, so the counter can overshoot K by at most one per participant.
+	 * Anything beyond that means somebody is claiming after the drain, or the
+	 * counter was not reset for a rescan.
+	 */
+	Assert(idx < (uint32) (node->rs_npartitions + node->rs_shared->nparticipants));
+
 	if (idx >= (uint32) node->rs_npartitions)
 		return -1;
+
+	Assert(node->rs_order != NULL);
+	Assert(node->rs_order[idx] >= 0 && node->rs_order[idx] < node->rs_npartitions);
 	return node->rs_order[idx];
 }
 
@@ -146,12 +171,20 @@ static void
 repartition_sink(RepartitionState *node)
 {
 	PlanState  *outerNode = outerPlanState(node);
-	pg_atomic_uint64 *shared_counts = RepartitionPartTuples(node->rs_shared);
+	pg_atomic_uint64 *shared_counts;
 	int64	   *counts;
 	int64		nwritten = 0;
 	int64		payload = 0;
 	int			i;
 
+	Assert(node->rs_shared != NULL);
+	Assert(node->rs_accessors != NULL);
+	Assert(node->rs_phase == RS_SINK);
+	Assert(node->rs_attached);
+	Assert(node->rs_curpart == -1);
+	Assert(node->rs_npartitions == node->rs_shared->npartitions);
+
+	shared_counts = RepartitionPartTuples(node->rs_shared);
 	counts = palloc0(node->rs_npartitions * sizeof(int64));
 
 
@@ -168,8 +201,10 @@ repartition_sink(RepartitionState *node)
 
 		partno = repartition_partition_of(node, slot);
 		Assert(partno >= 0 && partno < node->rs_npartitions);
+		Assert(node->rs_accessors[partno] != NULL);
 
 		tuple = ExecFetchSlotMinimalTuple(slot, &shouldFree);
+		Assert(tuple->t_len >= SizeofMinimalTupleHeader);
 		sts_puttuple(node->rs_accessors[partno], NULL, tuple);
 		counts[partno]++;
 		nwritten++;
@@ -194,9 +229,17 @@ repartition_sink(RepartitionState *node)
 	 * uses them to hand out the biggest partitions first (§ ExecRepartition).
 	 */
 	for (i = 0; i < node->rs_npartitions; i++)
+	{
+		Assert(counts[i] >= 0);
 		if (counts[i] != 0)
 			pg_atomic_fetch_add_u64(&shared_counts[i], (uint64) counts[i]);
+	}
 	pfree(counts);
+
+#ifdef USE_ASSERT_CHECKING
+	/* one add, for the conservation checks in repartition_end_read() */
+	pg_atomic_fetch_add_u64(&node->rs_shared->assert_written, (uint64) nwritten);
+#endif
 
 	if (node->rs_instrument)
 	{
@@ -284,6 +327,25 @@ repartition_order_partitions(RepartitionState *node)
 	}
 	pfree(sizes);
 
+#ifdef USE_ASSERT_CHECKING
+	{
+		/*
+		 * The order is a permutation, and the drain hands partitions out by
+		 * index into it: a repeated or missing entry is a partition read twice
+		 * and one never read, which is silent.
+		 */
+		bool	   *seen = palloc0(k * sizeof(bool));
+
+		for (i = 0; i < k; i++)
+		{
+			Assert(node->rs_order[i] >= 0 && node->rs_order[i] < k);
+			Assert(!seen[node->rs_order[i]]);
+			seen[node->rs_order[i]] = true;
+		}
+		pfree(seen);
+	}
+#endif
+
 	/* Publish, or check against, the order everyone else computed. */
 	{
 		uint32		mine = repartition_order_checksum(node->rs_order, k);
@@ -316,6 +378,45 @@ repartition_end_read(RepartitionState *node, bool drained)
 		if (drained)
 			sts_delete_files(acc);
 
+#ifdef USE_ASSERT_CHECKING
+		if (drained)
+		{
+			ParallelRepartitionState *pstate = node->rs_shared;
+			uint64		written;
+			uint64		nread;
+			uint32		ndrained;
+
+			nread = pg_atomic_fetch_add_u64(&pstate->assert_read,
+											(uint64) node->rs_nread_part) +
+				(uint64) node->rs_nread_part;
+			written = pg_atomic_read_u64(&pstate->assert_written);
+			ndrained = pg_atomic_fetch_add_u32(&pstate->assert_drained, 1) + 1;
+			Assert(ndrained <= (uint32) pstate->npartitions);
+
+			/*
+			 * The weak check, on every partition: reading more than was
+			 * written is wrong however the query ends.  This is the only one a
+			 * query that stops early ever gets to run, and stopping early is
+			 * where a truncated exchange would be hardest to notice.
+			 *
+			 * written is complete from the moment the barrier releases, so
+			 * reading it here needs no synchronisation of its own.
+			 */
+			if (nread > written)
+				elog(PANIC, "repartition returned " UINT64_FORMAT " tuples but only " UINT64_FORMAT " were written",
+					 nread, written);
+
+			/*
+			 * The strong check, for whoever finishes the last partition: by
+			 * then every read has been added, so the two must be equal.
+			 */
+			if (ndrained == (uint32) pstate->npartitions && nread != written)
+				elog(PANIC, "repartition exchanged " UINT64_FORMAT " tuples but returned " UINT64_FORMAT,
+					 written, nread);
+		}
+#endif
+
+		node->rs_nread_part = 0;
 		node->rs_curpart = -1;
 		if (node->rs_instrument)
 			node->rs_instrument->nclaimed++;
@@ -368,6 +469,8 @@ ExecRepartition(PlanState *pstate)
 				if (IsParallelWorker())
 					INJECTION_POINT("repartition-worker-sink-start", NULL);
 
+				INJECTION_POINT("repartition-sink-start", NULL);
+
 				/*
 				 * The barrier counts one slot per *requested* worker; the
 				 * slots of the workers that never started are given back by
@@ -400,6 +503,14 @@ ExecRepartition(PlanState *pstate)
 				if ((int32) (node->rs_rescan_count - node->rs_reinit_count) > 0)
 					elog(ERROR, "repartition node rescanned without reinitialising its shared state");
 
+				/*
+				 * From here until we are through the barrier, leaving without
+				 * arriving would let the others past it early and truncate the
+				 * exchange without a word.  ExecShutdownRepartition() asserts
+				 * on this flag for exactly that reason.
+				 */
+				node->rs_sink_started = true;
+
 				INSTR_TIME_SET_CURRENT(start);
 				repartition_sink(node);
 
@@ -413,8 +524,13 @@ ExecRepartition(PlanState *pstate)
 				 * can be blocked writing into a full tuple queue while we sit
 				 * here.
 				 */
+				INJECTION_POINT("repartition-before-barrier", NULL);
+
 				BarrierArriveAndWait(&node->rs_shared->sink_barrier,
 									 WAIT_EVENT_REPARTITION_SINK);
+
+				node->rs_sink_started = false;
+				INJECTION_POINT("repartition-after-barrier", NULL);
 
 				/*
 				 * Everyone who was going to write has written.  If the fixup
@@ -465,6 +581,9 @@ ExecRepartition(PlanState *pstate)
 						return NULL;
 					}
 					node->rs_curpart = partno;
+					node->rs_nread_part = 0;
+					Assert(node->rs_accessors[partno] != NULL);
+					INJECTION_POINT("repartition-drain-claim", NULL);
 					sts_begin_parallel_scan(node->rs_accessors[partno]);
 				}
 
@@ -477,6 +596,9 @@ ExecRepartition(PlanState *pstate)
 					 * the next call overwrites.  Fine for Agg, which copies
 					 * into its hash table; any future consumer must be told.
 					 */
+#ifdef USE_ASSERT_CHECKING
+					node->rs_nread_part++;
+#endif
 					if (node->rs_instrument)
 						node->rs_instrument->ntuples_read++;
 					return ExecStoreMinimalTuple(tuple, node->rs_slot, false);
@@ -517,10 +639,28 @@ ExecInitRepartition(Repartition *node, EState *estate, int eflags)
 		while ((1 << bits) < node->npartitions)
 			bits++;
 		rstate->rs_part_shift = 32 - bits;
+
+		/*
+		 * bits == 0 gives a shift of 32, which is undefined on a uint32 and
+		 * is why repartition_partition_of() special-cases it.
+		 */
+		Assert(bits >= 0 && bits <= 6);
+		Assert((1 << bits) == node->npartitions);
 	}
+	Assert(node->npartitions > 0 &&
+		   node->npartitions <= REPARTITION_MAX_PARTITIONS);
+	Assert(node->npartitions == pg_nextpower2_32(node->npartitions));
+	Assert(node->numCols > 0);
+	Assert(node->plan.parallel_aware);
+
 	rstate->rs_phase = RS_SINK;
 	rstate->rs_curpart = -1;
 	rstate->rs_attached = false;
+	rstate->rs_post_launch_seen = false;
+	rstate->rs_sink_started = false;
+	rstate->rs_nread_part = 0;
+	rstate->rs_reinit_count = 0;
+	rstate->rs_rescan_count = 0;
 	rstate->rs_shared = NULL;
 	rstate->rs_accessors = NULL;
 	rstate->rs_order = NULL;
@@ -593,6 +733,29 @@ ExecShutdownRepartition(RepartitionState *node)
 	 * touch nothing shared beyond our own barrier slot and our own accessors:
 	 * the other participants are still running.
 	 */
+	/*
+	 * Detaching from the barrier is only safe once this participant has either
+	 * arrived at it or written nothing.  Detaching in between reduces the
+	 * party and lets everyone else through early, and what they then read is a
+	 * partially written exchange -- a short answer with no error anywhere.  No
+	 * caller does this today: ExecShutdownNode() runs after the plan has
+	 * stopped producing tuples, and this node produces none before the
+	 * barrier.  That is a property of the callers, not of this code, so check
+	 * it here rather than trust it.
+	 */
+	Assert(!node->rs_sink_started);
+
+	/*
+	 * No guard check here, tempting as it is: this function runs twice, once
+	 * from ExecShutdownNode() while the segment is still mapped and again from
+	 * ExecEndRepartition() after ExecParallelCleanup() has destroyed the
+	 * parallel context, and by then rs_shared points into unmapped memory.
+	 * The prototype gets away with reading it only because rs_attached is
+	 * false by that point.  The guards are checked instead at every point that
+	 * is provably inside the parallel region: post-launch, worker attach,
+	 * re-initialise, the end of the drain, and instrumentation retrieval,
+	 * which ExecParallelCleanup() calls before the detach.
+	 */
 	repartition_end_read(node, false);
 
 	if (node->rs_attached)
@@ -619,42 +782,67 @@ ExecShutdownRepartition(RepartitionState *node)
  *
  * *instrument_offset is set to 0 when ninstrument is 0.
  */
-static Size
-repartition_dsm_size(int npartitions, int nparticipants, int ninstrument,
-					 Size *instrument_offset)
+/*
+ * repartition_layout
+ *		Decide where everything lives inside the single DSM allocation.
+ *
+ * Called once by the leader, for the estimate and again for the real thing;
+ * the result is then stored in the shared state and never recomputed.  See
+ * RepartitionLayout in repartition.h for the picture.
+ *
+ */
+static void
+repartition_layout(int npartitions, int nparticipants, int ninstrument,
+				   RepartitionLayout *layout)
 {
 	Size		size;
 
-	Assert(npartitions > 0 && nparticipants > 0);
-	Assert(instrument_offset != NULL);
+	Assert(npartitions > 0 && npartitions <= REPARTITION_MAX_PARTITIONS);
+	Assert(npartitions == pg_nextpower2_32(npartitions));
+	Assert(nparticipants > 0);
+	Assert(ninstrument == 0 || ninstrument == nparticipants - 1);
+	Assert(layout != NULL);
 
 	size = MAXALIGN(sizeof(ParallelRepartitionState));
-	size = add_size(size, MAXALIGN(npartitions * sizeof(pg_atomic_uint64)));
-	size = add_size(size, mul_size(MAXALIGN(sts_estimate(nparticipants)),
-								   npartitions));
+
+	layout->counts_offset = size;
+	size = add_size(size, MAXALIGN(mul_size(npartitions,
+											sizeof(pg_atomic_uint64))));
+
+	layout->sts_size = MAXALIGN(sts_estimate(nparticipants));
+	layout->sts_stride = layout->sts_size;
+	layout->sts_offset = size;
+	size = add_size(size, mul_size(layout->sts_stride, npartitions));
+
 	if (ninstrument > 0)
 	{
-		*instrument_offset = size;
-		size = add_size(size, offsetof(SharedRepartitionInfo, instrument));
-		size = add_size(size, mul_size(ninstrument,
-									   sizeof(RepartitionInstrumentation)));
+		layout->instrument_offset = size;
+		layout->instrument_size = RepartitionSharedInfoSize(ninstrument);
+		size = add_size(size, MAXALIGN(layout->instrument_size));
 	}
 	else
-		*instrument_offset = 0;
+	{
+		layout->instrument_offset = 0;
+		layout->instrument_size = 0;
+	}
 
-	return size;
+	layout->alloc_size = size;
+
+	Assert(layout->counts_offset == MAXALIGN(layout->counts_offset));
+	Assert(layout->sts_offset == MAXALIGN(layout->sts_offset));
+	Assert(layout->instrument_offset == MAXALIGN(layout->instrument_offset));
+	Assert(layout->alloc_size == MAXALIGN(layout->alloc_size));
+	Assert(layout->alloc_size < MaxAllocSize);
 }
 
 void
 ExecRepartitionEstimate(RepartitionState *node, ParallelContext *pcxt)
 {
-	Size		size;
-	Size		instrument_offset;
+	RepartitionLayout layout;
 
-	size = repartition_dsm_size(node->rs_npartitions, pcxt->nworkers + 1,
-								node->ps.instrument ? pcxt->nworkers : 0,
-								&instrument_offset);
-	shm_toc_estimate_chunk(&pcxt->estimator, size);
+	repartition_layout(node->rs_npartitions, pcxt->nworkers + 1,
+					   node->ps.instrument ? pcxt->nworkers : 0, &layout);
+	shm_toc_estimate_chunk(&pcxt->estimator, layout.alloc_size);
 	shm_toc_estimate_keys(&pcxt->estimator, 1);
 }
 
@@ -662,12 +850,17 @@ void
 ExecRepartitionInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 {
 	ParallelRepartitionState *pstate;
+	RepartitionLayout layout;
 	MemoryContext oldcxt;
 	int			nparticipants = pcxt->nworkers + 1;
 	int			ninstrument;
-	Size		size;
-	Size		instrument_offset;
 	int			i;
+
+	Assert(node->rs_shared == NULL);		/* once per execution, before launch */
+	Assert(node->rs_npartitions > 0 &&
+		   node->rs_npartitions <= REPARTITION_MAX_PARTITIONS);
+	Assert(node->rs_npartitions == pg_nextpower2_32(node->rs_npartitions));
+	Assert(!IsParallelWorker());
 
 	/*
 	 * Must be first.  With no real segment pcxt->toc is still valid (it is
@@ -679,22 +872,41 @@ ExecRepartitionInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 		return;
 
 	ninstrument = node->ps.instrument ? pcxt->nworkers : 0;
-	size = repartition_dsm_size(node->rs_npartitions, nparticipants,
-								ninstrument, &instrument_offset);
-	pstate = shm_toc_allocate(pcxt->toc, size);
-	memset(pstate, 0, size);
+	repartition_layout(node->rs_npartitions, nparticipants, ninstrument,
+					   &layout);
+	pstate = shm_toc_allocate(pcxt->toc, layout.alloc_size);
+	memset(pstate, 0, layout.alloc_size);
 	shm_toc_insert(pcxt->toc, node->ps.plan->plan_node_id, pstate);
 
+	/*
+	 * magic first: every accessor asserts on it, so anything that reads this
+	 * area before this point is reading a zeroed struct and will say so.
+	 */
+	pstate->magic = REPARTITION_MAGIC;
 	pstate->npartitions = node->rs_npartitions;
 	pstate->nparticipants = nparticipants;
-	pstate->instrument_offset = instrument_offset;
+	pstate->ninstrument = ninstrument;
+	pstate->layout = layout;
 	pg_atomic_init_u32(&pstate->distributor, 0);
 	pg_atomic_init_u32(&pstate->order_checksum, 0);
+	pg_atomic_init_u64(&pstate->assert_written, 0);
+	pg_atomic_init_u64(&pstate->assert_read, 0);
+	pg_atomic_init_u32(&pstate->assert_drained, 0);
 	for (i = 0; i < node->rs_npartitions; i++)
 		pg_atomic_init_u64(&RepartitionPartTuples(pstate)[i], 0);
 
 	if (ninstrument > 0)
-		RepartitionSharedInfo(pstate)->num_workers = ninstrument;
+	{
+		/*
+		 * Set num_workers through the raw offset: RepartitionSharedInfo()
+		 * asserts on the value we are about to write.
+		 */
+		SharedRepartitionInfo *si = (SharedRepartitionInfo *)
+			((char *) pstate + pstate->layout.instrument_offset);
+
+		si->num_workers = ninstrument;
+		Assert(RepartitionSharedInfo(pstate) == si);
+	}
 
 	/*
 	 * The barrier must already account for every participant before any of
@@ -741,6 +953,7 @@ ExecRepartitionInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 	node->rs_shared = pstate;
 	node->rs_attached = true;
 	node->rs_post_launch_seen = false;
+	node->rs_sink_started = false;
 
 	/*
 	 * The leader's own counters stay in backend-local memory, as they do for
@@ -775,6 +988,12 @@ ExecRepartitionPostLaunch(RepartitionState *node, ParallelContext *pcxt,
 	if (node->rs_shared == NULL)
 		return;
 
+	Assert(!IsParallelWorker());
+	Assert(pcxt->nworkers_launched >= 0 &&
+		   pcxt->nworkers_launched <= pcxt->nworkers);
+	Assert(node->rs_shared->nparticipants == pcxt->nworkers + 1);
+	Assert(!node->rs_post_launch_seen);		/* exactly once per launch */
+
 	ncancel = pcxt->nworkers - pcxt->nworkers_launched;
 	if (!leader_participates)
 	{
@@ -798,6 +1017,8 @@ ExecRepartitionReInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 	if (pstate == NULL)
 		return;
 
+	Assert(!IsParallelWorker());
+
 	/*
 	 * sts_reinitialize() is not enough and is in fact unused in the tree: it
 	 * resets read_page only, leaving the data in the files and npages
@@ -818,6 +1039,7 @@ ExecRepartitionReInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 	 * repartition_end_read(), which still reads rs_accessors.
 	 */
 	MemoryContextReset(node->rs_spillCxt);
+	node->rs_accessors = NULL;
 
 	oldcxt = MemoryContextSwitchTo(node->rs_spillCxt);
 	node->rs_accessors = palloc(node->rs_npartitions *
@@ -841,6 +1063,9 @@ ExecRepartitionReInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 
 	pg_atomic_write_u32(&pstate->distributor, 0);
 	pg_atomic_write_u32(&pstate->order_checksum, 0);
+	pg_atomic_write_u64(&pstate->assert_written, 0);
+	pg_atomic_write_u64(&pstate->assert_read, 0);
+	pg_atomic_write_u32(&pstate->assert_drained, 0);
 	for (i = 0; i < node->rs_npartitions; i++)
 		pg_atomic_write_u64(&RepartitionPartTuples(pstate)[i], 0);
 	BarrierInit(&pstate->sink_barrier, 0);
@@ -850,7 +1075,9 @@ ExecRepartitionReInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 
 	/* the workers are launched again, so the fixup has to run again */
 	node->rs_post_launch_seen = false;
+	node->rs_sink_started = false;
 	node->rs_reinit_count++;
+
 }
 
 void
@@ -863,8 +1090,23 @@ ExecRepartitionInitializeWorker(RepartitionState *node,
 
 	pstate = shm_toc_lookup(pwcxt->toc, node->ps.plan->plan_node_id, false);
 
+	/*
+	 * The plan and the shared state are two sources of truth for K: this node
+	 * takes the partition count from the shared state below, but
+	 * repartition_partition_of() shifts by rs_part_shift, which was computed
+	 * from the plan in ExecInitRepartition().  They agree because the plan is
+	 * the same everywhere -- but if they ever stop agreeing, tuples land in
+	 * rs_accessors[] past its end, and that is a heap corruption in a worker
+	 * with no proximate cause.
+	 */
+	Assert(pstate->magic == REPARTITION_MAGIC);
+	Assert(pstate->npartitions == node->rs_npartitions);
+	Assert(pstate->nparticipants > ParallelWorkerNumber + 1);
+	Assert(IsParallelWorker());
+
 	/* a relaunched worker re-attaches; do not leak the previous set */
 	MemoryContextReset(node->rs_spillCxt);
+	node->rs_accessors = NULL;
 
 	oldcxt = MemoryContextSwitchTo(node->rs_spillCxt);
 	node->rs_accessors = palloc(pstate->npartitions *
@@ -905,12 +1147,14 @@ ExecRepartitionRetrieveInstrumentation(RepartitionState *node)
 
 	if (node->rs_shared == NULL)
 		return;
+
+	Assert(!IsParallelWorker());
+
 	si = RepartitionSharedInfo(node->rs_shared);
 	if (si == NULL)
 		return;
 
-	size = offsetof(SharedRepartitionInfo, instrument) +
-		si->num_workers * sizeof(RepartitionInstrumentation);
+	size = RepartitionSharedInfoSize(si->num_workers);
 	node->rs_shared_info = palloc(size);
 	memcpy(node->rs_shared_info, si, size);
 }

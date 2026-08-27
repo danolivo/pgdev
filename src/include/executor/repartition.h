@@ -40,21 +40,53 @@ typedef struct SharedRepartitionInfo
 } SharedRepartitionInfo;
 
 /*
+ * Stamped into the head of the allocation.  Catches a stale or mistyped
+ * shm_toc lookup before the result is dereferenced as something else.
+ */
+#define REPARTITION_MAGIC		((uint32) 0x52505254)	/* "RPRT" */
+
+
+/*
+ * Where everything lives inside the single allocation, decided once in
+ * repartition_layout() and never recomputed.  Recomputing an offset at the
+ * point of use is how two functions that must agree stop agreeing, so the
+ * accessors below read these fields instead and bounds-check themselves
+ * against alloc_size.
+ *
+ *	 [ ParallelRepartitionState ][ counts[K] ]
+ *	 [ SharedTuplestore x K ]
+ *	 [ SharedRepartitionInfo -- only when instrumenting ]
+ *
+ * Every area start is MAXALIGNed, which is what makes the int64s and the
+ * atomics inside them addressable everywhere: MAXIMUM_ALIGNOF is by definition
+ * the strictest alignment any C type on the platform needs.  Do not replace
+ * these with sizeof-based arithmetic at the point of use.
+ */
+typedef struct RepartitionLayout
+{
+	Size		alloc_size;		/* total bytes handed out by shm_toc_allocate */
+	Size		counts_offset;	/* per-partition tuple counters */
+	Size		sts_offset;		/* first SharedTuplestore */
+	Size		sts_size;		/* bytes one SharedTuplestore occupies */
+	Size		sts_stride;		/* bytes from one to the next */
+	Size		instrument_offset;	/* 0 when not instrumenting */
+	Size		instrument_size;	/* 0 when not instrumenting */
+} RepartitionLayout;
+
+/*
  * Shared state for one Repartition node.  A single shm_toc entry, keyed by
  * plan_node_id, holds all of it: shm_toc_insert() does not detect duplicate
  * keys and shm_toc_lookup() returns the first match, so a second entry for the
- * instrumentation would be unreachable.  Layout:
- *
- *	 [ ParallelRepartitionState                 ]
- *	 [ pg_atomic_uint64 part_tuples[npartitions] ]
- *	 [ SharedTuplestore x npartitions            ]
- *	 [ SharedRepartitionInfo   -- only when instrumenting ]
+ * instrumentation would be unreachable.
  */
 typedef struct ParallelRepartitionState
 {
+	uint32		magic;			/* REPARTITION_MAGIC */
 	int			npartitions;	/* K; power of two */
 	int			nparticipants;	/* pcxt->nworkers + 1; sizes each STS */
-	Size		instrument_offset;	/* 0 when not instrumenting */
+	int			ninstrument;	/* participants with a shared counter slot */
+
+	RepartitionLayout layout;
 
 	/*
 	 * Hands out partitions during the drain phase.  A plain fetch-add, no
@@ -72,6 +104,25 @@ typedef struct ParallelRepartitionState
 	pg_atomic_uint32 order_checksum;
 
 	/*
+	 * Conservation of tuples.  Maintained and checked only in assert-enabled
+	 * builds -- the counter that feeds assert_read is incremented per tuple,
+	 * and that is not a cost to impose on a production drain loop for a check
+	 * that has never fired.  The fields stay in the struct unconditionally so
+	 * that the layout does not depend on the build.
+	 *
+	 * Two checks, because they cover different things.  Whoever drains the
+	 * last partition can compare the totals: every write precedes the barrier
+	 * and every read has been added by then, so written must equal read.  A
+	 * query that stops early -- LIMIT, a cursor, an error above us -- never
+	 * reaches that point, which is precisely where a silent truncation would
+	 * be least visible, so every partition also checks the weaker
+	 * read <= written as it finishes.
+	 */
+	pg_atomic_uint64 assert_written;
+	pg_atomic_uint64 assert_read;
+	pg_atomic_uint32 assert_drained;
+
+	/*
 	 * Separates the sink phase from the drain phase.  Slots are reserved by
 	 * the leader before any worker exists; see ExecRepartitionInitializeDSM().
 	 */
@@ -80,11 +131,44 @@ typedef struct ParallelRepartitionState
 	SharedFileSet fileset;
 } ParallelRepartitionState;
 
+/*
+ * Bounds-checked address of one area inside the allocation.
+ *
+ * The asserts are the whole point of routing every access through here: an
+ * offset that has drifted, or a length that has outgrown its area, is caught
+ * at the first dereference instead of quietly landing in the next area and
+ * showing up as a corrupted tuplestore an hour later.
+ */
+static inline char *
+RepartitionArea(ParallelRepartitionState *pstate, Size offset, Size len)
+{
+	Assert(pstate->magic == REPARTITION_MAGIC);
+	Assert(offset >= MAXALIGN(sizeof(ParallelRepartitionState)));
+	Assert(offset == MAXALIGN(offset));
+	Assert(len > 0);
+	Assert(offset + len <= pstate->layout.alloc_size);
+
+	return (char *) pstate + offset;
+}
+
 static inline pg_atomic_uint64 *
 RepartitionPartTuples(ParallelRepartitionState *pstate)
 {
-	return (pg_atomic_uint64 *) ((char *) pstate +
-								 MAXALIGN(sizeof(ParallelRepartitionState)));
+	pg_atomic_uint64 *counts;
+
+	counts = (pg_atomic_uint64 *)
+		RepartitionArea(pstate, pstate->layout.counts_offset,
+						pstate->npartitions * sizeof(pg_atomic_uint64));
+
+	/*
+	 * pg_atomic_init_u64() asserts this itself where 64-bit atomics are
+	 * native, but not where they are simulated with a spinlock -- and the
+	 * simulated build is exactly the one where a misaligned uint64 would
+	 * still be a SIGBUS on a strict-alignment machine.
+	 */
+	AssertPointerAlignment(counts, 8);
+
+	return counts;
 }
 
 /*
@@ -95,21 +179,52 @@ RepartitionPartTuples(ParallelRepartitionState *pstate)
 static inline SharedTuplestore *
 RepartitionSTS(ParallelRepartitionState *pstate, int n)
 {
-	char	   *base = (char *) pstate +
-		MAXALIGN(sizeof(ParallelRepartitionState)) +
-		MAXALIGN(pstate->npartitions * sizeof(pg_atomic_uint64));
+	Assert(n >= 0 && n < pstate->npartitions);
+	Assert(pstate->layout.sts_size == MAXALIGN(sts_estimate(pstate->nparticipants)));
+	Assert(pstate->layout.sts_stride == pstate->layout.sts_size);
 
 	return (SharedTuplestore *)
-		(base + MAXALIGN(sts_estimate(pstate->nparticipants)) * n);
+		RepartitionArea(pstate,
+						pstate->layout.sts_offset +
+						pstate->layout.sts_stride * (Size) n,
+						pstate->layout.sts_size);
+}
+
+/* Size of the instrumentation area for n participants' worth of counters. */
+static inline Size
+RepartitionSharedInfoSize(int nworkers)
+{
+	Assert(nworkers >= 0);
+	return add_size(offsetof(SharedRepartitionInfo, instrument),
+					mul_size(nworkers, sizeof(RepartitionInstrumentation)));
 }
 
 static inline SharedRepartitionInfo *
 RepartitionSharedInfo(ParallelRepartitionState *pstate)
 {
-	if (pstate->instrument_offset == 0)
+	SharedRepartitionInfo *si;
+
+	Assert(pstate->magic == REPARTITION_MAGIC);
+	if (pstate->layout.instrument_offset == 0)
 		return NULL;
-	return (SharedRepartitionInfo *)
-		((char *) pstate + pstate->instrument_offset);
+
+	si = (SharedRepartitionInfo *)
+		RepartitionArea(pstate, pstate->layout.instrument_offset,
+						pstate->layout.instrument_size);
+
+	/*
+	 * num_workers is written once by the leader before any worker exists, so
+	 * reading it here is not a race.  Compare it against what the layout was
+	 * built for rather than against nparticipants - 1: the two happen to be
+	 * equal today, but only because of how ExecRepartitionInitializeDSM()
+	 * chooses ninstrument, and an assertion that encodes a coincidence stops
+	 * catching anything the moment the coincidence ends.
+	 */
+	Assert(si->num_workers == pstate->ninstrument);
+	Assert(pstate->layout.instrument_size ==
+		   RepartitionSharedInfoSize(pstate->ninstrument));
+
+	return si;
 }
 
 #endif							/* REPARTITION_H */
