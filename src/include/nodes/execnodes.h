@@ -2318,6 +2318,7 @@ typedef struct RepartitionState
 	RepartitionPhase rs_phase;
 	int			rs_curpart;		/* partition being drained, or -1 */
 	bool		rs_attached;	/* still counted by the sink barrier? */
+	bool		rs_post_launch_seen;	/* ExecRepartitionPostLaunch() ran? */
 	TupleTableSlot *rs_slot;
 	MemoryContext rs_spillCxt;	/* holds STS accessors and their buffers */
 	int		   *rs_order;		/* partitions in descending size order */

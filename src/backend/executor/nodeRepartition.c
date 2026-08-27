@@ -316,6 +316,23 @@ ExecRepartition(PlanState *pstate)
 				if (IsParallelWorker())
 					INJECTION_POINT("repartition-worker-sink-start", NULL);
 
+				/*
+				 * The barrier counts one slot per *requested* worker; the
+				 * slots of the workers that never started are given back by
+				 * ExecRepartitionPostLaunch(), which Gather and Gather Merge
+				 * call for us.  If that call is ever lost -- a third launch
+				 * site, a reordering in ExecGather(), a back-patch -- the
+				 * barrier can no longer be released and every participant
+				 * waits on RepartitionSink forever: no error, no timeout, and
+				 * nothing in the log.  Refuse to enter the wait instead.
+				 *
+				 * Only the leader can check this, and only when it takes part
+				 * in the scan: it is the one that runs the fixup, and it is
+				 * guaranteed to run it before it first executes this node.
+				 */
+				if (!IsParallelWorker() && !node->rs_post_launch_seen)
+					elog(ERROR, "repartition node reached without post-launch fixup");
+
 				INSTR_TIME_SET_CURRENT(start);
 				repartition_sink(node);
 
@@ -331,6 +348,14 @@ ExecRepartition(PlanState *pstate)
 				 */
 				BarrierArriveAndWait(&node->rs_shared->sink_barrier,
 									 WAIT_EVENT_REPARTITION_SINK);
+
+				/*
+				 * Everyone who was going to write has written.  If the fixup
+				 * had been skipped we could not have got here at all, so this
+				 * only documents the invariant for the leader's sake.
+				 */
+				Assert(IsParallelWorker() || node->rs_post_launch_seen);
+
 				BarrierDetach(&node->rs_shared->sink_barrier);
 				node->rs_attached = false;
 
@@ -645,6 +670,7 @@ ExecRepartitionInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 
 	node->rs_shared = pstate;
 	node->rs_attached = true;
+	node->rs_post_launch_seen = false;
 
 	/*
 	 * The leader's own counters stay in backend-local memory, as they do for
@@ -688,6 +714,8 @@ ExecRepartitionPostLaunch(RepartitionState *node, ParallelContext *pcxt,
 
 	for (i = 0; i < ncancel; i++)
 		BarrierDetach(&node->rs_shared->sink_barrier);
+
+	node->rs_post_launch_seen = true;
 }
 
 void
@@ -735,6 +763,9 @@ ExecRepartitionReInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 	for (i = 0; i < pstate->nparticipants; i++)
 		BarrierAttach(&pstate->sink_barrier);
 	node->rs_attached = true;
+
+	/* the workers are launched again, so the fixup has to run again */
+	node->rs_post_launch_seen = false;
 }
 
 void
