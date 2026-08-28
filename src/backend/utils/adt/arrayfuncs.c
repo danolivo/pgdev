@@ -5675,18 +5675,30 @@ accumArrayResultArr(ArrayBuildStateArr *astate,
 			/*
 			 * First input with nulls; we must retrospectively handle any
 			 * previous inputs by marking all their items non-null.
+			 *
+			 * palloc0, not palloc: array_bitmap_copy() sets individual bits,
+			 * but it does so by reading the destination byte and writing it
+			 * back, so the bits past the last item have to already have a
+			 * value.  Otherwise they reach the finished array as
+			 * uninitialised bytes, and from there anything that writes that
+			 * array out verbatim -- a spill file, a tuple queue -- writes
+			 * uninitialised bytes too.
 			 */
 			astate->aitems = pg_nextpower2_32(Max(256, newnitems + 1));
-			astate->nullbitmap = (bits8 *) palloc((astate->aitems + 7) / 8);
+			astate->nullbitmap = (bits8 *) palloc0((astate->aitems + 7) / 8);
 			array_bitmap_copy(astate->nullbitmap, 0,
 							  NULL, 0,
 							  astate->nitems);
 		}
 		else if (newnitems > astate->aitems)
 		{
+			int			oldbytes = (astate->aitems + 7) / 8;
+
 			astate->aitems = Max(astate->aitems * 2, newnitems);
+			/* repalloc0, for the same reason; it zeroes what it adds */
 			astate->nullbitmap = (bits8 *)
-				repalloc(astate->nullbitmap, (astate->aitems + 7) / 8);
+				repalloc0(astate->nullbitmap, oldbytes,
+						  (astate->aitems + 7) / 8);
 		}
 		array_bitmap_copy(astate->nullbitmap, astate->nitems,
 						  ARR_NULLBITMAP(arg), 0,
