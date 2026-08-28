@@ -562,16 +562,21 @@ ExecRepartition(PlanState *pstate)
 				 * ExecReScanRepartition() puts us back into RS_SINK, but the
 				 * shared state -- the distributor, the barrier, the files --
 				 * is reset by ExecRepartitionReInitializeDSM(), which
-				 * ExecParallelReinitialize() drives separately.  A rescan that
-				 * did not go through it would write into stores that have
-				 * already been read and deleted: no error, and a silently
-				 * short answer.  The planner cannot build such a plan today
-				 * (a parallel-aware node cannot be the inner side of a nested
-				 * loop, and the path is only ever built for an upper rel), so
-				 * this is a tripwire for the day one of those changes.
+				 * ExecParallelReinitialize() drives separately.  A second sink
+				 * phase that did not go through it would write into stores
+				 * that have already been read and deleted: no error, and a
+				 * silently short answer.
+				 *
+				 * Do not try to infer that from the number of ExecReScan()
+				 * calls.  ExecNestLoop() rescans its inner plan before the
+				 * first scan as well as between scans, and the first setup of
+				 * the shared state is ExecRepartitionInitializeDSM(), not the
+				 * ReInitialize path, so the two counts are legitimately
+				 * unequal.  What matters is only whether anything was written
+				 * since the state was last made fresh.
 				 */
-				if ((int32) (node->rs_rescan_count - node->rs_reinit_count) > 0)
-					elog(ERROR, "repartition node rescanned without reinitialising its shared state");
+				if (node->rs_shared_written)
+					elog(ERROR, "repartition node reused without reinitialising its shared state");
 
 				/*
 				 * From here until we are through the barrier, leaving without
@@ -580,6 +585,7 @@ ExecRepartition(PlanState *pstate)
 				 * on this flag for exactly that reason.
 				 */
 				node->rs_sink_started = true;
+				node->rs_shared_written = true;
 
 				INSTR_TIME_SET_CURRENT(start);
 				repartition_sink(node);
@@ -729,8 +735,7 @@ ExecInitRepartition(Repartition *node, EState *estate, int eflags)
 	rstate->rs_post_launch_seen = false;
 	rstate->rs_sink_started = false;
 	rstate->rs_nread_part = 0;
-	rstate->rs_reinit_count = 0;
-	rstate->rs_rescan_count = 0;
+	rstate->rs_shared_written = false;
 	rstate->rs_shared = NULL;
 	rstate->rs_accessors = NULL;
 	rstate->rs_order = NULL;
@@ -781,11 +786,15 @@ ExecReScanRepartition(RepartitionState *node)
 	 * ExecRepartitionReInitializeDSM(), which ExecParallelReinitialize()
 	 * drives from ExecReScanGather() -- the node is parallel_aware, so
 	 * ExecReScanGather() does not call ExecReScan() on us directly.
+	 *
+	 * In particular do not clear rs_shared_written here.  Whether the exchange
+	 * still holds a previous pass is a property of the shared state, and this
+	 * function is reached both before and after that state is reset; only the
+	 * two DSM entry points below know that it is fresh.
 	 */
 	repartition_end_read(node, false);
 	node->rs_phase = RS_SINK;
 	node->rs_curpart = -1;
-	node->rs_rescan_count++;
 
 	if (node->ps.lefttree->chgParam == NULL)
 		ExecReScan(node->ps.lefttree);
@@ -1114,6 +1123,7 @@ ExecRepartitionInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 	node->rs_attached = true;
 	node->rs_post_launch_seen = false;
 	node->rs_sink_started = false;
+	node->rs_shared_written = false;
 
 	/*
 	 * The leader's own counters stay in backend-local memory, as they do for
@@ -1246,7 +1256,7 @@ ExecRepartitionReInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 	/* the workers are launched again, so the fixup has to run again */
 	node->rs_post_launch_seen = false;
 	node->rs_sink_started = false;
-	node->rs_reinit_count++;
+	node->rs_shared_written = false;
 
 	repartition_paint_guards(pstate);
 }
@@ -1305,6 +1315,14 @@ ExecRepartitionInitializeWorker(RepartitionState *node,
 	 * of those, and give it back when we arrive or shut down.
 	 */
 	node->rs_attached = true;
+
+	/*
+	 * A worker is launched once per pass over the exchange and has written
+	 * nothing yet.  Set explicitly rather than relying on ExecInitRepartition()
+	 * having just run: a worker relaunched for a rescan re-attaches through
+	 * this same path.
+	 */
+	node->rs_shared_written = false;
 }
 
 /*
