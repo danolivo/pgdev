@@ -2491,6 +2491,16 @@ cost_merge_append(Path *path, PlannerInfo *root,
  * choose_repartition_count
  *		Pick the number of partitions for a Repartition node.
  *
+ * K is the one knob of the exchange, and the shapes it can produce form a
+ * single family rather than two cases to compare: at K = 1 the exchange
+ * funnels everything to one participant and the plan does what the existing
+ * leader-side shape does, at larger K the finalize step spreads out.  That is
+ * deliberate.  It means the planner never has to reason about "exchange or no
+ * exchange" as a discrete choice -- the degenerate point is priced by the same
+ * function as the rest, and since it charges for a materialisation the
+ * leader-side plan does not pay, it loses to that plan by construction rather
+ * than by a special case.
+ *
  * Oversubscribe relative to the participant count so that work stealing can
  * balance, and so that the algorithm does not depend on how many workers
  * actually start.  Cap by memory: during the sink phase each participant holds
@@ -2566,6 +2576,12 @@ choose_repartition_count(int nparticipants, int tuple_width)
  * The node is blocking, so everything the sink phase does lands in
  * startup_cost.  Each participant writes its own input and reads back roughly
  * the same volume (1/P of P times as much), so write and read are symmetric.
+ *
+ * At K = 1 this prices the funnel: one store, written by everyone and read by
+ * the leader.  The result is deliberately not free -- the exchange goes
+ * through temporary files where the leader-side plan goes through the tuple
+ * queues, measured at about 1.6x -- which is what keeps the planner from
+ * choosing the degenerate exchange over the plan it imitates.
  *
  * The floor on npages matters more than it looks: sts_end_write() always
  * flushes a full chunk, so every non-empty partition costs

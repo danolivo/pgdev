@@ -3,10 +3,50 @@
  * nodeRepartition.c
  *	  Redistribute tuples among parallel participants by hash.
  *
- * The node guarantees that every tuple whose partition-key columns are equal
- * (under the hash opfamily's equality operator) is handed to the same
- * participant.  That is exactly the precondition a Finalize Aggregate needs in
- * order to run below Gather instead of single-threaded in the leader.
+ * What this node produces is a property of its output, not a favour to the
+ * node above it: after it, the tuples of the parallel region are partitioned
+ * by hash of the partition-key columns, and every tuple whose key columns are
+ * equal (under the hash opfamily's equality operator) is held by the same
+ * participant.  State it that way round, because the property is the point.
+ * A finalize aggregate is merely its first consumer: partitioning by the
+ * grouping key is exactly what lets that aggregate run below Gather instead
+ * of single-threaded in the leader.  The same property is what a merge join
+ * on a redistributed key, a window function partitioned by key, or a parallel
+ * DISTINCT would need.
+ *
+ * PostgreSQL has had exactly one way to move tuples between participants --
+ * the tuple queues at Gather, a star with the leader in the middle and
+ * therefore a funnel.  This is the other one.  The literature has been settled
+ * on this since Gamma and Volcano: parallelism is local operators plus an
+ * exchange, and where you put the exchange is the whole game.  Nothing here
+ * knows about aggregation.
+ *
+ * The planner cannot yet reason about that property -- there is no notion of
+ * a path's distribution alongside its pathkeys -- so today the node is built
+ * in one place and consumed by one caller.  That is a limitation of the
+ * planner, not of the operator, and the day pathnodes.h grows a distribution
+ * property is the day this stops being a one-off.  Two consequences are
+ * already visible: a table already hash-partitioned on the grouping key gets
+ * no benefit because "already partitioned" cannot be expressed, and nothing
+ * would stop two exchanges on the same key appearing in one plan.
+ *
+ * What crosses the exchange.  Note what this node moves when it sits above a
+ * partial aggregate: partial aggregate values, not tuples.  The classic
+ * complaint about hash redistribution -- one heavy key sinks one participant
+ * -- is largely answered by that, because partial aggregation has already
+ * collapsed a heavy group to one row per participant before the exchange sees
+ * it.  Skew in the number of *groups* per partition remains, and that is what
+ * the size-ordered drain below is for.
+ *
+ * K = 1 is the degenerate exchange.  Everything lands in one partition and one
+ * participant does the whole finalize step; repartition_claim_next() gives
+ * that partition to the leader, so the shape matches the plan it degenerates
+ * to -- partial aggregates everywhere, one final aggregate in the leader --
+ * and the two shapes stay one family for the cost model to price by K.  It is
+ * not free: the funnel still goes through a shared tuplestore rather than the
+ * tuple queues, which measures about 1.6x the cost of the plan it imitates.
+ * Until the exchange learns to keep small partitions in memory, K = 1 exists
+ * to make the family continuous, not to be chosen.
  *
  * Execution has two phases separated by a barrier:
  *
@@ -144,6 +184,29 @@ static inline int
 repartition_claim_next(RepartitionState *node)
 {
 	uint32		idx;
+
+	/*
+	 * K = 1 is the degenerate exchange: there is nothing to redistribute,
+	 * every tuple went to the same store, and whoever reads it runs the whole
+	 * finalize step by itself.  Hand it to the leader.
+	 *
+	 * That is not an arbitrary choice.  With one partition this plan does
+	 * exactly what the plan it degenerates to does -- partial aggregates in
+	 * every participant, one final aggregate in the leader -- and the only
+	 * remaining difference is the transport, a shared tuplestore instead of
+	 * the Gather tuple queues.  Letting a worker win the race instead would
+	 * put the single final aggregate in a worker while the leader sat idle
+	 * waiting for it, which is worse than either plan.  Keeping the two
+	 * shapes on one continuum is also what lets the cost model treat them as
+	 * one family, priced by K, rather than as two cases to compare.
+	 *
+	 * When the leader does not execute the plan at all there is nobody to
+	 * prefer, so fall back to whoever asks first.
+	 */
+	if (node->rs_npartitions == 1 &&
+		node->rs_shared->leader_participates &&
+		IsParallelWorker())
+		return -1;
 
 	idx = pg_atomic_fetch_add_u32(&node->rs_shared->distributor, 1);
 
@@ -1113,6 +1176,14 @@ ExecRepartitionPostLaunch(RepartitionState *node, ParallelContext *pcxt,
 
 	for (i = 0; i < ncancel; i++)
 		BarrierDetach(&node->rs_shared->sink_barrier);
+
+	/*
+	 * Safe to publish here without synchronisation: this runs before the
+	 * leader executes the plan, and no participant can leave the sink barrier
+	 * until every one of them has arrived at it, the leader included when it
+	 * takes part.  Readers of this field all run after that point.
+	 */
+	node->rs_shared->leader_participates = leader_participates;
 
 	node->rs_post_launch_seen = true;
 }
