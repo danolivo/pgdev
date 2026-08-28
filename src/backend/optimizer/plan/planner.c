@@ -7367,6 +7367,7 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 	bool		can_sort = (extra->flags & GROUPING_CAN_USE_SORT) != 0;
 	List	   *havingQual = (List *) extra->havingQual;
 	AggClauseCosts *agg_final_costs = &extra->agg_final_costs;
+	bool		repartition_built = false;
 
 	if (can_sort)
 	{
@@ -7562,6 +7563,192 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 									 dNumGroups));
 		}
 	}
+
+	/*
+	 * Consider redistributing the partial aggregates between participants by
+	 * hash of the grouping key, so that the finalize aggregate can run below
+	 * Gather instead of single-threaded in the leader.  This wins when the
+	 * grouping is high-cardinality, i.e. when partial aggregation compresses
+	 * little and the leader would otherwise merge W * G tuples on its own.
+	 * The old shape is still built above and competes on cost.
+	 *
+	 * How much it wins by rests on dNumGroups, which is the estimate with the
+	 * widest error bars in the planner: measured on 44 cores, the exchange is
+	 * worth 4-5x when partial aggregation compresses poorly and costs 1.5x
+	 * when it compresses well, and which side of that line a query lands on is
+	 * decided by an ndistinct estimate.  The exposure is asymmetric in our
+	 * favour, but it is exposure.  The node is blocking and therefore knows
+	 * the true count before it commits to anything, so the eventual answer is
+	 * probably to choose K at execution time rather than here; K = 1 exists
+	 * partly so that such a choice has a floor to fall back to.
+	 *
+	 * Note also what cannot be expressed here.  A path has pathkeys but no
+	 * distribution, so a relation already hash-partitioned on the grouping key
+	 * -- where the exchange is pure waste -- looks the same to this code as
+	 * one that is not, and nothing stops two exchanges on the same key in one
+	 * plan.  Both want a distribution property on paths, which is a much
+	 * larger patch than this one.
+	 */
+	if ((can_hash || can_sort) &&
+		enable_parallel_repartition &&
+		partially_grouped_rel != NULL &&
+		partially_grouped_rel->partial_pathlist != NIL &&
+		grouped_rel->consider_parallel &&
+		grouped_rel->reloptkind == RELOPT_UPPER_REL &&
+		root->processed_groupClause != NIL &&
+		gd == NULL &&
+		grouping_is_hashable(root->processed_groupClause) &&
+		is_parallel_safe(root, (Node *) havingQual) &&
+		is_parallel_safe(root, (Node *) grouped_rel->reltarget->exprs))
+	{
+		Path	   *subpath = linitial(partially_grouped_rel->partial_pathlist);
+		Path	   *rpath;
+		double		divisor;
+		double		local_groups;
+		int			nparticipants;
+		int			npartitions;
+
+		nparticipants = subpath->parallel_workers +
+			(parallel_leader_participation ? 1 : 0);
+		nparticipants = Max(nparticipants, 1);
+		npartitions = choose_repartition_count(nparticipants,
+											   subpath->pathtarget->width);
+
+		/*
+		 * Groups per participant.  get_parallel_divisor() is the canonical
+		 * row divisor; its model (the leader spends 30% of its time servicing
+		 * each worker) is pessimistic for us, because the leader pulls its
+		 * share during the sink phase like everyone else and there is nothing
+		 * in the queues to service before the barrier.  Being pessimistic
+		 * here is the safe direction.
+		 */
+		divisor = get_parallel_divisor(subpath);
+		local_groups = clamp_row_est(dNumGroups / divisor);
+
+		rpath = (Path *) create_repartition_path(root, grouped_rel, subpath,
+												 root->processed_groupClause,
+												 npartitions);
+
+		if (can_hash)
+		{
+			add_partial_path(grouped_rel, (Path *)
+							 create_agg_path(root,
+											 grouped_rel,
+											 rpath,
+											 grouped_rel->reltarget,
+											 AGG_HASHED,
+											 AGGSPLIT_FINAL_DESERIAL,
+											 root->processed_groupClause,
+											 havingQual,
+											 agg_final_costs,
+											 local_groups));
+			repartition_built = true;
+		}
+
+		/*
+		 * Also consider finalizing by sort.  Measurement says this is not a
+		 * luxury: at high cardinality with a small work_mem the hashed
+		 * finalize spills recursively and loses to a plain sort, which is
+		 * exactly the plan the existing (leader-side) shape picks in that
+		 * regime.  Offering only the hashed variant handed the planner a
+		 * choice between an exchange plus heavy spilling and no exchange at
+		 * all, and it made the wrong one.
+		 *
+		 * Repartition produces no ordering, so the Sort is explicit.  Groups
+		 * are disjoint between participants, so gather_grouping_paths() may
+		 * legitimately put Gather Merge on top of this.
+		 */
+		if (can_sort && root->group_pathkeys != NIL)
+		{
+			List	   *groupby_pathkeys;
+			Path	   *spath;
+
+			if (list_length(root->group_pathkeys) > root->num_groupby_pathkeys)
+				groupby_pathkeys = list_copy_head(root->group_pathkeys,
+												  root->num_groupby_pathkeys);
+			else
+				groupby_pathkeys = root->group_pathkeys;
+
+			spath = (Path *) create_sort_path(root, grouped_rel, rpath,
+											  groupby_pathkeys, -1.0);
+
+			add_partial_path(grouped_rel, (Path *)
+							 create_agg_path(root,
+											 grouped_rel,
+											 spath,
+											 grouped_rel->reltarget,
+											 AGG_SORTED,
+											 AGGSPLIT_FINAL_DESERIAL,
+											 root->processed_groupClause,
+											 havingQual,
+											 agg_final_costs,
+											 local_groups));
+			repartition_built = true;
+		}
+
+		/*
+		 * Developer option.  There is no data shape that reliably forces this
+		 * plan through the cost model, which makes the shape hard to test and
+		 * impossible to test in the regimes the model rejects.  When the GUC
+		 * is set, penalise every competing path already collected for this
+		 * relation, leaving the exchange as the only undisabled candidate.
+		 * Our own paths are in partial_pathlist and are gathered below, so
+		 * they are untouched.
+		 */
+		if (debug_parallel_repartition)
+		{
+			ListCell   *lc2;
+
+			/*
+			 * Every path in the list is penalised by the same amount, which is
+			 * what keeps the list sorted by disabled_nodes and then by
+			 * total_cost -- the order add_path() requires and relies on for
+			 * the paths gather_grouping_paths() is about to add.  A penalty
+			 * applied to only some of them would have to re-sort the list.
+			 */
+			foreach(lc2, grouped_rel->pathlist)
+				((Path *) lfirst(lc2))->disabled_nodes++;
+
+#ifdef USE_ASSERT_CHECKING
+			{
+				Path	   *prev = NULL;
+
+				foreach(lc2, grouped_rel->pathlist)
+				{
+					Path	   *cur = (Path *) lfirst(lc2);
+
+					if (prev != NULL)
+						Assert(prev->disabled_nodes < cur->disabled_nodes ||
+							   (prev->disabled_nodes == cur->disabled_nodes &&
+								prev->total_cost <= cur->total_cost));
+					prev = cur;
+				}
+			}
+#endif
+		}
+
+		/*
+		 * The GUC only penalises the competition; it cannot conjure the
+		 * exchange into existence.  When the node could not be built -- no
+		 * hashable grouping, grouping sets, a parallel-unsafe target -- the
+		 * setting silently does nothing, and any test that trusts it to force
+		 * the shape is checking an ordinary plan.  Say so, so that at least
+		 * the developer who turned the GUC on can find out.  Tests must still
+		 * verify the plan shape themselves.
+		 */
+	}
+
+	/*
+	 * The GUC only penalises the competition; it cannot conjure the exchange
+	 * into existence.  When the node could not be built -- grouping sets, a
+	 * non-hashable grouping key, a parallel-unsafe target, a grouped rel that
+	 * is not an upper rel -- the setting silently does nothing, and a test
+	 * that trusts it to force the shape is checking an ordinary plan instead.
+	 * Say so.  Tests must still verify the plan shape themselves; this only
+	 * saves the developer who set the GUC from wondering.
+	 */
+	if (debug_parallel_repartition && !repartition_built)
+		elog(DEBUG1, "debug_parallel_repartition: no Parallel Repartition path was built");
 
 	/*
 	 * When partitionwise aggregate is used, we might have fully aggregated

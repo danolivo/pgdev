@@ -106,6 +106,7 @@
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
+#include "utils/sharedtuplestore.h"
 #include "utils/spccache.h"
 #include "utils/tuplesort.h"
 
@@ -160,6 +161,9 @@ bool		enable_partitionwise_join = false;
 bool		enable_partitionwise_aggregate = false;
 bool		enable_parallel_append = true;
 bool		enable_parallel_hash = true;
+bool		enable_parallel_repartition = true;
+bool		debug_parallel_repartition = false;
+int			parallel_repartition_partitions = 0;
 bool		enable_partition_pruning = true;
 bool		enable_presorted_aggregate = true;
 bool		enable_async_append = true;
@@ -203,7 +207,7 @@ static void set_rel_width(PlannerInfo *root, RelOptInfo *rel);
 static int32 get_expr_width(PlannerInfo *root, const Node *expr);
 static double relation_byte_size(double tuples, int width);
 static double page_size(double tuples, int width);
-static double get_parallel_divisor(Path *path);
+
 
 
 /*
@@ -2807,6 +2811,158 @@ cost_merge_append(Path *path, PlannerInfo *root,
  * relation, so the materialization is all overhead --- any savings will
  * occur only on rescan, which is estimated in cost_rescan.
  */
+/* Fixed costs of the exchange, in planner cost units. */
+#define REPARTITION_SETUP_COST				100.0
+#define REPARTITION_PARTITION_SETUP_COST	10.0
+
+/*
+ * choose_repartition_count
+ *		Pick the number of partitions for a Repartition node.
+ *
+ * K is the one knob of the exchange, and the shapes it can produce form a
+ * single family rather than two cases to compare: at K = 1 the exchange
+ * funnels everything to one participant and the plan does what the existing
+ * leader-side shape does, at larger K the finalize step spreads out.  That is
+ * deliberate.  It means the planner never has to reason about "exchange or no
+ * exchange" as a discrete choice -- the degenerate point is priced by the same
+ * function as the rest, and since it charges for a materialisation the
+ * leader-side plan does not pay, it loses to that plan by construction rather
+ * than by a special case.
+ *
+ * Oversubscribe relative to the participant count so that work stealing can
+ * balance, and so that the algorithm does not depend on how many workers
+ * actually start.  Cap by memory: during the sink phase each participant holds
+ * one write buffer per partition (STS_CHUNK_PAGES pages) plus the
+ * BufFile's own BLCKSZ buffer, and that has to be charged against the same
+ * budget the Agg above uses for its hash table.
+ *
+ * Deliberately no Max(k, nparticipants) at the end: that would undo the memory
+ * cap and could return a non-power-of-two.  Fewer partitions than participants
+ * merely leaves some idle, which is a graceful degradation.
+ */
+int
+choose_repartition_count(int nparticipants, int tuple_width)
+{
+	int			k;
+	int			k_mem;
+	int			k_width;
+	Size		per_partition;
+	Size		budget;
+	double		tuple_sz;
+
+	per_partition = (Size) (STS_CHUNK_PAGES + 1) * BLCKSZ;
+	budget = get_hash_memory_limit();
+
+	/* leave half the budget to the finalize aggregate above us */
+	k_mem = 1;
+	while ((Size) k_mem * 2 * per_partition <= budget / 2 &&
+		   k_mem < REPARTITION_MAX_PARTITIONS)
+		k_mem *= 2;
+
+	if (parallel_repartition_partitions > 0)
+		k = pg_nextpower2_32(parallel_repartition_partitions);
+	else
+		k = pg_nextpower2_32(Max(nparticipants * 4, 4));
+
+	/*
+	 * Scattering into many buffers costs more the wider the tuple: measured,
+	 * going from 32 to 256 partitions costs about 1 ns per 48-byte tuple but
+	 * about 4.6 ns per 144-byte one.  DuckDB bounds its radix bits by row
+	 * width for the same reason (ROW_WIDTH_THRESHOLD_ONE/TWO).  Give back one
+	 * bit past 64 bytes and two past 256.
+	 *
+	 * Compare against the size of the MinimalTuple that actually reaches the
+	 * buffer, not against the payload width, and use the same expression
+	 * cost_repartition() uses so the two cannot drift.  The header is not a
+	 * rounding error: for count(*) over an int4 key the planner's width is 12
+	 * and the exchange moves 32 bytes per tuple.  Note also that tuple_width
+	 * itself is only as good as the planner's estimate of the partial
+	 * aggregate's target, which for an internal transtype is the weakest
+	 * estimate it has -- measured error on this node runs from 0.8x to 2.7x.
+	 */
+	tuple_sz = MAXALIGN(tuple_width) + MAXALIGN(SizeofMinimalTupleHeader);
+
+	k_width = REPARTITION_MAX_PARTITIONS;
+	if (tuple_sz > 256)
+		k_width /= 4;
+	else if (tuple_sz > 64)
+		k_width /= 2;
+	k = Min(k, Max(k_width, 1));
+
+	k = Min(k, k_mem);
+	k = Min(k, REPARTITION_MAX_PARTITIONS);
+	k = Max(k, 1);
+
+	Assert(k == pg_nextpower2_32(k));
+	return k;
+}
+
+/*
+ * cost_repartition
+ *		Cost of redistributing tuples among parallel participants.
+ *
+ * The node is blocking, so everything the sink phase does lands in
+ * startup_cost.  Each participant writes its own input and reads back roughly
+ * the same volume (1/P of P times as much), so write and read are symmetric.
+ *
+ * At K = 1 this prices the funnel: one store, written by everyone and read by
+ * the leader.  The result is deliberately not free -- the exchange goes
+ * through temporary files where the leader-side plan goes through the tuple
+ * queues, measured at about 1.6x -- which is what keeps the planner from
+ * choosing the degenerate exchange over the plan it imitates.
+ *
+ * The floor on npages matters more than it looks: sts_end_write() always
+ * flushes a full chunk, so every non-empty partition costs
+ * STS_CHUNK_PAGES pages per participant regardless of how little data
+ * it holds.  That term is what stops the planner from choosing an exchange
+ * when there is hardly anything to exchange.
+ */
+void
+cost_repartition(Path *path, int disabled_nodes,
+				 int numCols, int npartitions,
+				 Cost input_startup_cost, Cost input_total_cost,
+				 double tuples, int width)
+{
+	Cost		startup_cost = input_total_cost;
+	Cost		run_cost = 0;
+	double		tuple_sz;
+	double		npages;
+
+	tuple_sz = MAXALIGN(width) + MAXALIGN(SizeofMinimalTupleHeader);
+	npages = ceil(tuples * tuple_sz / BLCKSZ);
+	npages = Max(npages, (double) npartitions * STS_CHUNK_PAGES);
+
+	/* hash the key columns */
+	startup_cost += tuples * numCols * cpu_operator_cost;
+
+	/*
+	 * I/O.  This is BufFile traffic scattered across npartitions files, which
+	 * is exactly the character of HashAgg's spilling, so charge it the way
+	 * cost_agg() charges that: writes at random_page_cost, reads at
+	 * seq_page_cost, both with the same generic 2.0 penalty, plus
+	 * cpu_tuple_cost each way.
+	 *
+	 * The first cut charged plain seq_page_cost each way, which came out four
+	 * to five times cheaper than what the aggregate node next door pays for
+	 * the identical operation.  That inconsistency -- not the absolute
+	 * numbers -- is what made the planner pick an exchange that lost by a
+	 * factor of two in measurement.
+	 */
+	startup_cost += npages * 2.0 * random_page_cost;
+	startup_cost += tuples * cpu_tuple_cost;
+	startup_cost += REPARTITION_SETUP_COST;
+	startup_cost += npartitions * REPARTITION_PARTITION_SETUP_COST;
+
+	/* read back: in expectation the same volume we wrote */
+	run_cost += npages * 2.0 * seq_page_cost;
+	run_cost += tuples * cpu_tuple_cost;
+
+	path->rows = tuples;
+	path->disabled_nodes = disabled_nodes;
+	path->startup_cost = startup_cost;
+	path->total_cost = startup_cost + run_cost;
+}
+
 void
 cost_material(Path *path,
 			  int input_disabled_nodes,
@@ -6834,7 +6990,7 @@ page_size(double tuples, int width)
  * Estimate the fraction of the work that each worker will do given the
  * number of workers budgeted for the path.
  */
-static double
+double
 get_parallel_divisor(Path *path)
 {
 	double		parallel_divisor = path->parallel_workers;
