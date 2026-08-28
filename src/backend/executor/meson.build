@@ -42,6 +42,7 @@ backend_sources += files(
   'nodeLockRows.c',
   'nodeMaterial.c',
   'nodeMemoize.c',
+  'nodeRepartition.c',
   'nodeMergeAppend.c',
   'nodeMergejoin.c',
   'nodeModifyTable.c',

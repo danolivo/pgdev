@@ -93,6 +93,9 @@ static Result *create_group_result_plan(PlannerInfo *root,
 static ProjectSet *create_project_set_plan(PlannerInfo *root, ProjectSetPath *best_path);
 static Material *create_material_plan(PlannerInfo *root, MaterialPath *best_path,
 									  int flags);
+static Repartition *create_repartition_plan(PlannerInfo *root,
+											RepartitionPath *best_path,
+											int flags);
 static Memoize *create_memoize_plan(PlannerInfo *root, MemoizePath *best_path,
 									int flags);
 static Plan *create_unique_plan(PlannerInfo *root, UniquePath *best_path,
@@ -460,6 +463,11 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 			plan = (Plan *) create_material_plan(root,
 												 (MaterialPath *) best_path,
 												 flags);
+			break;
+		case T_Repartition:
+			plan = (Plan *) create_repartition_plan(root,
+													(RepartitionPath *) best_path,
+													flags);
 			break;
 		case T_Memoize:
 			plan = (Plan *) create_memoize_plan(root,
@@ -6637,6 +6645,49 @@ make_sort_from_groupcols(List *groupcls,
 					 collations, nullsFirst);
 }
 
+/*
+ * create_repartition_plan
+ *	  Create a Repartition plan for 'best_path' and its subpaths.
+ *
+ * Like Material, the node does not project: its targetlist must be a verbatim
+ * copy of the child's.  Three things depend on that -- hashColIdx stays valid,
+ * the Agg above finds its grouping columns by ressortgroupref in our tlist,
+ * and EXPLAIN can deparse the partition key against it.  setrefs.c runs
+ * set_dummy_tlist_references() on this node, which encodes the same
+ * requirement.
+ */
+static Repartition *
+create_repartition_plan(PlannerInfo *root, RepartitionPath *best_path,
+						int flags)
+{
+	Repartition *plan;
+	Plan	   *subplan;
+	int			numCols;
+
+	/* No excess columns: like Material, we don't project. */
+	subplan = create_plan_recurse(root, best_path->subpath,
+								  flags | CP_SMALL_TLIST);
+
+	plan = makeNode(Repartition);
+	plan->plan.targetlist = subplan->targetlist;
+	plan->plan.qual = NIL;
+	plan->plan.lefttree = subplan;
+	plan->plan.righttree = NULL;
+
+	numCols = list_length(best_path->partitionClause);
+	plan->numCols = numCols;
+	plan->hashColIdx = extract_grouping_cols(best_path->partitionClause,
+											 subplan->targetlist);
+	plan->hashOperators = extract_grouping_ops(best_path->partitionClause);
+	plan->collations = extract_grouping_collations(best_path->partitionClause,
+												   subplan->targetlist);
+	plan->npartitions = best_path->npartitions;
+
+	copy_generic_path_info(&plan->plan, (Path *) best_path);
+
+	return plan;
+}
+
 static Material *
 make_material(Plan *lefttree)
 {
@@ -7395,6 +7446,7 @@ is_projection_capable_path(Path *path)
 	switch (path->pathtype)
 	{
 		case T_Hash:
+		case T_Repartition:
 		case T_Material:
 		case T_Memoize:
 		case T_Sort:
@@ -7445,6 +7497,7 @@ is_projection_capable_plan(Plan *plan)
 	switch (nodeTag(plan))
 	{
 		case T_Hash:
+		case T_Repartition:
 		case T_Material:
 		case T_Memoize:
 		case T_Sort:

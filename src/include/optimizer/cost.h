@@ -67,6 +67,9 @@ extern PGDLLIMPORT bool enable_partitionwise_join;
 extern PGDLLIMPORT bool enable_partitionwise_aggregate;
 extern PGDLLIMPORT bool enable_parallel_append;
 extern PGDLLIMPORT bool enable_parallel_hash;
+extern PGDLLIMPORT bool enable_parallel_repartition;
+extern PGDLLIMPORT bool debug_parallel_repartition;
+extern PGDLLIMPORT int parallel_repartition_partitions;
 extern PGDLLIMPORT bool enable_partition_pruning;
 extern PGDLLIMPORT bool enable_presorted_aggregate;
 extern PGDLLIMPORT bool enable_async_append;
@@ -124,6 +127,13 @@ extern void cost_merge_append(Path *path, PlannerInfo *root,
 							  int input_disabled_nodes,
 							  Cost input_startup_cost, Cost input_total_cost,
 							  double tuples);
+extern void cost_repartition(Path *path,
+							 int disabled_nodes,
+							 int numCols, int npartitions,
+							 Cost input_startup_cost, Cost input_total_cost,
+							 double tuples, int width);
+extern int	choose_repartition_count(int nparticipants, int tuple_width);
+extern double get_parallel_divisor(Path *path);
 extern void cost_material(Path *path,
 						  int input_disabled_nodes,
 						  Cost input_startup_cost, Cost input_total_cost,

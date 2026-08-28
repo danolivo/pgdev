@@ -43,6 +43,8 @@ extern ParallelExecutorInfo *ExecInitParallelPlan(PlanState *planstate,
 extern void ExecParallelCreateReaders(ParallelExecutorInfo *pei);
 extern void ExecParallelFinish(ParallelExecutorInfo *pei);
 extern void ExecParallelCleanup(ParallelExecutorInfo *pei);
+extern void ExecParallelPostLaunch(ParallelExecutorInfo *pei,
+								   bool leader_participates);
 extern void ExecParallelReinitialize(PlanState *planstate,
 									 ParallelExecutorInfo *pei, Bitmapset *sendParams);
 

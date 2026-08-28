@@ -2118,6 +2118,20 @@ typedef struct MaterialPath
 } MaterialPath;
 
 /*
+ * RepartitionPath represents a hash redistribution of tuples among parallel
+ * participants.  Only ever a partial path.
+ */
+typedef struct RepartitionPath
+{
+	pg_node_attr(nodetag_number(481))
+
+	Path		path;
+	Path	   *subpath;
+	List	   *partitionClause;	/* list of SortGroupClause */
+	int			npartitions;
+} RepartitionPath;
+
+/*
  * MemoizePath represents a Memoize plan node, i.e., a cache that caches
  * tuples from parameterized paths to save the underlying node from having to
  * be rescanned for parameter values which are already cached.

@@ -212,6 +212,15 @@ ExecGather(PlanState *pstate)
 		/* Run plan locally if no workers or enabled and not single-copy. */
 		node->need_to_scan_locally = (node->nreaders == 0)
 			|| (!gather->single_copy && parallel_leader_participation);
+
+		/*
+		 * Tell parallel-aware nodes how many workers really started, and
+		 * whether the leader will take part.  Must happen before the leader
+		 * touches the subplan.
+		 */
+		if (node->pei != NULL && node->pei->pcxt != NULL)
+			ExecParallelPostLaunch(node->pei, node->need_to_scan_locally);
+
 		node->initialized = true;
 	}
 

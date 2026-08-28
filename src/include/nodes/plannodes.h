@@ -1059,6 +1059,38 @@ typedef struct Memoize
 } Memoize;
 
 /* ----------------
+ *		repartition node
+ *
+ * Redistributes tuples among parallel participants by hash of the partition
+ * key, so that all tuples with equal keys reach the same participant.  Always
+ * parallel_aware; meaningless otherwise.  Does not project: its targetlist is
+ * a verbatim copy of the child's, which is what keeps hashColIdx valid and
+ * lets the Agg above find its grouping columns by ressortgroupref.
+ * ----------------
+ */
+typedef struct Repartition
+{
+	pg_node_attr(nodetag_number(480))
+
+	Plan		plan;
+
+	/* number of partition key columns */
+	int			numCols;
+
+	/* their indexes in the child tuple */
+	AttrNumber *hashColIdx pg_node_attr(array_size(numCols));
+
+	/* equality operators, from which the hash functions are derived */
+	Oid		   *hashOperators pg_node_attr(array_size(numCols));
+
+	/* collations for each key column */
+	Oid		   *collations pg_node_attr(array_size(numCols));
+
+	/* number of partitions; a power of two */
+	int			npartitions;
+} Repartition;
+
+/* ----------------
  *		sort node
  * ----------------
  */

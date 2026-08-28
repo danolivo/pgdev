@@ -1663,6 +1663,47 @@ create_material_path(RelOptInfo *rel, Path *subpath)
 }
 
 /*
+ * create_repartition_path
+ *	  Creates a path for a Repartition node.
+ *
+ * Only ever used as a partial path: redistribution between participants is
+ * meaningless outside a parallel region, and setrefs.c rejects a
+ * parallel_aware node that is not below a Gather.
+ */
+RepartitionPath *
+create_repartition_path(PlannerInfo *root, RelOptInfo *rel, Path *subpath,
+						List *partitionClause, int npartitions)
+{
+	RepartitionPath *pathnode = makeNode(RepartitionPath);
+
+	pathnode->path.pathtype = T_Repartition;
+	pathnode->path.parent = rel;
+	pathnode->path.pathtarget = subpath->pathtarget;
+	pathnode->path.param_info = NULL;
+	pathnode->path.parallel_aware = true;
+	pathnode->path.parallel_safe = rel->consider_parallel &&
+		subpath->parallel_safe;
+	pathnode->path.parallel_workers = subpath->parallel_workers;
+	pathnode->path.pathkeys = NIL;	/* redistribution destroys any order */
+
+	pathnode->subpath = subpath;
+	pathnode->partitionClause = partitionClause;
+	pathnode->npartitions = npartitions;
+
+	cost_repartition(&pathnode->path,
+					 subpath->disabled_nodes +
+					 (enable_parallel_repartition ? 0 : 1),
+					 list_length(partitionClause),
+					 npartitions,
+					 subpath->startup_cost,
+					 subpath->total_cost,
+					 subpath->rows,
+					 subpath->pathtarget->width);
+
+	return pathnode;
+}
+
+/*
  * create_memoize_path
  *	  Creates a path corresponding to a Memoize plan, returning the pathnode.
  */

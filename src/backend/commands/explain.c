@@ -22,6 +22,7 @@
 #include "commands/explain_format.h"
 #include "commands/explain_state.h"
 #include "commands/prepare.h"
+#include "executor/repartition.h"
 #include "foreign/fdwapi.h"
 #include "jit/jit.h"
 #include "libpq/pqformat.h"
@@ -125,6 +126,7 @@ static void show_sort_info(SortState *sortstate, ExplainState *es);
 static void show_incremental_sort_info(IncrementalSortState *incrsortstate,
 									   ExplainState *es);
 static void show_hash_info(HashState *hashstate, ExplainState *es);
+static void show_repartition_info(RepartitionState *rstate, ExplainState *es);
 static void show_material_info(MaterialState *mstate, ExplainState *es);
 static void show_windowagg_info(WindowAggState *winstate, ExplainState *es);
 static void show_ctescan_info(CteScanState *ctescanstate, ExplainState *es);
@@ -1516,6 +1518,9 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_Material:
 			pname = sname = "Materialize";
 			break;
+		case T_Repartition:
+			pname = sname = "Repartition";
+			break;
 		case T_Memoize:
 			pname = sname = "Memoize";
 			break;
@@ -2248,6 +2253,23 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			break;
 		case T_Material:
 			show_material_info(castNode(MaterialState, planstate), es);
+			break;
+		case T_Repartition:
+			{
+				Repartition *rplan = (Repartition *) plan;
+
+				ancestors = lcons(plan, ancestors);
+				show_sort_group_keys(outerPlanState(planstate),
+									 "Partition Key",
+									 rplan->numCols, 0, rplan->hashColIdx,
+									 NULL, NULL, NULL,
+									 ancestors, es);
+				ancestors = list_delete_first(ancestors);
+				ExplainPropertyInteger("Partitions", NULL,
+									   rplan->npartitions, es);
+				show_repartition_info(castNode(RepartitionState, planstate),
+									  es);
+			}
 			break;
 		case T_Memoize:
 			show_memoize_info(castNode(MemoizeState, planstate), ancestors,
@@ -3364,6 +3386,88 @@ show_incremental_sort_info(IncrementalSortState *incrsortstate,
 
 			if (es->workers_state)
 				ExplainCloseWorker(n, es);
+		}
+	}
+}
+
+/*
+ * Show exchange statistics for a Repartition node.
+ *
+ * The three timings are the point of this.  Without the barrier time there is
+ * no way to separate skew from throughput, and skew is precisely the term the
+ * cost model does not have.
+ */
+static void
+show_repartition_info(RepartitionState *rstate, ExplainState *es)
+{
+	RepartitionInstrumentation total;
+	int			nparts = 0;
+	int			i;
+
+	if (!es->analyze)
+		return;
+
+	memset(&total, 0, sizeof(total));
+	if (rstate->rs_instrument)
+	{
+		total = *rstate->rs_instrument;
+		nparts++;
+	}
+	if (rstate->rs_shared_info)
+	{
+		for (i = 0; i < rstate->rs_shared_info->num_workers; i++)
+		{
+			RepartitionInstrumentation *w =
+				&rstate->rs_shared_info->instrument[i];
+
+			if (w->ntuples_written == 0 && w->nclaimed == 0)
+				continue;
+			total.nclaimed += w->nclaimed;
+			total.ntuples_written += w->ntuples_written;
+			total.ntuples_read += w->ntuples_read;
+			total.bytes_payload += w->bytes_payload;
+			INSTR_TIME_ADD(total.time_sink, w->time_sink);
+			INSTR_TIME_ADD(total.time_barrier, w->time_barrier);
+			INSTR_TIME_ADD(total.time_drain, w->time_drain);
+			nparts++;
+		}
+	}
+
+	if (nparts == 0)
+		return;
+
+	if (es->format == EXPLAIN_FORMAT_TEXT)
+	{
+		ExplainIndentText(es);
+		appendStringInfo(es->str,
+						 "Exchanged: " INT64_FORMAT " tuples  Payload: " INT64_FORMAT "kB  Claimed: %d\n",
+						 total.ntuples_written,
+						 (total.bytes_payload + 1023) / 1024,
+						 total.nclaimed);
+		if (es->timing)
+		{
+			ExplainIndentText(es);
+			appendStringInfo(es->str,
+							 "Sink: %.3f ms  Barrier: %.3f ms  Drain: %.3f ms\n",
+							 INSTR_TIME_GET_MILLISEC(total.time_sink),
+							 INSTR_TIME_GET_MILLISEC(total.time_barrier),
+							 INSTR_TIME_GET_MILLISEC(total.time_drain));
+		}
+	}
+	else
+	{
+		ExplainPropertyInteger("Tuples Exchanged", NULL,
+							   total.ntuples_written, es);
+		ExplainPropertyInteger("Payload Bytes", NULL, total.bytes_payload, es);
+		ExplainPropertyInteger("Partitions Claimed", NULL, total.nclaimed, es);
+		if (es->timing)
+		{
+			ExplainPropertyFloat("Sink Time", "ms",
+								 INSTR_TIME_GET_MILLISEC(total.time_sink), 3, es);
+			ExplainPropertyFloat("Barrier Time", "ms",
+								 INSTR_TIME_GET_MILLISEC(total.time_barrier), 3, es);
+			ExplainPropertyFloat("Drain Time", "ms",
+								 INSTR_TIME_GET_MILLISEC(total.time_drain), 3, es);
 		}
 	}
 }

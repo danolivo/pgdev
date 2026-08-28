@@ -293,6 +293,32 @@ sts_end_parallel_scan(SharedTuplestoreAccessor *accessor)
 }
 
 /*
+ * Delete every file backing this tuplestore.
+ *
+ * Only legal when the caller knows that nobody will read from the store again.
+ * sts_end_parallel_scan() cannot do this itself because in general it would
+ * need a reference count of live scanners; a caller that gives one whole store
+ * to exactly one reader, as the Repartition node does, has that guarantee by
+ * construction and can free the space as soon as the store is drained.
+ */
+void
+sts_delete_files(SharedTuplestoreAccessor *accessor)
+{
+	int			i;
+
+	Assert(accessor->read_file == NULL);
+	Assert(accessor->write_file == NULL);
+
+	for (i = 0; i < accessor->sts->nparticipants; ++i)
+	{
+		char		name[MAXPGPATH];
+
+		sts_filename(name, accessor, i);
+		BufFileDeleteFileSet(&accessor->fileset->fs, name, true);
+	}
+}
+
+/*
  * Write a tuple.  If a meta-data size was provided to sts_initialize, then a
  * pointer to meta data of that size must be provided.
  */

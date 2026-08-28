@@ -83,6 +83,11 @@ extern GroupResultPath *create_group_result_path(PlannerInfo *root,
 												 PathTarget *target,
 												 List *havingqual);
 extern MaterialPath *create_material_path(RelOptInfo *rel, Path *subpath);
+extern RepartitionPath *create_repartition_path(PlannerInfo *root,
+												RelOptInfo *rel,
+												Path *subpath,
+												List *partitionClause,
+												int npartitions);
 extern MemoizePath *create_memoize_path(PlannerInfo *root,
 										RelOptInfo *rel,
 										Path *subpath,

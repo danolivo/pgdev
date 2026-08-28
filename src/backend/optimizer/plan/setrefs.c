@@ -887,6 +887,7 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				break;
 			}
 
+		case T_Repartition:
 		case T_Material:
 		case T_Sort:
 		case T_IncrementalSort:

@@ -980,6 +980,26 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"enable_parallel_repartition", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables the planner's use of parallel repartition plans."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&enable_parallel_repartition,
+		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"debug_parallel_repartition", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Forces use of parallel repartition plans where possible."),
+			NULL,
+			GUC_NOT_IN_SAMPLE | GUC_EXPLAIN
+		},
+		&debug_parallel_repartition,
+		false,
+		NULL, NULL, NULL
+	},
+	{
 		{"enable_partition_pruning", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables plan-time and execution-time partition pruning."),
 			gettext_noop("Allows the query planner and executor to compare partition "
@@ -3732,6 +3752,17 @@ struct config_int ConfigureNamesInt[] =
 		},
 		&min_parallel_table_scan_size,
 		(8 * 1024 * 1024) / BLCKSZ, 0, INT_MAX / 3,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"parallel_repartition_partitions", PGC_USERSET, QUERY_TUNING_COST,
+			gettext_noop("Sets the number of partitions used by parallel repartition."),
+			gettext_noop("Zero selects a value based on the number of participants and the memory budget. Other values are rounded up to a power of two."),
+			GUC_EXPLAIN
+		},
+		&parallel_repartition_partitions,
+		0, 0, 64,
 		NULL, NULL, NULL
 	},
 

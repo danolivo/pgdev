@@ -163,6 +163,7 @@ XACT_GROUP_UPDATE	"Waiting for the group leader to update transaction status at 
 
 ABI_compatibility:
 WAL_RECEIVER_UPSTREAM_CATCHUP	"Waiting for upstream server WAL flush position to catch up to requested start point."
+REPARTITION_SINK	"Waiting for all parallel participants to finish redistributing tuples."
 
 #
 # Wait Events - Timeout
