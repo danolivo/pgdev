@@ -1096,16 +1096,19 @@ array_agg_array_combine(PG_FUNCTION_ARGS)
 				 * previous inputs by marking all their items non-null.
 				 */
 				state1->aitems = pg_nextpower2_32(Max(256, newnitems));
-				state1->nullbitmap = (bits8 *) palloc((state1->aitems + 7) / 8);
+				state1->nullbitmap = (bits8 *) palloc0((state1->aitems + 7) / 8);
 				array_bitmap_copy(state1->nullbitmap, 0,
 								  NULL, 0,
 								  state1->nitems);
 			}
 			else if (newnitems > state1->aitems)
 			{
+				int			oldbytes = (state1->aitems + 7) / 8;
+
 				state1->aitems = pg_nextpower2_32(newnitems);
 				state1->nullbitmap = (bits8 *)
-					repalloc(state1->nullbitmap, (state1->aitems + 7) / 8);
+					repalloc0(state1->nullbitmap, oldbytes,
+							  (state1->aitems + 7) / 8);
 			}
 			/* This will do the right thing if state2->nullbitmap is NULL: */
 			array_bitmap_copy(state1->nullbitmap, state1->nitems,
