@@ -107,6 +107,13 @@ typedef struct ParallelRepartitionState
 	RepartitionLayout layout;
 
 	/*
+	 * Set by ExecRepartitionPostLaunch(), before any participant can be
+	 * released from the sink barrier, and read only afterwards.  Needed by the
+	 * K = 1 case below, which wants the leader specifically.
+	 */
+	bool		leader_participates;
+
+	/*
 	 * Hands out partitions during the drain phase.  A plain fetch-add, no
 	 * modulo: each partition is read exactly once, by exactly one participant.
 	 * (Parallel hash join uses a modulo here because its batches are

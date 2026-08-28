@@ -7462,6 +7462,23 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 	 * grouping is high-cardinality, i.e. when partial aggregation compresses
 	 * little and the leader would otherwise merge W * G tuples on its own.
 	 * The old shape is still built above and competes on cost.
+	 *
+	 * How much it wins by rests on dNumGroups, which is the estimate with the
+	 * widest error bars in the planner: measured on 44 cores, the exchange is
+	 * worth 4-5x when partial aggregation compresses poorly and costs 1.5x
+	 * when it compresses well, and which side of that line a query lands on is
+	 * decided by an ndistinct estimate.  The exposure is asymmetric in our
+	 * favour, but it is exposure.  The node is blocking and therefore knows
+	 * the true count before it commits to anything, so the eventual answer is
+	 * probably to choose K at execution time rather than here; K = 1 exists
+	 * partly so that such a choice has a floor to fall back to.
+	 *
+	 * Note also what cannot be expressed here.  A path has pathkeys but no
+	 * distribution, so a relation already hash-partitioned on the grouping key
+	 * -- where the exchange is pure waste -- looks the same to this code as
+	 * one that is not, and nothing stops two exchanges on the same key in one
+	 * plan.  Both want a distribution property on paths, which is a much
+	 * larger patch than this one.
 	 */
 	if ((can_hash || can_sort) &&
 		enable_parallel_repartition &&
