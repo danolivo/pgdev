@@ -1100,6 +1100,12 @@ try_mergejoin_path(PlannerInfo *root,
 		pathkeys_contained_in(innersortkeys, inner_path->pathkeys))
 		innersortkeys = NIL;
 
+	if ((innersortkeys != NIL || outersortkeys != NIL) && jointype != JOIN_FULL)
+	{
+		bms_free(required_outer);
+		return;
+	}
+
 	/*
 	 * See comments in try_nestloop_path().
 	 */

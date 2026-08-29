@@ -21,6 +21,8 @@ OBJS = \
 	hio.o \
 	pruneheap.o \
 	rewriteheap.o \
+	tempcat.o \
+	tupmap.o \
 	vacuumlazy.o \
 	visibilitymap.o
 

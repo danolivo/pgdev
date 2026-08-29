@@ -97,6 +97,7 @@ usage(void)
 	printf(_("  -d, --dbname=CONNSTR   connection string\n"));
 	printf(_("  -h, --host=HOSTNAME    database server host or socket directory\n"));
 	printf(_("  -p, --port=PORT        database server port number\n"));
+	printf(_("  -u, --umask            set files mode according to umask (might break security!)\n"));
 	printf(_("  -U, --username=NAME    connect as specified database user\n"));
 	printf(_("  -w, --no-password      never prompt for password\n"));
 	printf(_("  -W, --password         force password prompt (should happen automatically)\n"));
@@ -631,6 +632,7 @@ main(int argc, char **argv)
 		{"endpos", required_argument, NULL, 'E'},
 		{"host", required_argument, NULL, 'h'},
 		{"port", required_argument, NULL, 'p'},
+		{"umask", no_argument, NULL, 'u'},
 		{"username", required_argument, NULL, 'U'},
 		{"no-loop", no_argument, NULL, 'n'},
 		{"no-password", no_argument, NULL, 'w'},
@@ -677,7 +679,7 @@ main(int argc, char **argv)
 		}
 	}
 
-	while ((c = getopt_long(argc, argv, "d:D:E:h:np:s:S:U:vwWZ:",
+	while ((c = getopt_long(argc, argv, "d:D:E:h:np:s:S:U:vuwWZ:",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -711,6 +713,9 @@ main(int argc, char **argv)
 				break;
 			case 'S':
 				replication_slot = pg_strdup(optarg);
+				break;
+			case 'u':
+				useumask = 1;
 				break;
 			case 'U':
 				dbuser = pg_strdup(optarg);

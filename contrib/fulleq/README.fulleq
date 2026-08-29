@@ -1,0 +1,2 @@
+Introduce operator == which returns true when
+operands are equal or both are nulls.

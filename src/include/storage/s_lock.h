@@ -390,6 +390,17 @@ do \
 #endif	 /* __sparc__ */
 
 
+/* Elbrus */
+#ifdef __e2k__
+#define HAS_TEST_AND_SET
+typedef int slock_t;
+/* There is no need to check for sync_lock availability. */
+#define TAS(lock) __sync_lock_test_and_set(lock, 1)
+#define S_UNLOCK(lock) __sync_lock_release(lock)
+#define SPIN_DELAY() do { __asm__ __volatile__ ("nop" : : ); } while(0)
+#endif
+
+
 /* PowerPC */
 #if defined(__ppc__) || defined(__powerpc__) || defined(__ppc64__) || defined(__powerpc64__)
 #define HAS_TEST_AND_SET

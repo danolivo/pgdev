@@ -83,6 +83,13 @@ extern bool RelationInvalidatesSnapshotsOnly(Oid relid);
 extern bool RelationHasSysCache(Oid relid);
 extern bool RelationSupportsSysCache(Oid relid);
 
+
+/* Retreive relation description data, if possible.
+ * Use only in situations when it's ok if this function will
+ * fail (return false) for no reason.
+ */
+extern HeapTuple TryGetSysCacheRelationClassTuple(Oid relid);
+
 /*
  * The use of the macros below rather than direct calls to the corresponding
  * functions is encouraged, as it insulates the caller from changes in the

@@ -17,6 +17,7 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include "access/xlog.h"
 #include "miscadmin.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
@@ -126,8 +127,8 @@
  * per iteration.
  */
 
-#define MAXNUMMESSAGES 4096
-#define MSGNUMWRAPAROUND (MAXNUMMESSAGES * 262144)
+#define MAXNUMMESSAGES 16384
+#define MSGNUMWRAPAROUND (MAXNUMMESSAGES * 65536)
 #define CLEANUP_MIN (MAXNUMMESSAGES / 2)
 #define CLEANUP_QUANTUM (MAXNUMMESSAGES / 16)
 #define SIG_THRESHOLD (MAXNUMMESSAGES / 2)
@@ -170,8 +171,6 @@ typedef struct SISeg
 	int			minMsgNum;		/* oldest message still needed */
 	int			maxMsgNum;		/* next message number to be assigned */
 	int			nextThreshold;	/* # of messages to call SICleanupQueue */
-
-	slock_t		msgnumLock;		/* spinlock protecting maxMsgNum */
 
 	/*
 	 * Circular buffer holding shared-inval messages
@@ -246,7 +245,6 @@ SharedInvalShmemInit(void)
 	shmInvalBuffer->minMsgNum = 0;
 	shmInvalBuffer->maxMsgNum = 0;
 	shmInvalBuffer->nextThreshold = CLEANUP_MIN;
-	SpinLockInit(&shmInvalBuffer->msgnumLock);
 
 	/* The buffer[] array is initially all unused, so we need not fill it */
 
@@ -362,6 +360,13 @@ CleanupInvalidationState(int status, Datum arg)
 	LWLockRelease(SInvalWriteLock);
 }
 
+
+#define MAXNUMLOCALMESSAGES 8192
+static SharedInvalidationMessage localInvalBuffer[MAXNUMLOCALMESSAGES];
+static int localInvalRPos = 0;
+static int localInvalWPos = 0;
+
+
 /*
  * SIInsertDataEntries
  *		Add new invalidation message(s) to the buffer.
@@ -370,6 +375,21 @@ void
 SIInsertDataEntries(const SharedInvalidationMessage *data, int n)
 {
 	SISeg	   *segP = shmInvalBuffer;
+	
+	/* Place local messages to local-only buffer */
+	if (MyDatabaseId != InvalidOid)
+	{
+		int count = n;
+		for (int i=0; i<count; i++)
+		{
+			if (data[i].isLocal)
+			{
+				localInvalBuffer[localInvalWPos] = data[i];
+				localInvalWPos = (localInvalWPos + 1 ) % MAXNUMLOCALMESSAGES;
+				n--;
+			}
+		}
+	}
 
 	/*
 	 * N can be arbitrarily large.  We divide the work into groups of no more
@@ -412,16 +432,21 @@ SIInsertDataEntries(const SharedInvalidationMessage *data, int n)
 		 * Insert new message(s) into proper slot of circular buffer
 		 */
 		max = segP->maxMsgNum;
-		while (nthistime-- > 0)
+		while (nthistime)
 		{
-			segP->buffer[max % MAXNUMMESSAGES] = *data++;
-			max++;
+			if ((MyDatabaseId == InvalidOid) || !data->isLocal)
+			{
+				segP->buffer[max % MAXNUMMESSAGES] = *data;
+				max++;
+				nthistime--;
+			}
+
+			data++;
 		}
 
 		/* Update current value of maxMsgNum using spinlock */
-		SpinLockAcquire(&segP->msgnumLock);
+		pg_memory_barrier();
 		segP->maxMsgNum = max;
-		SpinLockRelease(&segP->msgnumLock);
 
 		/*
 		 * Now that the maxMsgNum change is globally visible, we give everyone
@@ -475,7 +500,16 @@ SIGetDataEntries(SharedInvalidationMessage *data, int datasize)
 	SISeg	   *segP;
 	ProcState  *stateP;
 	int			max;
-	int			n;
+	int			n = 0;
+
+	if (localInvalRPos != localInvalWPos)
+	{
+		while (n < datasize && localInvalRPos != localInvalWPos)
+		{
+			data[n++] = localInvalBuffer[localInvalRPos];
+			localInvalRPos = (localInvalRPos + 1) % MAXNUMLOCALMESSAGES;
+		}
+	}
 
 	segP = shmInvalBuffer;
 	stateP = &segP->procState[MyProcNumber];
@@ -492,7 +526,7 @@ SIGetDataEntries(SharedInvalidationMessage *data, int datasize)
 	 * invalidation had arrived slightly later in the first place.
 	 */
 	if (!stateP->hasMessages)
-		return 0;
+		return n;
 
 	LWLockAcquire(SInvalReadLock, LW_SHARED);
 
@@ -507,10 +541,9 @@ SIGetDataEntries(SharedInvalidationMessage *data, int datasize)
 	 */
 	stateP->hasMessages = false;
 
-	/* Fetch current value of maxMsgNum using spinlock */
-	SpinLockAcquire(&segP->msgnumLock);
+	/* Fetch current value of maxMsgNum */
+	pg_memory_barrier();
 	max = segP->maxMsgNum;
-	SpinLockRelease(&segP->msgnumLock);
 
 	if (stateP->resetState)
 	{
@@ -534,7 +567,6 @@ SIGetDataEntries(SharedInvalidationMessage *data, int datasize)
 	 * cannot delete them here.  SICleanupQueue() will eventually remove them
 	 * from the queue.
 	 */
-	n = 0;
 	while (n < datasize && stateP->nextMsgNum < max)
 	{
 		data[n++] = segP->buffer[stateP->nextMsgNum % MAXNUMMESSAGES];

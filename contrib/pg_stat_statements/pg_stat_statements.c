@@ -891,7 +891,7 @@ pgss_planner(Query *parse,
 			 int cursorOptions,
 			 ParamListInfo boundParams)
 {
-	PlannedStmt *result;
+	PlannedStmt *result = NULL;
 
 	/*
 	 * We can't process the query if no query_string is provided, as

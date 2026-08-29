@@ -642,6 +642,7 @@ sub init
 		note("initializing database system by running initdb");
 		PostgreSQL::Test::Utils::system_or_bail(
 			'initdb', '--no-sync',
+			"--no-autoconfig",
 			'--pgdata' => $pgdata,
 			'--auth' => 'trust',
 			@{ $params{extra} });

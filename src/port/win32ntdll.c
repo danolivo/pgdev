@@ -19,7 +19,10 @@
 
 RtlGetLastNtStatus_t pg_RtlGetLastNtStatus;
 RtlNtStatusToDosError_t pg_RtlNtStatusToDosError;
+
+#if WINVER >= _WIN32_WINNT_WIN8
 NtFlushBuffersFileEx_t pg_NtFlushBuffersFileEx;
+#endif
 
 typedef struct NtDllRoutine
 {
@@ -30,7 +33,9 @@ typedef struct NtDllRoutine
 static const NtDllRoutine routines[] = {
 	{"RtlGetLastNtStatus", (pg_funcptr_t *) &pg_RtlGetLastNtStatus},
 	{"RtlNtStatusToDosError", (pg_funcptr_t *) &pg_RtlNtStatusToDosError},
+#if WINVER >= _WIN32_WINNT_WIN8
 	{"NtFlushBuffersFileEx", (pg_funcptr_t *) &pg_NtFlushBuffersFileEx}
+#endif
 };
 
 static bool initialized;

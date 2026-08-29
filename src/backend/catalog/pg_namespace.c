@@ -22,6 +22,7 @@
 #include "catalog/objectaccess.h"
 #include "catalog/pg_namespace.h"
 #include "utils/builtins.h"
+#include "utils/inval.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
@@ -69,6 +70,11 @@ NamespaceCreate(const char *nspName, Oid ownerId, bool isTemp)
 	else
 		nspacl = NULL;
 
+	/*
+	 * Don't send invalidation messages related to temporary namespaces.
+	 */
+	BEGIN_TEMP_TABLE_SCOPE_LOCAL(isTemp);
+
 	nspdesc = table_open(NamespaceRelationId, RowExclusiveLock);
 	tupDesc = nspdesc->rd_att;
 
@@ -115,6 +121,8 @@ NamespaceCreate(const char *nspName, Oid ownerId, bool isTemp)
 
 	/* Post creation hook for new schema */
 	InvokeObjectPostCreateHook(NamespaceRelationId, nspoid, 0);
+
+	END_TEMP_TABLE_SCOPE();
 
 	return nspoid;
 }

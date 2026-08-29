@@ -32,6 +32,7 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include "access/tempcat.h"
 #include "access/transam.h"
 #include "access/twophase.h"
 #include "access/twophase_rmgr.h"
@@ -44,10 +45,13 @@
 #include "storage/procarray.h"
 #include "storage/spin.h"
 #include "storage/standby.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/resowner.h"
-
+#include "catalog/pg_class.h"
+#include "utils/syscache.h"
+#include "access/htup_details.h"
 
 /* GUC variables */
 int			max_locks_per_xact; /* used to set the lock table size */
@@ -428,6 +432,68 @@ static void LockRefindAndRelease(LockMethod lockMethodTable, PGPROC *proc,
 static void GetSingleProcBlockerStatusData(PGPROC *blocked_proc,
 										   BlockedProcsData *data);
 
+/*
+ * Check if locking/unlocking specific lock can be skipped.
+ * Currently only some locks on temporary tables are skipped.
+ */
+static bool IsLockCanBeSkipped(const LOCKTAG *locktag, bool sessionLock)
+{
+	Form_pg_class form;
+	HeapTuple     tuple;
+	bool          isTemp;
+	static bool   inRecursion = false;
+
+	/*
+	 * Only relation locks can be skipped
+	 */
+	if (locktag->locktag_type != LOCKTAG_RELATION)
+		return false;
+
+	/*
+	 * Skip locks only in transaction, otherwise cache search will fail
+	 */
+	if (!IsTransactionState())
+		return false;
+
+	/*
+	 *  Don't skip session locks for relation, because during unlock we
+	 * can't verify here if lock was skipped or not
+	 */
+	if (sessionLock)
+		return false;
+
+	/*
+	 * Searching SysCache result recursive call to this function.
+	 * Since no SysCache locks can be skipped don't check if it's temporary table
+	 * inside recursion.
+	 */
+	if (inRecursion)
+		return false;
+
+	if(enable_temp_memory_catalog && IsTempTableScope())
+		return true;
+
+	/*
+	 * Try get relation description, if possible 
+	 */
+	inRecursion = true;
+	tuple = TryGetSysCacheRelationClassTuple(locktag->locktag_field2);
+	inRecursion = false;
+
+	/*
+	 * Treat fails as if relation is not temporary
+	 */
+	if (!tuple)
+		return false;
+
+	form = (Form_pg_class) GETSTRUCT(tuple);
+	isTemp = form->relpersistence == RELPERSISTENCE_TEMP;
+
+	ReleaseSysCache(tuple);
+
+	return isTemp;
+}
+
 
 /*
  * Initialize the lock manager's shmem data structures.
@@ -656,7 +722,7 @@ LockHeldByMe(const LOCKTAG *locktag,
 										  &localtag,
 										  HASH_FIND, NULL);
 
-	if (locallock && locallock->nLocks > 0)
+	if ((locallock && locallock->nLocks > 0) || IsLockCanBeSkipped(locktag, false))
 		return true;
 
 	if (orstronger)
@@ -869,6 +935,10 @@ LockAcquireExtended(const LOCKTAG *locktag,
 				 errmsg("cannot acquire lock mode %s on database objects while recovery is in progress",
 						lockMethodTable->lockModeNames[lockmode]),
 				 errhint("Only RowExclusiveLock or less can be acquired on database objects during recovery.")));
+
+	/* Don't lock if it's not required. Treat as already locked. */
+	if (IsLockCanBeSkipped(locktag, sessionLock))
+		return LOCKACQUIRE_ALREADY_CLEAR;
 
 #ifdef LOCK_DEBUG
 	if (LOCK_DEBUG_ENABLED(locktag))
@@ -2107,6 +2177,9 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 	 */
 	if (!locallock || locallock->nLocks <= 0)
 	{
+		/* Treat skipped locks (they aren't actually locked) as unlocked */
+		if (IsLockCanBeSkipped(locktag, sessionLock))
+			return true;
 		elog(WARNING, "you don't own a lock of type %s",
 			 lockMethodTable->lockModeNames[lockmode]);
 		return false;
@@ -2145,6 +2218,8 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 		}
 		if (i < 0)
 		{
+			if (IsLockCanBeSkipped(locktag, sessionLock))
+				return true;
 			/* don't release a lock belonging to another owner */
 			elog(WARNING, "you don't own a lock of type %s",
 				 lockMethodTable->lockModeNames[lockmode]);

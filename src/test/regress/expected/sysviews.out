@@ -171,8 +171,10 @@ select name, setting from pg_settings where name like 'enable%';
  enable_self_join_elimination   | on
  enable_seqscan                 | on
  enable_sort                    | on
+ enable_temp_memory_catalog     | off
+ enable_temp_rd_buffers         | off
  enable_tidscan                 | on
-(24 rows)
+(26 rows)
 
 -- There are always wait event descriptions for various types.  InjectionPoint
 -- may be present or absent, depending on history since last postmaster start.

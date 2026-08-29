@@ -19,6 +19,7 @@
 
 #include "postgres.h"
 
+#include "access/tempcat.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -31,6 +32,7 @@
 #include "storage/bulk_write.h"
 #include "storage/freespace.h"
 #include "storage/proc.h"
+#include "storage/rd.h"
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
@@ -437,6 +439,13 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	 */
 	if (need_fsm_vacuum)
 		FreeSpaceMapVacuumRange(rel, nblocks, InvalidBlockNumber);
+
+	if (enable_temp_rd_buffers
+		&& nblocks == 0
+	    && rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+	{
+		rd_reset(RelationGetSmgr(rel));
+	}
 }
 
 /*

@@ -36,8 +36,11 @@
 #include "common/pg_prng.h"
 #include "executor/executor.h"
 #include "foreign/fdwapi.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/makefuncs.h"
+#include "nodes/pg_list.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_relation.h"
 #include "pgstat.h"
@@ -48,6 +51,7 @@
 #include "utils/attoptcache.h"
 #include "utils/datum.h"
 #include "utils/guc.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
@@ -55,6 +59,7 @@
 #include "utils/sortsupport.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
+#include "utils/typcache.h"
 
 
 /* Per-index data for ANALYZE */
@@ -64,6 +69,8 @@ typedef struct AnlIndexData
 	double		tupleFract;		/* fraction of rows for partial index */
 	VacAttrStats **vacattrstats;	/* index attrs to analyze */
 	int			attr_cnt;
+	RowExpr	   *row;
+	Relation	rel;
 } AnlIndexData;
 
 
@@ -241,6 +248,8 @@ analyze_rel(Oid relid, RangeVar *relation,
 	pgstat_progress_start_command(PROGRESS_COMMAND_ANALYZE,
 								  RelationGetRelid(onerel));
 
+	BEGIN_TEMP_TABLE_SCOPE_SHARED(onerel->rd_rel->relpersistence == RELPERSISTENCE_TEMP);
+
 	/*
 	 * Do the normal non-recursive ANALYZE.  We can skip this for partitioned
 	 * tables, which don't contain any rows.
@@ -263,6 +272,8 @@ analyze_rel(Oid relid, RangeVar *relation,
 	 * expose us to concurrent-update failures in update_attstats.)
 	 */
 	relation_close(onerel, NoLock);
+
+	END_TEMP_TABLE_SCOPE();
 
 	pgstat_progress_end_command();
 }
@@ -308,6 +319,9 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 	BufferUsage bufferusage;
 	PgStat_Counter startreadtime = 0;
 	PgStat_Counter startwritetime = 0;
+	int    rowsAttrPitch;
+	Datum *rowsAttrValues;
+	bool  *rowsAttrNulls;
 
 	verbose = (params->options & VACOPT_VERBOSE) != 0;
 	instrument = (verbose || (AmAutoVacuumWorkerProcess() &&
@@ -322,6 +336,8 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 				(errmsg("analyzing \"%s.%s\"",
 						get_namespace_name(RelationGetNamespace(onerel)),
 						RelationGetRelationName(onerel))));
+
+	BEGIN_TEMP_TABLE_SCOPE_LOCAL(RelationUsesLocalBuffers(onerel))
 
 	/*
 	 * Set up a working context so that we can easily free whatever junk gets
@@ -484,6 +500,26 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 				}
 				thisdata->attr_cnt = tcnt;
 			}
+			else if (indexInfo->ii_NumIndexAttrs > 1 && va_cols == NIL &&
+					 Irel[ind]->rd_rel->reltype != InvalidOid)
+			{
+				/* Collect statistic for multicolumn index for better predicting selectivity of multicolumn joins */
+				Oid			baseTypeId = Irel[ind]->rd_rel->reltype;
+				TupleDesc	baseTupleDesc = lookup_type_cache(baseTypeId, TYPECACHE_TUPDESC)->tupDesc;
+
+				thisdata->rel = Irel[ind];
+				thisdata->attr_cnt = 1;
+				thisdata->row = makeNode(RowExpr);
+				thisdata->row->row_typeid = baseTypeId;
+				thisdata->row->row_format = COERCE_EXPLICIT_CAST;
+				thisdata->row->location = -1;
+				thisdata->row->colnames = NULL;
+				
+				thisdata->vacattrstats = (VacAttrStats **)palloc(sizeof(VacAttrStats *) * thisdata->attr_cnt);
+				thisdata->vacattrstats[0] = examine_attribute(thisdata->rel, baseTupleDesc->natts, (Node*)thisdata->row);
+				thisdata->vacattrstats[0]->tupDesc = baseTupleDesc;
+				thisdata->vacattrstats[0]->multicolumn = baseTupleDesc->natts;
+			}
 		}
 	}
 
@@ -536,6 +572,25 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 								  rows, targrows,
 								  &totalrows, &totaldeadrows);
 
+
+	if (va_cols == NIL && AllocSizeIsValid(numrows * onerel->rd_att->natts * sizeof(Datum)))
+	{
+		rowsAttrPitch  = onerel->rd_att->natts;
+		rowsAttrValues = (Datum *) palloc(numrows * rowsAttrPitch * sizeof(Datum));
+		rowsAttrNulls  = (bool *)  palloc(numrows * rowsAttrPitch * sizeof(bool));
+		for(i = 0; i < numrows; i++)
+		{
+			size_t index = i * rowsAttrPitch;
+			heap_deform_tuple(rows[i], onerel->rd_att, rowsAttrValues + index, rowsAttrNulls + index);
+		}
+	}
+	else
+	{
+		rowsAttrPitch  = 0;
+		rowsAttrValues = NULL;
+		rowsAttrNulls  = NULL;
+	}
+
 	/*
 	 * Compute the statistics.  Temporary results during the calculations for
 	 * each column are stored in a child context.  The calc routines are
@@ -561,6 +616,10 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 			AttributeOpts *aopt;
 
 			stats->rows = rows;
+			stats->rowsAttrPitch  = rowsAttrPitch;
+			stats->rowsAttrValues = rowsAttrValues + (stats->tupattnum - 1);
+			stats->rowsAttrNulls  = rowsAttrNulls  + (stats->tupattnum - 1);
+
 			stats->tupDesc = onerel->rd_att;
 			stats->compute_stats(stats,
 								 std_fetch_func,
@@ -856,6 +915,8 @@ do_analyze_rel(Relation onerel, VacuumParams *params,
 	MemoryContextSwitchTo(caller_context);
 	MemoryContextDelete(anl_context);
 	anl_context = NULL;
+
+	END_TEMP_TABLE_SCOPE();
 }
 
 /*
@@ -956,28 +1017,41 @@ compute_index_stats(Relation onerel, double totalrows,
 							   values,
 							   isnull);
 
-				/*
-				 * Save just the columns we care about.  We copy the values
-				 * into ind_context from the estate's per-tuple context.
-				 */
-				for (i = 0; i < attr_cnt; i++)
+				if (thisdata->vacattrstats[0]->multicolumn)
 				{
-					VacAttrStats *stats = thisdata->vacattrstats[i];
-					int			attnum = stats->tupattnum;
-
-					if (isnull[attnum - 1])
-					{
-						exprvals[tcnt] = (Datum) 0;
-						exprnulls[tcnt] = true;
-					}
-					else
-					{
-						exprvals[tcnt] = datumCopy(values[attnum - 1],
-												   stats->attrtype->typbyval,
-												   stats->attrtype->typlen);
-						exprnulls[tcnt] = false;
-					}
+					/* For multicolumn index construct compound value */
+					VacAttrStats *stats = thisdata->vacattrstats[0];
+					exprvals[tcnt] = HeapTupleGetDatum(heap_form_tuple(stats->tupDesc,
+																	   values,
+																	   isnull));
+					exprnulls[tcnt] = false;
 					tcnt++;
+				}
+				else
+				{
+					/*
+					 * Save just the columns we care about.  We copy the values
+					 * into ind_context from the estate's per-tuple context.
+					 */
+					for (i = 0; i < attr_cnt; i++)
+					{
+						VacAttrStats *stats = thisdata->vacattrstats[i];
+						int			attnum = stats->tupattnum;
+
+						if (isnull[attnum - 1])
+						{
+							exprvals[tcnt] = (Datum) 0;
+							exprnulls[tcnt] = true;
+						}
+						else
+						{
+							exprvals[tcnt] = datumCopy(values[attnum - 1],
+													   stats->attrtype->typbyval,
+													   stats->attrtype->typlen);
+							exprnulls[tcnt] = false;
+						}
+						tcnt++;
+					}
 				}
 			}
 		}
@@ -1006,6 +1080,69 @@ compute_index_stats(Relation onerel, double totalrows,
 									 ind_fetch_func,
 									 numindexrows,
 									 totalindexrows);
+
+				if (stats->multicolumn)
+				{
+					VacAttrStats *prefixStats = NULL;
+
+					for(int n_keys = stats->tupDesc->natts-1; n_keys > 1; n_keys--)
+					{
+						bool foundSamePrefix = false;
+
+						for(int nindex=0; nindex < nindexes; nindex++)
+						{
+							AnlIndexData *other = &indexdata[nindex];
+							bool match = true;
+							if (nindex == ind ||
+								other->attr_cnt < 1 ||
+								other->vacattrstats[0]->multicolumn < n_keys)
+								continue;
+		
+							for (int c=0; c<n_keys; c++)
+							{
+								AttrNumber thisAttNum = thisdata->rel->rd_index->indkey.values[c];
+								AttrNumber otherAttNum = other->rel->rd_index->indkey.values[c];
+								if (thisAttNum != otherAttNum)
+								{
+									match = false;
+									break;
+								}
+							}
+
+							if (match && (
+								(other->vacattrstats[0]->tupDesc->natts == n_keys) ||
+								(nindex < ind)
+							))
+							{
+								foundSamePrefix = true;
+								break;
+							}
+						}
+
+						if (foundSamePrefix)
+							continue;
+
+						if (!prefixStats)
+						{
+							prefixStats = examine_attribute(thisdata->rel, stats->tupattnum, (Node*)thisdata->row);
+							prefixStats->exprvals = exprvals + i;
+							prefixStats->exprnulls = exprnulls + i;
+							prefixStats->rowstride = attr_cnt;
+						}
+
+						prefixStats->tupattnum = n_keys;
+						prefixStats->multicolumn = stats->tupDesc->natts;
+						prefixStats->tupDesc = CreateTupleDescTruncatedCopy(stats->tupDesc, n_keys);
+
+						prefixStats->compute_stats(prefixStats,
+											 NULL,
+											 numindexrows,
+											 totalindexrows);
+
+						update_attstats(RelationGetRelid(thisdata->rel), false,
+							1, &prefixStats);
+					}
+				}
 
 				MemoryContextReset(col_context);
 			}
@@ -1797,11 +1934,22 @@ update_attstats(Oid relid, bool inh, int natts, VacAttrStats **vacattrstats)
 static Datum
 std_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull)
 {
-	int			attnum = stats->tupattnum;
-	HeapTuple	tuple = stats->rows[rownum];
-	TupleDesc	tupDesc = stats->tupDesc;
+	if (stats->rowsAttrPitch)
+	{
+		size_t index = rownum * stats->rowsAttrPitch;
+		*isNull = stats->rowsAttrNulls[index];
 
-	return heap_getattr(tuple, attnum, tupDesc, isNull);
+		return stats->rowsAttrValues[index];
+	}
+	else
+	{
+		int			attnum = stats->tupattnum;
+		HeapTuple	tuple = stats->rows[rownum];
+		TupleDesc	tupDesc = stats->tupDesc;
+
+		return heap_getattr(tuple, attnum, tupDesc, isNull);
+	}
+
 }
 
 /*
@@ -1859,6 +2007,7 @@ typedef struct
 {
 	SortSupport ssup;
 	int		   *tupnoLink;
+	bool		multicolumn;
 } CompareScalarsContext;
 
 
@@ -2386,6 +2535,31 @@ compute_distinct_stats(VacAttrStatsP stats,
 }
 
 
+static Datum
+datumCopyPrefix(Datum value, bool typByVal, int typLen, VacAttrStats* stats)
+{
+	HeapTupleData tuple;
+	Datum *values;
+	bool *nulls;
+	Datum ret;
+
+	if (!stats->multicolumn || stats->tupattnum == stats->multicolumn)
+		return datumCopy(value, typByVal, typLen);
+	
+	tuple.t_data = DatumGetHeapTupleHeader(value);
+	tuple.t_len = HeapTupleHeaderGetDatumLength(tuple.t_data);
+	ItemPointerSetInvalid(&(tuple.t_self));
+	tuple.t_tableOid = InvalidOid;
+
+	values = (Datum *) palloc(stats->multicolumn * sizeof(Datum));
+	nulls = (bool *) palloc(stats->multicolumn * sizeof(bool));
+	heap_deform_tuple(&tuple, stats->tupDesc, values, nulls);
+	ret = HeapTupleGetDatum(heap_form_tuple(stats->tupDesc, values,nulls));
+	pfree(values);
+	pfree(nulls);
+	return ret;
+}
+
 /*
  *	compute_scalar_stats() -- compute column statistics
  *
@@ -2405,96 +2579,107 @@ compute_scalar_stats(VacAttrStatsP stats,
 					 double totalrows)
 {
 	int			i;
-	int			null_cnt = 0;
-	int			nonnull_cnt = 0;
-	int			toowide_cnt = 0;
-	double		total_width = 0;
+	static int			null_cnt;
+	static int			nonnull_cnt;
+	static int			toowide_cnt;
+	static double		total_width;
 	bool		is_varlena = (!stats->attrtype->typbyval &&
 							  stats->attrtype->typlen == -1);
 	bool		is_varwidth = (!stats->attrtype->typbyval &&
 							   stats->attrtype->typlen < 0);
 	double		corr_xysum;
 	SortSupportData ssup;
-	ScalarItem *values;
-	int			values_cnt = 0;
-	int		   *tupnoLink;
-	ScalarMCVItem *track;
+	static ScalarItem *values;
+	static int			values_cnt;
+	static int		   *tupnoLink;
+	static ScalarMCVItem *track;
 	int			track_cnt = 0;
 	int			num_mcv = stats->attstattarget;
 	int			num_bins = stats->attstattarget;
 	StdAnalyzeData *mystats = (StdAnalyzeData *) stats->extra_data;
+	bool fetch_values = (!stats->multicolumn || stats->tupattnum == stats->multicolumn);
 
-	values = (ScalarItem *) palloc(samplerows * sizeof(ScalarItem));
-	tupnoLink = (int *) palloc(samplerows * sizeof(int));
-	track = (ScalarMCVItem *) palloc(num_mcv * sizeof(ScalarMCVItem));
 
-	memset(&ssup, 0, sizeof(ssup));
-	ssup.ssup_cxt = CurrentMemoryContext;
-	ssup.ssup_collation = stats->attrcollid;
-	ssup.ssup_nulls_first = false;
-
-	/*
-	 * For now, don't perform abbreviated key conversion, because full values
-	 * are required for MCV slot generation.  Supporting that optimization
-	 * would necessitate teaching compare_scalars() to call a tie-breaker.
-	 */
-	ssup.abbreviate = false;
-
-	PrepareSortSupportFromOrderingOp(mystats->ltopr, &ssup);
-
-	/* Initial scan to find sortable values */
-	for (i = 0; i < samplerows; i++)
+	if (fetch_values)
 	{
-		Datum		value;
-		bool		isnull;
-
-		vacuum_delay_point(true);
-
-		value = fetchfunc(stats, i, &isnull);
-
-		/* Check for null/nonnull */
-		if (isnull)
-		{
-			null_cnt++;
-			continue;
-		}
-		nonnull_cnt++;
+		values = (ScalarItem *) palloc(samplerows * sizeof(ScalarItem));
+		tupnoLink = (int *) palloc(samplerows * sizeof(int));
+		track = (ScalarMCVItem *) palloc(num_mcv * sizeof(ScalarMCVItem));
+		
+		memset(&ssup, 0, sizeof(ssup));
+		ssup.ssup_cxt = CurrentMemoryContext;
+		ssup.ssup_collation = stats->attrcollid;
+		ssup.ssup_nulls_first = false;
 
 		/*
-		 * If it's a variable-width field, add up widths for average width
-		 * calculation.  Note that if the value is toasted, we use the toasted
-		 * width.  We don't bother with this calculation if it's a fixed-width
-		 * type.
-		 */
-		if (is_varlena)
-		{
-			total_width += VARSIZE_ANY(DatumGetPointer(value));
+		* For now, don't perform abbreviated key conversion, because full values
+		* are required for MCV slot generation.  Supporting that optimization
+		* would necessitate teaching compare_scalars() to call a tie-breaker.
+		*/
+		ssup.abbreviate = false;
 
-			/*
-			 * If the value is toasted, we want to detoast it just once to
-			 * avoid repeated detoastings and resultant excess memory usage
-			 * during the comparisons.  Also, check to see if the value is
-			 * excessively wide, and if so don't detoast at all --- just
-			 * ignore the value.
-			 */
-			if (toast_raw_datum_size(value) > WIDTH_THRESHOLD)
+		PrepareSortSupportFromOrderingOp(mystats->ltopr, &ssup);
+
+		values_cnt = 0;
+		null_cnt = 0;
+		nonnull_cnt = 0;
+		toowide_cnt = 0;
+		total_width = 0;
+
+		/* Initial scan to find sortable values */
+		for (i = 0; i < samplerows; i++)
+		{
+			Datum		value;
+			bool		isnull;
+
+			vacuum_delay_point(true);
+
+			value = fetchfunc(stats, i, &isnull);
+
+			/* Check for null/nonnull */
+			if (isnull)
 			{
-				toowide_cnt++;
+				null_cnt++;
 				continue;
 			}
-			value = PointerGetDatum(PG_DETOAST_DATUM(value));
-		}
-		else if (is_varwidth)
-		{
-			/* must be cstring */
-			total_width += strlen(DatumGetCString(value)) + 1;
-		}
+			nonnull_cnt++;
 
-		/* Add it to the list to be sorted */
-		values[values_cnt].value = value;
-		values[values_cnt].tupno = values_cnt;
-		tupnoLink[values_cnt] = values_cnt;
-		values_cnt++;
+			/*
+			* If it's a variable-width field, add up widths for average width
+			* calculation.  Note that if the value is toasted, we use the toasted
+			* width.  We don't bother with this calculation if it's a fixed-width
+			* type.
+			*/
+			if (is_varlena)
+			{
+				total_width += VARSIZE_ANY(DatumGetPointer(value));
+
+				/*
+				* If the value is toasted, we want to detoast it just once to
+				* avoid repeated detoastings and resultant excess memory usage
+				* during the comparisons.  Also, check to see if the value is
+				* excessively wide, and if so don't detoast at all --- just
+				* ignore the value.
+				*/
+				if (toast_raw_datum_size(value) > WIDTH_THRESHOLD)
+				{
+					toowide_cnt++;
+					continue;
+				}
+				value = PointerGetDatum(PG_DETOAST_DATUM(value));
+			}
+			else if (is_varwidth)
+			{
+				/* must be cstring */
+				total_width += strlen(DatumGetCString(value)) + 1;
+			}
+
+			/* Add it to the list to be sorted */
+			values[values_cnt].value = value;
+			values[values_cnt].tupno = values_cnt;
+			tupnoLink[values_cnt] = values_cnt;
+			values_cnt++;
+		}
 	}
 
 	/* We can only compute real stats if we found some sortable values. */
@@ -2505,13 +2690,31 @@ compute_scalar_stats(VacAttrStatsP stats,
 					num_hist,
 					dups_cnt;
 		int			slot_idx = 0;
-		CompareScalarsContext cxt;
 
-		/* Sort the collected values */
-		cxt.ssup = &ssup;
-		cxt.tupnoLink = tupnoLink;
-		qsort_interruptible(values, values_cnt, sizeof(ScalarItem),
-							compare_scalars, &cxt);
+
+
+		if (values_cnt > 0 && fetch_values)
+		{
+			CompareScalarsContext cxt;
+
+			/* Sort the collected values */
+			cxt.ssup = &ssup;
+			cxt.tupnoLink = tupnoLink;
+			cxt.multicolumn = stats->multicolumn;
+			qsort_interruptible(values, values_cnt, sizeof(ScalarItem),
+								compare_scalars, &cxt);
+
+			if (stats->multicolumn)
+			{
+				for (int c=0; c < values_cnt-1; c++)
+				{
+					int diffatt = abs(ApplySortComparator(values[c].value, false, values[c+1].value, false, &ssup));
+					tupnoLink[c] = diffatt ? (diffatt-1) : stats->multicolumn;
+				}
+
+				tupnoLink[values_cnt-1] = 0;
+			}
+		}
 
 		/*
 		 * Now scan the values in order, find the most common ones, and also
@@ -2532,6 +2735,7 @@ compute_scalar_stats(VacAttrStatsP stats,
 		 * is the last item of its group of duplicates (since the group will
 		 * be ordered by tupno).
 		 */
+
 		corr_xysum = 0;
 		ndistinct = 0;
 		nmultiple = 0;
@@ -2542,7 +2746,7 @@ compute_scalar_stats(VacAttrStatsP stats,
 
 			corr_xysum += ((double) i) * ((double) tupno);
 			dups_cnt++;
-			if (tupnoLink[tupno] == tupno)
+			if (stats->multicolumn ? (tupnoLink[i] < stats->tupattnum) : (tupnoLink[tupno] == tupno))
 			{
 				/* Reached end of duplicates of this value */
 				ndistinct++;
@@ -2714,9 +2918,10 @@ compute_scalar_stats(VacAttrStatsP stats,
 			mcv_freqs = (float4 *) palloc(num_mcv * sizeof(float4));
 			for (i = 0; i < num_mcv; i++)
 			{
-				mcv_values[i] = datumCopy(values[track[i].first].value,
+				mcv_values[i] = datumCopyPrefix(values[track[i].first].value,
 										  stats->attrtype->typbyval,
-										  stats->attrtype->typlen);
+										  stats->attrtype->typlen,
+										  stats);
 				mcv_freqs[i] = (double) track[i].count / (double) samplerows;
 			}
 			MemoryContextSwitchTo(old_context);
@@ -2742,12 +2947,14 @@ compute_scalar_stats(VacAttrStatsP stats,
 		 * histogram won't collapse to empty or a singleton.)
 		 */
 		num_hist = ndistinct - num_mcv;
+
 		if (num_hist > num_bins)
 			num_hist = num_bins + 1;
 		if (num_hist >= 2)
 		{
 			MemoryContext old_context;
 			Datum	   *hist_values;
+			ScalarItem *collapsed_values = values;
 			int			nvals;
 			int			pos,
 						posfrac,
@@ -2771,6 +2978,9 @@ compute_scalar_stats(VacAttrStatsP stats,
 							dest;
 				int			j;
 
+				if (stats->multicolumn)
+					collapsed_values = palloc(sizeof(ScalarItem) * values_cnt);
+
 				src = dest = 0;
 				j = 0;			/* index of next interesting MCV item */
 				while (src < values_cnt)
@@ -2792,7 +3002,7 @@ compute_scalar_stats(VacAttrStatsP stats,
 					}
 					else
 						ncopy = values_cnt - src;
-					memmove(&values[dest], &values[src],
+					memmove(&collapsed_values[dest], &values[src],
 							ncopy * sizeof(ScalarItem));
 					src += ncopy;
 					dest += ncopy;
@@ -2822,9 +3032,10 @@ compute_scalar_stats(VacAttrStatsP stats,
 
 			for (i = 0; i < num_hist; i++)
 			{
-				hist_values[i] = datumCopy(values[pos].value,
-										   stats->attrtype->typbyval,
-										   stats->attrtype->typlen);
+				hist_values[i] = datumCopyPrefix(collapsed_values[pos].value,
+												 stats->attrtype->typbyval,
+												 stats->attrtype->typlen,
+												 stats);
 				pos += delta;
 				posfrac += deltafrac;
 				if (posfrac >= (num_hist - 1))
@@ -2941,13 +3152,16 @@ compare_scalars(const void *a, const void *b, void *arg)
 	if (compare != 0)
 		return compare;
 
-	/*
-	 * The two datums are equal, so update cxt->tupnoLink[].
-	 */
-	if (cxt->tupnoLink[ta] < tb)
-		cxt->tupnoLink[ta] = tb;
-	if (cxt->tupnoLink[tb] < ta)
-		cxt->tupnoLink[tb] = ta;
+	if (!cxt->multicolumn)
+	{
+		/*
+		* The two datums are equal, so update cxt->tupnoLink[].
+		*/
+		if (cxt->tupnoLink[ta] < tb)
+			cxt->tupnoLink[ta] = tb;
+		if (cxt->tupnoLink[tb] < ta)
+			cxt->tupnoLink[tb] = ta;
+	}
 
 	/*
 	 * For equal datums, sort by tupno

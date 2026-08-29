@@ -606,6 +606,14 @@ GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 		else
 			rlocator.locator.relNumber = GetNewObjectId();
 
+		/* There is no chance that temporary table name will collide, because
+		 * name contains backend id which is unique among all backends */
+		if (rlocator.backend != INVALID_PROC_NUMBER)
+		{
+			collides = false;
+			break;
+		}
+
 		/* Check for existing file of same name */
 		rpath = relpath(rlocator, MAIN_FORKNUM);
 

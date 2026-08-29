@@ -695,4 +695,12 @@
   typreceive => 'brin_minmax_multi_summary_recv',
   typsend => 'brin_minmax_multi_summary_send', typalign => 'i',
   typstorage => 'x', typcollation => 'default' },
+{ oid => '14756', descr => 'pseudo-type representing removed abstime',
+   typname => 'abstime', typlen => '-1', typbyval => 'f', typtype => 'p',
+   typcategory => 'P', typinput => 'timestamp_in', typoutput => 'timestamp_out',
+   typreceive => 'timestamp_recv', typsend => 'timestamp_send', typalign => 'c' },
+{ oid => '14757', descr => 'pseudo-type representing removed reltime',
+   typname => 'reltime', typlen => '-1', typbyval => 'f', typtype => 'p',
+   typcategory => 'P', typinput => 'timestamp_in', typoutput => 'timestamp_out',
+   typreceive => 'timestamp_recv', typsend => 'timestamp_send', typalign => 'c' },
 ]

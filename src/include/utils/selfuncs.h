@@ -98,6 +98,7 @@ typedef struct VariableStatData
 								 * clause */
 	bool		acl_ok;			/* true if user has SELECT privilege on all
 								 * rows from the table or column */
+	AttStatsSlot	*sslots;
 } VariableStatData;
 
 #define ReleaseVariableStats(vardata)  \
@@ -180,6 +181,9 @@ extern double generic_restriction_selectivity(PlannerInfo *root,
 											  Oid oproid, Oid collation,
 											  List *args, int varRelid,
 											  double default_selectivity);
+double prefix_record_histogram_selectivity(VariableStatData *vardata,
+							Datum constvalLeft, Datum constvalRight, int record_cmp_prefix,
+							double ndistinct,int *n_bins);
 extern double ineq_histogram_selectivity(PlannerInfo *root,
 										 VariableStatData *vardata,
 										 Oid opoid, FmgrInfo *opproc,
@@ -224,6 +228,11 @@ extern List *estimate_multivariate_bucketsize(PlannerInfo *root,
 											  RelOptInfo *inner,
 											  List *hashclauses,
 											  Selectivity *innerbucketsize);
+extern double estimate_num_groups_incremental(PlannerInfo *root, List *groupExprs,
+											  double input_rows, List **pgset,
+											  EstimationInfo *estinfo,
+											  List **cache_varinfos, int prevNExprs);
+
 extern void estimate_hash_bucket_stats(PlannerInfo *root,
 									   Node *hashkey, double nbuckets,
 									   Selectivity *mcv_freq,
@@ -247,5 +256,13 @@ extern Selectivity scalararraysel_containment(PlannerInfo *root,
 											  Node *leftop, Node *rightop,
 											  Oid elemtype, bool isEquality, bool useOr,
 											  int varRelid);
-
+extern Selectivity eqjoin_selectivity(PlannerInfo *root, Oid operator, Oid
+									  collation,
+									  VariableStatData* vardata1,
+									  VariableStatData* vardata2,
+									  SpecialJoinInfo *sjinfo,
+									  int record_cmp_prefix);
+extern Selectivity eqconst_selectivity(Oid operator, Oid collation,
+					VariableStatData *vardata, Datum constval, bool constisnull, 
+					bool varonleft, bool negate, int record_cmp_prefix);
 #endif							/* SELFUNCS_H */

@@ -1379,3 +1379,64 @@ SELECT * FROM onek t1, lateral (SELECT * FROM onek t2 WHERE t2.ten IN (values (t
 -- VtA causes the whole expression to be evaluated as a constant
 EXPLAIN (COSTS OFF)
 SELECT ten FROM onek t WHERE 1.0::integer IN ((VALUES (1), (3)));
+
+
+
+
+-- test join predicate pushdowns
+create temp table facts (id bigint primary key, commodity__id bigint, moment timestamp, price numeric, quantity numeric, discount numeric);
+create temp table dim01 (id bigint primary key, sku int, naming text);
+
+insert into dim01(id, sku, naming)
+  select i, i, 'name_' || i::text
+  from generate_series(1,1000) AS g(i);
+
+insert into facts(id, commodity__id, moment, price, quantity, discount)
+  select i,
+    (i % 1000) + 1,
+    timestamp '2020-01-01 00:00' + (i % 200000) * interval '1 second',
+    ((i % 10000) + 1)::numeric as price,
+    ((i % 200) + 1)::numeric as quantity,
+    ((i % 1000) + 1)::numeric as discount
+  from generate_series(1,200000) AS g(i);
+
+create index facts_commodity_fk_idx on facts (commodity__id);
+create index dim01_sku_idx on dim01 (sku);
+
+analyze dim01;
+analyze facts;
+
+-- set DateStyle for explain output
+SET DateStyle = 'ISO, YMD';
+
+-- disable parallel plans
+SET max_parallel_workers_per_gather = 0;
+
+-- there must be join predicate pushdown
+explain (costs off)
+select dim01.sku, dim01.naming, t_join.price, t_join.quantity
+from dim01
+inner join (
+  select commodity__id, sum(price) as price, sum(quantity) as quantity from facts
+  where moment >= '2020-01-01 00:00'::timestamp and moment < '2020-01-10 00:00'::timestamp
+  group by commodity__id
+  having sum(quantity) >= 100
+) t_join
+on dim01.id = t_join.commodity__id
+where dim01.sku = 550;
+
+-- it's ok to push baserestrictinfo qual to having clause of the subquery
+explain (costs off)
+select dim01.sku, dim01.naming, t_join.price, t_join.quantity
+from dim01
+inner join (
+  select commodity__id, sum(price) as price, sum(quantity) as quantity from facts
+  where moment >= '2020-01-01 00:00'::timestamp and moment < '2020-01-10 00:00'::timestamp
+  group by commodity__id
+) t_join
+on dim01.id = t_join.commodity__id
+where dim01.sku = 550
+  and t_join.quantity >= 100;
+
+RESET max_parallel_workers_per_gather;
+RESET DateStyle;

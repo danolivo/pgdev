@@ -202,6 +202,7 @@ typedef struct ParallelIndexScanDescData
 }			ParallelIndexScanDescData;
 
 struct TupleTableSlot;
+struct TempCatScanData;
 
 /* Struct for storage-or-index scans of system tables */
 typedef struct SysScanDescData
@@ -212,6 +213,8 @@ typedef struct SysScanDescData
 	struct IndexScanDescData *iscan;	/* only valid in index-scan case */
 	struct SnapshotData *snapshot;	/* snapshot to unregister at end of scan */
 	struct TupleTableSlot *slot;
+	struct TempCatScanData *tempscan;
+
 }			SysScanDescData;
 
 #endif							/* RELSCAN_H */

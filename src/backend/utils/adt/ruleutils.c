@@ -39,6 +39,7 @@
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "commands/tablespace.h"
+#include "common/hashfn.h"
 #include "common/keywords.h"
 #include "executor/spi.h"
 #include "funcapi.h"
@@ -4923,6 +4924,8 @@ static char *
 make_colname_unique(char *colname, deparse_namespace *dpns,
 					deparse_columns *colinfo)
 {
+	CHECK_FOR_INTERRUPTS();
+
 	/*
 	 * If the selected name isn't unique, append digits to make it so.  For a
 	 * very long input name, we might have to truncate to stay within

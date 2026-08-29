@@ -74,6 +74,8 @@ typedef struct ExplainState
 	/* extensions */
 	void	  **extension_state;
 	int			extension_state_allocated;
+
+	uint64		es_processed;	/* sum of queryDesc->estate->es_processed */
 } ExplainState;
 
 typedef void (*ExplainOptionHandler) (ExplainState *, DefElem *, ParseState *);

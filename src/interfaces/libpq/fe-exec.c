@@ -3858,7 +3858,9 @@ PQcmdTuples(PGresult *res)
 	if (!res)
 		return "";
 
-	if (strncmp(res->cmdStatus, "INSERT ", 7) == 0)
+	if (strncmp(res->cmdStatus, "EXPLAIN ", 8) == 0)
+		p = res->cmdStatus + 8;
+	else if (strncmp(res->cmdStatus, "INSERT ", 7) == 0)
 	{
 		p = res->cmdStatus + 7;
 		/* INSERT: skip oid and space */

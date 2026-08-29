@@ -660,16 +660,16 @@ retry3:
 	{
 		switch (SOCK_ERRNO)
 		{
-			case EINTR:
+			case SOCK_EINTR:
 				goto retry3;
 
 				/* Some systems return EAGAIN/EWOULDBLOCK for no data */
-#ifdef EAGAIN
-			case EAGAIN:
+#ifdef SOCK_EAGAIN
+			case SOCK_EAGAIN:
 				return someread;
 #endif
-#if defined(EWOULDBLOCK) && (!defined(EAGAIN) || (EWOULDBLOCK != EAGAIN))
-			case EWOULDBLOCK:
+#if defined(SOCK_EWOULDBLOCK) && (!defined(SOCK_EAGAIN) || (SOCK_EWOULDBLOCK != SOCK_EAGAIN))
+			case SOCK_EWOULDBLOCK:
 				return someread;
 #endif
 
@@ -755,16 +755,16 @@ retry4:
 	{
 		switch (SOCK_ERRNO)
 		{
-			case EINTR:
+			case SOCK_EINTR:
 				goto retry4;
 
 				/* Some systems return EAGAIN/EWOULDBLOCK for no data */
-#ifdef EAGAIN
-			case EAGAIN:
+#ifdef SOCK_EAGAIN
+			case SOCK_EAGAIN:
 				return 0;
 #endif
-#if defined(EWOULDBLOCK) && (!defined(EAGAIN) || (EWOULDBLOCK != EAGAIN))
-			case EWOULDBLOCK:
+#if defined(SOCK_EWOULDBLOCK) && (!defined(SOCK_EAGAIN) || (SOCK_EWOULDBLOCK != SOCK_EAGAIN))
+			case SOCK_EWOULDBLOCK:
 				return 0;
 #endif
 
@@ -883,15 +883,15 @@ pqSendSome(PGconn *conn, int len)
 			/* Anything except EAGAIN/EWOULDBLOCK/EINTR is trouble */
 			switch (SOCK_ERRNO)
 			{
-#ifdef EAGAIN
-				case EAGAIN:
+#ifdef SOCK_EAGAIN
+				case SOCK_EAGAIN:
 					break;
 #endif
-#if defined(EWOULDBLOCK) && (!defined(EAGAIN) || (EWOULDBLOCK != EAGAIN))
-				case EWOULDBLOCK:
+#if defined(SOCK_EWOULDBLOCK) && (!defined(SOCK_EAGAIN) || (SOCK_EWOULDBLOCK != SOCK_EAGAIN))
+				case SOCK_EWOULDBLOCK:
 					break;
 #endif
-				case EINTR:
+				case SOCK_EINTR:
 					continue;
 
 				default:
@@ -1112,7 +1112,7 @@ pqSocketCheck(PGconn *conn, int forRead, int forWrite, pg_usec_time_t end_time)
 	/* We will retry as long as we get EINTR */
 	do
 		result = PQsocketPoll(sock, forRead, forWrite, end_time);
-	while (result < 0 && SOCK_ERRNO == EINTR);
+	while (result < 0 && SOCK_ERRNO == SOCK_EINTR);
 
 	if (result < 0)
 	{

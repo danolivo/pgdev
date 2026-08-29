@@ -17,10 +17,12 @@
 #define PATHNODES_H
 
 #include "access/sdir.h"
+#include "catalog/pg_statistic.h"
 #include "lib/stringinfo.h"
 #include "nodes/params.h"
 #include "nodes/parsenodes.h"
 #include "storage/block.h"
+#include "utils/lsyscache.h"
 
 
 /*
@@ -899,6 +901,7 @@ typedef struct RelOptInfo
 	 */
 	/* estimated number of result tuples */
 	Cardinality rows;
+	Cardinality rowsUnclamped;
 
 	/*
 	 * per-relation planner control flags
@@ -1236,6 +1239,10 @@ struct IndexOptInfo
 	/* AM's cost estimator */
 	/* Rather than include amapi.h here, we declare amcostestimate like this */
 	void		(*amcostestimate) (struct PlannerInfo *, struct IndexPath *, double, Cost *, Cost *, Selectivity *, double *, double *) pg_node_attr(read_write_ignore);
+
+	/* cache for per-tuple index statistic. That stats could be large and it
+	 * will be expensive to uncompress it every time */
+	AttStatsSlot	*sslots pg_node_attr(equal_ignore, query_jumble_ignore, read_write_ignore, read_as(0));
 };
 
 /*
@@ -1604,6 +1611,16 @@ typedef struct PathKey
 	CompareType pk_cmptype;		/* sort direction (ASC or DESC) */
 	bool		pk_nulls_first; /* do NULLs come before normal values? */
 } PathKey;
+
+/*
+ * Combines information about pathkeys and the associated clauses.
+ */
+typedef struct PathKeyInfo
+{
+	NodeTag		type;
+	List	   *pathkeys;
+	List	   *clauses;
+} PathKeyInfo;
 
 /*
  * Contains an order of group-by clauses and the corresponding list of
@@ -2068,6 +2085,11 @@ typedef struct AppendPath
 	/* Index of first partial path in subpaths; list_length(subpaths) if none */
 	int			first_partial_path;
 	Cardinality limit_tuples;	/* hard limit on output tuples, or -1 */
+	bool		pull_tlist;	/* if = true, create_append_plan()
+							 * should get targetlist from any
+							 * subpath - they are the same,
+							 * because the only place - append
+							 * index scan for range OR */
 } AppendPath;
 
 #define IS_DUMMY_APPEND(p) \

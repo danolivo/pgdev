@@ -86,6 +86,7 @@
 #include "storage/pg_shmem.h"
 #include "storage/predicate.h"
 #include "storage/procnumber.h"
+#include "storage/rd.h"
 #include "storage/standby.h"
 #include "tcop/backend_startup.h"
 #include "tcop/tcopprot.h"
@@ -102,6 +103,7 @@
 #include "utils/ps_status.h"
 #include "utils/rls.h"
 #include "utils/xml.h"
+#include "access/tempcat.h"
 
 #ifdef TRACE_SYNCSCAN
 #include "access/syncscan.h"
@@ -1043,6 +1045,26 @@ struct config_bool ConfigureNamesBool[] =
 		},
 		&enable_distinct_reordering,
 		true,
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_temp_memory_catalog", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enable in-memory system catalog for temporary tables."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&enable_temp_memory_catalog,
+		false,
+		NULL, NULL, NULL
+	},
+	{
+		{"enable_temp_rd_buffers", PGC_USERSET, RESOURCES_MEM,
+			gettext_noop("Enable in-memory page buffers for temporary tables."),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&enable_temp_rd_buffers,
+		false,
 		NULL, NULL, NULL
 	},
 	{
@@ -3868,6 +3890,17 @@ struct config_int ConfigureNamesInt[] =
 		SCRAM_SHA_256_DEFAULT_ITERATIONS, 1, INT_MAX,
 		NULL, NULL, NULL
 	},
+
+	// {
+	// 	{"temp_rd_buffers", PGC_USERSET, RESOURCES_MEM,
+	// 		gettext_noop("Sets the default number of buffers for each temporary table."),
+	// 		NULL,
+	// 		GUC_UNIT_BLOCKS | GUC_EXPLAIN
+	// 	},
+	// 	&temp_rd_buffers,
+	// 	4, 1, 128<<10,
+	// 	NULL, NULL, NULL
+	// },
 
 	/* End-of-list marker */
 	{

@@ -82,6 +82,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 
+#include "autoconfig.h"
 
 /* Ideally this would be in a .h file, but it hardly seems worth the trouble */
 extern const char *select_default_timezone(const char *share_path);
@@ -169,6 +170,7 @@ static char *xlog_dir = NULL;
 static int	wal_segment_size_mb = (DEFAULT_XLOG_SEG_SIZE) / (1024 * 1024);
 static DataDirSyncMethod sync_method = DATA_DIR_SYNC_METHOD_FSYNC;
 static bool sync_data_files = true;
+static bool autoconfig = true;
 
 
 /* internal vars */
@@ -1434,6 +1436,10 @@ setup_config(void)
 		conflines = replace_guc_value(conflines, gnames->str,
 									  gvalues->str, false);
 	}
+	
+	/* Append auto-configured recommended parameters */
+	if (autoconfig)
+		conflines = initdb_autoconfig_update(conflines);
 
 	/* ... and write out the finished postgresql.conf file */
 	snprintf(path, sizeof(path), "%s/postgresql.conf", pg_data);
@@ -2559,6 +2565,7 @@ usage(const char *progname)
 	printf(_("  -s, --show                show internal settings, then exit\n"));
 	printf(_("      --sync-method=METHOD  set method for syncing files to disk\n"));
 	printf(_("  -S, --sync-only           only sync database files to disk, then exit\n"));
+	printf(_("      --no-autoconfig       do not append auto-generated configuration for 1C:Enterprise\n"));
 	printf(_("\nOther options:\n"));
 	printf(_("  -V, --version             output version information, then exit\n"));
 	printf(_("  -?, --help                show this help, then exit\n"));
@@ -3198,6 +3205,7 @@ main(int argc, char *argv[])
 		{"sync-method", required_argument, NULL, 19},
 		{"no-data-checksums", no_argument, NULL, 20},
 		{"no-sync-data-files", no_argument, NULL, 21},
+		{"no-autoconfig", no_argument, NULL, 22},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -3394,6 +3402,9 @@ main(int argc, char *argv[])
 				break;
 			case 21:
 				sync_data_files = false;
+				break;
+			case 22:
+				autoconfig = false;
 				break;
 			default:
 				/* getopt_long already emitted a complaint */

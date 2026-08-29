@@ -72,6 +72,7 @@
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
+#include "utils/builtins.h"
 #include "utils/guc_hooks.h"
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
@@ -3297,6 +3298,15 @@ ProcessRecoveryConflictInterrupts(void)
  */
 void
 ProcessInterrupts(void)
+{
+	if (likely(!ProcessInterrupts_hook))
+		standard_ProcessInterrupts();
+	else
+		ProcessInterrupts_hook();
+}
+
+void
+standard_ProcessInterrupts(void)
 {
 	/* OK to accept any interrupts now? */
 	if (InterruptHoldoffCount != 0 || CritSectionCount != 0)

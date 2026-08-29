@@ -968,6 +968,7 @@ count_usable_fds(int max_to_probe, int *usable_fds, int *already_open)
 	int			used = 0;
 	int			highestfd = 0;
 	int			j;
+	int			fdTest = 0;
 
 #ifdef HAVE_GETRLIMIT
 	struct rlimit rlim;
@@ -983,6 +984,15 @@ count_usable_fds(int max_to_probe, int *usable_fds, int *already_open)
 		ereport(WARNING, (errmsg("getrlimit failed: %m")));
 #endif							/* HAVE_GETRLIMIT */
 
+#ifdef WIN32
+	/*
+	 * we have error on Windows7 with max_files_per_process > 1200 when dup(0) - stdin
+	 * make test on postgresql.conf file
+	 */
+	fdTest = _open(ConfigFileName, _O_RDONLY);
+	if (fdTest < 0)
+		fdTest = 0; /* fallback to stdin */
+#endif
 	/* dup until failure or probe limit reached */
 	for (;;)
 	{
@@ -998,7 +1008,7 @@ count_usable_fds(int max_to_probe, int *usable_fds, int *already_open)
 			break;
 #endif
 
-		thisfd = dup(2);
+		thisfd = dup(fdTest);
 		if (thisfd < 0)
 		{
 			/* Expect EMFILE or ENFILE, else it's fishy */
@@ -1025,6 +1035,10 @@ count_usable_fds(int max_to_probe, int *usable_fds, int *already_open)
 	for (j = 0; j < used; j++)
 		close(fd[j]);
 
+#ifdef WIN32
+	if (fdTest>0)
+		_close(fdTest);
+#endif
 	pfree(fd);
 
 	/*

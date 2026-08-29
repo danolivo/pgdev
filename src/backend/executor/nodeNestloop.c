@@ -163,6 +163,11 @@ ExecNestLoop(PlanState *pstate)
 		{
 			ENL1_printf("no inner tuple, need new outer tuple");
 
+			if (innerPlan->guaranteed_empty &&
+				(node->js.jointype == JOIN_INNER ||
+				 node->js.jointype == JOIN_SEMI))
+				return NULL;
+
 			node->nl_NeedNewOuter = true;
 
 			if (!node->nl_MatchedOuter &&

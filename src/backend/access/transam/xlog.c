@@ -96,6 +96,7 @@
 #include "utils/guc_hooks.h"
 #include "utils/guc_tables.h"
 #include "utils/injection_point.h"
+#include "utils/inval.h"
 #include "utils/pgstat_internal.h"
 #include "utils/ps_status.h"
 #include "utils/relmapper.h"
@@ -165,6 +166,8 @@ static double PrevCheckPointDistance = 0;
  * specified in wal_consistency_checking.
  */
 static bool check_wal_consistency_checking_deferred = false;
+
+static bool have_non_temp_records = false;
 
 /*
  * GUC support
@@ -778,6 +781,9 @@ XLogInsertRecord(XLogRecData *rdata,
 	if (!XLogInsertAllowed())
 		elog(ERROR, "cannot make new WAL entries during recovery");
 
+	if (!IsTempTableScope() && rechdr->xl_rmid != RM_XACT_ID)
+		have_non_temp_records = true;
+	
 	/*
 	 * Given that we're not in recovery, InsertTimeLineID is set and can't
 	 * change, so we can read it without a lock.
@@ -2598,6 +2604,8 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 		Assert(Insert >= Write);
 	}
 #endif
+
+	have_non_temp_records = false;
 }
 
 /*
@@ -8747,6 +8755,9 @@ issue_xlog_fsync(int fd, XLogSegNo segno, TimeLineID tli)
 	instr_time	start;
 
 	Assert(tli != 0);
+
+	if (MyBackendType == B_BACKEND && !have_non_temp_records)
+		return;
 
 	/*
 	 * Quick exit if fsync is disabled or write() has already synced the WAL

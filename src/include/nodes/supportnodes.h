@@ -35,6 +35,22 @@
 
 #include "nodes/plannodes.h"
 
+typedef enum
+{
+	Pattern_Type_Like,
+	Pattern_Type_Like_IC,
+	Pattern_Type_Regex,
+	Pattern_Type_Regex_IC,
+	Pattern_Type_Prefix
+} Pattern_Type;
+
+typedef enum
+{
+	Pattern_Prefix_None,
+	Pattern_Prefix_Partial,
+	Pattern_Prefix_Exact
+} Pattern_Prefix_Status;
+
 struct PlannerInfo;				/* avoid including pathnodes.h here */
 struct IndexOptInfo;
 struct SpecialJoinInfo;

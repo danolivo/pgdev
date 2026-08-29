@@ -44,6 +44,8 @@ volatile uint32 InterruptHoldoffCount = 0;
 volatile uint32 QueryCancelHoldoffCount = 0;
 volatile uint32 CritSectionCount = 0;
 
+ProcessInterrupts_hook_type ProcessInterrupts_hook = NULL;
+
 int			MyProcPid;
 pg_time_t	MyStartTime;
 TimestampTz MyStartTimestamp;

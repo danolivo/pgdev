@@ -194,15 +194,14 @@ EXPLAIN (COSTS OFF) MERGE INTO stats_track_tab
 (6 rows)
 
 EXPLAIN (COSTS OFF) SELECT 1 UNION SELECT 2;
-        QUERY PLAN        
---------------------------
- Unique
-   ->  Sort
-         Sort Key: (1)
-         ->  Append
-               ->  Result
-               ->  Result
-(6 rows)
+     QUERY PLAN     
+--------------------
+ HashAggregate
+   Group Key: (1)
+   ->  Append
+         ->  Result
+         ->  Result
+(5 rows)
 
 SELECT toplevel, calls, query FROM pg_stat_statements
   ORDER BY query COLLATE "C";
@@ -320,15 +319,14 @@ EXPLAIN (COSTS OFF) MERGE INTO stats_track_tab
 (6 rows)
 
 EXPLAIN (COSTS OFF) SELECT 1 UNION SELECT 2;
-        QUERY PLAN        
---------------------------
- Unique
-   ->  Sort
-         Sort Key: (1)
-         ->  Append
-               ->  Result
-               ->  Result
-(6 rows)
+     QUERY PLAN     
+--------------------
+ HashAggregate
+   Group Key: (1)
+   ->  Append
+         ->  Result
+         ->  Result
+(5 rows)
 
 SELECT toplevel, calls, query FROM pg_stat_statements
   ORDER BY query COLLATE "C";
@@ -383,25 +381,23 @@ EXPLAIN (COSTS OFF) (SELECT 1, 2, 3)\; EXPLAIN (COSTS OFF) (SELECT 1, 2, 3, 4);
 (1 row)
 
 EXPLAIN (COSTS OFF) SELECT 1, 2 UNION SELECT 3, 4\; EXPLAIN (COSTS OFF) (SELECT 1, 2, 3) UNION SELECT 3, 4, 5;
+      QUERY PLAN       
+-----------------------
+ HashAggregate
+   Group Key: (1), (2)
+   ->  Append
+         ->  Result
+         ->  Result
+(5 rows)
+
          QUERY PLAN         
 ----------------------------
- Unique
-   ->  Sort
-         Sort Key: (1), (2)
-         ->  Append
-               ->  Result
-               ->  Result
-(6 rows)
-
-           QUERY PLAN            
----------------------------------
- Unique
-   ->  Sort
-         Sort Key: (1), (2), (3)
-         ->  Append
-               ->  Result
-               ->  Result
-(6 rows)
+ HashAggregate
+   Group Key: (1), (2), (3)
+   ->  Append
+         ->  Result
+         ->  Result
+(5 rows)
 
 SELECT toplevel, calls, query FROM pg_stat_statements
   ORDER BY query COLLATE "C";
@@ -674,25 +670,23 @@ EXPLAIN (COSTS OFF) MERGE INTO stats_track_tab USING (SELECT id FROM generate_se
 (1 row)
 
 EXPLAIN (COSTS OFF) SELECT 1, 2 UNION SELECT 3, 4\; EXPLAIN (COSTS OFF) (SELECT 1, 2, 3) UNION SELECT 3, 4, 5;
+      QUERY PLAN       
+-----------------------
+ HashAggregate
+   Group Key: (1), (2)
+   ->  Append
+         ->  Result
+         ->  Result
+(5 rows)
+
          QUERY PLAN         
 ----------------------------
- Unique
-   ->  Sort
-         Sort Key: (1), (2)
-         ->  Append
-               ->  Result
-               ->  Result
-(6 rows)
-
-           QUERY PLAN            
----------------------------------
- Unique
-   ->  Sort
-         Sort Key: (1), (2), (3)
-         ->  Append
-               ->  Result
-               ->  Result
-(6 rows)
+ HashAggregate
+   Group Key: (1), (2), (3)
+   ->  Append
+         ->  Result
+         ->  Result
+(5 rows)
 
 SELECT toplevel, calls, query FROM pg_stat_statements
   ORDER BY query COLLATE "C";
@@ -777,15 +771,14 @@ EXPLAIN (COSTS OFF) WITH a AS (SELECT 4) MERGE INTO stats_track_tab
 (6 rows)
 
 EXPLAIN (COSTS OFF) WITH a AS (select 4) SELECT 1 UNION SELECT 2;
-        QUERY PLAN        
---------------------------
- Unique
-   ->  Sort
-         Sort Key: (1)
-         ->  Append
-               ->  Result
-               ->  Result
-(6 rows)
+     QUERY PLAN     
+--------------------
+ HashAggregate
+   Group Key: (1)
+   ->  Append
+         ->  Result
+         ->  Result
+(5 rows)
 
 SELECT toplevel, calls, query FROM pg_stat_statements
   ORDER BY query COLLATE "C";
@@ -871,15 +864,14 @@ EXPLAIN (COSTS OFF) WITH a AS (SELECT 4) MERGE INTO stats_track_tab
 (6 rows)
 
 EXPLAIN (COSTS OFF) WITH a AS (select 4) SELECT 1 UNION SELECT 2;
-        QUERY PLAN        
---------------------------
- Unique
-   ->  Sort
-         Sort Key: (1)
-         ->  Append
-               ->  Result
-               ->  Result
-(6 rows)
+     QUERY PLAN     
+--------------------
+ HashAggregate
+   Group Key: (1)
+   ->  Append
+         ->  Result
+         ->  Result
+(5 rows)
 
 SELECT toplevel, calls, query FROM pg_stat_statements
   ORDER BY query COLLATE "C";

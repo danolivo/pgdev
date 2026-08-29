@@ -1,0 +1,4 @@
+comment = 'auto_dump'
+default_version = '1.1'
+module_pathname = '$libdir/auto_dump'
+relocatable = true

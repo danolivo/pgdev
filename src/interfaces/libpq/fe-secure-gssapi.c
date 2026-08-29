@@ -84,8 +84,8 @@
  * transport negotiation is complete).
  *
  * On success, returns the number of data bytes consumed (possibly less than
- * len).  On failure, returns -1 with errno set appropriately.  If the errno
- * indicates a non-retryable error, a message is added to conn->errorMessage.
+ * len). On failure, returns -1 with SOCK_ERRNO (need to use SOCK_ERRNO since it is different from errno in Windows)
+ * set appropriately. If the SOCK_ERRNO indicates a non-retryable error, a message is added to conn->errorMessage.
  * For retryable errors, caller should call again (passing the same or more
  * data) once the socket is ready.
  */
@@ -121,7 +121,7 @@ pg_GSS_write(PGconn *conn, const void *ptr, size_t len)
 	{
 		appendPQExpBufferStr(&conn->errorMessage,
 							 "GSSAPI caller failed to retransmit all data needing to be retried\n");
-		SOCK_ERRNO_SET(EINVAL);
+		SOCK_ERRNO_SET(SOCK_EINVAL);
 		return -1;
 	}
 
@@ -199,14 +199,14 @@ pg_GSS_write(PGconn *conn, const void *ptr, size_t len)
 		if (major != GSS_S_COMPLETE)
 		{
 			pg_GSS_error(libpq_gettext("GSSAPI wrap error"), conn, major, minor);
-			SOCK_ERRNO_SET(EIO);	/* for lack of a better idea */
+			SOCK_ERRNO_SET(SOCK_EIO);		/* for lack of a better idea */
 			goto cleanup;
 		}
 
 		if (conf_state == 0)
 		{
 			libpq_append_conn_error(conn, "outgoing GSSAPI message would not use confidentiality");
-			SOCK_ERRNO_SET(EIO);	/* for lack of a better idea */
+			SOCK_ERRNO_SET(SOCK_EIO);		/* for lack of a better idea */
 			goto cleanup;
 		}
 
@@ -215,7 +215,7 @@ pg_GSS_write(PGconn *conn, const void *ptr, size_t len)
 			libpq_append_conn_error(conn, "client tried to send oversize GSSAPI packet (%zu > %zu)",
 									(size_t) output.length,
 									PQ_GSS_MAX_PACKET_SIZE - sizeof(uint32));
-			SOCK_ERRNO_SET(EIO);	/* for lack of a better idea */
+			SOCK_ERRNO_SET(SOCK_EIO);		/* for lack of a better idea */
 			goto cleanup;
 		}
 
@@ -258,8 +258,8 @@ cleanup:
  * transport negotiation is complete).
  *
  * Returns the number of data bytes read, or on failure, returns -1
- * with errno set appropriately.  If the errno indicates a non-retryable
- * error, a message is added to conn->errorMessage.  For retryable errors,
+ * with SOCK_ERRNO (need to use SOCK_ERRNO since it is different from errno in Windows) set appropriately.
+ * If the SOCK_ERRNO indicates a non-retryable error, a message is added to conn->errorMessage.  For retryable errors,
  * caller should call again once the socket is ready.
  */
 ssize_t
@@ -341,7 +341,7 @@ pg_GSS_read(PGconn *conn, void *ptr, size_t len)
 			/* If we still haven't got the length, return to the caller */
 			if (PqGSSRecvLength < sizeof(uint32))
 			{
-				SOCK_ERRNO_SET(EWOULDBLOCK);
+				SOCK_ERRNO_SET(SOCK_EWOULDBLOCK);
 				return -1;
 			}
 		}
@@ -354,7 +354,7 @@ pg_GSS_read(PGconn *conn, void *ptr, size_t len)
 			libpq_append_conn_error(conn, "oversize GSSAPI packet sent by the server (%zu > %zu)",
 									(size_t) input.length,
 									PQ_GSS_MAX_PACKET_SIZE - sizeof(uint32));
-			SOCK_ERRNO_SET(EIO);	/* for lack of a better idea */
+			SOCK_ERRNO_SET(SOCK_EIO);		/* for lack of a better idea */
 			return -1;
 		}
 
@@ -373,7 +373,7 @@ pg_GSS_read(PGconn *conn, void *ptr, size_t len)
 		/* If we don't yet have the whole packet, return to the caller */
 		if (PqGSSRecvLength - sizeof(uint32) < input.length)
 		{
-			SOCK_ERRNO_SET(EWOULDBLOCK);
+			SOCK_ERRNO_SET(SOCK_EWOULDBLOCK);
 			return -1;
 		}
 
@@ -393,7 +393,7 @@ pg_GSS_read(PGconn *conn, void *ptr, size_t len)
 			pg_GSS_error(libpq_gettext("GSSAPI unwrap error"), conn,
 						 major, minor);
 			ret = -1;
-			SOCK_ERRNO_SET(EIO);	/* for lack of a better idea */
+			SOCK_ERRNO_SET(SOCK_EIO);		/* for lack of a better idea */
 			goto cleanup;
 		}
 
@@ -401,7 +401,7 @@ pg_GSS_read(PGconn *conn, void *ptr, size_t len)
 		{
 			libpq_append_conn_error(conn, "incoming GSSAPI message did not use confidentiality");
 			ret = -1;
-			SOCK_ERRNO_SET(EIO);	/* for lack of a better idea */
+			SOCK_ERRNO_SET(SOCK_EIO);		/* for lack of a better idea */
 			goto cleanup;
 		}
 
@@ -437,8 +437,15 @@ gss_read(PGconn *conn, void *recv_buffer, size_t length, ssize_t *ret)
 	*ret = pqsecure_raw_read(conn, recv_buffer, length);
 	if (*ret < 0)
 	{
-		if (SOCK_ERRNO == EAGAIN || SOCK_ERRNO == EWOULDBLOCK ||
-			SOCK_ERRNO == EINTR)
+		int err = SOCK_ERRNO;
+		if (
+#ifdef SOCK_EAGAIN
+			err == SOCK_EAGAIN ||
+#endif
+#ifdef SOCK_EWOULDBLOCK
+			err == SOCK_EWOULDBLOCK ||
+#endif
+			err == SOCK_EINTR)
 			return PGRES_POLLING_READING;
 		else
 			return PGRES_POLLING_FAILED;
@@ -458,8 +465,16 @@ gss_read(PGconn *conn, void *recv_buffer, size_t length, ssize_t *ret)
 		*ret = pqsecure_raw_read(conn, recv_buffer, length);
 		if (*ret < 0)
 		{
-			if (SOCK_ERRNO == EAGAIN || SOCK_ERRNO == EWOULDBLOCK ||
-				SOCK_ERRNO == EINTR)
+			int err = SOCK_ERRNO;
+			
+			if (
+#ifdef SOCK_EAGAIN
+				err == SOCK_EAGAIN ||
+#endif
+#ifdef SOCK_EWOULDBLOCK
+				err == SOCK_EWOULDBLOCK ||
+#endif
+				err == SOCK_EINTR)
 				return PGRES_POLLING_READING;
 			else
 				return PGRES_POLLING_FAILED;
@@ -522,8 +537,15 @@ pqsecure_open_gss(PGconn *conn)
 		ret = pqsecure_raw_write(conn, PqGSSSendBuffer + PqGSSSendNext, amount);
 		if (ret < 0)
 		{
-			if (SOCK_ERRNO == EAGAIN || SOCK_ERRNO == EWOULDBLOCK ||
-				SOCK_ERRNO == EINTR)
+			int err = SOCK_ERRNO;
+			if (
+#ifdef SOCK_EAGAIN
+				err == SOCK_EAGAIN ||
+#endif
+#ifdef SOCK_EWOULDBLOCK
+				err == SOCK_EWOULDBLOCK ||
+#endif
+				err == SOCK_EINTR)
 				return PGRES_POLLING_WRITING;
 			else
 				return PGRES_POLLING_FAILED;

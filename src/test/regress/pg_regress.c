@@ -2337,7 +2337,7 @@ regression_main(int argc, char *argv[],
 			note("initializing database system by running initdb");
 
 			appendStringInfo(&cmd,
-							 "\"%s%sinitdb\" -D \"%s/data\" --no-clean --no-sync",
+							 "\"%s%sinitdb\" -D \"%s/data\" --no-clean --no-sync --no-autoconfig",
 							 bindir ? bindir : "",
 							 bindir ? "/" : "",
 							 temp_instance);

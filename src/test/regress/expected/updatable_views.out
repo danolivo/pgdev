@@ -2440,19 +2440,16 @@ UPDATE rw_view1 SET a = a + 1000 FROM other_tbl_parent WHERE a = id;
  Update on base_tbl_parent
    Update on base_tbl_parent base_tbl_parent_1
    Update on base_tbl_child base_tbl_parent_2
-   ->  Merge Join
-         Merge Cond: (base_tbl_parent.a = other_tbl_parent.id)
-         ->  Sort
-               Sort Key: base_tbl_parent.a
-               ->  Append
-                     ->  Seq Scan on base_tbl_parent base_tbl_parent_1
-                     ->  Seq Scan on base_tbl_child base_tbl_parent_2
-         ->  Sort
-               Sort Key: other_tbl_parent.id
+   ->  Hash Join
+         Hash Cond: (base_tbl_parent.a = other_tbl_parent.id)
+         ->  Append
+               ->  Seq Scan on base_tbl_parent base_tbl_parent_1
+               ->  Seq Scan on base_tbl_child base_tbl_parent_2
+         ->  Hash
                ->  Append
                      ->  Seq Scan on other_tbl_parent other_tbl_parent_1
                      ->  Seq Scan on other_tbl_child other_tbl_parent_2
-(15 rows)
+(12 rows)
 
 UPDATE rw_view1 SET a = a + 1000 FROM other_tbl_parent WHERE a = id;
 SELECT * FROM ONLY base_tbl_parent ORDER BY a;
@@ -3502,23 +3499,20 @@ CREATE RULE v1_upd_rule AS ON UPDATE TO v1 DO INSTEAD
 CREATE VIEW v2 WITH (security_barrier = true) AS
   SELECT * FROM v1 WHERE EXISTS (SELECT 1);
 EXPLAIN (COSTS OFF) UPDATE v2 SET a = 1;
-                          QUERY PLAN                          
---------------------------------------------------------------
+                       QUERY PLAN                       
+--------------------------------------------------------
  Update on t1
    InitPlan 1
      ->  Result
-   ->  Merge Join
-         Merge Cond: (t1.a = v1.a)
-         ->  Sort
-               Sort Key: t1.a
+   ->  Hash Join
+         Hash Cond: (v1.a = t1.a)
+         ->  Subquery Scan on v1
+               ->  Result
+                     One-Time Filter: (InitPlan 1).col1
+                     ->  Seq Scan on t1 t1_1
+         ->  Hash
                ->  Seq Scan on t1
-         ->  Sort
-               Sort Key: v1.a
-               ->  Subquery Scan on v1
-                     ->  Result
-                           One-Time Filter: (InitPlan 1).col1
-                           ->  Seq Scan on t1 t1_1
-(14 rows)
+(11 rows)
 
 DROP VIEW v2;
 DROP VIEW v1;

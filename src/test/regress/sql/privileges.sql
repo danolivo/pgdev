@@ -307,7 +307,6 @@ bar	true
 \.
 SELECT * FROM atest1; -- ok
 
-
 -- test leaky-function protections in selfuncs
 
 -- regress_priv_user1 will own a table and provide views for it.
@@ -339,8 +338,8 @@ EXPLAIN (COSTS OFF) SELECT * FROM atest12v x, atest12v y WHERE x.a = y.b;
 EXPLAIN (COSTS OFF) SELECT * FROM atest12 x, atest12 y
   WHERE x.a = y.b and abs(y.a) <<< 5;
 
--- This should also be a nestloop, but the security barrier forces the inner
--- scan to be materialized
+-- This is a nestloop, becase we can push down x.a = y.b to the subquery
+-- There are no leaky functions here
 EXPLAIN (COSTS OFF) SELECT * FROM atest12sbv x, atest12sbv y WHERE x.a = y.b;
 
 -- Check if regress_priv_user2 can break security.

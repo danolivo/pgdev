@@ -177,7 +177,6 @@ remove_join_clause_from_rels(PlannerInfo *root,
 		 * Remove the restrictinfo from the list.  Pointer comparison is
 		 * sufficient.
 		 */
-		Assert(list_member_ptr(rel->joininfo, restrictinfo));
 		rel->joininfo = list_delete_ptr(rel->joininfo, restrictinfo);
 	}
 }

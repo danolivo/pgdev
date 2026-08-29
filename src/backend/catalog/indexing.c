@@ -18,10 +18,12 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/tempcat.h"
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "executor/executor.h"
+#include "utils/inval.h"
 #include "utils/rel.h"
 
 
@@ -234,6 +236,12 @@ CatalogTupleInsert(Relation heapRel, HeapTuple tup)
 {
 	CatalogIndexState indstate;
 
+	if (enable_temp_memory_catalog && IsTempTableScope())
+	{
+		temp_catalog_insert(heapRel, tup);
+		return;
+	}
+
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	indstate = CatalogOpenIndexes(heapRel);
@@ -256,6 +264,12 @@ void
 CatalogTupleInsertWithInfo(Relation heapRel, HeapTuple tup,
 						   CatalogIndexState indstate)
 {
+	if (enable_temp_memory_catalog && IsTempTableScope())
+	{
+		temp_catalog_insert(heapRel, tup);
+		return;
+	}
+
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	simple_heap_insert(heapRel, tup);
@@ -276,6 +290,14 @@ CatalogTuplesMultiInsertWithInfo(Relation heapRel, TupleTableSlot **slot,
 	/* Nothing to do */
 	if (ntuples <= 0)
 		return;
+
+	if (enable_temp_memory_catalog && IsTempTableScope())
+	{
+		for (int i = 0; i < ntuples; i++)
+			temp_catalog_insert(heapRel, ExecFetchSlotHeapTuple(slot[i], true, NULL));
+		return;
+	}
+
 
 	heap_multi_insert(heapRel, slot, ntuples,
 					  GetCurrentCommandId(true), 0, NULL);
@@ -315,6 +337,12 @@ CatalogTupleUpdate(Relation heapRel, ItemPointer otid, HeapTuple tup)
 	CatalogIndexState indstate;
 	TU_UpdateIndexes updateIndexes = TU_All;
 
+	if (enable_temp_memory_catalog && IsTempTableScope())
+	{
+		temp_catalog_update(heapRel, otid, tup);
+		return;
+	}
+
 	CatalogTupleCheckConstraints(heapRel, tup);
 
 	indstate = CatalogOpenIndexes(heapRel);
@@ -338,6 +366,12 @@ CatalogTupleUpdateWithInfo(Relation heapRel, ItemPointer otid, HeapTuple tup,
 						   CatalogIndexState indstate)
 {
 	TU_UpdateIndexes updateIndexes = TU_All;
+
+	if (enable_temp_memory_catalog && IsTempTableScope())
+	{
+		temp_catalog_update(heapRel, otid, tup);
+		return;
+	}
 
 	CatalogTupleCheckConstraints(heapRel, tup);
 
@@ -364,5 +398,11 @@ CatalogTupleUpdateWithInfo(Relation heapRel, ItemPointer otid, HeapTuple tup,
 void
 CatalogTupleDelete(Relation heapRel, ItemPointer tid)
 {
+	if (enable_temp_memory_catalog && IsTempTableScope())
+	{
+		temp_catalog_delete(heapRel, tid);
+		return;
+	}
+
 	simple_heap_delete(heapRel, tid);
 }
