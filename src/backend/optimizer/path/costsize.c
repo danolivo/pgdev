@@ -2142,6 +2142,64 @@ cost_incremental_sort(Path *path,
 }
 
 /*
+ * Calculate multiplier reflecting the number of comparisons which executor
+ * have to perform during the sort with this specific order of columns.
+ *
+ * The comparison factor f = 1.+F(pathkeys). There 1. incapsulates the
+ * second-order of significance phusics which cost function doesn't consider.
+ * F(pathkeys) is the estimated fraction of comparisons in the range [1..N].
+ * F = 1 corresponds the 'all-unique' first column case. In that case the sort
+ * will call comparison function only once for each couple of tuples.
+ * F = N represents the case, when values in all columns are constant.
+ */
+static double
+sort_comparisons_factor(PlannerInfo *root, List *pathkeys, double ntuples)
+{
+	int		n = list_length(pathkeys);
+	double	cmpfrac = (n == 0) ? 2.0 : n + 1;
+
+	if (root != NULL && ntuples > 1 && n > 1)
+	{
+		PathKey			   *key = linitial_node(PathKey, pathkeys);
+		EquivalenceMember  *em =  NULL;
+		VariableStatData	vardata;
+		bool	isdefault = true;
+		double	ndist = 0.;
+
+		/* Look for the first appropriate member */
+		foreach_node(EquivalenceMember, em, key->pk_eclass->ec_members)
+		{
+
+			if (em->em_is_child || em->em_is_const || bms_is_empty(em->em_relids) ||
+				bms_is_member(0, em->em_relids))
+				continue;
+			break;
+		}
+
+		if (em == NULL)
+			return cmpfrac;
+
+		examine_variable(root, (Node *) em->em_expr, 0, &vardata);
+		if (HeapTupleIsValid(vardata.statsTuple))
+			ndist = get_variable_numdistinct(&vardata, &isdefault);
+		ReleaseVariableStats(vardata);
+
+		if (isdefault)
+			/*
+			 * Optimiser doesn't have an info on ndistinct value, return
+			 * extreme case
+			 */
+			return cmpfrac;
+
+		if (ntuples >= ndist)
+			cmpfrac =
+				2.0 + ((ntuples - ndist) / (ntuples - 1)) * (n - 1);
+	}
+
+	return cmpfrac;
+}
+
+/*
  * cost_sort
  *	  Determines and returns the cost of sorting a relation, including
  *	  the cost of reading the input data.
@@ -2163,8 +2221,7 @@ cost_sort(Path *path, PlannerInfo *root,
 {
 	Cost		startup_cost;
 	Cost		run_cost;
-	double		cmpfrac =
-						(pathkeys == NIL) ? 2.0 : list_length(pathkeys) + 1.0;
+	double		cmpfrac = sort_comparisons_factor(root, pathkeys, tuples);
 
 	cost_tuplesort(root, pathkeys, &startup_cost, &run_cost,
 				   tuples, width,
