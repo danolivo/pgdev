@@ -2656,7 +2656,8 @@ find_join_domain(PlannerInfo *root, Relids relids)
  * check that case if it's possible to pass identical items.
  */
 bool
-exprs_known_equal(PlannerInfo *root, Node *item1, Node *item2, Oid opfamily)
+exprs_known_equal(PlannerInfo *root, Node *item1, Node *item2, Oid opfamily,
+				  Relids item1_relids, Relids item2_relids)
 {
 	ListCell   *lc1;
 
@@ -2671,6 +2672,9 @@ exprs_known_equal(PlannerInfo *root, Node *item1, Node *item2, Oid opfamily)
 		if (ec->ec_has_volatile)
 			continue;
 
+		if (!bms_is_subset(item1_relids, ec->ec_relids) ||
+			!bms_is_subset(item2_relids, ec->ec_relids))
+			continue;
 		/*
 		 * It's okay to consider ec_broken ECs here.  Brokenness just means we
 		 * couldn't derive all the implied clauses we'd have liked to; it does
@@ -2689,9 +2693,11 @@ exprs_known_equal(PlannerInfo *root, Node *item1, Node *item2, Oid opfamily)
 
 			/* Child members should not exist in ec_members */
 			Assert(!em->em_is_child);
-			if (equal(item1, em->em_expr))
+			if (bms_is_subset(item1_relids, em->em_relids) &&
+				equal(item1, em->em_expr))
 				item1member = true;
-			else if (equal(item2, em->em_expr))
+			else if (bms_is_subset(item2_relids, em->em_relids) &&
+					 equal(item2, em->em_expr))
 				item2member = true;
 			/* Exit as soon as equality is proven */
 			if (item1member && item2member)

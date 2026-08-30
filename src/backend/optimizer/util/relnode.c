@@ -2313,7 +2313,7 @@ have_partkey_equi_join(PlannerInfo *root, RelOptInfo *joinrel,
 			{
 				Node	   *expr2 = (Node *) lfirst(lc2);
 
-				if (exprs_known_equal(root, expr1, expr2, btree_opfamily))
+				if (exprs_known_equal(root, expr1, expr2, btree_opfamily, NULL, NULL))
 				{
 					/*
 					 * Ensure that the collation of the expression matches

@@ -3737,6 +3737,7 @@ add_unique_group_var(PlannerInfo *root, List *varinfos,
 	double		ndistinct;
 	bool		isdefault;
 	ListCell   *lc;
+	Relids		vrelids;
 
 	ndistinct = get_variable_numdistinct(vardata, &isdefault);
 
@@ -3748,14 +3749,19 @@ add_unique_group_var(PlannerInfo *root, List *varinfos,
 	 * them out first.
 	 */
 	var = remove_nulling_relids(var, root->outer_join_rels, NULL);
+	vrelids = pull_varnos(root, var);
 
 	foreach(lc, varinfos)
 	{
+		Relids vrelids2;
+
 		varinfo = (GroupVarInfo *) lfirst(lc);
 
 		/* Drop exact duplicates */
 		if (equal(var, varinfo->var))
 			return varinfos;
+
+		vrelids2 = pull_varnos(root, varinfo->var);
 
 		/*
 		 * Drop known-equal vars, but only if they belong to different
@@ -3763,7 +3769,7 @@ add_unique_group_var(PlannerInfo *root, List *varinfos,
 		 * fussy about the semantics of "equal" here.
 		 */
 		if (vardata->rel != varinfo->rel &&
-			exprs_known_equal(root, var, varinfo->var, InvalidOid))
+			exprs_known_equal(root, var, varinfo->var, InvalidOid, vrelids, vrelids2))
 		{
 			if (varinfo->ndistinct <= ndistinct)
 			{
