@@ -494,6 +494,8 @@ cost_gather_merge(GatherMergePath *path, PlannerInfo *root,
 	Cost		comparison_cost;
 	double		N;
 	double		logN;
+	int			npathkeys = list_length(((Path *) path)->pathkeys);
+	double		cmpfrac = (npathkeys == 0) ? 2.0 : npathkeys + 1.0;
 
 	/* Mark the path with the correct row estimate */
 	if (rows)
@@ -513,7 +515,7 @@ cost_gather_merge(GatherMergePath *path, PlannerInfo *root,
 	logN = LOG2(N);
 
 	/* Assumed cost per tuple comparison */
-	comparison_cost = 2.0 * cpu_operator_cost;
+	comparison_cost = cmpfrac * cpu_operator_cost;
 
 	/* Heap creation cost */
 	startup_cost += comparison_cost * N * logN;
@@ -1909,7 +1911,7 @@ static void
 cost_tuplesort(PlannerInfo *root, List *pathkeys, Cost *startup_cost, Cost *run_cost,
 			   double tuples, int width,
 			   Cost comparison_cost, int sort_mem,
-			   double limit_tuples)
+			   double limit_tuples, double cmpfrac)
 {
 	double		input_bytes = relation_byte_size(tuples, width);
 	double		output_bytes;
@@ -1922,6 +1924,9 @@ cost_tuplesort(PlannerInfo *root, List *pathkeys, Cost *startup_cost, Cost *run_
 	 */
 	if (tuples < 2.0)
 		tuples = 2.0;
+
+	/* Include the default cost-per-comparison */
+	comparison_cost += cmpfrac * cpu_operator_cost;
 
 	/* Do we have a useful LIMIT? */
 	if (limit_tuples > 0 && limit_tuples < tuples)
@@ -2095,7 +2100,7 @@ cost_incremental_sort(Path *path,
 	 */
 	cost_tuplesort(root, pathkeys, &group_startup_cost, &group_run_cost,
 				   group_tuples, width, comparison_cost, sort_mem,
-				   limit_tuples);
+				   limit_tuples, list_length(pathkeys) + 1.0);
 
 	/*
 	 * Startup cost of incremental sort is the startup cost of its first group
@@ -2118,7 +2123,7 @@ cost_incremental_sort(Path *path,
 	 * detect the sort groups. This is roughly equal to one extra copy and
 	 * comparison per tuple.
 	 */
-	run_cost += (cpu_tuple_cost + comparison_cost) * input_tuples;
+	run_cost += (cpu_tuple_cost + (presorted_keys + 1) * comparison_cost) * input_tuples;
 
 	/*
 	 * Additionally, we charge double cpu_tuple_cost for each input group to
@@ -2158,11 +2163,13 @@ cost_sort(Path *path, PlannerInfo *root,
 {
 	Cost		startup_cost;
 	Cost		run_cost;
+	double		cmpfrac =
+						(pathkeys == NIL) ? 2.0 : list_length(pathkeys) + 1.0;
 
 	cost_tuplesort(root, pathkeys, &startup_cost, &run_cost,
 				   tuples, width,
 				   comparison_cost, sort_mem,
-				   limit_tuples);
+				   limit_tuples, cmpfrac);
 
 	startup_cost += input_cost;
 
@@ -2448,6 +2455,8 @@ cost_merge_append(Path *path, PlannerInfo *root,
 	Cost		comparison_cost;
 	double		N;
 	double		logN;
+	double		cmpfrac =
+						(pathkeys == NIL) ? 2.0 : list_length(pathkeys) + 1.0;
 
 	/*
 	 * Avoid log(0)...
@@ -2456,7 +2465,7 @@ cost_merge_append(Path *path, PlannerInfo *root,
 	logN = LOG2(N);
 
 	/* Assumed cost per tuple comparison */
-	comparison_cost = 2.0 * cpu_operator_cost;
+	comparison_cost = cmpfrac * cpu_operator_cost;
 
 	/* Heap creation cost */
 	startup_cost += comparison_cost * N * logN;
