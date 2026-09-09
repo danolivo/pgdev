@@ -95,6 +95,14 @@ typedef struct
 } max_parallel_hazard_context;
 
 /*
+ * Hook for plugins to take over simplification of an Aggref at plan time;
+ * see the comment on agg_simplify_hook_type in optimizer/clauses.h.  NULL
+ * means no plugin is interested, which is the state on a stock server: the
+ * check costs one predicted-not-taken branch per Aggref.
+ */
+agg_simplify_hook_type agg_simplify_hook = NULL;
+
+/*
  * Walker context for expression_has_grouping_conflict.  get_eqop is a callback
  * that returns the equality operator used for grouping.  cb_context is opaque
  * to the walker and is forwarded to get_eqop unchanged.  case_var is the Var
@@ -2650,6 +2658,21 @@ eval_const_expressions_mutator(Node *node,
 				newexpr->args = args;
 				newexpr->location = expr->location;
 				return (Node *) newexpr;
+			}
+		case T_Aggref:
+			{
+				node = ece_generic_processing(node);
+
+				if (agg_simplify_hook)
+				{
+					Node	   *newnode;
+
+					newnode = agg_simplify_hook(context->root, (Aggref *) node);
+					if (newnode != NULL)
+						return newnode;
+				}
+
+				return node;
 			}
 		case T_OpExpr:
 			{

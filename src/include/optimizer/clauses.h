@@ -33,6 +33,27 @@ typedef struct
  */
 typedef Oid (*grouping_eqop_callback) (Var *var, void *context);
 
+/*
+ * Hook for plugins to take over simplification of an Aggref at plan time.
+ *
+ * eval_const_expressions_mutator() calls this, if set, for every Aggref it
+ * meets, immediately after simplifying the Aggref's own arguments.  The hook
+ * gets the current PlannerInfo and the Aggref itself; it must not modify the
+ * Aggref in place (build a copy if it wants to return a changed one -- see
+ * copyObject()).  Returning NULL leaves the Aggref alone; returning a
+ * non-NULL Node substitutes that node in its place, exactly like any other
+ * eval_const_expressions_mutator() rewrite.
+ *
+ * There is no catalog-driven dispatch here -- unlike a plain function's
+ * SupportRequestSimplify, which core looks up per-function via
+ * pg_proc.prosupport, this hook is a single global entry point that a
+ * loaded module installs in its _PG_init() and that fires for every
+ * Aggref in every query; the hook function itself has to recognise which
+ * aggregate (if any) it wants to touch, from aggref->aggfnoid.
+ */
+typedef Node *(*agg_simplify_hook_type) (PlannerInfo *root, Aggref *aggref);
+extern PGDLLIMPORT agg_simplify_hook_type agg_simplify_hook;
+
 extern bool contain_agg_clause(Node *clause);
 
 extern bool contain_window_function(Node *clause);
