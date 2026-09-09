@@ -55,6 +55,7 @@
 #include "utils/jsonpath.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/numeric.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
@@ -2661,12 +2662,25 @@ eval_const_expressions_mutator(Node *node,
 			}
 		case T_Aggref:
 			{
+				Node	   *newnode;
+
 				node = ece_generic_processing(node);
+
+				/*
+				 * sum(numeric) over an argument of statically known
+				 * precision and scale is common and provably safe to
+				 * specialise, so core substitutes it directly -- a plain
+				 * function call taking the Aggref and nothing else, not a
+				 * hook dispatch -- rather than leaving even this one case to
+				 * a loaded module.  See simplify_sum_numeric_aggref() in
+				 * numeric.c.
+				 */
+				newnode = simplify_sum_numeric_aggref((Aggref *) node);
+				if (newnode != NULL)
+					return newnode;
 
 				if (agg_simplify_hook)
 				{
-					Node	   *newnode;
-
 					newnode = agg_simplify_hook(context->root, (Aggref *) node);
 					if (newnode != NULL)
 						return newnode;

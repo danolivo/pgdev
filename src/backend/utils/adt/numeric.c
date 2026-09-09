@@ -26,19 +26,23 @@
 #include <limits.h>
 #include <math.h>
 
+#include "catalog/pg_type.h"
 #include "common/hashfn.h"
 #include "common/int.h"
 #include "funcapi.h"
 #include "lib/hyperloglog.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/supportnodes.h"
 #include "optimizer/optimizer.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/float.h"
+#include "utils/fmgroids.h"
 #include "utils/guc.h"
+#include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "utils/pg_lsn.h"
 #include "utils/sortsupport.h"
@@ -6346,6 +6350,552 @@ numeric_sum(PG_FUNCTION_ARGS)
 	free_var(&sumX_var);
 
 	PG_RETURN_NUMERIC(result);
+}
+
+/* ----------------------------------------------------------------
+ * numeric_scaled_sum(numeric, int4)
+ *
+ * sum(numeric) specialised for an argument whose precision and scale are
+ * known, statically, to satisfy 1 <= p <= NUMERIC_SCALED_MAX_PRECISION and
+ * 0 <= s <= p.  simplify_sum_numeric_aggref(), below, is where that is
+ * proved and the substitution made.  It is called directly, unconditionally,
+ * from eval_const_expressions_mutator()'s T_Aggref case (see clauses.c) for
+ * every Aggref the planner meets -- not dispatched through pg_proc.prosupport,
+ * because an Aggref carries no function OID for prosupport to key off until
+ * the planner has already decided which pg_proc row it means, and that
+ * decision is exactly the one we want to change.
+ *
+ * The payoff is the transition state.  On a platform with native 128-bit
+ * integers it is a single int128 mantissa and four counters -- one cache
+ * line, no pointers -- where NumericAggState keeps NumericVars whose digit
+ * arrays are separately palloc'd.  hash_agg_entry_size() takes the size of a
+ * HashAgg entry from aggtransspace below, so that difference is what moves
+ * the point at which a GROUP BY starts to spill, not merely a constant factor
+ * on top of the same plan.
+ *
+ * Where int128 is unavailable, the transition-side functions fall back to
+ * plain NumericAggState accumulation, ignoring the scale argument: correct,
+ * simply not specialised, in the same spirit as PolyNumAggState's own #else
+ * branch above.
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * The mantissa value * 10^scale stays below 10^28 ~ 2^93, so the int128
+ * accumulator has room for about 1.7e10 further additions before it could
+ * overflow -- the same headroom argument sum(int8) relies on accumulating
+ * unchecked into int128.
+ */
+#define NUMERIC_SCALED_MAX_PRECISION	28
+
+#ifdef HAVE_INT128
+typedef struct NumericScaledAggState
+{
+	int128		sumX;			/* sum of mantissas at scale "scale" */
+	int64		N;				/* count of ordinary (non-special) inputs */
+	int64		NaNcount;
+	int64		pInfcount;
+	int64		nInfcount;
+	int32		scale;			/* the declared scale, 0..NUMERIC_SCALED_MAX_PRECISION */
+} NumericScaledAggState;
+
+StaticAssertDecl(sizeof(NumericScaledAggState) == 56,
+				  "NumericScaledAggState changed size; update aggtransspace "
+				  "for numeric_scaled_sum in pg_aggregate.dat");
+
+/*
+ * numeric_scaled_mantissa
+ *		var's value as an int128 mantissa at scale "target_scale", that is
+ *		var * 10^target_scale as an exact integer.
+ *
+ * Returns false, rather than silently rounding, whenever var has a nonzero
+ * digit below target_scale.  numeric_scaled_accum() is only ever reached
+ * with a target_scale that the argument's own typmod declared as sufficient
+ * (see simplify_sum_numeric_aggref()), so a false return here means a row
+ * broke that promise -- from an FDW, a function result cast without a
+ * runtime check, or similar -- and the caller turns it into an error rather
+ * than a silently wrong sum.
+ *
+ * The bound checked up front keeps the result, and every partial product in
+ * the loops below, under 10^28 ~ 2^93: it is exact, not conservative, because
+ * digits[0] is the leading base-NBASE digit and weight fixes its decimal
+ * position, so numeric(28,0) -- twenty-eight nines -- is correctly accepted
+ * and nothing larger is.
+ */
+static bool
+numeric_scaled_mantissa(const NumericVar *var, int32 target_scale,
+						 int128 *result)
+{
+	static const int32 pow10_int32[DEC_DIGITS] = {1, 10, 100, 1000};
+	NumericDigit *digits = var->digits;
+	int			ndigits = var->ndigits;
+	int			weight = var->weight;
+	int128		m;
+	int			decimal_len;
+	int			stored;
+	int			i;
+
+	Assert(target_scale >= 0 && target_scale <= NUMERIC_SCALED_MAX_PRECISION);
+
+	if (ndigits <= 0)
+	{
+		*result = 0;
+		return true;
+	}
+
+	if (unlikely(digits[0] <= 0 || digits[0] >= NBASE))
+		return false;			/* not normalised; should be unreachable */
+
+	decimal_len = 1 + (digits[0] >= 10) + (digits[0] >= 100) +
+		(digits[0] >= 1000);
+	if (unlikely(decimal_len + DEC_DIGITS * weight + target_scale >
+				 NUMERIC_SCALED_MAX_PRECISION))
+		return false;
+
+	stored = DEC_DIGITS * (ndigits - 1 - weight);
+	m = 0;
+
+	if (stored >= target_scale)
+	{
+		int			down = stored - target_scale;
+		int32		split;
+
+		if (unlikely(down >= DEC_DIGITS))
+			return false;
+
+		split = pow10_int32[down];
+
+		for (i = 0; i < ndigits - 1; i++)
+			m = m * NBASE + digits[i];
+
+		if (unlikely(digits[ndigits - 1] % split != 0))
+			return false;		/* a nonzero tail would mean rounding */
+
+		m = m * (NBASE / split) + digits[ndigits - 1] / split;
+	}
+	else
+	{
+		int			up = target_scale - stored;
+
+		for (i = 0; i < ndigits; i++)
+			m = m * NBASE + digits[i];
+
+		while (up >= DEC_DIGITS)
+		{
+			m *= NBASE;
+			up -= DEC_DIGITS;
+		}
+		if (up > 0)
+			m *= pow10_int32[up];
+	}
+
+	*result = (var->sign == NUMERIC_NEG) ? -m : m;
+	return true;
+}
+
+static NumericScaledAggState *
+numeric_scaled_state(MemoryContext aggcontext, int32 scale)
+{
+	NumericScaledAggState *state;
+	MemoryContext old_context;
+
+	old_context = MemoryContextSwitchTo(aggcontext);
+	state = (NumericScaledAggState *) palloc0(sizeof(NumericScaledAggState));
+	MemoryContextSwitchTo(old_context);
+
+	state->scale = scale;
+	return state;
+}
+
+Datum
+numeric_scaled_accum(PG_FUNCTION_ARGS)
+{
+	NumericScaledAggState *state;
+	MemoryContext agg_context;
+
+	if (!AggCheckCallContext(fcinfo, &agg_context))
+		elog(ERROR, "numeric_scaled_accum called in non-aggregate context");
+
+	if (PG_ARGISNULL(0))
+	{
+		int32		scale;
+
+		if (PG_ARGISNULL(2))
+			elog(ERROR, "scale argument of numeric_scaled_accum must not be null");
+		scale = PG_GETARG_INT32(2);
+		if (scale < 0 || scale > NUMERIC_SCALED_MAX_PRECISION)
+			elog(ERROR, "unrecognized scale %d for numeric_scaled_accum", scale);
+		state = numeric_scaled_state(agg_context, scale);
+	}
+	else
+		state = (NumericScaledAggState *) PG_GETARG_POINTER(0);
+
+	if (!PG_ARGISNULL(1))
+	{
+		Numeric		num = PG_GETARG_NUMERIC(1);
+
+		if (NUMERIC_IS_SPECIAL(num))
+		{
+			if (NUMERIC_IS_NAN(num))
+				state->NaNcount++;
+			else if (NUMERIC_IS_PINF(num))
+				state->pInfcount++;
+			else
+				state->nInfcount++;
+		}
+		else
+		{
+			NumericVar	arg;
+			int128		mantissa;
+
+			init_var_from_num(num, &arg);
+			if (unlikely(!numeric_scaled_mantissa(&arg, state->scale, &mantissa)))
+				ereport(ERROR,
+						(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+						 errmsg("value does not fit the declared numeric scale %d",
+								state->scale),
+						 errdetail("The aggregate was specialised on the "
+								   "argument's declared type; a row source "
+								   "supplied a value outside that declaration.")));
+			state->sumX += mantissa;
+			state->N++;
+		}
+	}
+
+	PG_RETURN_POINTER(state);
+}
+
+Datum
+numeric_scaled_combine(PG_FUNCTION_ARGS)
+{
+	NumericScaledAggState *state1;
+	NumericScaledAggState *state2;
+	MemoryContext agg_context;
+
+	if (!AggCheckCallContext(fcinfo, &agg_context))
+		elog(ERROR, "numeric_scaled_combine called in non-aggregate context");
+
+	state1 = PG_ARGISNULL(0) ? NULL : (NumericScaledAggState *) PG_GETARG_POINTER(0);
+	state2 = PG_ARGISNULL(1) ? NULL : (NumericScaledAggState *) PG_GETARG_POINTER(1);
+
+	if (state2 == NULL)
+	{
+		if (state1 == NULL)
+			PG_RETURN_NULL();
+		PG_RETURN_POINTER(state1);
+	}
+
+	if (state1 == NULL)
+	{
+		state1 = numeric_scaled_state(agg_context, state2->scale);
+		state1->sumX = state2->sumX;
+		state1->N = state2->N;
+		state1->NaNcount = state2->NaNcount;
+		state1->pInfcount = state2->pInfcount;
+		state1->nInfcount = state2->nInfcount;
+		PG_RETURN_POINTER(state1);
+	}
+
+	/*
+	 * Both states come from the same Aggref, so the scale has to match; a
+	 * mismatch means the state was corrupted in transit, and adding
+	 * mantissas at different scales would produce a wrong sum with nothing
+	 * to show for it.
+	 */
+	if (unlikely(state1->scale != state2->scale))
+		elog(ERROR, "mismatched scales in numeric_scaled_combine: %d vs %d",
+			 state1->scale, state2->scale);
+
+	state1->sumX += state2->sumX;
+	state1->N += state2->N;
+	state1->NaNcount += state2->NaNcount;
+	state1->pInfcount += state2->pInfcount;
+	state1->nInfcount += state2->nInfcount;
+
+	PG_RETURN_POINTER(state1);
+}
+
+Datum
+numeric_scaled_serialize(PG_FUNCTION_ARGS)
+{
+	NumericScaledAggState *state;
+	StringInfoData buf;
+
+	if (!AggCheckCallContext(fcinfo, NULL))
+		elog(ERROR, "numeric_scaled_serialize called in non-aggregate context");
+
+	state = (NumericScaledAggState *) PG_GETARG_POINTER(0);
+
+	pq_begintypsend(&buf);
+	pq_sendint32(&buf, state->scale);
+	pq_sendint64(&buf, state->N);
+	pq_sendint64(&buf, state->NaNcount);
+	pq_sendint64(&buf, state->pInfcount);
+	pq_sendint64(&buf, state->nInfcount);
+	pq_sendint64(&buf, (int64) (state->sumX >> 64));
+	pq_sendint64(&buf, (int64) state->sumX);
+
+	PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
+}
+
+Datum
+numeric_scaled_deserialize(PG_FUNCTION_ARGS)
+{
+	bytea	   *sstate = PG_GETARG_BYTEA_PP(0);
+	NumericScaledAggState *state;
+	MemoryContext agg_context;
+	StringInfoData buf;
+	int32		scale;
+	int64		hi;
+	uint64		lo;
+
+	if (!AggCheckCallContext(fcinfo, &agg_context))
+		elog(ERROR, "numeric_scaled_deserialize called in non-aggregate context");
+
+	initReadOnlyStringInfo(&buf, VARDATA_ANY(sstate), VARSIZE_ANY_EXHDR(sstate));
+
+	scale = pq_getmsgint(&buf, 4);
+	if (scale < 0 || scale > NUMERIC_SCALED_MAX_PRECISION)
+		elog(ERROR, "unrecognized scale %d in serialized numeric_scaled_sum state",
+			 scale);
+
+	state = numeric_scaled_state(agg_context, scale);
+	state->N = pq_getmsgint64(&buf);
+	state->NaNcount = pq_getmsgint64(&buf);
+	state->pInfcount = pq_getmsgint64(&buf);
+	state->nInfcount = pq_getmsgint64(&buf);
+	hi = pq_getmsgint64(&buf);
+	lo = (uint64) pq_getmsgint64(&buf);
+	state->sumX = (((int128) hi) << 64) | (int128) lo;
+
+	pq_getmsgend(&buf);
+
+	PG_RETURN_POINTER(state);
+}
+
+Datum
+numeric_scaled_sum_final(PG_FUNCTION_ARGS)
+{
+	NumericScaledAggState *state;
+	Numeric		res;
+	int128		v;
+	int64		part[3];
+	int			i;
+
+	if (!AggCheckCallContext(fcinfo, NULL))
+		elog(ERROR, "numeric_scaled_sum_final called in non-aggregate context");
+
+	state = PG_ARGISNULL(0) ? NULL : (NumericScaledAggState *) PG_GETARG_POINTER(0);
+
+	/* order of tests matches numeric_sum(), word for word */
+	if (state == NULL ||
+		state->N + state->NaNcount + state->pInfcount + state->nInfcount == 0)
+		PG_RETURN_NULL();
+
+	if (state->NaNcount > 0)
+		PG_RETURN_NUMERIC(make_result(&const_nan));
+	if (state->pInfcount > 0 && state->nInfcount > 0)
+		PG_RETURN_NUMERIC(make_result(&const_nan));
+	if (state->pInfcount > 0)
+		PG_RETURN_NUMERIC(make_result(&const_pinf));
+	if (state->nInfcount > 0)
+		PG_RETURN_NUMERIC(make_result(&const_ninf));
+
+	/*
+	 * The mantissa is sumX at scale "scale", i.e. the real sum equals
+	 * sumX / 10^scale.  int128_to_numericvar() only ever builds the integer
+	 * value of its argument (dscale 0, weight sized for that integer): it
+	 * does not divide, so tacking scale onto its result as a dscale would
+	 * relabel the display without moving the decimal point, which prints the
+	 * mantissa itself rather than the sum -- silently 10^scale too large.
+	 * int64_div_fast_to_numeric() is the primitive that actually divides;
+	 * splitting the mantissa into three 18-digit chunks and adding the
+	 * chunks back together, each divided by the correspondingly larger power
+	 * of ten, is the same construction pps_int128_to_numeric() in
+	 * pg_prosupport's own numeric_agg.c uses for the identical problem.
+	 */
+	v = state->sumX;
+	for (i = 0; i < 2; i++)
+	{
+		int32		r0 = (int32) (v % 1000000000);
+
+		v /= 1000000000;
+
+		part[i] = (int64) (v % 1000000000) * INT64CONST(1000000000) + r0;
+		v /= 1000000000;
+	}
+	part[2] = (int64) v;
+
+	res = int64_div_fast_to_numeric(part[0], state->scale);
+	if (part[1] != 0)
+		res = numeric_add_opt_error(res,
+									 int64_div_fast_to_numeric(part[1], state->scale - 18),
+									 NULL);
+	if (part[2] != 0)
+		res = numeric_add_opt_error(res,
+									 int64_div_fast_to_numeric(part[2], state->scale - 36),
+									 NULL);
+
+	PG_RETURN_NUMERIC(res);
+}
+#else							/* !HAVE_INT128 */
+typedef NumericAggState NumericScaledAggState;
+
+Datum
+numeric_scaled_accum(PG_FUNCTION_ARGS)
+{
+	NumericScaledAggState *state;
+
+	state = PG_ARGISNULL(0) ? NULL : (NumericScaledAggState *) PG_GETARG_POINTER(0);
+	if (state == NULL)
+		state = makeNumericAggState(fcinfo, false);
+
+	/*
+	 * The scale argument (2) needs no attention here: NumericAggState
+	 * already keeps exact, arbitrary-precision digits, so there is nothing
+	 * left to specialise.  This branch exists only so the aggregate still
+	 * builds and behaves correctly on a platform without native 128-bit
+	 * integers.
+	 */
+	if (!PG_ARGISNULL(1))
+		do_numeric_accum(state, PG_GETARG_NUMERIC(1));
+
+	PG_RETURN_POINTER(state);
+}
+
+Datum
+numeric_scaled_combine(PG_FUNCTION_ARGS)
+{
+	return numeric_avg_combine(fcinfo);
+}
+
+Datum
+numeric_scaled_serialize(PG_FUNCTION_ARGS)
+{
+	return numeric_avg_serialize(fcinfo);
+}
+
+Datum
+numeric_scaled_deserialize(PG_FUNCTION_ARGS)
+{
+	return numeric_avg_deserialize(fcinfo);
+}
+
+Datum
+numeric_scaled_sum_final(PG_FUNCTION_ARGS)
+{
+	return numeric_sum(fcinfo);
+}
+#endif							/* HAVE_INT128 */
+
+/*
+ * simplify_sum_numeric_aggref
+ *		Recognise sum(numeric) over an argument whose precision and scale are
+ *		known statically, and substitute numeric_scaled_sum(numeric, int4)
+ *		for it.
+ *
+ * Called directly, unconditionally, from eval_const_expressions_mutator()'s
+ * T_Aggref case (see clauses.c) for every Aggref the planner meets -- a
+ * plain function call taking the Aggref and nothing else.  There is no
+ * catalog dispatch to opt into and nothing to chain: the substitution is
+ * always correct when it fires, so it is not something a query, a session or
+ * an extension needs a way to decline.
+ *
+ * Returns the replacement Aggref, or NULL to leave the original alone.  Most
+ * calls return NULL on the very first comparison, since sum(numeric) is a
+ * small fraction of the Aggrefs in an ordinary query.
+ */
+Node *
+simplify_sum_numeric_aggref(Aggref *aggref)
+{
+	TargetEntry *tle;
+	Node	   *arg;
+	Oid			argtype;
+	int32		typmod;
+	int32		precision;
+	int32		scale;
+	Const	   *scale_const;
+	Aggref	   *newagg;
+
+	if (aggref->aggfnoid != F_SUM_NUMERIC)
+		return NULL;
+
+	/*
+	 * DISTINCT, ORDER BY, FILTER and VARIADIC all change what has to be
+	 * computed, and an outer reference means this Aggref does not even
+	 * belong to the query level being planned here -- the same conditions
+	 * any Aggref rewrite at this point has to decline on, not anything
+	 * specific to sum().
+	 */
+	if (aggref->aggdistinct != NIL || aggref->aggorder != NIL ||
+		aggref->aggfilter != NULL || aggref->aggvariadic ||
+		aggref->agglevelsup != 0)
+		return NULL;
+
+	if (list_length(aggref->args) != 1)
+		return NULL;
+
+	tle = (TargetEntry *) linitial(aggref->args);
+	arg = (Node *) tle->expr;
+
+	/*
+	 * A RelabelType here is a domain being coerced to its base type; unwrap
+	 * it to reach the declaration, the same way exprTypmod() would if
+	 * domains carried their typmod through relabelling, which they do not.
+	 */
+	while (arg && IsA(arg, RelabelType))
+		arg = (Node *) ((RelabelType *) arg)->arg;
+
+	/*
+	 * A bare constant is deliberately left alone here, even though a numeric
+	 * Const carries its own typmod and would otherwise qualify: sum() over a
+	 * constant does not have to be computed as a sum at all (c * count(*)),
+	 * which is a better rewrite than specialising the accumulation, and it
+	 * belongs to whatever runs next in eval_const_expressions_mutator() (see
+	 * agg_simplify_hook and, in pg_prosupport, constagg.c) rather than to
+	 * this one. Substituting here first would take the Aggref before that
+	 * rewrite ever saw it.
+	 */
+	if (IsA(arg, Const))
+		return NULL;
+
+	argtype = exprType(arg);
+	typmod = exprTypmod(arg);
+
+	if (argtype != NUMERICOID)
+	{
+		if (typmod != -1)
+			return NULL;		/* exprTypmod() of a domain-typed expr is always -1 */
+		argtype = getBaseTypeAndTypmod(argtype, &typmod);
+		if (argtype != NUMERICOID)
+			return NULL;
+	}
+
+	if (!is_valid_numeric_typmod(typmod))
+		return NULL;
+
+	precision = numeric_typmod_precision(typmod);
+	scale = numeric_typmod_scale(typmod);
+
+	if (precision < 1 || precision > NUMERIC_SCALED_MAX_PRECISION ||
+		scale < 0 || scale > precision)
+		return NULL;
+
+	/*
+	 * Build a copy rather than editing the original in place: like any other
+	 * eval_const_expressions_mutator() rewrite, this one must not modify the
+	 * Aggref it was handed.
+	 */
+	scale_const = makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
+							 Int32GetDatum(scale), false, true);
+
+	newagg = copyObject(aggref);
+	newagg->aggfnoid = F_NUMERIC_SCALED_SUM;
+	newagg->args = lappend(newagg->args,
+							makeTargetEntry((Expr *) scale_const, 2, NULL, false));
+	newagg->aggargtypes = lappend_oid(newagg->aggargtypes, INT4OID);
+
+	return (Node *) newagg;
 }
 
 /*

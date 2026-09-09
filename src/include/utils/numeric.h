@@ -17,8 +17,9 @@
 #include "common/pg_prng.h"
 #include "fmgr.h"
 
-/* forward declaration to avoid node.h include */
+/* forward declarations to avoid node.h/primnodes.h includes here */
 struct Node;
+struct Aggref;
 
 /*
  * Limits on the precision and scale specifiable in a NUMERIC typmod.  The
@@ -111,5 +112,15 @@ extern int32 make_numeric_typmod_safe(int32 precision, int32 scale,
 
 extern Numeric random_numeric(pg_prng_state *state,
 							  Numeric rmin, Numeric rmax);
+
+/*
+ * Plan-time substitution of numeric_scaled_sum(numeric, int4) for
+ * sum(numeric); see the function's own header comment in numeric.c.  Called
+ * directly from eval_const_expressions_mutator()'s T_Aggref case, with the
+ * Aggref as its only argument -- there is no PlannerInfo involved because
+ * nothing here needs one, only the Aggref itself and the catalog.
+ */
+extern struct Node *simplify_sum_numeric_aggref(struct Aggref *aggref);
+
 
 #endif							/* _PG_NUMERIC_H_ */

@@ -91,6 +91,19 @@
   aggtransspace => '128', aggmtranstype => 'internal',
   aggmtransspace => '128' },
 
+# sum(numeric), specialised for an argument of statically known precision and
+# scale; substituted for sum(numeric) at plan time -- see
+# simplify_sum_numeric_aggref() in numeric.c -- never called directly by a
+# query the way the aggregates above are.  No moving-aggregate support: it is
+# only ever reached through the substitution, which happens well before
+# window function processing would need one.
+{ aggfnoid => 'numeric_scaled_sum(numeric,int4)',
+  aggtransfn => 'numeric_scaled_accum', aggfinalfn => 'numeric_scaled_sum_final',
+  aggcombinefn => 'numeric_scaled_combine',
+  aggserialfn => 'numeric_scaled_serialize',
+  aggdeserialfn => 'numeric_scaled_deserialize',
+  aggtranstype => 'internal', aggtransspace => '56' },
+
 # max
 { aggfnoid => 'max(int8)', aggtransfn => 'int8larger',
   aggcombinefn => 'int8larger', aggsortop => '>(int8,int8)',
