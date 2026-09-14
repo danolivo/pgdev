@@ -981,24 +981,17 @@ ExecSetTupleBound(int64 tuples_needed, PlanState *child_node)
 	{
 		/*
 		 * For a NestLoop, the bound can be propagated to the side that
-		 * drives the output row count:
+		 * drives the output row count. This works if only this join doesn't
+		 * have any filter clauses that might sort out outer's tuples and cause
+		 * exceed the limit on the outer side.
 		 *
-		 * - LEFT JOIN: every outer row produces at least one output row
-		 *   (with NULLs if no match), so bound the outer side.
-		 * - RIGHT JOIN: every inner row produces at least one output row,
-		 *   so bound the inner side.
-		 *
-		 * We do not propagate for INNER, ANTI, or FULL joins, since the
-		 * number of output rows can be less than the driving side's count
-		 * (INNER/ANTI may discard rows, FULL may expand both sides).
 		 */
+
 		NestLoopState  *nlstate = (NestLoopState *) child_node;
 		JoinType		jointype = nlstate->js.jointype;
 
-		if (jointype == JOIN_LEFT)
+		if (jointype == JOIN_LEFT && nlstate->js.ps.qual == NULL)
 			ExecSetTupleBound(tuples_needed, outerPlanState(child_node));
-		else if (jointype == JOIN_RIGHT)
-			ExecSetTupleBound(tuples_needed, innerPlanState(child_node));
 	}
 
 	/*
