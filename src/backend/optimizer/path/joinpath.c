@@ -2101,9 +2101,7 @@ match_unsorted_outer(PlannerInfo *root,
 				 */
 				sorted_outer = (Path *)
 					create_sort_path(root, outerrel, outerpath,
-									 useful_pathkeys,
-									 (jointype == JOIN_LEFT) ?
-									 root->limit_tuples : -1.0);
+									 useful_pathkeys, -1.0);
 
 				merge_pathkeys = build_join_pathkeys(root, joinrel, jointype,
 													 sorted_outer->pathkeys);
