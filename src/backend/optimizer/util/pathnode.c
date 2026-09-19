@@ -1425,7 +1425,7 @@ create_append_path_ext(PlannerInfo *root,
 		pathnode->path.pathkeys = child->pathkeys;
 	}
 	else
-	cost_append_ext(pathnode, root);
+		cost_append_ext(pathnode, root);
 
 	/* If the caller provided a row estimate, override the computed value. */
 	if (rows >= 0)

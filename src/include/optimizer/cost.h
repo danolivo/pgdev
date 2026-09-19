@@ -121,12 +121,7 @@ extern void cost_incremental_sort(Path *path,
 								  double limit_tuples);
 extern double eclass_ndistinct(PlannerInfo *root, EquivalenceClass *ec);
 extern void cost_append_ext(AppendPath *path, PlannerInfo *root);
-
-static inline void cost_append(AppendPath *apath)
-{
-	cost_append_ext(apath, NULL);
-}
-
+extern void cost_append(AppendPath *apath);
 extern void cost_merge_append(Path *path, PlannerInfo *root,
 							  List *pathkeys, int n_streams,
 							  int input_disabled_nodes,

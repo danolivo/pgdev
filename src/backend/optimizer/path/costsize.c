@@ -513,6 +513,7 @@ cost_gather_merge(GatherMergePath *path, PlannerInfo *root,
 	Cost		comparison_cost;
 	double		N;
 	double		logN;
+	double		cmpfrac;
 
 	/* Mark the path with the correct row estimate */
 	if (rows)
@@ -521,6 +522,14 @@ cost_gather_merge(GatherMergePath *path, PlannerInfo *root,
 		path->path.rows = param_info->ppi_rows;
 	else
 		path->path.rows = rel->rows;
+
+	/*
+	 * The merge heap compares tuples that are already ordered by the whole
+	 * pathkey list, so charge the same per-comparison factor a plain sort of
+	 * those keys would get.
+	 */
+	cmpfrac = sort_comparisons_factor(root, path->path.pathkeys, 0,
+									  path->path.rows);
 
 	/*
 	 * Add one to the number of workers to account for the leader.  This might
@@ -532,7 +541,7 @@ cost_gather_merge(GatherMergePath *path, PlannerInfo *root,
 	logN = LOG2(N);
 
 	/* Assumed cost per tuple comparison */
-	comparison_cost = 2.0 * cpu_operator_cost;
+	comparison_cost = cmpfrac * cpu_operator_cost;
 
 	/* Heap creation cost */
 	startup_cost += comparison_cost * N * logN;
@@ -2116,10 +2125,18 @@ cost_incremental_sort(Path *path,
 	/*
 	 * Estimate the average cost of sorting of one group where presorted keys
 	 * are equal.
+	 *
+	 * The tuplesort inside a group is built over the not-yet-sorted keys only
+	 * - see the prefixsort_state in ExecIncrementalSort(), which starts at
+	 * sortColIdx[nPresortedCols].  The presorted keys are never handed to that
+	 * comparator, so the factor is estimated from the leading key of the
+	 * remaining list, exactly as for a plain sort of those keys.
 	 */
 	cost_tuplesort(&group_startup_cost, &group_run_cost,
 				   group_tuples, width, comparison_cost, sort_mem,
-				   limit_tuples, SORT_CMPFRAC_BASE);
+				   limit_tuples,
+				   sort_comparisons_factor(root, pathkeys, presorted_keys,
+										   group_tuples));
 
 	/*
 	 * Startup cost of incremental sort is the startup cost of its first group
@@ -2644,6 +2661,12 @@ cost_append_ext(AppendPath *apath, PlannerInfo *root)
 		cpu_tuple_cost * APPEND_CPU_COST_MULTIPLIER * apath->path.rows;
 }
 
+void
+cost_append(AppendPath *apath)
+{
+	cost_append_ext(apath, NULL);
+}
+
 /*
  * cost_merge_append
  *	  Determines and returns the cost of a MergeAppend node.
@@ -2681,6 +2704,7 @@ cost_merge_append(Path *path, PlannerInfo *root,
 	Cost		comparison_cost;
 	double		N;
 	double		logN;
+	double		cmpfrac = sort_comparisons_factor(root, pathkeys, 0, tuples);
 
 	/*
 	 * Avoid log(0)...
@@ -2689,7 +2713,7 @@ cost_merge_append(Path *path, PlannerInfo *root,
 	logN = LOG2(N);
 
 	/* Assumed cost per tuple comparison */
-	comparison_cost = 2.0 * cpu_operator_cost;
+	comparison_cost = cmpfrac * cpu_operator_cost;
 
 	/* Heap creation cost */
 	startup_cost += comparison_cost * N * logN;
