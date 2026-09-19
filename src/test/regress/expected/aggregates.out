@@ -1259,8 +1259,7 @@ explain (costs off)
   select distinct min(f1), max(f1) from minmaxtest;
                                          QUERY PLAN                                          
 ---------------------------------------------------------------------------------------------
- HashAggregate
-   Group Key: (InitPlan 1).col1, (InitPlan 2).col1
+ Unique
    InitPlan 1
      ->  Limit
            ->  Merge Append
@@ -1283,8 +1282,10 @@ explain (costs off)
                  ->  Index Only Scan using minmaxtest2i on minmaxtest2 minmaxtest_8
                        Index Cond: (f1 IS NOT NULL)
                  ->  Index Only Scan Backward using minmaxtest3i on minmaxtest3 minmaxtest_9
-   ->  Result
-(25 rows)
+   ->  Sort
+         Sort Key: ((InitPlan 1).col1), ((InitPlan 2).col1)
+         ->  Result
+(26 rows)
 
 select distinct min(f1), max(f1) from minmaxtest;
  min | max 
@@ -1529,10 +1530,10 @@ explain (costs off)
 select a, b from t_opf group by a, b order by b;
           QUERY PLAN           
 -------------------------------
- Sort
-   Sort Key: b
-   ->  HashAggregate
-         Group Key: b, a
+ Group
+   Group Key: b, a
+   ->  Sort
+         Sort Key: b, a
          ->  Seq Scan on t_opf
 (5 rows)
 

@@ -125,8 +125,6 @@ static inline void cost_append(AppendPath *apath)
 	cost_append_ext(apath, NULL);
 }
 
-extern Cost cost_sort_estimate(PlannerInfo *root, List *pathkeys,
-							   int nPresortedKeys, double tuples);
 extern void cost_merge_append(Path *path, PlannerInfo *root,
 							  List *pathkeys, int n_streams,
 							  int input_disabled_nodes,
