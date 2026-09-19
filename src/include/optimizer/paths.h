@@ -217,6 +217,9 @@ typedef enum
 	PATHKEYS_DIFFERENT,			/* neither pathkey includes the other */
 } PathKeysComparison;
 
+extern int	pathkeys_best_ndistinct_pos(PlannerInfo *root, List *pathkeys,
+										int nkeys);
+extern List *pathkeys_promote_nth(List *pathkeys, int nkeys, int pos);
 extern PathKeysComparison compare_pathkeys(List *keys1, List *keys2);
 extern bool pathkeys_contained_in(List *keys1, List *keys2);
 extern bool pathkeys_count_contained_in(List *keys1, List *keys2, int *n_common);
