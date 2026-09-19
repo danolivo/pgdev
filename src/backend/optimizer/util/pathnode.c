@@ -1408,12 +1408,12 @@ create_append_path(PlannerInfo *root,
 			pathnode->path.total_cost = child->total_cost;
 		}
 		else
-			cost_append(pathnode);
+			cost_append_ext(pathnode, root);
 		/* Must do this last, else cost_append complains */
 		pathnode->path.pathkeys = child->pathkeys;
 	}
 	else
-		cost_append(pathnode);
+		cost_append_ext(pathnode, root);
 
 	/* If the caller provided a row estimate, override the computed value. */
 	if (rows >= 0)
