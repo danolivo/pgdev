@@ -19,6 +19,7 @@
 #include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/transam.h"
+#include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "commands/vacuum.h"
@@ -203,6 +204,19 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 	 * soon anyway, so this is no particular loss.
 	 */
 	if (RecoveryInProgress())
+		return;
+
+	/*
+	 * Opportunistic pruning physically rearranges the page and marks the
+	 * buffer dirty, which causes the page to be written back on eviction.  For
+	 * a temporary relation that is being scanned inside a parallel section the
+	 * leader and its workers each hold a private local buffer pool over the
+	 * same on-disk file; such a write-back would race with the other
+	 * participants reading the file and corrupt it.  Pruning is only an
+	 * optimization, so simply skip it for local-buffer (temporary) relations
+	 * while in a parallel section.
+	 */
+	if (RelationUsesLocalBuffers(relation) && IsInParallelMode())
 		return;
 
 	/*
