@@ -409,7 +409,7 @@ process_equivalence(PlannerInfo *root,
 		 * be found.
 		 */
 		ec1->ec_members = list_concat(ec1->ec_members, ec2->ec_members);
-		ec1->ec_ndistinct = EC_NDISTINCT_UNCOMPUTED;	/* members changed */
+		ec1->ec_sort_ndistinct = EC_SORT_NDISTINCT_UNCOMPUTED;	/* members changed */
 		ec1->ec_sources = list_concat(ec1->ec_sources, ec2->ec_sources);
 
 		/*
@@ -498,7 +498,7 @@ process_equivalence(PlannerInfo *root,
 		ec->ec_min_security = restrictinfo->security_level;
 		ec->ec_max_security = restrictinfo->security_level;
 		ec->ec_merged = NULL;
-		ec->ec_ndistinct = EC_NDISTINCT_UNCOMPUTED;
+		ec->ec_sort_ndistinct = EC_SORT_NDISTINCT_UNCOMPUTED;
 		em1 = add_eq_member(ec, item1, item1_relids,
 							jdomain, item1_type);
 		em2 = add_eq_member(ec, item2, item2_relids,
@@ -639,7 +639,7 @@ add_eq_member(EquivalenceClass *ec, Expr *expr, Relids relids,
 	ec->ec_members = lappend(ec->ec_members, em);
 
 	/* the member list changed, so the cached ndistinct is no longer valid */
-	ec->ec_ndistinct = EC_NDISTINCT_UNCOMPUTED;
+	ec->ec_sort_ndistinct = EC_SORT_NDISTINCT_UNCOMPUTED;
 
 	/* record the relids for parent members */
 	ec->ec_relids = bms_add_members(ec->ec_relids, relids);
@@ -840,7 +840,7 @@ get_eclass_for_sort_expr(PlannerInfo *root,
 	newec->ec_min_security = UINT_MAX;
 	newec->ec_max_security = 0;
 	newec->ec_merged = NULL;
-	newec->ec_ndistinct = EC_NDISTINCT_UNCOMPUTED;
+	newec->ec_sort_ndistinct = EC_SORT_NDISTINCT_UNCOMPUTED;
 
 	if (newec->ec_has_volatile && sortref == 0) /* should not happen */
 		elog(ERROR, "volatile EquivalenceClass has no sortref");

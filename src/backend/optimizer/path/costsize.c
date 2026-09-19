@@ -86,9 +86,10 @@
 #include <math.h>
 
 #include "access/amapi.h"
-#include "catalog/pg_collation.h"
 #include "access/htup_details.h"
 #include "access/tsmapi.h"
+#include "catalog/pg_collation.h"
+#include "catalog/pg_statistic.h"
 #include "executor/executor.h"
 #include "executor/nodeAgg.h"
 #include "executor/nodeHash.h"
@@ -218,6 +219,7 @@ static double relation_byte_size(double tuples, int width);
 #define SORT_CMPFRAC_BASE	2.0
 #define SORT_CMPFRAC_TIE	1.0
 
+static double effective_ndistinct(VariableStatData *vardata, double ndist);
 static double sort_comparisons_factor(PlannerInfo *root, List *pathkeys,
 									  int skip, double ntuples);
 static double page_size(double tuples, int width);
@@ -2167,15 +2169,87 @@ cost_incremental_sort(Path *path,
 }
 
 /*
+ * effective_ndistinct
+ *		Turn a column's ndistinct into the number of equally-sized groups that
+ *		would tie as often as this column does.
+ *
+ * A random pair of rows ties with probability sum(p_i^2) over the column's
+ * value frequencies.  For ndistinct groups of equal size that is 1/ndistinct,
+ * so the number of equal groups matching an observed sum is its reciprocal -
+ * the inverse Simpson index.  It is at most ndistinct, with equality exactly
+ * when the values are uniform, so a column with no skew comes back unchanged
+ * and nothing that does not need this pays for it.
+ *
+ * Skew is the case that needs it.  300k rows, a column with 30001 distinct
+ * values of which one covers 90% of the table: sum(p_i^2) is about 0.81 and
+ * the effective count is 1.2, not 30001.  Leading a sort with that column
+ * means nearly every comparison ties and moves on to the next one, which is
+ * what the caller is trying to avoid, and going by the raw count it would be
+ * ranked ahead of an evenly-spread column with 1000 values.  Measured, that
+ * choice costs 1.35x.
+ *
+ * The most common values come from pg_statistic; the rest of the column is
+ * assumed uniform over the remaining values, which is the same assumption
+ * eqsel() and friends make about the non-MCV part.  Without an MCV slot the
+ * whole column is assumed uniform and the answer is ndistinct itself.
+ */
+static double
+effective_ndistinct(VariableStatData *vardata, double ndist)
+{
+	AttStatsSlot sslot;
+	double		sumsq = 0.0;
+	double		covered = 0.0;
+	int			nmcv = 0;
+
+	if (HeapTupleIsValid(vardata->statsTuple) &&
+		get_attstatsslot(&sslot, vardata->statsTuple, STATISTIC_KIND_MCV,
+						 InvalidOid, ATTSTATSSLOT_NUMBERS))
+	{
+		for (int i = 0; i < sslot.nnumbers; i++)
+		{
+			double		freq = sslot.numbers[i];
+
+			sumsq += freq * freq;
+			covered += freq;
+		}
+		nmcv = sslot.nnumbers;
+		free_attstatsslot(&sslot);
+	}
+
+	/* The values we have no frequencies for are assumed evenly spread. */
+	if (ndist > nmcv)
+	{
+		double		rest = 1.0 - covered;
+
+		if (rest > 0.0)
+			sumsq += rest * rest / (ndist - nmcv);
+	}
+
+	if (sumsq <= 0.0)
+		return ndist;			/* no usable frequencies at all */
+
+	/* Cannot exceed the count it is derived from; guard against roundoff. */
+	return Min(1.0 / sumsq, ndist);
+}
+
+/*
  * eclass_ndistinct
  *		Estimate the number of distinct values of an EquivalenceClass, based on
  *		the first of its members we can find statistics for.
  *
- * Returns EC_NDISTINCT_UNKNOWN (0.0) if no usable estimate is available -
+ * What comes back is not the plain number of distinct values but the
+ * effective one: the number of equally-sized groups whose tie probability
+ * matches this column's.  Two columns with the same ndistinct do not
+ * necessarily tie equally often - one value covering most of the table makes
+ * a column behave nearly like a constant however many other values it has -
+ * and the caller's model assumes groups of equal size.  Reconciling the two
+ * here, rather than at every use, keeps the cached value self-contained.
+ *
+ * Returns EC_SORT_NDISTINCT_UNKNOWN (0.0) if no usable estimate is available -
  * either the EC has no member we could sensibly examine, or the optimizer
  * would have to fall back on DEFAULT_NUM_DISTINCT.
  *
- * Returns EC_NDISTINCT_EXPENSIVE (-2.0) when comparing this EC's expressions
+ * Returns EC_SORT_NDISTINCT_EXPENSIVE (-2.0) when comparing this EC's expressions
  * runs through a collation, i.e. through the locale.  That costs several
  * times what comparing a fixed-length datum does - measured on 300k rows with
  * two grouping columns, leading a sort with a unique text column instead of
@@ -2194,7 +2268,7 @@ cost_incremental_sort(Path *path,
  * consider, so doing this over and over for the same EC shows up in planning
  * time.  The estimate depends only on the member expression and on baserel
  * statistics, neither of which changes while we plan, so caching it is safe.
- * ec_ndistinct is reset whenever ec_members changes.
+ * ec_sort_ndistinct is reset whenever ec_members changes.
  */
 double
 eclass_ndistinct(PlannerInfo *root, EquivalenceClass *ec)
@@ -2205,8 +2279,8 @@ eclass_ndistinct(PlannerInfo *root, EquivalenceClass *ec)
 	bool		isdefault = true;
 	double		ndist = 0.0;
 
-	if (ec->ec_ndistinct != EC_NDISTINCT_UNCOMPUTED)
-		return ec->ec_ndistinct;	/* cached */
+	if (ec->ec_sort_ndistinct != EC_SORT_NDISTINCT_UNCOMPUTED)
+		return ec->ec_sort_ndistinct;	/* cached */
 
 	/*
 	 * Settle the collation question first: if the comparison goes through a
@@ -2216,8 +2290,8 @@ eclass_ndistinct(PlannerInfo *root, EquivalenceClass *ec)
 		ec->ec_collation != C_COLLATION_OID &&
 		!pg_newlocale_from_collation(ec->ec_collation)->collate_is_c)
 	{
-		ec->ec_ndistinct = EC_NDISTINCT_EXPENSIVE;
-		return ec->ec_ndistinct;
+		ec->ec_sort_ndistinct = EC_SORT_NDISTINCT_EXPENSIVE;
+		return ec->ec_sort_ndistinct;
 	}
 
 	/*
@@ -2258,13 +2332,17 @@ eclass_ndistinct(PlannerInfo *root, EquivalenceClass *ec)
 		ndist = get_variable_numdistinct(&vardata, &isdefault);
 		if (!HeapTupleIsValid(vardata.statsTuple) && !vardata.isunique)
 			isdefault = true;
+
+		if (!isdefault && ndist > 1.0)
+			ndist = effective_ndistinct(&vardata, ndist);
+
 		ReleaseVariableStats(vardata);
 	}
 
 	/* Cache "no usable estimate" too, so we don't redo the work */
-	ec->ec_ndistinct = isdefault ? EC_NDISTINCT_UNKNOWN : ndist;
+	ec->ec_sort_ndistinct = isdefault ? EC_SORT_NDISTINCT_UNKNOWN : ndist;
 
-	return ec->ec_ndistinct;
+	return ec->ec_sort_ndistinct;
 }
 
 /*
@@ -2354,12 +2432,12 @@ sort_comparisons_factor(PlannerInfo *root, List *pathkeys, int skip,
 	 */
 	if (ndist < 0.0)
 	{
-		Assert(ndist == EC_NDISTINCT_EXPENSIVE);
+		Assert(ndist == EC_SORT_NDISTINCT_EXPENSIVE);
 		return SORT_CMPFRAC_BASE + SORT_CMPFRAC_TIE;
 	}
 
 	/* No usable estimate: fall back on the default model charges. */
-	if (ndist == EC_NDISTINCT_UNKNOWN)
+	if (ndist == EC_SORT_NDISTINCT_UNKNOWN)
 		return SORT_CMPFRAC_BASE;
 
 	/* At least as many distinct values as rows: assume no ties at all. */

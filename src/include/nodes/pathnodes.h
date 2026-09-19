@@ -1466,8 +1466,12 @@ typedef struct EquivalenceClass
 	struct EquivalenceClass *ec_merged; /* set if merged into another EC */
 
 	/*
-	 * Cached number of distinct values of the first "sortable" member of
-	 * ec_members, as computed by eclass_ndistinct().  Looking that up
+	 * Cached effective number of distinct values of the first "sortable"
+	 * member of ec_members, as computed by eclass_ndistinct().  Effective
+	 * means adjusted for skew: the number of equally-sized groups that would
+	 * tie as often as the column does, which is what the sort cost model
+	 * wants and is not the same as the column's ndistinct.  Do not reach for
+	 * it as a cardinality estimate.  Looking that up
 	 * requires a syscache probe and, for non-Var members, a scan of the
 	 * relation's index and extended-statistics lists, which is far too
 	 * expensive to repeat for every sort path we cost.  The estimate depends
@@ -1475,18 +1479,18 @@ typedef struct EquivalenceClass
 	 * stable for the lifetime of the PlannerInfo; it is reset whenever
 	 * ec_members changes.
 	 *
-	 * Negative values are sentinels, see EC_NDISTINCT_* below.  A positive
+	 * Negative values are sentinels, see EC_SORT_NDISTINCT_* below.  A positive
 	 * value is the estimate itself.
 	 */
-	double		ec_ndistinct;
+	double		ec_sort_ndistinct;
 } EquivalenceClass;
 
-/* Sentinel values for EquivalenceClass.ec_ndistinct */
-#define EC_NDISTINCT_UNCOMPUTED	(-1.0)	/* not looked up yet */
-#define EC_NDISTINCT_EXPENSIVE	(-2.0)	/* comparison too costly for
+/* Sentinel values for EquivalenceClass.ec_sort_ndistinct */
+#define EC_SORT_NDISTINCT_UNCOMPUTED	(-1.0)	/* not looked up yet */
+#define EC_SORT_NDISTINCT_EXPENSIVE	(-2.0)	/* comparison too costly for
 										 * ndistinct to be what decides
 										 * where this key belongs */
-#define EC_NDISTINCT_UNKNOWN	0.0		/* looked up, no usable estimate */
+#define EC_SORT_NDISTINCT_UNKNOWN	0.0		/* looked up, no usable estimate */
 
 /*
  * If an EC contains a constant, any PathKey depending on it must be
