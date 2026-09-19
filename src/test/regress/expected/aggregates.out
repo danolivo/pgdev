@@ -1530,10 +1530,10 @@ explain (costs off)
 select a, b from t_opf group by a, b order by b;
           QUERY PLAN           
 -------------------------------
- Group
-   Group Key: b, a
-   ->  Sort
-         Sort Key: b, a
+ Sort
+   Sort Key: b
+   ->  HashAggregate
+         Group Key: b, a
          ->  Seq Scan on t_opf
 (5 rows)
 
