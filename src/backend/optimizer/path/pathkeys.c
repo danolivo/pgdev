@@ -31,6 +31,10 @@
 /* Consider reordering of GROUP BY keys? */
 bool		enable_group_by_reordering = true;
 
+static bool group_keys_reorder_by_ndistinct(PlannerInfo *root,
+											List **group_pathkeys,
+											List **group_clauses,
+											int num_groupby_pathkeys);
 static bool pathkey_is_redundant(PathKey *new_pathkey, List *pathkeys);
 static bool matches_boolean_partition_clause(RestrictInfo *rinfo,
 											 RelOptInfo *partrel,
@@ -450,6 +454,156 @@ group_keys_reorder_by_pathkeys(List *pathkeys, List **group_pathkeys,
 }
 
 /*
+ * pathkeys_best_ndistinct_pos
+ *		Which of the first 'nkeys' pathkeys should lead the sort?
+ *
+ * Comparing two tuples stops at the first column where they differ, so the
+ * leading key is what decides a sort's cost: one with many distinct values
+ * settles most comparisons in one call, one that keeps tying makes every
+ * comparison fall through.  Return the position of the key with the most
+ * distinct values, or -1 when there is nothing worth moving - no candidate at
+ * all, or the best one already leads.
+ *
+ * A key is a candidate only if eclass_ndistinct() gives a positive estimate
+ * for it.  It withholds one both when no usable statistic exists - reordering
+ * on a guess is not something we want to do - and when the comparison runs
+ * through a collation, where the cost of a single comparison dominates
+ * anything ndistinct could say.
+ */
+int
+pathkeys_best_ndistinct_pos(PlannerInfo *root, List *pathkeys, int nkeys)
+{
+	double		best_ndistinct = 0.0;
+	int			best_pos = -1;
+	int			i;
+
+	if (nkeys < 2 || list_length(pathkeys) < nkeys)
+		return -1;
+
+	for (i = 0; i < nkeys; i++)
+	{
+		PathKey    *pathkey = (PathKey *) list_nth(pathkeys, i);
+		double		ndistinct;
+
+		ndistinct = eclass_ndistinct(root, pathkey->pk_eclass);
+		if (ndistinct <= 0.0)
+			continue;
+
+		if (ndistinct > best_ndistinct)
+		{
+			best_ndistinct = ndistinct;
+			best_pos = i;
+		}
+	}
+
+	/* Position 0 means the best key is where it already is. */
+	return (best_pos > 0) ? best_pos : -1;
+}
+
+/*
+ * pathkeys_promote_nth
+ *		Copy of 'pathkeys' with entry 'pos' moved to the front.
+ *
+ * Entries past 'nkeys' are appended unchanged; callers use that to keep
+ * trailing pathkeys that must not move.
+ */
+List *
+pathkeys_promote_nth(List *pathkeys, int nkeys, int pos)
+{
+	List	   *result;
+	int			i;
+
+	result = list_make1(list_nth(pathkeys, pos));
+
+	for (i = 0; i < nkeys; i++)
+	{
+		if (i == pos)
+			continue;
+		result = lappend(result, list_nth(pathkeys, i));
+	}
+
+	return list_concat(result, list_copy_tail(pathkeys, nkeys));
+}
+
+/*
+ * group_keys_reorder_by_ndistinct
+ *		Move the grouping key with the most distinct values to the front,
+ *		leaving every other key where it was.
+ *
+ * No path below the grouping step offers this ordering, so unless we put it
+ * forward here the cost model never gets to look at it.  We only propose it;
+ * cost_sort(), through sort_comparisons_factor(), prices it against the other
+ * candidates.
+ *
+ * We move exactly one key.  sort_comparisons_factor() judges an ordering by
+ * its leading key and nothing else, so promoting a single key is as far as
+ * the evidence reaches; shuffling the rest would be a change we could not
+ * price.  It also keeps the proposal close to what the query asked for, which
+ * matters when something above us wants that order.
+ *
+ * 'num_groupby_pathkeys' is the number of leading '*group_pathkeys' entries
+ * that are grouping keys; anything past that is an aggregate pathkey and has
+ * to stay where it is.
+ *
+ * Returns true if a different ordering was produced.
+ */
+static bool
+group_keys_reorder_by_ndistinct(PlannerInfo *root, List **group_pathkeys,
+								List **group_clauses,
+								int num_groupby_pathkeys)
+{
+	List	   *new_clauses = NIL;
+	int			n = num_groupby_pathkeys;
+	int			best_pos;
+	int			i;
+
+	/*
+	 * Every grouping key we are about to move must be paired with a clause we
+	 * can move along with it.  Since 1349d27 a pathkey coming from an
+	 * underlying node can be in group_pathkeys without being in
+	 * processed_groupClause, so this is not a given.
+	 */
+	for (i = 0; i < n; i++)
+	{
+		PathKey    *pathkey = (PathKey *) list_nth(*group_pathkeys, i);
+
+		if (pathkey->pk_eclass->ec_sortref == 0)
+			return false;
+		if (!get_sortgroupref_clause_noerr(pathkey->pk_eclass->ec_sortref,
+										   *group_clauses))
+			return false;
+	}
+
+	best_pos = pathkeys_best_ndistinct_pos(root, *group_pathkeys, n);
+	if (best_pos < 0)
+		return false;
+
+	*group_pathkeys = pathkeys_promote_nth(*group_pathkeys, n, best_pos);
+
+	/* Rebuild the clause list in the same order ... */
+	for (i = 0; i < n; i++)
+	{
+		PathKey    *pathkey = (PathKey *) list_nth(*group_pathkeys, i);
+
+		new_clauses =
+			lappend(new_clauses,
+					get_sortgroupref_clause_noerr(pathkey->pk_eclass->ec_sortref,
+												  *group_clauses));
+	}
+
+	/*
+	 * ... and append whatever no grouping key covered, the way
+	 * group_keys_reorder_by_pathkeys() finishes off its own lists.
+	 * group_pathkeys and processed_groupClause are not guaranteed to run in
+	 * step, and a clause left behind here would silently disappear from the
+	 * GROUP BY.
+	 */
+	*group_clauses = list_concat_unique_ptr(new_clauses, *group_clauses);
+
+	return true;
+}
+
+/*
  * get_useful_group_keys_orderings
  *		Determine which orderings of GROUP BY keys are potentially interesting.
  *
@@ -515,6 +669,44 @@ get_useful_group_keys_orderings(PlannerInfo *root, Path *path)
 			info->clauses = clauses;
 
 			infos = lappend(infos, info);
+		}
+	}
+
+	/*
+	 * Finally, try ordering the keys by their estimated number of distinct
+	 * values, most distinct first.  No path below us produces this ordering,
+	 * so it reaches the cost model only if we propose it here.
+	 */
+	{
+		List	   *nd_pathkeys = root->group_pathkeys;
+		List	   *nd_clauses = root->processed_groupClause;
+
+		if (group_keys_reorder_by_ndistinct(root, &nd_pathkeys, &nd_clauses,
+											root->num_groupby_pathkeys))
+		{
+			bool		duplicate = false;
+			ListCell   *lc;
+
+			foreach(lc, infos)
+			{
+				GroupByOrdering *old = lfirst_node(GroupByOrdering, lc);
+
+				if (compare_pathkeys(nd_pathkeys,
+									 old->pathkeys) == PATHKEYS_EQUAL)
+				{
+					duplicate = true;
+					break;
+				}
+			}
+
+			if (!duplicate)
+			{
+				info = makeNode(GroupByOrdering);
+				info->pathkeys = nd_pathkeys;
+				info->clauses = nd_clauses;
+
+				infos = lappend(infos, info);
+			}
 		}
 	}
 
