@@ -1464,7 +1464,29 @@ typedef struct EquivalenceClass
 	Index		ec_min_security;	/* minimum security_level in ec_sources */
 	Index		ec_max_security;	/* maximum security_level in ec_sources */
 	struct EquivalenceClass *ec_merged; /* set if merged into another EC */
+
+	/*
+	 * Cached number of distinct values of the first "sortable" member of
+	 * ec_members, as computed by eclass_ndistinct().  Looking that up
+	 * requires a syscache probe and, for non-Var members, a scan of the
+	 * relation's index and extended-statistics lists, which is far too
+	 * expensive to repeat for every sort path we cost.  The estimate depends
+	 * only on the member expression and on baserel statistics, so it is
+	 * stable for the lifetime of the PlannerInfo; it is reset whenever
+	 * ec_members changes.
+	 *
+	 * Negative values are sentinels, see EC_NDISTINCT_* below.  A positive
+	 * value is the estimate itself.
+	 */
+	double		ec_ndistinct;
 } EquivalenceClass;
+
+/* Sentinel values for EquivalenceClass.ec_ndistinct */
+#define EC_NDISTINCT_UNCOMPUTED	(-1.0)	/* not looked up yet */
+#define EC_NDISTINCT_EXPENSIVE	(-2.0)	/* comparison too costly for
+										 * ndistinct to be what decides
+										 * where this key belongs */
+#define EC_NDISTINCT_UNKNOWN	0.0		/* looked up, no usable estimate */
 
 /*
  * If an EC contains a constant, any PathKey depending on it must be

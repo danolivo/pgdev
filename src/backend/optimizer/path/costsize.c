@@ -86,6 +86,7 @@
 #include <math.h>
 
 #include "access/amapi.h"
+#include "catalog/pg_collation.h"
 #include "access/htup_details.h"
 #include "access/tsmapi.h"
 #include "executor/executor.h"
@@ -105,6 +106,7 @@
 #include "optimizer/restrictinfo.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
+#include "utils/pg_locale.h"
 #include "utils/selfuncs.h"
 #include "utils/spccache.h"
 #include "utils/tuplesort.h"
@@ -148,6 +150,7 @@ bool		enable_indexonlyscan = true;
 bool		enable_bitmapscan = true;
 bool		enable_tidscan = true;
 bool		enable_sort = true;
+bool		enable_sort_comparison_factor = true;
 bool		enable_incremental_sort = true;
 bool		enable_hashagg = true;
 bool		enable_nestloop = true;
@@ -201,6 +204,22 @@ static Cost append_nonpartial_cost(List *subpaths, int numpaths,
 static void set_rel_width(PlannerInfo *root, RelOptInfo *rel);
 static int32 get_expr_width(PlannerInfo *root, const Node *expr);
 static double relation_byte_size(double tuples, int width);
+
+/*
+ * Per-comparison cost multipliers used by sort_comparisons_factor().
+ *
+ * BASE is one comparison call that decides the outcome, plus the per-
+ * comparison overhead we do not model separately.
+ *
+ * TIE is the one further comparison call we have to make when the leading
+ * column ties.  The overhead is already paid, so it costs a bare
+ * cpu_operator_cost.
+ */
+#define SORT_CMPFRAC_BASE	2.0
+#define SORT_CMPFRAC_TIE	1.0
+
+static double sort_comparisons_factor(PlannerInfo *root, List *pathkeys,
+									  int skip, double ntuples);
 static double page_size(double tuples, int width);
 static double get_parallel_divisor(Path *path);
 
@@ -1893,12 +1912,14 @@ cost_recursive_union(Path *runion, Path *nrterm, Path *rterm)
  * 'comparison_cost' is the extra cost per comparison, if any
  * 'sort_mem' is the number of kilobytes of work memory allowed for the sort
  * 'limit_tuples' is the bound on the number of output tuples; -1 if no bound
+ * 'cmpfrac' is the estimated number of comparison-function calls per tuple
+ *		comparison; see sort_comparisons_factor()
  */
 static void
 cost_tuplesort(Cost *startup_cost, Cost *run_cost,
 			   double tuples, int width,
 			   Cost comparison_cost, int sort_mem,
-			   double limit_tuples)
+			   double limit_tuples, double cmpfrac)
 {
 	double		input_bytes = relation_byte_size(tuples, width);
 	double		output_bytes;
@@ -1913,7 +1934,7 @@ cost_tuplesort(Cost *startup_cost, Cost *run_cost,
 		tuples = 2.0;
 
 	/* Include the default cost-per-comparison */
-	comparison_cost += 2.0 * cpu_operator_cost;
+	comparison_cost += cmpfrac * cpu_operator_cost;
 
 	/* Do we have a useful LIMIT? */
 	if (limit_tuples > 0 && limit_tuples < tuples)
@@ -2087,7 +2108,7 @@ cost_incremental_sort(Path *path,
 	 */
 	cost_tuplesort(&group_startup_cost, &group_run_cost,
 				   group_tuples, width, comparison_cost, sort_mem,
-				   limit_tuples);
+				   limit_tuples, SORT_CMPFRAC_BASE);
 
 	/*
 	 * Startup cost of incremental sort is the startup cost of its first group
@@ -2129,16 +2150,224 @@ cost_incremental_sort(Path *path,
 }
 
 /*
+ * eclass_ndistinct
+ *		Estimate the number of distinct values of an EquivalenceClass, based on
+ *		the first of its members we can find statistics for.
+ *
+ * Returns EC_NDISTINCT_UNKNOWN (0.0) if no usable estimate is available -
+ * either the EC has no member we could sensibly examine, or the optimizer
+ * would have to fall back on DEFAULT_NUM_DISTINCT.
+ *
+ * Returns EC_NDISTINCT_EXPENSIVE (-2.0) when comparing this EC's expressions
+ * runs through a collation, i.e. through the locale.  That costs several
+ * times what comparing a fixed-length datum does - measured on 300k rows with
+ * two grouping columns, leading a sort with a unique text column instead of
+ * an int that already resolves 90% of the comparisons costs 4.7x, and it
+ * stays a loss even when the text column has 300 times more distinct values.
+ * procost cannot express that: bttextcmp, btint4cmp and numeric_cmp are all
+ * labelled 1.0.  So rather than pretend the ndistinct of such a key means
+ * anything for where it belongs, we say so, and let the callers decide: the
+ * GROUP BY reordering skips the key, and sort_comparisons_factor() charges
+ * the top of its range when the key leads.  C and POSIX compare with memcmp
+ * and are treated as ordinary cheap keys.
+ *
+ * The result is cached in the EC.  examine_variable() costs a syscache lookup
+ * for a plain Var and, for anything else, a scan of the relation's index and
+ * extended-statistics lists; cost_sort() is called once per sort path we
+ * consider, so doing this over and over for the same EC shows up in planning
+ * time.  The estimate depends only on the member expression and on baserel
+ * statistics, neither of which changes while we plan, so caching it is safe.
+ * ec_ndistinct is reset whenever ec_members changes.
+ */
+double
+eclass_ndistinct(PlannerInfo *root, EquivalenceClass *ec)
+{
+	EquivalenceMember *found = NULL;
+	ListCell   *lc;
+	VariableStatData vardata;
+	bool		isdefault = true;
+	double		ndist = 0.0;
+
+	if (ec->ec_ndistinct != EC_NDISTINCT_UNCOMPUTED)
+		return ec->ec_ndistinct;	/* cached */
+
+	/*
+	 * Settle the collation question first: if the comparison goes through a
+	 * locale, no ndistinct estimate would change what we do with the key.
+	 */
+	if (OidIsValid(ec->ec_collation) &&
+		ec->ec_collation != C_COLLATION_OID &&
+		!pg_newlocale_from_collation(ec->ec_collation)->collate_is_c)
+	{
+		ec->ec_ndistinct = EC_NDISTINCT_EXPENSIVE;
+		return ec->ec_ndistinct;
+	}
+
+	/*
+	 * Look for the first member we can examine.  Note we deliberately don't
+	 * use foreach_node() here: it declares its own loop variable, so the
+	 * chosen member wouldn't survive the loop.
+	 */
+	foreach(lc, ec->ec_members)
+	{
+		EquivalenceMember *em = lfirst_node(EquivalenceMember, lc);
+
+		if (em->em_is_child || em->em_is_const ||
+			bms_is_empty(em->em_relids) || bms_is_member(0, em->em_relids))
+			continue;
+
+		found = em;
+		break;
+	}
+
+	if (found != NULL)
+	{
+		examine_variable(root, (Node *) found->em_expr, 0, &vardata);
+
+		/*
+		 * Don't insist on a pg_statistic entry before asking: a unique index
+		 * proves distinctness no matter what pg_statistic says, and that is
+		 * precisely the case this factor cares about most - a unique leading
+		 * column means one comparison call decides the ordering.
+		 *
+		 * But do insist on the answer resting on something.  Absent both a
+		 * stats entry and a uniqueness proof, get_variable_numdistinct() still
+		 * reports isdefault=false for a small unanalyzed relation, on the
+		 * assumption that every row is distinct.  That is a fine default for
+		 * selectivity, where being wrong costs an inaccurate row count, but
+		 * here it would silently hand the sort the best-case factor, so treat
+		 * it as unknown instead.
+		 */
+		ndist = get_variable_numdistinct(&vardata, &isdefault);
+		if (!HeapTupleIsValid(vardata.statsTuple) && !vardata.isunique)
+			isdefault = true;
+		ReleaseVariableStats(vardata);
+	}
+
+	/* Cache "no usable estimate" too, so we don't redo the work */
+	ec->ec_ndistinct = isdefault ? EC_NDISTINCT_UNKNOWN : ndist;
+
+	return ec->ec_ndistinct;
+}
+
+/*
+ * sort_comparisons_factor
+ *		Estimate the cost of one tuple comparison for this particular order of
+ *		sort columns, as a multiplier of cpu_operator_cost.
+ *
+ * Comparing two tuples stops at the first column where they differ, so what a
+ * comparison costs depends on how often the leading column ties.  The vanilla
+ * model charges a flat 2.0 * cpu_operator_cost no matter how many sort
+ * columns there are, and for a single-column sort that is exactly right: one
+ * call always decides.  Take that as the base and add the extra work only
+ * when we can show the leading column ties:
+ *
+ *	- SORT_CMPFRAC_BASE (2.0): the leading column is (nearly) unique, so the
+ *	  first call decides.  Also what we charge for a single-column sort, and
+ *	  whenever no usable statistic exists - i.e. we never move away from the
+ *	  vanilla estimate without evidence.
+ *	- SORT_CMPFRAC_BASE + SORT_CMPFRAC_TIE (3.0): comparisons tie on the
+ *	  leading column often enough that a second call is always needed.
+ *
+ * What we interpolate on is not the probability that a random pair ties.  A
+ * comparison sort does not compare random pairs: it separates the ndistinct
+ * groups of the leading column in the topmost levels of its recursion, and
+ * everything below that compares tuples that are already inside one group,
+ * where the leading column ties by construction.  So the share of comparisons
+ * that have to move past the leading column is the share of the recursion
+ * spent inside a group,
+ *
+ *		log2(ntuples / ndistinct) / log2(ntuples)
+ *
+ * which is 0 when every row is distinct and 1 when every row is equal, and in
+ * between falls off logarithmically rather than linearly.  The linear form
+ * this replaces charged two thirds of the maximum to a column holding a third
+ * of the table's rows as distinct values, which is a column that essentially
+ * never ties.
+ *
+ * Only the leading column is examined, and the charge deliberately does not
+ * grow with the number of sort columns.  Letting it grow - on the reasoning
+ * that once a comparison is inside a group it walks the rest of the list -
+ * was tried, with the product capped at SORT_CMPFRAC_TIE so it could not run
+ * away.  It does not work: the product saturates, and two orderings that both
+ * reach the cap become indistinguishable.  Measured on 300k rows with a
+ * 16-column GROUP BY, a two-valued leading key and a 50000-valued one were
+ * both priced at 3.0, so the planner kept the order the query asked for and
+ * never considered the one that runs 635 ms against 1399.  Tied to the
+ * leading column alone the same pair prices at 2.945 against 2.142, at any
+ * width.
+ *
+ * Walking the whole pathkey list and estimating the group size at each step
+ * is what the previous cost model did, and it cost far more planning time
+ * than the extra accuracy was worth.
+ */
+static double
+sort_comparisons_factor(PlannerInfo *root, List *pathkeys, int skip,
+						double ntuples)
+{
+	int			nkeys = list_length(pathkeys) - skip;
+	double		ndist;
+	double		tiefrac;
+
+	/*
+	 * With fewer than two sort columns there is no second column to fall
+	 * through to: the comparison always costs exactly the base, whatever the
+	 * statistics say.
+	 */
+	if (root == NULL || nkeys < 2 || !enable_sort_comparison_factor)
+		return SORT_CMPFRAC_BASE;
+
+	/*
+	 * Estimate for the same input cost_tuplesort() will be charging for: it
+	 * clamps the tuple count to 2.0, and the two need to agree about what is
+	 * being sorted.  The clamp also keeps LOG2(ntuples) below away from zero.
+	 */
+	if (ntuples < 2.0)
+		ntuples = 2.0;
+
+	ndist = eclass_ndistinct(root,
+							 ((PathKey *) list_nth(pathkeys, skip))->pk_eclass);
+
+	/*
+	 * A leading key whose comparison runs through a locale.  We cannot price
+	 * that comparison - see eclass_ndistinct() - so charge the top of our
+	 * range.  It is a proxy, not a model: within [BASE, BASE + TIE] the
+	 * factor's job is to rank orderings against each other, and an expensive
+	 * leading key ranks last whatever its ndistinct turns out to be.
+	 */
+	if (ndist < 0.0)
+	{
+		Assert(ndist == EC_NDISTINCT_EXPENSIVE);
+		return SORT_CMPFRAC_BASE + SORT_CMPFRAC_TIE;
+	}
+
+	/* No usable estimate: fall back on the default model charges. */
+	if (ndist == EC_NDISTINCT_UNKNOWN)
+		return SORT_CMPFRAC_BASE;
+
+	/* At least as many distinct values as rows: assume no ties at all. */
+	if (ndist >= ntuples)
+		return SORT_CMPFRAC_BASE;
+
+	if (ndist < 1.0)
+		ndist = 1.0;
+
+	/* Share of the sort's recursion spent inside one group of equal keys. */
+	tiefrac = LOG2(ntuples / ndist) / LOG2(ntuples);
+
+	return SORT_CMPFRAC_BASE + tiefrac * SORT_CMPFRAC_TIE;
+}
+
+
+/*
  * cost_sort
  *	  Determines and returns the cost of sorting a relation, including
  *	  the cost of reading the input data.
  *
- * NOTE: some callers currently pass NIL for pathkeys because they
- * can't conveniently supply the sort keys.  Since this routine doesn't
- * currently do anything with pathkeys anyway, that doesn't matter...
- * but if it ever does, it should react gracefully to lack of key data.
- * (Actually, the thing we'd most likely be interested in is just the number
- * of sort keys, which all callers *could* supply.)
+ * NOTE: some callers currently pass NIL for pathkeys because they can't
+ * conveniently supply the sort keys.  sort_comparisons_factor() does use the
+ * pathkeys, but it falls back on the default per-comparison cost when the list
+ * is empty, so such callers just get a slightly cruder estimate.
  */
 void
 cost_sort(Path *path, PlannerInfo *root,
@@ -2150,11 +2379,12 @@ cost_sort(Path *path, PlannerInfo *root,
 {
 	Cost		startup_cost;
 	Cost		run_cost;
+	double		cmpfrac = sort_comparisons_factor(root, pathkeys, 0, tuples);
 
 	cost_tuplesort(&startup_cost, &run_cost,
 				   tuples, width,
 				   comparison_cost, sort_mem,
-				   limit_tuples);
+				   limit_tuples, cmpfrac);
 
 	startup_cost += input_cost;
 

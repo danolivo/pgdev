@@ -55,6 +55,7 @@ extern PGDLLIMPORT bool enable_indexonlyscan;
 extern PGDLLIMPORT bool enable_bitmapscan;
 extern PGDLLIMPORT bool enable_tidscan;
 extern PGDLLIMPORT bool enable_sort;
+extern PGDLLIMPORT bool enable_sort_comparison_factor;
 extern PGDLLIMPORT bool enable_incremental_sort;
 extern PGDLLIMPORT bool enable_hashagg;
 extern PGDLLIMPORT bool enable_nestloop;
@@ -118,6 +119,7 @@ extern void cost_incremental_sort(Path *path,
 								  Cost input_startup_cost, Cost input_total_cost,
 								  double input_tuples, int width, Cost comparison_cost, int sort_mem,
 								  double limit_tuples);
+extern double eclass_ndistinct(PlannerInfo *root, EquivalenceClass *ec);
 extern void cost_append(AppendPath *apath);
 extern void cost_merge_append(Path *path, PlannerInfo *root,
 							  List *pathkeys, int n_streams,

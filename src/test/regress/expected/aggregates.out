@@ -1539,10 +1539,10 @@ explain (costs off)
 select a, b from t_opf group by a, b order by b;
           QUERY PLAN           
 -------------------------------
- Group
-   Group Key: b, a
-   ->  Sort
-         Sort Key: b, a
+ Sort
+   Sort Key: b
+   ->  HashAggregate
+         Group Key: b, a
          ->  Seq Scan on t_opf
 (5 rows)
 
@@ -3096,17 +3096,16 @@ SELECT count(*)
                                QUERY PLAN                                
 -------------------------------------------------------------------------
  GroupAggregate
-   Group Key: t1.x, t1.w, t1.z
+   Group Key: t1.w, t1.z, t1.x
    ->  Merge Join
-         Merge Cond: ((t1.x = t2.x) AND (t1.w = t2.w) AND (t1.z = t2.z))
-         ->  Incremental Sort
-               Sort Key: t1.x, t1.w, t1.z
-               Presorted Key: t1.x
+         Merge Cond: ((t1.w = t2.w) AND (t1.z = t2.z) AND (t1.x = t2.x))
+         ->  Sort
+               Sort Key: t1.w, t1.z, t1.x
                ->  Index Scan using btg_x_y_idx on btg t1
          ->  Sort
-               Sort Key: t2.x, t2.w, t2.z
+               Sort Key: t2.w, t2.z, t2.x
                ->  Index Scan using btg_x_y_idx on btg t2
-(11 rows)
+(10 rows)
 
 RESET enable_nestloop;
 RESET enable_hashjoin;

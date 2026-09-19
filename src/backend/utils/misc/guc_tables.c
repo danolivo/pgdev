@@ -860,6 +860,19 @@ struct config_bool ConfigureNamesBool[] =
 		NULL, NULL, NULL
 	},
 	{
+		{"enable_sort_comparison_factor", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enables estimating a sort's per-comparison cost from "
+						 "the leading key."),
+			gettext_noop("When off, every tuple comparison is charged a flat "
+						 "2 * cpu_operator_cost, as it was before the "
+						 "estimate existed."),
+			GUC_EXPLAIN
+		},
+		&enable_sort_comparison_factor,
+		true,
+		NULL, NULL, NULL
+	},
+	{
 		{"enable_incremental_sort", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of incremental sort steps."),
 			NULL,
