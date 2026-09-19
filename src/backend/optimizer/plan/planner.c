@@ -212,6 +212,9 @@ static void create_partial_distinct_paths(PlannerInfo *root,
 static RelOptInfo *create_final_distinct_paths(PlannerInfo *root,
 											   RelOptInfo *input_rel,
 											   RelOptInfo *distinct_rel);
+static List *add_ndistinct_pathkeys_for_distinct(PlannerInfo *root,
+												 List *needed_pathkeys,
+												 List *useful_pathkeys_list);
 static List *get_useful_pathkeys_for_distinct(PlannerInfo *root,
 											  List *needed_pathkeys,
 											  List *path_pathkeys);
@@ -5039,6 +5042,10 @@ create_partial_distinct_paths(PlannerInfo *root, RelOptInfo *input_rel,
 				get_useful_pathkeys_for_distinct(root,
 												 root->distinct_pathkeys,
 												 input_path->pathkeys);
+			useful_pathkeys_list =
+				add_ndistinct_pathkeys_for_distinct(root,
+													root->distinct_pathkeys,
+													useful_pathkeys_list);
 			Assert(list_length(useful_pathkeys_list) > 0);
 
 			foreach_node(List, useful_pathkeys, useful_pathkeys_list)
@@ -5234,6 +5241,9 @@ create_final_distinct_paths(PlannerInfo *root, RelOptInfo *input_rel,
 				get_useful_pathkeys_for_distinct(root,
 												 needed_pathkeys,
 												 input_path->pathkeys);
+			useful_pathkeys_list =
+				add_ndistinct_pathkeys_for_distinct(root, needed_pathkeys,
+													useful_pathkeys_list);
 			Assert(list_length(useful_pathkeys_list) > 0);
 
 			foreach_node(List, useful_pathkeys, useful_pathkeys_list)
@@ -5404,6 +5414,48 @@ get_useful_pathkeys_for_distinct(PlannerInfo *root, List *needed_pathkeys,
 								   useful_pathkeys);
 
 	return useful_pathkeys_list;
+}
+
+/*
+ * add_ndistinct_pathkeys_for_distinct
+ *		Offer an ordering of 'needed_pathkeys' led by the key with the most
+ *		distinct values, if that is not what we have already.
+ *
+ * Nothing below the DISTINCT step produces this ordering, so unless we put it
+ * forward the cost model never gets to compare it.  As with GROUP BY we move
+ * exactly one key and leave the rest alone: sort_comparisons_factor() judges
+ * an ordering by its leading key, so one key is as far as the evidence
+ * reaches.
+ *
+ * DISTINCT ON is left alone.  There 'needed_pathkeys' may be sort_pathkeys,
+ * and which row survives each group is decided by that order, so moving a key
+ * to the front is not ours to do.
+ */
+static List *
+add_ndistinct_pathkeys_for_distinct(PlannerInfo *root, List *needed_pathkeys,
+									List *useful_pathkeys_list)
+{
+	List	   *nd_pathkeys;
+	int			nkeys = list_length(needed_pathkeys);
+	int			best_pos;
+
+	if (root->parse->hasDistinctOn)
+		return useful_pathkeys_list;
+
+	best_pos = pathkeys_best_ndistinct_pos(root, needed_pathkeys, nkeys);
+	if (best_pos < 0)
+		return useful_pathkeys_list;
+
+	nd_pathkeys = pathkeys_promote_nth(needed_pathkeys, nkeys, best_pos);
+
+	/* Drop it if some earlier candidate already covers this ordering. */
+	foreach_node(List, old_pathkeys, useful_pathkeys_list)
+	{
+		if (compare_pathkeys(nd_pathkeys, old_pathkeys) == PATHKEYS_EQUAL)
+			return useful_pathkeys_list;
+	}
+
+	return lappend(useful_pathkeys_list, nd_pathkeys);
 }
 
 /*
