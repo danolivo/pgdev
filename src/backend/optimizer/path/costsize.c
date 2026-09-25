@@ -104,6 +104,7 @@
 #include "optimizer/plancat.h"
 #include "optimizer/restrictinfo.h"
 #include "parser/parsetree.h"
+#include "storage/bufmgr.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
 #include "utils/spccache.h"
@@ -129,6 +130,7 @@
 
 double		seq_page_cost = DEFAULT_SEQ_PAGE_COST;
 double		random_page_cost = DEFAULT_RANDOM_PAGE_COST;
+double		write_page_cost = DEFAULT_WRITE_PAGE_COST;
 double		cpu_tuple_cost = DEFAULT_CPU_TUPLE_COST;
 double		cpu_index_tuple_cost = DEFAULT_CPU_INDEX_TUPLE_COST;
 double		cpu_operator_cost = DEFAULT_CPU_OPERATOR_COST;
@@ -163,6 +165,8 @@ bool		enable_parallel_hash = true;
 bool		enable_partition_pruning = true;
 bool		enable_presorted_aggregate = true;
 bool		enable_async_append = true;
+
+bool extended_parallel_processing = true;
 
 typedef struct
 {
@@ -462,6 +466,10 @@ cost_gather(GatherPath *path, PlannerInfo *root,
 
 	run_cost = path->subpath->total_cost - path->subpath->startup_cost;
 
+	/* Account for flushing dirty temp buffers before launching workers */
+	if (path->subpath->parallel_safe == NEEDS_TEMP_FLUSH)
+		startup_cost += tempbuf_flush_extra_cost();
+
 	/* Parallel setup and communication cost. */
 	startup_cost += parallel_setup_cost;
 	run_cost += parallel_tuple_cost * path->path.rows;
@@ -532,10 +540,22 @@ cost_gather_merge(GatherMergePath *path, PlannerInfo *root,
 	startup_cost += parallel_setup_cost;
 	run_cost += parallel_tuple_cost * path->path.rows * 1.05;
 
+	/*
+	 * Fold in the input (subpath) costs, following the same pattern as
+	 * cost_gather: input startup goes into startup_cost, the incremental
+	 * portion goes into run_cost, so total = startup + run naturally.
+	 */
+	startup_cost += input_startup_cost;
+	run_cost += input_total_cost - input_startup_cost;
+
+	/* Account for flushing dirty temp buffers before launching workers */
+	if (path->subpath->parallel_safe == NEEDS_TEMP_FLUSH)
+		startup_cost += tempbuf_flush_extra_cost();
+
 	path->path.disabled_nodes = input_disabled_nodes
 		+ (enable_gathermerge ? 0 : 1);
-	path->path.startup_cost = startup_cost + input_startup_cost;
-	path->path.total_cost = (startup_cost + run_cost + input_total_cost);
+	path->path.startup_cost = startup_cost;
+	path->path.total_cost = (startup_cost + run_cost);
 }
 
 /*
@@ -6627,4 +6647,26 @@ compute_gather_rows(Path *path)
 	Assert(path->parallel_workers > 0);
 
 	return clamp_row_est(path->rows * get_parallel_divisor(path));
+}
+
+/*
+ * Before the launch parallel workers in a SELECT query, the leader process must
+ * flush all dirty pages in temp buffers to guarantee equal access to the data
+ * in each parallel worker.
+ * It seems difficult to calculate specific set of tables, indexes and toasts
+ * that may be touched inside the subtree. Moreover, stored procedures may also
+ * scan temporary tables. So, it makes sense to flush all temporary buffers.
+ * Here we calculate the cost of such operation to allow small queries do not
+ * activate expensive parallel scan over temp resources.
+ */
+Cost
+tempbuf_flush_extra_cost()
+{
+	if (!extended_parallel_processing)
+		/* Fast exit if feature is disabled */
+		return 0.0;
+
+	/* Hopefully, we have an statistics on the number of dirtied buffers */
+	Assert(dirtied_localbufs >= 0);
+	return write_page_cost * dirtied_localbufs;
 }
