@@ -1383,6 +1383,10 @@ pa_start_subtrans(TransactionId current_xid, TransactionId top_xid)
 		MemoryContext oldctx;
 		char		spname[NAMEDATALEN];
 
+		/* Let extensions complete deferred work in the current level. */
+		if (logicalrep_savepoint_hook)
+			logicalrep_savepoint_hook();
+
 		pa_savepoint_name(MySubscription->oid, current_xid,
 						  spname, sizeof(spname));
 
