@@ -231,6 +231,37 @@ extern PGDLLIMPORT struct WalReceiverConn *LogRepWorkerWalRcvConn;
 
 /* Worker and subscription objects. */
 extern PGDLLIMPORT Subscription *MySubscription;
+
+/*
+ * Hooks for extensions that want to change how the apply worker applies
+ * remote INSERTs, e.g. to batch them.
+ *
+ * logicalrep_insert_hook is called from apply_handle_insert() for a remote
+ * INSERT that is going to be applied, after the remote tuple has been
+ * converted into remoteslot and missing columns have been filled with their
+ * defaults, and after switching to the table owner (unless run_as_owner).
+ * relinfo and estate are the per-message executor state that the built-in
+ * code would use for the insertion.  If the hook returns true, the tuple is
+ * considered applied and the built-in insertion is skipped.  The slot and
+ * its contents are only valid during the call.
+ *
+ * logicalrep_message_hook is called from apply_dispatch() for every message,
+ * before it is handled.  An extension that defers work in
+ * logicalrep_insert_hook must complete it here for every message other
+ * than an INSERT, so that later changes, and the commit, see its effects.
+ */
+struct EState;
+struct ResultRelInfo;
+struct TupleTableSlot;
+
+typedef bool (*logicalrep_insert_hook_type) (LogicalRepRelMapEntry *rel,
+											 struct ResultRelInfo *relinfo,
+											 struct EState *estate,
+											 struct TupleTableSlot *remoteslot);
+extern PGDLLIMPORT logicalrep_insert_hook_type logicalrep_insert_hook;
+
+typedef void (*logicalrep_message_hook_type) (LogicalRepMsgType action);
+extern PGDLLIMPORT logicalrep_message_hook_type logicalrep_message_hook;
 extern PGDLLIMPORT LogicalRepWorker *MyLogicalRepWorker;
 
 extern PGDLLIMPORT bool in_remote_transaction;

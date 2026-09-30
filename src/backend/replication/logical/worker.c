@@ -291,6 +291,10 @@ static MemoryContext LogicalStreamingContext = NULL;
 WalReceiverConn *LogRepWorkerWalRcvConn = NULL;
 
 Subscription *MySubscription = NULL;
+
+/* Hooks for extensions, see worker_internal.h */
+logicalrep_insert_hook_type logicalrep_insert_hook = NULL;
+logicalrep_message_hook_type logicalrep_message_hook = NULL;
 static bool MySubscriptionValid = false;
 
 static List *on_commit_wakeup_workers_subids = NIL;
@@ -2461,8 +2465,13 @@ apply_handle_insert(StringInfo s)
 	slot_fill_defaults(rel, estate, remoteslot);
 	MemoryContextSwitchTo(oldctx);
 
+	if (logicalrep_insert_hook &&
+		logicalrep_insert_hook(rel, edata->targetRelInfo, estate, remoteslot))
+	{
+		/* The tuple has been taken over by the hook. */
+	}
 	/* For a partitioned table, insert the tuple into a partition. */
-	if (rel->localrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	else if (rel->localrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 		apply_handle_tuple_routing(edata,
 								   remoteslot, NULL, CMD_INSERT);
 	else
@@ -3415,6 +3424,9 @@ apply_dispatch(StringInfo s)
 	 */
 	saved_command = apply_error_callback_arg.command;
 	apply_error_callback_arg.command = action;
+
+	if (logicalrep_message_hook)
+		logicalrep_message_hook(action);
 
 	switch (action)
 	{
