@@ -80,8 +80,7 @@ CATALOG(pg_subscription,6100,SubscriptionRelationId) BKI_SHARED_RELATION BKI_ROW
 
 	bool		submultiinsert; /* True if the apply worker is allowed to
 								 * batch consecutive INSERTs via
-								 * heap_multi_insert(). Pilot opt-in;
-								 * see §4.12. */
+								 * table_multi_insert(). */
 
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	/* Connection string to the publisher */
@@ -137,7 +136,7 @@ typedef struct Subscription
 								 * slots) in the upstream database are enabled
 								 * to be synchronized to the standbys. */
 	bool		multiinsert;	/* Apply worker may batch INSERTs via
-								 * heap_multi_insert (pilot, §4.12) */
+								 * table_multi_insert */
 	char	   *conninfo;		/* Connection string to the publisher */
 	char	   *slotname;		/* Name of the replication slot */
 	char	   *synccommit;		/* Synchronous commit setting for worker */

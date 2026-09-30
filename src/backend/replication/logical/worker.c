@@ -378,11 +378,12 @@ static void send_feedback(XLogRecPtr recvpos, bool force, bool requestReply);
 
 static void apply_worker_exit(void);
 
-/* Multi-insert batching (pilot, §4.12) -- forward declarations so the
- * flush hooks at non-INSERT handlers (which appear earlier in the file
- * than the apply_mi block) can call them.  The apply_mi_buf pointer is
- * exposed here for defensive Assert(apply_mi_buf == NULL) usage in
- * streaming-path handlers without needing the complete struct type. */
+/*
+ * Multi-insert batching.  Forward declarations so that the flush hooks in
+ * the non-INSERT handlers, which appear earlier in the file than the
+ * apply_mi code, can call them.  apply_mi_buf is declared here so those
+ * handlers can Assert(apply_mi_buf == NULL) without the complete struct.
+ */
 struct ApplyMIBuffer;
 static struct ApplyMIBuffer *apply_mi_buf;
 static void apply_handle_buffer_flush_any(void);
@@ -1227,9 +1228,7 @@ apply_handle_commit_prepared(StringInfo s)
 	/*
 	 * The buffer must be empty at COMMIT PREPARED -- the preceding PREPARE
 	 * (live or streamed) already drained it, and no INSERT activity can
-	 * occur between PREPARE and COMMIT PREPARED.  Defensive assert to keep
-	 * this in lock-step with the stream_stop / stream_abort handlers
-	 * (§4.12.3.1).
+	 * occur between PREPARE and COMMIT PREPARED.
 	 */
 	Assert(apply_mi_buf == NULL);
 
@@ -1282,7 +1281,7 @@ apply_handle_rollback_prepared(StringInfo s)
 	LogicalRepRollbackPreparedTxnData rollback_data;
 	char		gid[GIDSIZE];
 
-	/* Symmetric with apply_handle_commit_prepared (§4.12.3.1). */
+	/* See apply_handle_commit_prepared. */
 	Assert(apply_mi_buf == NULL);
 
 	logicalrep_read_rollback_prepared(s, &rollback_data);
@@ -1712,7 +1711,7 @@ apply_handle_stream_stop(StringInfo s)
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg_internal("STREAM STOP message without STREAM START")));
 
-	/* Pilot excludes streaming; no buffer should exist here (§4.12). */
+	/* Multi-insert is disabled for streaming; no buffer can exist here. */
 	Assert(apply_mi_buf == NULL);
 
 	apply_action = get_transaction_apply_action(stream_xid, &winfo);
@@ -1908,7 +1907,7 @@ apply_handle_stream_abort(StringInfo s)
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg_internal("STREAM ABORT message without STREAM STOP")));
 
-	/* Pilot excludes streaming; no buffer should exist here (§4.12). */
+	/* Multi-insert is disabled for streaming; no buffer can exist here. */
 	Assert(apply_mi_buf == NULL);
 
 	/* We receive abort information only when we can apply in parallel. */
@@ -2239,10 +2238,9 @@ apply_handle_stream_commit(StringInfo s)
 
 			/*
 			 * The transaction has been serialized to file, so replay all the
-			 * spooled operations.  Multi-insert batching is intentionally
-			 * disabled in streaming mode (§4.12), so there is nothing to
-			 * flush between replay and commit; an Assert in apply_handle_
-			 * buffer_flush_any backstops that.
+			 * spooled operations.  Multi-insert batching is disabled in
+			 * streaming mode, so there is nothing to flush between replay
+			 * and commit.
 			 */
 			apply_spooled_messages(MyLogicalRepWorker->stream_fileset, xid,
 								   commit_data.commit_lsn);
@@ -2462,76 +2460,59 @@ TargetPrivilegesCheck(Relation rel, AclMode mode)
 }
 
 /* ------------------------------------------------------------------------- *
- * Batched multi-insert for the apply worker -- pilot (Release N-0).
+ * Batched multi-insert for the apply worker.
  *
- * Opt-in via the subscription option "multi_insert".  When enabled AND the
- * target relation satisfies apply_mi_relation_is_safe() (plain table, no
- * triggers / RLS / constraints / stored-generated / deferrable-unique /
- * exclusion), consecutive INSERTs against the same relation accumulate in
- * a single in-memory buffer and are flushed via heap_multi_insert() (+
- * per-tuple ExecInsertIndexTuples if any indexes) in one WAL record.
+ * Opt-in via the subscription option "multi_insert".  When enabled and the
+ * target relation satisfies apply_mi_relation_is_safe(), consecutive INSERTs
+ * against the same relation accumulate in a single in-memory buffer and are
+ * flushed via table_multi_insert(), followed by per-tuple
+ * ExecInsertIndexTuples() if the relation has indexes.
  *
- * Intra-batch duplicate safety (spec §4.12.4):
- *   A batch contains only consecutive INSERTs from one publisher/stream
- *   xact targeting one relation.  UPDATE, DELETE, relation-change, or any
- *   non-INSERT message flushes.  The publisher would have rejected a
- *   same-key duplicate at INSERT time; a key-changing UPDATE is a non-
- *   INSERT and therefore flushes.  Therefore two buffered tuples cannot
- *   share a unique-key value.  The only conflict source is a pre-existing
- *   subscriber row.
+ * Every tuple passes the same NOT NULL, CHECK and partition-constraint
+ * checks as the per-row path (ExecConstraints / ExecPartitionCheck) before
+ * it enters the buffer, so batching never admits a row the per-row path
+ * would reject.  The flush runs as the table owner unless the subscription
+ * has run_as_owner = true, mirroring apply_handle_insert(), and it bumps
+ * the command counter afterwards so that subsequent changes of the same
+ * remote transaction see the inserted rows.
  *
- * Conflict handling (pilot, intentional simplification):
- *   The pilot does NOT wrap the flush in a subxact.  A unique-index
- *   violation against a pre-existing subscriber row propagates to the
- *   outer apply error handler, aborting the remote xact.  This is a
- *   regression versus the upstream per-row path (which delivers unique
- *   violations through CheckAndReportConflict and honours disable_on_
- *   error / ALTER SUBSCRIPTION SKIP); we accept it for the pilot in
- *   exchange for materially less code and zero per-flush subxact
- *   overhead on the common conflict-free case.  A follow-up will add a
- *   tuple-by-tuple fallback: on unique violation, re-apply the buffered
- *   tuples through ExecSimpleRelationInsert so the standard conflict-
- *   reporting path runs unchanged.  The §4.12.3 safety check already
- *   rules out CHECK, stored-generated, exclusion, and deferred-unique
- *   failure modes, so unique-index conflicts are the one remaining
- *   class this affects.
+ * Intra-batch duplicate safety:
+ *   A batch contains only consecutive INSERTs from one remote transaction
+ *   targeting one relation.  UPDATE, DELETE, a relation change, or any
+ *   other non-INSERT message flushes.  The publisher would have rejected a
+ *   same-key duplicate at INSERT time, and a key-changing UPDATE flushes,
+ *   so two buffered tuples cannot share a unique-key value.  The only
+ *   conflict source is a pre-existing subscriber row.
  *
- * Lifetime: one active buffer at a time.  The ApplyMIBuffer struct itself
- * lives in file-scope BSS (apply_mi_buf_storage); its referenced palloc'd
- * children -- Relation handle, EState, ResultRelInfo, slot objects -- live
- * in ApplyContext and are torn down by apply_mi_buffer_destroy() at every
- * non-INSERT boundary (flush triggers, spec §4.3.3).  An intermediate flush
- * (apply_mi_buffer_flush, spec §4.3.1.2) keeps the buffer alive and reuses
- * its slots across batches; only the final flush (apply_handle_buffer_
- * flush_any) invokes destroy.  The buffer is never persisted across
- * transaction boundaries, which keeps us out of trouble with TupleDesc
- * pin lifetimes.
+ * Conflict handling:
+ *   The flush is not wrapped in a subtransaction.  A unique-index violation
+ *   against a pre-existing subscriber row raises an ordinary error and
+ *   aborts the remote transaction.  Unlike the per-row path, the conflict is
+ *   not routed through CheckAndReportConflict(), so it is not counted in
+ *   pg_stat_subscription_stats and the error context names the message
+ *   that triggered the flush rather than the INSERT itself.  A tuple-by-tuple
+ *   fallback through ExecSimpleRelationInsert() would restore the standard
+ *   conflict reporting.
+ *
+ * Lifetime: one active buffer at a time.  The ApplyMIBuffer struct lives in
+ * static storage (apply_mi_buf_storage); the objects it references --
+ * Relation handle, EState, ResultRelInfo, slots -- live in ApplyContext and
+ * are released by apply_mi_buffer_destroy() at every non-INSERT boundary.
+ * An intermediate flush (apply_mi_buffer_flush) keeps the buffer alive and
+ * reuses its slots; only the final flush (apply_handle_buffer_flush_any)
+ * destroys it.  The buffer never survives a transaction boundary.  Both
+ * destroy and abandon leave the static storage zeroed.
  *
  * Storage sizing: APPLY_MI_MAX_SLOTS is a compile-time cap.  The slot
- * pointer array and the per-tuple was_null scratch are fixed members of
- * ApplyMIBuffer and together consume roughly sizeof(void *) *
- * APPLY_MI_MAX_SLOTS + MaxTupleAttributeNumber bytes in BSS per apply
- * worker.  The per-tuple Datum storage itself lives in batch_mcxt (an
- * AllocSet child of ApplyContext created at buffer init, reset per
- * flush, deleted at destroy) and therefore does not scale with
- * APPLY_MI_MAX_SLOTS at rest.  Raising the cap without reconsidering the
- * storage model grows the slots[] footprint linearly; exposing batch
- * size as a subscription option (spec §4.12.6 → §8 Patch 4) will require
- * revisiting the fixed-array choice.
+ * pointer array and the was_null scratch array are fixed members of
+ * ApplyMIBuffer.  Datums produced by slot_store_data() live in batch_mcxt,
+ * which is reset at every flush and deleted at destroy.
  *
- * Zero-copy Datum lifetime: the buffered slots' tts_values[] pointers
- * reference storage inside batch_mcxt (populated directly by
- * slot_store_data's input functions; no ExecMaterializeSlot deep copy).
- * Invariants:
- *   - Between the MemoryContextReset(batch_mcxt) at end of flush and the
- *     next apply_mi_buffer_add that overwrites the slot, the slot's
- *     tts_values[] point into freed memory.  Nothing reads them during
- *     that window: ExecClearTuple marks the slot empty, and
- *     ExecFetchSlotHeapTuple is only called from apply_mi_flush_heap_
- *     phase BEFORE the reset.
- *   - TTS_FLAG_SHOULDFREE is never set on a buffered slot (we no longer
- *     call ExecMaterializeSlot), so ExecClearTuple's attempt to pfree
- *     vslot->data is a no-op.  That keeps the post-reset dangle safe.
+ * Datum lifetime: the buffered slots' tts_values[] reference storage inside
+ * batch_mcxt.  Between the MemoryContextReset(batch_mcxt) at the end of a
+ * flush and the next apply_mi_buffer_add() that overwrites a slot, its
+ * tts_values[] point into freed memory; nothing reads them in that window,
+ * because the slots have been cleared.
  * ------------------------------------------------------------------------- */
 
 #define APPLY_MI_MAX_SLOTS		10000
@@ -2562,6 +2543,10 @@ typedef struct ApplyMIBuffer
 									 * -copy-loop block entirely when false,
 									 * which is the common narrow-fact-
 									 * table case */
+	bool		check_constraints;	/* tupdesc->constr != NULL: run
+									 * ExecConstraints on every tuple */
+	bool		check_partition;	/* target is a partition: run
+									 * ExecPartitionCheck on every tuple */
 	ResultRelInfo *relinfo;			/* palloc'd, owns ExecOpenIndices state */
 	EState	   *estate;				/* executor state for slot_fill_defaults,
 									 * constraint evaluation, and flush */
@@ -2633,11 +2618,11 @@ apply_mi_reset_xact_state(void)
  * apply_mi_relation_is_safe
  *		Decide whether a relation is eligible for the batched-insert path.
  *
- *		Rejects: non-plain-table, no multi_insert AM, triggers, RLS, any
- *		tuple constraint (CHECK/stored-generated; NOT-NULL is in
- *		attnotnull and is implied safe by publisher correctness per
- *		§4.12.3), exclusion constraints, deferrable unique, indexes that
- *		aren't valid/ready/live.
+ *		Rejects: non-plain-table, no multi_insert AM, triggers, RLS, CHECK
+ *		constraints, stored-generated columns, exclusion constraints,
+ *		deferrable unique, indexes that aren't valid/ready/live.  NOT NULL
+ *		and partition constraints are allowed: apply_mi_buffer_add checks
+ *		them per tuple.
  *
  *		Immediate UNIQUE / PRIMARY KEY indexes are permitted but no longer
  *		trigger any special wrap (see apply_mi_buffer_flush): on conflict,
@@ -2668,13 +2653,12 @@ apply_mi_relation_is_safe(LogicalRepRelMapEntry *rel)
 		return false;
 
 	/*
-	 * Reject only constraints that can raise per tuple: CHECK constraints
-	 * and stored-generated columns.  NOT NULL is represented inside the
-	 * TupleConstr struct too, but the publisher guarantees non-null values
-	 * by its own constraint, and under the pilot's schema-identity
-	 * assumption the subscriber's NOT NULL is satisfied by construction.
-	 * Default values (defval / missing) are evaluated safely by
-	 * slot_fill_defaults before the tuple enters the buffer.
+	 * Reject CHECK constraints and stored-generated columns.  NOT NULL
+	 * constraints are allowed: the publisher and subscriber schemas may
+	 * differ, so apply_mi_buffer_add enforces them per tuple through
+	 * ExecConstraints, exactly as the per-row path does.  Default values
+	 * are evaluated by slot_fill_defaults before the tuple enters the
+	 * buffer.
 	 */
 	if (tupdesc->constr != NULL &&
 		(tupdesc->constr->num_check > 0 ||
@@ -2734,16 +2718,9 @@ apply_mi_buffer_init(LogicalRepRelMapEntry *rel)
 	Assert(rel->localrel != NULL);
 
 	/*
-	 * Defensive: the pilot excludes streaming (§4.12.3.1).  CREATE /
-	 * ALTER SUBSCRIPTION refuses to combine multi_insert=on with
-	 * streaming != off; hitting any of these asserts means the DDL check
-	 * was bypassed.  Concrete bypass scenarios to be guarded against:
-	 *   - pg_upgrade of a subscription whose source cluster had a
-	 *     different streaming/multi_insert combination than the new
-	 *     cluster allows;
-	 *   - a direct UPDATE pg_subscription SET ... by a superuser;
-	 *   - a future code path (e.g. a new ALTER_SUBSCRIPTION kind) that
-	 *     forgets to run the combination check in parse_subscription_options.
+	 * CREATE / ALTER SUBSCRIPTION refuse to combine multi_insert = on with
+	 * streaming != off, and apply_handle_insert checks both before getting
+	 * here, so none of these should fire.
 	 */
 	Assert(MySubscription->stream == LOGICALREP_STREAM_OFF);
 	Assert(!am_parallel_apply_worker());
@@ -2752,111 +2729,106 @@ apply_mi_buffer_init(LogicalRepRelMapEntry *rel)
 	oldctx = MemoryContextSwitchTo(ApplyContext);
 
 	/*
-	 * Bind to static storage.  We rely on the invariant that apply_mi_
-	 * buffer_destroy (happy path) and apply_mi_buffer_abandon (error path)
-	 * both leave the storage in a clean state, so init does not memset --
-	 * it sets the fields it cares about and trusts the rest are zero.
+	 * Bind to static storage.  apply_mi_buffer_destroy and
+	 * apply_mi_buffer_abandon both leave the storage zeroed, so init only
+	 * sets the fields it needs.
+	 *
+	 * No PG_TRY here: an error in the apply worker always ends the process
+	 * (see start_apply), so a partially initialised buffer never has to be
+	 * unwound.  apply_mi_buffer_abandon only clears the static pointer.
 	 */
 	apply_mi_buf = &apply_mi_buf_storage;
+	apply_mi_buf->relid = RelationGetRelid(rel->localrel);
 
 	/*
-	 * Wrap the resource-acquiring section so a throw mid-init (e.g.
-	 * ExecOpenIndices on catalog corruption, AllocSetContextCreate on
-	 * OOM) can't leak ApplyContext allocations.  apply_mi_buffer_destroy
-	 * is written to handle arbitrarily-partial state -- every field it
-	 * touches is NULL-checked -- so calling it on an in-progress init is
-	 * safe.  Without this wrapping, the top-level PG_CATCH in start_apply
-	 * would call apply_mi_buffer_abandon, which only deletes batch_mcxt;
-	 * an EState, ResultRelInfo, or opened-index list allocated earlier
-	 * would stay pinned in ApplyContext until the next successful buffer
-	 * destroy (i.e. unbounded for repeated error cycles).
+	 * Own the Relation handle for the buffer's lifetime.  The caller's
+	 * logicalrep_rel_close(rel, NoLock) at the end of apply_handle_insert
+	 * sets the map entry's localrel to NULL, so a flush at commit time
+	 * cannot use it.  The extra RowExclusiveLock acquisition only bumps the
+	 * local lock count.
 	 */
-	PG_TRY();
+	apply_mi_buf->local_rel = table_open(apply_mi_buf->relid,
+										 RowExclusiveLock);
+
+	/*
+	 * Cache TupleDesc-derived values; they cannot change while we hold the
+	 * relation open.  has_defaults gates the defaults-handling block in
+	 * apply_mi_buffer_add: if the publisher sends every subscriber column,
+	 * slot_fill_defaults has nothing to do.
+	 */
+	apply_mi_buf->tupdesc = RelationGetDescr(apply_mi_buf->local_rel);
+	apply_mi_buf->natts = apply_mi_buf->tupdesc->natts;
+	apply_mi_buf->has_defaults =
+		(apply_mi_buf->natts != rel->remoterel.natts);
+	apply_mi_buf->check_constraints = (apply_mi_buf->tupdesc->constr != NULL);
+	apply_mi_buf->check_partition =
+		apply_mi_buf->local_rel->rd_rel->relispartition;
+
+	apply_mi_buf->estate = CreateExecutorState();
+
+	/*
+	 * Everything below that belongs to the executor state -- range table,
+	 * ResultRelInfo, the index descriptors and IndexInfos built by
+	 * ExecOpenIndices -- goes into es_query_cxt, so FreeExecutorState at
+	 * destroy time releases it.  Allocating it in ApplyContext would leak it
+	 * once per buffer lifetime, i.e. once per remote transaction.
+	 */
+	MemoryContextSwitchTo(apply_mi_buf->estate->es_query_cxt);
+
+	/*
+	 * Set up a one-entry range table, as create_edata_for_relation does.
+	 * ExecConstraints and ExecPartitionCheck look up the RTE permission info
+	 * when they build the failing-row description for an error message.
+	 */
 	{
-		apply_mi_buf->relid = RelationGetRelid(rel->localrel);
+		RangeTblEntry *rte;
+		List	   *perminfos = NIL;
 
-		/*
-		 * Own the Relation handle for the buffer's lifetime.  The caller's
-		 * logicalrep_rel_close(rel, NoLock) at end of apply_handle_insert
-		 * sets the shared map entry's localrel to NULL; if we kept the
-		 * caller's Relation pointer, the flush at commit/prepare time
-		 * would deref a stale pointer.  A dedicated table_open +
-		 * table_close pair gives the buffer a stable handle.  The second
-		 * RowExclusiveLock acquisition on top of the caller's is an
-		 * idempotent refcount bump in LockRelationOid -- accepted as the
-		 * cost of ownership decoupling.
-		 */
-		apply_mi_buf->local_rel = table_open(apply_mi_buf->relid,
-											 RowExclusiveLock);
-
-		/*
-		 * Cache TupleDesc-derived values.  tupdesc and natts are invariant
-		 * for the buffer's lifetime (schema-stability assumption,
-		 * §4.12.3); reading them once lets apply_mi_buffer_add skip the
-		 * slot -> tupdesc -> natts pointer chase per tuple.  has_defaults
-		 * is the short-circuit gate for the defaults-handling block in
-		 * add: if the publisher sends every column the subscriber has,
-		 * slot_fill_defaults does no work and we shouldn't pay the
-		 * ResetExprContext / memcpy / function-call / post-walk costs
-		 * either.
-		 */
-		apply_mi_buf->tupdesc = RelationGetDescr(apply_mi_buf->local_rel);
-		apply_mi_buf->natts = apply_mi_buf->tupdesc->natts;
-		apply_mi_buf->has_defaults =
-			(apply_mi_buf->natts != rel->remoterel.natts);
-
-		apply_mi_buf->estate = CreateExecutorState();
-
-		/*
-		 * ResultRelInfo palloc'd explicitly (not registered on the
-		 * estate's es_opened_result_relations list) so that
-		 * FreeExecutorState at destroy time does not close our indexes
-		 * behind our back.
-		 */
-		apply_mi_buf->relinfo = makeNode(ResultRelInfo);
-		InitResultRelInfo(apply_mi_buf->relinfo, apply_mi_buf->local_rel,
-						  1 /* RT index; any positive works here */,
-						  NULL /* partition_root_rri */, 0 /* instrument */);
-		ExecOpenIndices(apply_mi_buf->relinfo, false);
-
-		/*
-		 * Per-batch memory context.  slot_store_data's input-function
-		 * output and any datumCopy'd defaulted columns are allocated
-		 * here; the buffered slots' tts_values[] point into this context.
-		 * Reset at every flush, deleted at destroy.  Keeping Datum
-		 * storage batch-scoped (rather than per-message, which would
-		 * force an ExecMaterializeSlot copy per tuple) is the
-		 * optimisation this context enables.
-		 */
-		apply_mi_buf->batch_mcxt = AllocSetContextCreate(ApplyContext,
-														 "ApplyMIBatch",
-														 ALLOCSET_DEFAULT_SIZES);
-
-		apply_mi_buf->nslots = 0;
-		apply_mi_buf->slots_allocated = 0;
-		apply_mi_buf->cum_bytes = 0;
-		apply_mi_buf->owner_at_init = CurrentResourceOwner;
+		rte = makeNode(RangeTblEntry);
+		rte->rtekind = RTE_RELATION;
+		rte->relid = apply_mi_buf->relid;
+		rte->relkind = apply_mi_buf->local_rel->rd_rel->relkind;
+		rte->rellockmode = AccessShareLock;
+		addRTEPermissionInfo(&perminfos, rte);
+		ExecInitRangeTable(apply_mi_buf->estate, list_make1(rte), perminfos,
+						   bms_make_singleton(1));
 	}
-	PG_CATCH();
-	{
-		/*
-		 * Partial init failure -- unwind whatever was allocated.  destroy
-		 * handles all-NULL fields gracefully, so calling it on an in-
-		 * progress init releases exactly what we've populated so far.
-		 */
-		apply_mi_buffer_destroy();
-		MemoryContextSwitchTo(oldctx);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
+
+	/*
+	 * The ResultRelInfo is not registered on es_opened_result_relations, so
+	 * FreeExecutorState at destroy time does not close our indexes behind
+	 * our back.
+	 */
+	apply_mi_buf->relinfo = makeNode(ResultRelInfo);
+	InitResultRelInfo(apply_mi_buf->relinfo, apply_mi_buf->local_rel,
+					  1, NULL, 0);
+	ExecOpenIndices(apply_mi_buf->relinfo, false);
+
+	MemoryContextSwitchTo(ApplyContext);
+
+	/*
+	 * Per-batch memory context.  slot_store_data's input-function output and
+	 * any datumCopy'd defaulted columns are allocated here; the buffered
+	 * slots' tts_values[] point into this context.  Reset at every flush,
+	 * deleted at destroy.
+	 */
+	apply_mi_buf->batch_mcxt = AllocSetContextCreate(ApplyContext,
+													 "ApplyMIBatch",
+													 ALLOCSET_DEFAULT_SIZES);
+
+	apply_mi_buf->nslots = 0;
+	apply_mi_buf->slots_allocated = 0;
+	apply_mi_buf->cum_bytes = 0;
+	apply_mi_buf->owner_at_init = CurrentResourceOwner;
 
 	MemoryContextSwitchTo(oldctx);
 }
 
 /*
  * apply_mi_buffer_destroy
- *		Release all slots owned by the buffer.  No AfterTriggerEndQuery:
- *		the pilot forbids triggers so no after-trigger queue was opened.
+ *		Release everything the buffer owns and zero the static storage.  No
+ *		AfterTriggerEndQuery: tables with triggers are not eligible, so no
+ *		after-trigger queue was opened.
  */
 static void
 apply_mi_buffer_destroy(void)
@@ -2879,12 +2851,9 @@ apply_mi_buffer_destroy(void)
 	}
 	apply_mi_buf->slots_allocated = 0;
 
+	/* relinfo lives in the estate's query context; close indexes first. */
 	if (apply_mi_buf->relinfo != NULL)
-	{
 		ExecCloseIndices(apply_mi_buf->relinfo);
-		pfree(apply_mi_buf->relinfo);
-		apply_mi_buf->relinfo = NULL;
-	}
 
 	if (apply_mi_buf->estate != NULL)
 		FreeExecutorState(apply_mi_buf->estate);
@@ -2896,25 +2865,32 @@ apply_mi_buffer_destroy(void)
 	}
 
 	if (apply_mi_buf->batch_mcxt != NULL)
-	{
 		MemoryContextDelete(apply_mi_buf->batch_mcxt);
-		apply_mi_buf->batch_mcxt = NULL;
-	}
 
+	/*
+	 * Zero every field, not just the pointers released above: init relies
+	 * on the storage being clean, and a stale estate or relinfo pointer here
+	 * would be freed a second time by a later destroy.  slots[] has already
+	 * been cleared up to slots_allocated and was never used beyond it, and
+	 * was_null[] is scratch, so skip those two arrays rather than memset
+	 * ~80 kB on every transaction.
+	 */
+	memset(&apply_mi_buf_storage, 0, offsetof(ApplyMIBuffer, slots));
+	apply_mi_buf_storage.nslots = 0;
+	apply_mi_buf_storage.slots_allocated = 0;
+	apply_mi_buf_storage.cum_bytes = 0;
+	apply_mi_buf_storage.owner_at_init = NULL;
 	apply_mi_buf = NULL;
 }
 
 /*
  * apply_mi_buffer_abandon
- *		Drop the active buffer without freeing its ApplyContext children.
- *		Called from start_apply's top-level PG_CATCH: those allocations
- *		would be touched by xact abort's ResourceOwner release, so explicit
- *		per-resource cleanup would free-twice.  We DO explicitly delete
- *		the per-batch memory context here: it is a child of ApplyContext,
- *		not xact-scoped, so without manual cleanup it would persist and
- *		accumulate across every error cycle.  After deletion we memset the
- *		static storage to zero so the next apply_mi_buffer_init starts
- *		from a clean state (including a NULL batch_mcxt field).
+ *		Forget the active buffer on the error path, from start_apply's
+ *		PG_CATCH.  The relation reference and tupdesc pins are released by
+ *		transaction abort; the remaining ApplyContext allocations go away
+ *		with the process, since the apply worker exits after an error.  We
+ *		still delete batch_mcxt and zero the static storage, so nothing
+ *		dangling is left behind if that ever changes.
  */
 static void
 apply_mi_buffer_abandon(void)
@@ -3097,6 +3073,28 @@ apply_mi_buffer_add(LogicalRepRelMapEntry *rel, LogicalRepTupleData *newtup)
 	}
 	MemoryContextSwitchTo(oldctx);
 
+	/*
+	 * Enforce the same constraints as ExecSimpleRelationInsert: NOT NULL
+	 * (CHECK constraints make the relation ineligible, see
+	 * apply_mi_relation_is_safe) and, for a partition, its partition bound.
+	 * table_multi_insert checks neither, and the publisher's schema does not
+	 * have to match ours, so skipping this would let rows that violate
+	 * subscriber-side constraints into the table.
+	 *
+	 * The defaulted values have already been copied out of the per-tuple
+	 * memory, so it is safe to reset it here.
+	 */
+	if (apply_mi_buf->check_constraints || apply_mi_buf->check_partition)
+	{
+		ResetExprContext(GetPerTupleExprContext(apply_mi_buf->estate));
+
+		if (apply_mi_buf->check_constraints)
+			ExecConstraints(apply_mi_buf->relinfo, dst, apply_mi_buf->estate);
+		if (apply_mi_buf->check_partition)
+			ExecPartitionCheck(apply_mi_buf->relinfo, dst,
+							   apply_mi_buf->estate, true);
+	}
+
 	apply_mi_buf->nslots++;
 
 	/*
@@ -3107,7 +3105,7 @@ apply_mi_buffer_add(LogicalRepRelMapEntry *rel, LogicalRepTupleData *newtup)
 	 * throughput-tuning knob, not a memory-safety bound -- actual
 	 * batch_mcxt footprint can exceed APPLY_MI_MAX_BYTES materially on
 	 * wide TOAST-heavy schemas.  If memory pressure becomes a concern,
-	 * move to a varlena-aware accounting pass (see §9 question 8).
+	 * move to a varlena-aware accounting pass.
 	 */
 	est_bytes = MAXALIGN(sizeof(HeapTupleHeaderData)) +
 		MAXALIGN(natts * sizeof(Datum));
@@ -3121,8 +3119,8 @@ apply_mi_buffer_add(LogicalRepRelMapEntry *rel, LogicalRepTupleData *newtup)
 /*
  * apply_mi_flush_heap_phase
  *		Run heap_multi_insert + per-tuple ExecInsertIndexTuples for the
- *		buffer.  Caller has already set up edata with indexes open and the
- *		active snapshot.  BulkInsertState is allocated here and freed in
+ *		buffer.  The caller has pushed an active snapshot and switched to
+ *		the table owner where required.  BulkInsertState is allocated here and freed in
  *		PG_FINALLY so a throw does not leak the pin.
  */
 static void
@@ -3153,7 +3151,7 @@ apply_mi_flush_heap_phase(ApplyMIBuffer *buf,
 		 * heap_multi_insert can run long for big batches; give the apply
 		 * worker a responsiveness point before we enter the per-tuple index
 		 * loop below.  Without this, a batched flush widens the
-		 * CHECK_FOR_INTERRUPTS window from ~1 tuple (upstream per-tuple
+		 * CHECK_FOR_INTERRUPTS window from ~1 tuple (per-row
 		 * apply) to ~max_slots tuples, which shows up as sluggish response
 		 * to pg_terminate_backend / SIGHUP during bulk loads.
 		 */
@@ -3163,8 +3161,11 @@ apply_mi_flush_heap_phase(ApplyMIBuffer *buf,
 		{
 			List	   *recheck;
 
-			/* Per-tuple interrupt check to match upstream per-tuple apply. */
+			/* Per-tuple interrupt check, as in the per-row path. */
 			CHECK_FOR_INTERRUPTS();
+
+			/* Index expressions are evaluated in per-tuple memory. */
+			ResetPerTupleExprContext(estate);
 
 			recheck = ExecInsertIndexTuples(relinfo, buf->slots[i], estate,
 											false, false, NULL, NIL, false);
@@ -3181,43 +3182,43 @@ apply_mi_flush_heap_phase(ApplyMIBuffer *buf,
 
 /*
  * apply_mi_buffer_flush
- *		Intermediate flush: run the heap phase (heap_multi_insert +
- *		per-tuple ExecInsertIndexTuples), clear the buffered slots,
- *		reset the counters.  The buffer object, its per-tuple slots,
- *		the ResultRelInfo, the EState, the receive slot, and the owned
- *		Relation all stay alive.
+ *		Intermediate flush: run the heap phase (table_multi_insert +
+ *		per-tuple ExecInsertIndexTuples), clear the buffered slots, reset
+ *		the counters.  The buffer object, its slots, the ResultRelInfo, the
+ *		EState and the owned Relation all stay alive.
  *
- *		This is the mode used when the size/row cap is hit mid-batch;
- *		the next tuple reuses the same slots + tupdesc pins, which is a
- *		significant win against the quadratic-flavoured ResourceOwner
- *		churn that flush-and-destroy triggers (1000 tupdesc-pin forgets
- *		against a ResourceArray holding exactly those 1000 pins = O(N²)
- *		scans -- visible in profile as ~53% of apply-worker CPU).
+ *		This is the mode used when the size/row cap is hit mid-batch; the
+ *		next tuple reuses the same slots and tupdesc pins.
  *
- *		A transaction snapshot is pushed when none is active and popped
- *		before return.
+ *		The flush can be triggered by any message (COMMIT, UPDATE, a
+ *		relation switch, ...), so it sets up its own execution context
+ *		rather than relying on the caller's:
  *
- *		Conflict handling: deliberately minimal in this pilot.  Any error
- *		raised by heap_multi_insert or the per-tuple ExecInsertIndexTuples
- *		loop -- including unique-index violations -- propagates to the
- *		outer apply error handler in start_apply, aborting the remote
- *		xact.  That is a regression relative to the upstream per-row path,
- *		which delivers unique violations through CheckAndReportConflict
- *		and honours disable_on_error / ALTER SUBSCRIPTION SKIP.  We accept
- *		the regression for the pilot and plan to add a tuple-by-tuple
- *		fallback in a follow-up (on unique violation, re-apply the
- *		buffered tuples through the standard per-row path so conflict
- *		reporting and SKIP machinery run unchanged).  The schema safety
- *		check (§4.12.3) rules out the other per-tuple failure classes
- *		(CHECK, stored-generated, exclusion, deferred unique), so
- *		unique-index conflicts are the one remaining class this affects.
+ *		- it switches to the table owner unless run_as_owner is set, as
+ *		  apply_handle_insert does.  Index expressions and partial-index
+ *		  predicates are evaluated here, and they must not run with the
+ *		  subscription owner's privileges;
+ *		- it pushes a transaction snapshot when none is active;
+ *		- it increments the command counter afterwards, as
+ *		  end_replication_step does.  Without that, an UPDATE or DELETE of
+ *		  a just-flushed row in the same remote transaction would find the
+ *		  row with a dirty snapshot and then fail to lock it with
+ *		  "attempted to lock invisible tuple", since its cmin would equal
+ *		  the current command ID.
+ *
+ *		Conflict handling: any error raised by table_multi_insert or the
+ *		index loop -- including unique-index violations -- propagates to
+ *		start_apply and aborts the remote transaction.  Unlike the per-row
+ *		path, unique violations are not routed through
+ *		CheckAndReportConflict.
  */
 static void
 apply_mi_buffer_flush(void)
 {
 	ApplyMIBuffer *buf = apply_mi_buf;
 	bool		pushed_snap = false;
-	ResourceOwner entry_owner;
+	bool		run_as_owner;
+	UserContext ucxt;
 
 	if (buf == NULL || buf->nslots == 0)
 		return;
@@ -3226,42 +3227,38 @@ apply_mi_buffer_flush(void)
 	Assert(buf->local_rel != NULL);
 	Assert(buf->relinfo != NULL);
 	Assert(buf->estate != NULL);
-	entry_owner = CurrentResourceOwner;
 
 	/*
-	 * Ensure an active snapshot for heap_multi_insert.  When called from
-	 * commit/prepare paths we are outside begin_replication_step(), so
-	 * push a transaction snapshot ourselves and pop on exit.
+	 * Make sure that any user-supplied code runs as the table owner, unless
+	 * the user has opted out of that behavior.  Nesting is fine: when the
+	 * flush is called from apply_mi_buffer_add we are already running as
+	 * this owner.
 	 */
+	run_as_owner = MySubscription->runasowner;
+	if (!run_as_owner)
+		SwitchToUntrustedUser(buf->local_rel->rd_rel->relowner, &ucxt);
+
 	if (!ActiveSnapshotSet())
 	{
 		PushActiveSnapshot(GetTransactionSnapshot());
 		pushed_snap = true;
 	}
 
-	/*
-	 * Relinfo was opened at buffer init with indexes; initialise the
-	 * conflict-arbiter list lazily here (needed only at flush).
-	 */
-	InitConflictIndexes(buf->relinfo);
-
 	apply_mi_flush_heap_phase(buf, buf->estate, buf->relinfo);
 
 	if (pushed_snap)
-	{
-		Assert(CurrentResourceOwner == entry_owner);
 		PopActiveSnapshot();
-	}
 
-	Assert(CurrentResourceOwner == entry_owner);
+	if (!run_as_owner)
+		RestoreUserContext(&ucxt);
+
+	/* Make the inserted rows visible to the rest of the remote xact. */
+	CommandCounterIncrement();
 
 	/*
-	 * Clear slots so the next batch can reuse them.  ExecClearTuple on a
-	 * TTSOpsVirtual slot marks the slot empty and clears tts_nvalid; it
-	 * does NOT release the tupdesc pin or the tts_values array, and with
-	 * the zero-copy Datum-lifetime model it also does NOT pfree any
-	 * per-tuple data (there is no SHOULDFREE data to free -- the Datums
-	 * live in batch_mcxt, which we reset next).
+	 * Clear slots so the next batch can reuse them.  ExecClearTuple keeps
+	 * the tupdesc pin and the tts_values array.  table_multi_insert
+	 * materialises virtual slots, so it also frees that copy.
 	 */
 	for (int i = 0; i < buf->nslots; i++)
 		ExecClearTuple(buf->slots[i]);
@@ -3269,10 +3266,9 @@ apply_mi_buffer_flush(void)
 	/*
 	 * Reset the batch context.  This reclaims every palloc that
 	 * slot_store_data or datumCopy (for defaulted columns) made for the
-	 * buffered tuples in a single pass, without having to free them
-	 * individually.  After the reset, the tts_values[] entries in the
-	 * slots point into freed memory, but they are never read before the
-	 * next apply_mi_buffer_add overwrites them.
+	 * buffered tuples in a single pass.  After the reset, the tts_values[]
+	 * entries in the slots point into freed memory, but they are never read
+	 * before the next apply_mi_buffer_add overwrites them.
 	 */
 	MemoryContextReset(buf->batch_mcxt);
 
@@ -3283,8 +3279,8 @@ apply_mi_buffer_flush(void)
 /*
  * apply_handle_buffer_flush_any
  *		Final flush: drain any pending batch, then tear the buffer down
- *		entirely.  Called at every non-INSERT entry point (§4.3.3 "flush
- *		triggers"), at xact/stream boundaries, and on relation-change
+ *		entirely.  Called at every non-INSERT entry point, at transaction
+ *		boundaries, and on a relation change
  *		within apply_handle_insert.  Safe to call with a NULL or empty
  *		buffer.
  */
@@ -3350,14 +3346,12 @@ apply_handle_insert(StringInfo s)
 	apply_error_callback_arg.rel = rel;
 
 	/*
-	 * Multi-insert batching fast path (pilot §4.12).  Eligible when: the
-	 * subscription option is on; streaming is off (streamed xacts involve
-	 * chunked / spooled / parallel paths the pilot deliberately excludes
-	 * for clarity -- see §4.12.3 and §4.12.6); we are not in a parallel-
-	 * apply worker; the current apply xact has not hit a conflict that
-	 * forced per-row fallback; the target is a plain (non-partitioned)
-	 * table; and apply_mi_relation_is_safe says the schema satisfies the
-	 * pilot's restrictions.
+	 * Multi-insert batching fast path.  Eligible when: the subscription
+	 * option is on; streaming is off (streamed transactions go through
+	 * chunked, spooled or parallel paths, which batching does not support);
+	 * we are not in a parallel apply worker; batching has not been disabled
+	 * for the current remote transaction; the target is not a partitioned
+	 * table; and apply_mi_relation_is_safe accepts the relation.
 	 *
 	 * The streaming/multi_insert combination is also rejected at
 	 * CREATE / ALTER SUBSCRIPTION time (see parse_subscription_options),

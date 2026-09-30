@@ -607,11 +607,10 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 	parse_subscription_options(pstate, stmt->options, supported_opts, &opts);
 
 	/*
-	 * The pilot multi_insert opt-in (spec §4.12) deliberately excludes the
-	 * streaming apply paths for clarity.  Refuse the combination at DDL
-	 * time so that we never end up with a subscription whose runtime
-	 * would silently fall back to the per-tuple path on every streamed
-	 * chunk.
+	 * multi_insert does not support the streaming apply paths.  Refuse the
+	 * combination at DDL time so that we never end up with a subscription
+	 * whose apply worker would silently fall back to the per-row path on
+	 * every streamed chunk.
 	 */
 	if (opts.multiinsert && opts.streaming != LOGICALREP_STREAM_OFF)
 		ereport(ERROR,
@@ -1228,7 +1227,7 @@ AlterSubscription(ParseState *pstate, AlterSubscriptionStmt *stmt,
 										   supported_opts, &opts);
 
 				/*
-				 * Refuse multi_insert + streaming combinations (§4.12).
+				 * Refuse multi_insert + streaming combinations.
 				 * Check the *effective* values after this ALTER: anything
 				 * not specified carries over from the existing subscription.
 				 */
