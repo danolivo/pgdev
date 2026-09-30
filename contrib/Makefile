@@ -26,6 +26,7 @@ SUBDIRS = \
 		intarray	\
 		isn		\
 		lo		\
+		lr_batch	\
 		ltree		\
 		oid2name	\
 		pageinspect	\
