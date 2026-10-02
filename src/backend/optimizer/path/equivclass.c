@@ -1015,6 +1015,7 @@ find_computable_ec_member(PlannerInfo *root,
 	{
 		List	   *emvars;
 		ListCell   *lc2;
+		bool		needs_temp_flush = false;
 
 		/*
 		 * We shouldn't be trying to sort by an equivalence class that
@@ -1049,9 +1050,11 @@ find_computable_ec_member(PlannerInfo *root,
 		/*
 		 * If requested, reject expressions that are not parallel-safe.  We
 		 * check this last because it's a rather expensive test.
+		 * TODO: Not sure if it is really necessary.
 		 */
 		if (require_parallel_safe &&
-			!is_parallel_safe(root, (Node *) em->em_expr))
+			(!is_parallel_safe(root, (Node *) em->em_expr, &needs_temp_flush) ||
+			needs_temp_flush))
 			continue;
 
 		return em;				/* found usable expression */
@@ -1093,6 +1096,7 @@ relation_can_be_sorted_early(PlannerInfo *root, RelOptInfo *rel,
 	foreach(lc, target->exprs)
 	{
 		Expr	   *targetexpr = (Expr *) lfirst(lc);
+		bool		needs_temp_flush = false;
 
 		em = find_ec_member_matching_expr(ec, targetexpr, rel->relids);
 		if (!em)
@@ -1112,7 +1116,8 @@ relation_can_be_sorted_early(PlannerInfo *root, RelOptInfo *rel,
 		 * check this last because it's a rather expensive test.
 		 */
 		if (require_parallel_safe &&
-			!is_parallel_safe(root, (Node *) em->em_expr))
+			(!is_parallel_safe(root, (Node *) em->em_expr, &needs_temp_flush) ||
+			needs_temp_flush))
 			continue;
 
 		return true;
