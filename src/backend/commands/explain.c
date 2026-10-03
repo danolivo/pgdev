@@ -3413,6 +3413,7 @@ show_repartition_info(RepartitionState *rstate, ExplainState *es)
 	RepartitionInstrumentation total;
 	int			ncontributors = 0;
 	int			nparts;
+	int			planned_parts;
 	int64		exchange_kb;
 	int			i;
 
@@ -3420,7 +3421,14 @@ show_repartition_info(RepartitionState *rstate, ExplainState *es)
 		return;
 
 	memset(&total, 0, sizeof(total));
-	if (rstate->rs_instrument)
+
+	/*
+	 * The leader has counters even when it took no part in the scan, so skip
+	 * empty ones the same way as for the workers below.
+	 */
+	if (rstate->rs_instrument &&
+		(rstate->rs_instrument->ntuples_written != 0 ||
+		 rstate->rs_instrument->nclaimed != 0))
 	{
 		total = *rstate->rs_instrument;
 		ncontributors++;
@@ -3450,17 +3458,24 @@ show_repartition_info(RepartitionState *rstate, ExplainState *es)
 
 	/*
 	 * Buffer memory the exchange itself needs, per participant: one write
-	 * buffer per partition plus the BufFile's own.  choose_repartition_count()
-	 * charges this against work_mem at plan time, but K is then frozen in the
-	 * plan, so a prepared statement can be executed with a work_mem that no
-	 * longer covers it.  Print it rather than leave the reader to multiply it
-	 * out.
+	 * buffer per partition plus the BufFile's own.  Use the K that actually
+	 * ran, which is lower than the plan's when a cached plan executes under a
+	 * smaller work_mem than it was planned with (see
+	 * ExecRepartitionEstimate()), and say so when it is.
 	 */
-	nparts = ((Repartition *) rstate->ps.plan)->npartitions;
+	nparts = rstate->rs_npartitions;
+	planned_parts = ((Repartition *) rstate->ps.plan)->npartitions;
 	exchange_kb = ((int64) nparts * (STS_CHUNK_PAGES + 1) * BLCKSZ + 1023) / 1024;
 
 	if (es->format == EXPLAIN_FORMAT_TEXT)
 	{
+		if (nparts != planned_parts)
+		{
+			ExplainIndentText(es);
+			appendStringInfo(es->str,
+							 "Partitions Used: %d (lowered to fit work_mem)\n",
+							 nparts);
+		}
 		ExplainIndentText(es);
 		appendStringInfo(es->str,
 						 "Exchanged: " INT64_FORMAT " written / " INT64_FORMAT " read  Payload: " INT64_FORMAT "kB  Claimed: %d/%d\n",
@@ -3468,7 +3483,7 @@ show_repartition_info(RepartitionState *rstate, ExplainState *es)
 						 total.ntuples_read,
 						 (total.bytes_payload + 1023) / 1024,
 						 total.nclaimed,
-						 nparts);
+						 nparts * Max(rstate->rs_npasses, 1));
 		ExplainIndentText(es);
 		appendStringInfo(es->str,
 						 "Exchange Buffers: " INT64_FORMAT "kB per participant\n",
@@ -3489,8 +3504,9 @@ show_repartition_info(RepartitionState *rstate, ExplainState *es)
 							   total.ntuples_written, es);
 		ExplainPropertyInteger("Tuples Read", NULL, total.ntuples_read, es);
 		ExplainPropertyInteger("Payload Bytes", NULL, total.bytes_payload, es);
+		/* "Partitions" itself is printed by ExplainNode(), analyze or not */
+		ExplainPropertyInteger("Partitions Used", NULL, nparts, es);
 		ExplainPropertyInteger("Partitions Claimed", NULL, total.nclaimed, es);
-		ExplainPropertyInteger("Partitions", NULL, nparts, es);
 		ExplainPropertyInteger("Exchange Buffer Bytes", NULL,
 							   exchange_kb * 1024, es);
 		if (es->timing)

@@ -217,9 +217,13 @@ ExecGatherMerge(PlanState *pstate)
 										 node->pei,
 										 gm->initParam);
 
-			/* Try to launch workers. */
+			/*
+			 * Try to launch workers, and tell parallel-aware nodes below how
+			 * many started and whether the leader will take part.
+			 */
 			pcxt = node->pei->pcxt;
-			LaunchParallelWorkers(pcxt);
+			(void) ExecParallelLaunchWorkers(node->pei,
+											 parallel_leader_participation);
 			/* We save # workers launched for the benefit of EXPLAIN */
 			node->nworkers_launched = pcxt->nworkers_launched;
 
@@ -252,9 +256,6 @@ ExecGatherMerge(PlanState *pstate)
 		/* allow leader to participate if enabled or no choice */
 		if (parallel_leader_participation || node->nreaders == 0)
 			node->need_to_scan_locally = true;
-
-		if (node->pei != NULL && node->pei->pcxt != NULL)
-			ExecParallelPostLaunch(node->pei, node->need_to_scan_locally);
 
 		node->initialized = true;
 	}

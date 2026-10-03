@@ -1044,7 +1044,7 @@ ExecParallelReInitializeDSM(PlanState *planstate,
 }
 
 /*
- * Walker for ExecParallelPostLaunch.
+ * Walker for ExecParallelLaunchWorkers.
  */
 typedef struct ExecParallelPostLaunchContext
 {
@@ -1074,22 +1074,35 @@ ExecParallelPostLaunchWalker(PlanState *planstate,
 }
 
 /*
- * Notify parallel-aware nodes of how many workers actually started.
+ * ExecParallelLaunchWorkers
+ *		Launch the workers for a Gather or Gather Merge, and tell the
+ *		parallel-aware nodes below it how many of them started.
+ *
+ * leader_willing says whether the leader would take part in executing the
+ * plan if it had a choice; it always takes part when no worker starts.
+ * Returns whether it will.
  *
  * A node whose shared state depends on the real participant count cannot
  * learn it in InitializeDSM, because that runs before LaunchParallelWorkers().
- * Gather and Gather Merge call this immediately after launching, and before
- * the leader begins executing the subplan, so that such a node can fix up its
- * state while it is still guaranteed that the leader has not reached it.
+ * Repartition is one: its barrier reserves a slot per requested worker, and
+ * the slots of workers that did not start must be given back before anybody
+ * waits on it, or the wait never ends.  Doing the launch and the fix-up in
+ * one call means that a launch site cannot do one and forget the other, and
+ * that the fix-up always happens before the leader executes the plan.
  */
-void
-ExecParallelPostLaunch(ParallelExecutorInfo *pei, bool leader_participates)
+bool
+ExecParallelLaunchWorkers(ParallelExecutorInfo *pei, bool leader_willing)
 {
 	ExecParallelPostLaunchContext c;
 
+	LaunchParallelWorkers(pei->pcxt);
+
 	c.pcxt = pei->pcxt;
-	c.leader_participates = leader_participates;
+	c.leader_participates = (pei->pcxt->nworkers_launched == 0 ||
+							 leader_willing);
 	ExecParallelPostLaunchWalker(pei->planstate, &c);
+
+	return c.leader_participates;
 }
 
 /*

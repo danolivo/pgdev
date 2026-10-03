@@ -6698,6 +6698,9 @@ create_repartition_plan(PlannerInfo *root, RepartitionPath *best_path,
 
 	copy_generic_path_info(&plan->plan, (Path *) best_path);
 
+	/* have standard_planner() check where the exchange ended up */
+	root->glob->hasRepartition = true;
+
 	return plan;
 }
 

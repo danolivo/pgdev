@@ -120,5 +120,31 @@ $node->safe_psql('postgres',
 my $after = $node->safe_psql('postgres', "$force $qry");
 is($after, '20000|200000', 'cluster is fine afterwards');
 
+#
+# 3. Only the leader fails, after the workers have written everything and are
+#    waiting for it at the barrier.  They must be torn down with the query,
+#    not left waiting for a slot that will never be released, and the
+#    exchange's temporary files must go with them.
+#
+($ret, $stdout, $stderr) = $node->psql('postgres', qq{
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('repartition-sink-done', 'error');
+	$force $qry
+});
+isnt($ret, 0, 'error in the leader alone fails the query');
+like($stderr, qr/error triggered for injection point repartition-sink-done/,
+	'and it is our error');
+
+$node->poll_query_until('postgres', q{
+	SELECT count(*) = 0 FROM pg_stat_activity
+	 WHERE backend_type = 'parallel worker'
+}) or die 'timed out waiting for the workers to go away';
+
+is($node->safe_psql('postgres', 'SELECT count(*) FROM pg_ls_tmpdir()'),
+	'0', 'no temporary files are left behind');
+
+$after = $node->safe_psql('postgres', "$force $qry");
+is($after, '20000|200000', 'cluster is fine after a leader-only error');
+
 $node->stop;
 done_testing();

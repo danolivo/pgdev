@@ -175,10 +175,14 @@ ExecGather(PlanState *pstate)
 
 			/*
 			 * Register backend workers. We might not get as many as we
-			 * requested, or indeed any at all.
+			 * requested, or indeed any at all.  This also tells
+			 * parallel-aware nodes below how many started and whether the
+			 * leader will take part, before the leader touches the subplan.
 			 */
 			pcxt = node->pei->pcxt;
-			LaunchParallelWorkers(pcxt);
+			(void) ExecParallelLaunchWorkers(node->pei,
+											 !gather->single_copy &&
+											 parallel_leader_participation);
 			/* We save # workers launched for the benefit of EXPLAIN */
 			node->nworkers_launched = pcxt->nworkers_launched;
 
@@ -212,14 +216,6 @@ ExecGather(PlanState *pstate)
 		/* Run plan locally if no workers or enabled and not single-copy. */
 		node->need_to_scan_locally = (node->nreaders == 0)
 			|| (!gather->single_copy && parallel_leader_participation);
-
-		/*
-		 * Tell parallel-aware nodes how many workers really started, and
-		 * whether the leader will take part.  Must happen before the leader
-		 * touches the subplan.
-		 */
-		if (node->pei != NULL && node->pei->pcxt != NULL)
-			ExecParallelPostLaunch(node->pei, node->need_to_scan_locally);
 
 		node->initialized = true;
 	}

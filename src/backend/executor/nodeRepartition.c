@@ -95,6 +95,7 @@
 #include "access/parallel.h"
 #include "common/hashfn.h"
 #include "executor/executor.h"
+#include "executor/nodeHash.h"
 #include "executor/nodeRepartition.h"
 #include "executor/repartition.h"
 #include "miscadmin.h"
@@ -470,7 +471,7 @@ repartition_end_read(RepartitionState *node, bool drained)
 			 * reading it here needs no synchronisation of its own.
 			 */
 			if (nread > written)
-				elog(PANIC, "repartition returned " UINT64_FORMAT " tuples but only " UINT64_FORMAT " were written",
+				elog(ERROR, "repartition returned " UINT64_FORMAT " tuples but only " UINT64_FORMAT " were written",
 					 nread, written);
 
 			/*
@@ -478,7 +479,7 @@ repartition_end_read(RepartitionState *node, bool drained)
 			 * then every read has been added, so the two must be equal.
 			 */
 			if (ndrained == (uint32) pstate->npartitions && nread != written)
-				elog(PANIC, "repartition exchanged " UINT64_FORMAT " tuples but returned " UINT64_FORMAT,
+				elog(ERROR, "repartition exchanged " UINT64_FORMAT " tuples but returned " UINT64_FORMAT,
 					 written, nread);
 
 			if (ndrained == (uint32) pstate->npartitions)
@@ -544,9 +545,9 @@ ExecRepartition(PlanState *pstate)
 				/*
 				 * The barrier counts one slot per *requested* worker; the
 				 * slots of the workers that never started are given back by
-				 * ExecRepartitionPostLaunch(), which Gather and Gather Merge
-				 * call for us.  If that call is ever lost -- a third launch
-				 * site, a reordering in ExecGather(), a back-patch -- the
+				 * ExecRepartitionPostLaunch(), which ExecParallelLaunchWorkers()
+				 * calls right after launching.  If that call is ever lost --
+				 * a launch site that bypasses it, a back-patch -- the
 				 * barrier can no longer be released and every participant
 				 * waits on RepartitionSink forever: no error, no timeout, and
 				 * nothing in the log.  Refuse to enter the wait instead.
@@ -702,6 +703,60 @@ ExecRepartition(PlanState *pstate)
 	return NULL;				/* keep compiler quiet */
 }
 
+/*
+ * repartition_set_npartitions
+ *		Set the partition count this participant routes tuples by.
+ *
+ * K starts out as the plan's, and the leader may lower it once, in
+ * ExecRepartitionEstimate(), before the shared state is laid out; workers then
+ * take it from the shared state.  rs_part_shift must always follow
+ * rs_npartitions: a shift computed for a larger K sends tuples to partitions
+ * past the end of rs_accessors[].
+ */
+static void
+repartition_set_npartitions(RepartitionState *node, int npartitions)
+{
+	int			bits = 0;
+
+	Assert(npartitions > 0 && npartitions <= REPARTITION_MAX_PARTITIONS);
+	Assert(npartitions == pg_nextpower2_32(npartitions));
+
+	while ((1 << bits) < npartitions)
+		bits++;
+
+	/*
+	 * bits == 0 gives a shift of 32, which is undefined on a uint32 and is
+	 * why repartition_partition_of() special-cases it.
+	 */
+	node->rs_npartitions = npartitions;
+	node->rs_part_shift = 32 - bits;
+}
+
+/*
+ * ExecRepartitionMemoryCap
+ *		The largest partition count whose write buffers fit the memory budget.
+ *
+ * During the sink phase every participant keeps one STS write chunk plus the
+ * BufFile's own buffer per partition.  That is charged against half of the
+ * hash memory limit; the other half is left to the finalize aggregate above,
+ * which draws on the same budget.  The planner uses this to choose K, and the
+ * executor uses it again to lower the K of a cached plan that runs with less
+ * memory than it was planned with.  Always a power of two, at least 1.
+ */
+int
+ExecRepartitionMemoryCap(void)
+{
+	Size		per_partition = (Size) (STS_CHUNK_PAGES + 1) * BLCKSZ;
+	Size		budget = get_hash_memory_limit() / 2;
+	int			k = 1;
+
+	while (k < REPARTITION_MAX_PARTITIONS &&
+		   (Size) k * 2 * per_partition <= budget)
+		k *= 2;
+
+	return k;
+}
+
 RepartitionState *
 ExecInitRepartition(Repartition *node, EState *estate, int eflags)
 {
@@ -719,24 +774,7 @@ ExecInitRepartition(Repartition *node, EState *estate, int eflags)
 	rstate->rs_numCols = node->numCols;
 	rstate->rs_hashColIdx = node->hashColIdx;
 	rstate->rs_collations = node->collations;
-	rstate->rs_npartitions = node->npartitions;
-	{
-		int			bits = 0;
-
-		while ((1 << bits) < node->npartitions)
-			bits++;
-		rstate->rs_part_shift = 32 - bits;
-
-		/*
-		 * bits == 0 gives a shift of 32, which is undefined on a uint32 and
-		 * is why repartition_partition_of() special-cases it.
-		 */
-		Assert(bits >= 0 && bits <= 6);
-		Assert((1 << bits) == node->npartitions);
-	}
-	Assert(node->npartitions > 0 &&
-		   node->npartitions <= REPARTITION_MAX_PARTITIONS);
-	Assert(node->npartitions == pg_nextpower2_32(node->npartitions));
+	repartition_set_npartitions(rstate, node->npartitions);
 	Assert(node->numCols > 0);
 	Assert(node->plan.parallel_aware);
 
@@ -985,7 +1023,7 @@ repartition_check_guards(ParallelRepartitionState *pstate)
 	Size		j;
 
 	if (pstate->magic != REPARTITION_MAGIC)
-		elog(PANIC, "repartition shared state corrupted: magic is %08X, expected %08X",
+		elog(ERROR, "repartition shared state corrupted: magic is %08X, expected %08X",
 			 pstate->magic, REPARTITION_MAGIC);
 
 	nstarts = RepartitionAreaStarts(pstate, starts);
@@ -997,7 +1035,7 @@ repartition_check_guards(ParallelRepartitionState *pstate)
 		for (j = 0; j < REPARTITION_REDZONE; j++)
 		{
 			if (rz[j] != (char) REPARTITION_REDZONE_BYTE)
-				elog(PANIC, "repartition shared state corrupted: redzone before offset %zu of %zu was written",
+				elog(ERROR, "repartition shared state corrupted: redzone before offset %zu of %zu was written",
 					 starts[i], pstate->layout.alloc_size);
 		}
 		VALGRIND_MAKE_MEM_NOACCESS(rz, REPARTITION_REDZONE);
@@ -1012,6 +1050,22 @@ void
 ExecRepartitionEstimate(RepartitionState *node, ParallelContext *pcxt)
 {
 	RepartitionLayout layout;
+	int			cap;
+
+	Assert(node->rs_shared == NULL);
+
+	/*
+	 * K was chosen against the memory budget at plan time, but a cached plan
+	 * can run under a smaller work_mem.  The aggregates around us adapt to
+	 * that at run time by spilling; our write buffers cannot spill, so lower
+	 * K instead.  This is the one place to do it: the layout is computed from
+	 * K right below, and workers take K from the shared state rather than
+	 * from the plan.  Any K routes equal keys together, so a smaller one only
+	 * costs balance, never correctness.
+	 */
+	cap = ExecRepartitionMemoryCap();
+	if (node->rs_npartitions > cap)
+		repartition_set_npartitions(node, cap);
 
 	repartition_layout(node->rs_npartitions, pcxt->nworkers + 1,
 					   node->ps.instrument ? pcxt->nworkers : 0, &layout);
@@ -1135,6 +1189,7 @@ ExecRepartitionInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 	node->rs_post_launch_seen = false;
 	node->rs_sink_started = false;
 	node->rs_shared_written = false;
+	node->rs_npasses = 1;
 
 	/*
 	 * The leader's own counters stay in backend-local memory, as they do for
@@ -1268,6 +1323,7 @@ ExecRepartitionReInitializeDSM(RepartitionState *node, ParallelContext *pcxt)
 	node->rs_post_launch_seen = false;
 	node->rs_sink_started = false;
 	node->rs_shared_written = false;
+	node->rs_npasses++;
 
 	repartition_paint_guards(pstate);
 }
@@ -1283,19 +1339,20 @@ ExecRepartitionInitializeWorker(RepartitionState *node,
 	pstate = shm_toc_lookup(pwcxt->toc, node->ps.plan->plan_node_id, false);
 
 	/*
-	 * The plan and the shared state are two sources of truth for K: this node
-	 * takes the partition count from the shared state below, but
-	 * repartition_partition_of() shifts by rs_part_shift, which was computed
-	 * from the plan in ExecInitRepartition().  They agree because the plan is
-	 * the same everywhere -- but if they ever stop agreeing, tuples land in
-	 * rs_accessors[] past its end, and that is a heap corruption in a worker
-	 * with no proximate cause.
+	 * K comes from the shared state, not from the plan: the leader may have
+	 * lowered it in ExecRepartitionEstimate().  Route by the same K the
+	 * stores were built for -- a shift left over from the plan's larger K
+	 * would put tuples in rs_accessors[] past its end, a heap corruption in a
+	 * worker with no proximate cause.
 	 */
 	Assert(pstate->magic == REPARTITION_MAGIC);
-	Assert(pstate->npartitions == node->rs_npartitions);
+	Assert(pstate->npartitions <=
+		   ((Repartition *) node->ps.plan)->npartitions);
 	Assert(pstate->nparticipants > ParallelWorkerNumber + 1);
 	Assert(IsParallelWorker());
 	repartition_check_guards(pstate);
+
+	repartition_set_npartitions(node, pstate->npartitions);
 
 	/* a relaunched worker re-attaches; do not leak the previous set */
 	MemoryContextReset(node->rs_spillCxt);

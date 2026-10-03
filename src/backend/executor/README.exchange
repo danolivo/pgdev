@@ -118,11 +118,13 @@ Parallel hash join может позволить себе динамически
 ExecRepartitionPostLaunch(): он возвращает слоты воркеров, которые не
 стартовали, и слот лидера, если лидер в скане не участвует.
 
-Этот вызов — новая точка расширения (ExecParallelPostLaunch в
-execParallel.c), которую делают Gather и Gather Merge. Если её потерять,
-барьер никогда не откроется и все участники зависнут навсегда — без ошибки,
-без таймаута, без записи в лог. Поэтому лидер проверяет флаг и отказывается
-входить в ожидание, а не зависает.
+Запуск воркеров и этот вызов объединены в одну функцию,
+ExecParallelLaunchWorkers() в execParallel.c, которой пользуются и Gather, и
+Gather Merge: запустить воркеров и забыть вернуть слоты больше нельзя. Если
+кто-то всё же запустит воркеров в обход неё, барьер никогда не откроется и
+все участники зависнут навсегда — без ошибки, без таймаута, без записи в
+лог. Поэтому лидер проверяет флаг и отказывается входить в ожидание, а не
+зависает.
 
 3. Регион закрывается сразу над финальной агрегацией.
 
@@ -310,7 +312,7 @@ EXPLAIN (ANALYZE) печатает ключ разбиения, число па�
   src/backend/executor/nodeRepartition.c   узел целиком
   src/include/executor/repartition.h       разделяемое состояние, раскладка
   src/include/executor/nodeRepartition.h   внешний интерфейс
-  src/backend/executor/execParallel.c      ExecParallelPostLaunch()
+  src/backend/executor/execParallel.c      ExecParallelLaunchWorkers()
   src/backend/utils/sort/sharedtuplestore.c  sts_delete_files()
   src/backend/optimizer/path/costsize.c    cost_repartition(),
                                            choose_repartition_count()

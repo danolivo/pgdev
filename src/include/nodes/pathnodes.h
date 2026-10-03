@@ -181,6 +181,12 @@ typedef struct PlannerGlobal
 
 	/* partition descriptors */
 	PartitionDirectory partition_directory pg_node_attr(read_write_ignore);
+
+	/*
+	 * Does the plan contain a Repartition node?  Kept last so that the offsets
+	 * of the fields above do not move for extensions compiled against them.
+	 */
+	bool		hasRepartition;
 } PlannerGlobal;
 
 /* macro for fetching the Plan associated with a SubPlan node */

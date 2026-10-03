@@ -31,4 +31,6 @@ extern void ExecRepartitionPostLaunch(RepartitionState *node,
 									  ParallelContext *pcxt,
 									  bool leader_participates);
 
+extern int	ExecRepartitionMemoryCap(void);
+
 #endif							/* NODEREPARTITION_H */

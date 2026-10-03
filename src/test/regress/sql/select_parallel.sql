@@ -682,6 +682,15 @@ select count(*), sum(c) from (
   union all
   select k, count(*) from repart_t group by k) s;
 reset enable_parallel_append;
+-- An error inside the sink phase fails the query; it must not leave anybody
+-- waiting at the barrier.  Which participant hits the limit first varies, so
+-- keep the CONTEXT line out of the output.
+set temp_file_limit = '64kB';
+\set VERBOSITY terse
+select count(*) from (select k, count(*) from repart_t group by k) s;
+\set VERBOSITY default
+reset temp_file_limit;
+select count(*) from (select k, count(*) from repart_t group by k) s;
 -- An outer aggregate over the same union.
 select count(*), sum(s) from (
   select k, sum(c) s from (

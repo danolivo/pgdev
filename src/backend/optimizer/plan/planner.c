@@ -265,10 +265,10 @@ static Path *make_ordered_path(PlannerInfo *root,
 							   List *pathkeys,
 							   double limit_tuples);
 static void gather_grouping_paths(PlannerInfo *root, RelOptInfo *rel);
-#ifdef USE_ASSERT_CHECKING
+static void gather_repartition_paths(PlannerInfo *root, RelOptInfo *rel,
+									 List *partial_paths);
 static void check_repartition_placement(Plan *plan, Plan *p1, Plan *p2,
 										Plan *p3, Plan *p4);
-#endif
 static bool can_partial_agg(PlannerInfo *root);
 static void apply_scanjoin_target_to_paths(PlannerInfo *root,
 										   RelOptInfo *rel,
@@ -575,13 +575,19 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 		lfirst(lp) = set_plan_references(subroot, subplan);
 	}
 
-#ifdef USE_ASSERT_CHECKING
-	/* every exchange must sit in the one place where it cannot hang */
-	check_repartition_placement(top_plan, NULL, NULL, NULL, NULL);
-	foreach(lp, glob->subplans)
-		check_repartition_placement((Plan *) lfirst(lp),
-									NULL, NULL, NULL, NULL);
-#endif
+	/*
+	 * Every exchange must sit in the one place where it cannot hang.  Checked
+	 * in every build, not only with assertions: a misplaced exchange does not
+	 * fail, it waits forever, and the walk costs nothing for the plans that
+	 * have no exchange at all.
+	 */
+	if (glob->hasRepartition)
+	{
+		check_repartition_placement(top_plan, NULL, NULL, NULL, NULL);
+		foreach(lp, glob->subplans)
+			check_repartition_placement((Plan *) lfirst(lp),
+										NULL, NULL, NULL, NULL);
+	}
 
 	/* build the PlannedStmt result */
 	result = makeNode(PlannedStmt);
@@ -7773,23 +7779,8 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 		 * a planner that can tell where the region is safe to extend, or an
 		 * exchange that does not wait for participants that have not reached
 		 * it; neither exists yet.
-		 *
-		 * gather_grouping_paths() works on the rel's partial_pathlist, so let
-		 * it see only our paths for the duration of the call and put the
-		 * original list -- possibly holding partitionwise paths, which are
-		 * gathered at the end of this function as before -- back afterwards.
 		 */
-		if (repart_paths != NIL)
-		{
-			List	   *saved_partial_pathlist = grouped_rel->partial_pathlist;
-			ListCell   *lc2;
-
-			grouped_rel->partial_pathlist = NIL;
-			foreach(lc2, repart_paths)
-				add_partial_path(grouped_rel, (Path *) lfirst(lc2));
-			gather_grouping_paths(root, grouped_rel);
-			grouped_rel->partial_pathlist = saved_partial_pathlist;
-		}
+		gather_repartition_paths(root, grouped_rel, repart_paths);
 
 		/*
 		 * The GUC only penalises the competition; it cannot conjure the
@@ -8270,10 +8261,75 @@ gather_grouping_paths(PlannerInfo *root, RelOptInfo *rel)
 	}
 }
 
-#ifdef USE_ASSERT_CHECKING
 /*
- * Check that every Repartition sits where add_paths_to_grouping_rel() puts
- * it: directly below the finalize Agg it feeds, which in turn is directly
+ * gather_repartition_paths
+ *		Close the parallel region right above each finalize-over-Repartition
+ *		path in partial_paths, adding only the gathered paths to rel.
+ *
+ * The same shapes gather_grouping_paths() would produce from these paths: a
+ * Gather over each, a Gather Merge over each one already sorted by the group
+ * key, and a Gather Merge over an explicit sort of each one that is not.
+ * gather_grouping_paths() cannot be used directly because it works on
+ * rel->partial_pathlist, and these paths must never be put there -- see the
+ * comment in add_paths_to_grouping_rel().
+ */
+static void
+gather_repartition_paths(PlannerInfo *root, RelOptInfo *rel,
+						 List *partial_paths)
+{
+	List	   *groupby_pathkeys;
+	ListCell   *lc;
+
+	/* trim any pathkeys added for ORDER BY / DISTINCT aggregates */
+	if (list_length(root->group_pathkeys) > root->num_groupby_pathkeys)
+		groupby_pathkeys = list_copy_head(root->group_pathkeys,
+										  root->num_groupby_pathkeys);
+	else
+		groupby_pathkeys = root->group_pathkeys;
+
+	foreach(lc, partial_paths)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+		double		total_groups;
+		int			presorted_keys;
+
+		Assert(path->parallel_safe && path->parallel_workers > 0);
+
+		total_groups = compute_gather_rows(path);
+		add_path(rel, (Path *)
+				 create_gather_path(root, rel, path, rel->reltarget,
+									NULL, &total_groups));
+
+		if (groupby_pathkeys == NIL)
+			continue;
+
+		if (!pathkeys_count_contained_in(groupby_pathkeys, path->pathkeys,
+										 &presorted_keys))
+		{
+			if (presorted_keys == 0 || !enable_incremental_sort)
+				path = (Path *) create_sort_path(root, rel, path,
+												 groupby_pathkeys, -1.0);
+			else
+				path = (Path *) create_incremental_sort_path(root, rel, path,
+															 groupby_pathkeys,
+															 presorted_keys,
+															 -1.0);
+		}
+
+		total_groups = compute_gather_rows(path);
+		add_path(rel, (Path *)
+				 create_gather_merge_path(root, rel, path, rel->reltarget,
+										  groupby_pathkeys, NULL,
+										  &total_groups));
+	}
+}
+
+/*
+ * check_repartition_placement
+ *		Check that every Repartition sits where add_paths_to_grouping_rel()
+ *		puts it.
+ *
+ * That is directly below the finalize Agg it feeds, which in turn is directly
  * below the Gather or Gather Merge that closes the parallel region.  At most
  * one Sort may come in between on either side -- the sorted finalize sorts
  * the exchange's output, and an ORDER BY on the group key may sort the
@@ -8346,7 +8402,6 @@ check_repartition_placement(Plan *plan, Plan *p1, Plan *p2, Plan *p3,
 			break;
 	}
 }
-#endif
 
 /*
  * can_partial_agg

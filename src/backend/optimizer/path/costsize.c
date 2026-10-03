@@ -92,6 +92,7 @@
 #include "executor/nodeAgg.h"
 #include "executor/nodeHash.h"
 #include "executor/nodeMemoize.h"
+#include "executor/nodeRepartition.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -207,7 +208,6 @@ static void set_rel_width(PlannerInfo *root, RelOptInfo *rel);
 static int32 get_expr_width(PlannerInfo *root, const Node *expr);
 static double relation_byte_size(double tuples, int width);
 static double page_size(double tuples, int width);
-
 
 
 /*
@@ -2799,18 +2799,6 @@ cost_merge_append(Path *path, PlannerInfo *root,
 	path->total_cost = startup_cost + run_cost + input_total_cost;
 }
 
-/*
- * cost_material
- *	  Determines and returns the cost of materializing a relation, including
- *	  the cost of reading the input data.
- *
- * If the total volume of data to materialize exceeds work_mem, we will need
- * to write it to disk, so the cost is much higher in that case.
- *
- * Note that here we are estimating the costs for the first scan of the
- * relation, so the materialization is all overhead --- any savings will
- * occur only on rescan, which is estimated in cost_rescan.
- */
 /* Fixed costs of the exchange, in planner cost units. */
 #define REPARTITION_SETUP_COST				100.0
 #define REPARTITION_PARTITION_SETUP_COST	10.0
@@ -2846,18 +2834,13 @@ choose_repartition_count(int nparticipants, int tuple_width)
 	int			k;
 	int			k_mem;
 	int			k_width;
-	Size		per_partition;
-	Size		budget;
 	double		tuple_sz;
 
-	per_partition = (Size) (STS_CHUNK_PAGES + 1) * BLCKSZ;
-	budget = get_hash_memory_limit();
-
-	/* leave half the budget to the finalize aggregate above us */
-	k_mem = 1;
-	while ((Size) k_mem * 2 * per_partition <= budget / 2 &&
-		   k_mem < REPARTITION_MAX_PARTITIONS)
-		k_mem *= 2;
+	/*
+	 * The executor applies the same cap again at run time, which is why it
+	 * lives there; see ExecRepartitionEstimate().
+	 */
+	k_mem = ExecRepartitionMemoryCap();
 
 	if (parallel_repartition_partitions > 0)
 		k = pg_nextpower2_32(parallel_repartition_partitions);
@@ -2963,6 +2946,18 @@ cost_repartition(Path *path, int disabled_nodes,
 	path->total_cost = startup_cost + run_cost;
 }
 
+/*
+ * cost_material
+ *	  Determines and returns the cost of materializing a relation, including
+ *	  the cost of reading the input data.
+ *
+ * If the total volume of data to materialize exceeds work_mem, we will need
+ * to write it to disk, so the cost is much higher in that case.
+ *
+ * Note that here we are estimating the costs for the first scan of the
+ * relation, so the materialization is all overhead --- any savings will
+ * occur only on rescan, which is estimated in cost_rescan.
+ */
 void
 cost_material(Path *path,
 			  int input_disabled_nodes,

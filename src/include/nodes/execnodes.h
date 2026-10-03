@@ -2320,6 +2320,7 @@ typedef struct RepartitionState
 	Oid		   *rs_collations;
 	int			rs_npartitions;
 	int			rs_part_shift;
+	int			rs_npasses;		/* exchanges run so far (leader only) */
 	RepartitionPhase rs_phase;
 	int			rs_curpart;		/* partition being drained, or -1 */
 	bool		rs_attached;	/* still counted by the sink barrier? */

@@ -1691,6 +1691,21 @@ select count(*), sum(c) from (
 (1 row)
 
 reset enable_parallel_append;
+-- An error inside the sink phase fails the query; it must not leave anybody
+-- waiting at the barrier.  Which participant hits the limit first varies, so
+-- keep the CONTEXT line out of the output.
+set temp_file_limit = '64kB';
+\set VERBOSITY terse
+select count(*) from (select k, count(*) from repart_t group by k) s;
+ERROR:  temporary file size exceeds "temp_file_limit" (64kB)
+\set VERBOSITY default
+reset temp_file_limit;
+select count(*) from (select k, count(*) from repart_t group by k) s;
+ count 
+-------
+ 20000
+(1 row)
+
 -- An outer aggregate over the same union.
 select count(*), sum(s) from (
   select k, sum(c) s from (
