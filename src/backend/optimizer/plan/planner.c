@@ -265,6 +265,10 @@ static Path *make_ordered_path(PlannerInfo *root,
 							   List *pathkeys,
 							   double limit_tuples);
 static void gather_grouping_paths(PlannerInfo *root, RelOptInfo *rel);
+#ifdef USE_ASSERT_CHECKING
+static void check_repartition_placement(Plan *plan, Plan *p1, Plan *p2,
+										Plan *p3, Plan *p4);
+#endif
 static bool can_partial_agg(PlannerInfo *root);
 static void apply_scanjoin_target_to_paths(PlannerInfo *root,
 										   RelOptInfo *rel,
@@ -570,6 +574,14 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 
 		lfirst(lp) = set_plan_references(subroot, subplan);
 	}
+
+#ifdef USE_ASSERT_CHECKING
+	/* every exchange must sit in the one place where it cannot hang */
+	check_repartition_placement(top_plan, NULL, NULL, NULL, NULL);
+	foreach(lp, glob->subplans)
+		check_repartition_placement((Plan *) lfirst(lp),
+									NULL, NULL, NULL, NULL);
+#endif
 
 	/* build the PlannedStmt result */
 	result = makeNode(PlannedStmt);
@@ -7607,6 +7619,8 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 		double		local_groups;
 		int			nparticipants;
 		int			npartitions;
+		Path	   *aggpath;
+		List	   *repart_paths = NIL;
 
 		nparticipants = subpath->parallel_workers +
 			(parallel_leader_participation ? 1 : 0);
@@ -7631,17 +7645,17 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 
 		if (can_hash)
 		{
-			add_partial_path(grouped_rel, (Path *)
-							 create_agg_path(root,
-											 grouped_rel,
-											 rpath,
-											 grouped_rel->reltarget,
-											 AGG_HASHED,
-											 AGGSPLIT_FINAL_DESERIAL,
-											 root->processed_groupClause,
-											 havingQual,
-											 agg_final_costs,
-											 local_groups));
+			aggpath = (Path *) create_agg_path(root,
+											   grouped_rel,
+											   rpath,
+											   grouped_rel->reltarget,
+											   AGG_HASHED,
+											   AGGSPLIT_FINAL_DESERIAL,
+											   root->processed_groupClause,
+											   havingQual,
+											   agg_final_costs,
+											   local_groups);
+			repart_paths = lappend(repart_paths, aggpath);
 			repartition_built = true;
 		}
 
@@ -7672,17 +7686,17 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 			spath = (Path *) create_sort_path(root, grouped_rel, rpath,
 											  groupby_pathkeys, -1.0);
 
-			add_partial_path(grouped_rel, (Path *)
-							 create_agg_path(root,
-											 grouped_rel,
-											 spath,
-											 grouped_rel->reltarget,
-											 AGG_SORTED,
-											 AGGSPLIT_FINAL_DESERIAL,
-											 root->processed_groupClause,
-											 havingQual,
-											 agg_final_costs,
-											 local_groups));
+			aggpath = (Path *) create_agg_path(root,
+											   grouped_rel,
+											   spath,
+											   grouped_rel->reltarget,
+											   AGG_SORTED,
+											   AGGSPLIT_FINAL_DESERIAL,
+											   root->processed_groupClause,
+											   havingQual,
+											   agg_final_costs,
+											   local_groups);
+			repart_paths = lappend(repart_paths, aggpath);
 			repartition_built = true;
 		}
 
@@ -7692,8 +7706,8 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 		 * impossible to test in the regimes the model rejects.  When the GUC
 		 * is set, penalise every competing path already collected for this
 		 * relation, leaving the exchange as the only undisabled candidate.
-		 * Our own paths are in partial_pathlist and are gathered below, so
-		 * they are untouched.
+		 * Our own paths are not in any list yet -- they are gathered and
+		 * added just below -- so they are untouched.
 		 */
 		if (debug_parallel_repartition)
 		{
@@ -7725,6 +7739,56 @@ add_paths_to_grouping_rel(PlannerInfo *root, RelOptInfo *input_rel,
 				}
 			}
 #endif
+		}
+
+		/*
+		 * Close the parallel region right here, the way the classic shape
+		 * closes it right above the Partial Aggregate: our paths are gathered
+		 * now and only the gathered, complete paths reach grouped_rel.  They
+		 * are never left in grouped_rel->partial_pathlist.
+		 *
+		 * That list is not private to this function.  grouping_planner()
+		 * copies it into the final rel of a subquery, and from there a
+		 * partial path travels into the outer query level: under an Append
+		 * for UNION ALL or an inheritance parent, under a join, under another
+		 * aggregate.  The exchange cannot follow it there.  Its sink barrier
+		 * reserves a slot for every launched participant, and a participant
+		 * gives the slot back only by arriving or by shutting down.  So the
+		 * node is safe only if every participant reaches it, in the same
+		 * order as every other exchange in the region, before it has emitted
+		 * anything into a tuple queue.  Directly under Gather -> Finalize
+		 * that holds by construction.  Elsewhere it does not:
+		 *
+		 * - Parallel Append sends participants into different children.  Two
+		 *   exchanges in two children then wait for each other forever, each
+		 *   holding the slot the other one needs.
+		 *
+		 * - Even a plain Append streaming into Gather is unsafe.  A worker
+		 *   still emitting the output of the first child blocks on a full
+		 *   tuple queue, while the leader, already in the sink of the second
+		 *   child, waits at the barrier for that very worker and does not
+		 *   read the queue.
+		 *
+		 * Both hang without an error.  Lifting this restriction needs either
+		 * a planner that can tell where the region is safe to extend, or an
+		 * exchange that does not wait for participants that have not reached
+		 * it; neither exists yet.
+		 *
+		 * gather_grouping_paths() works on the rel's partial_pathlist, so let
+		 * it see only our paths for the duration of the call and put the
+		 * original list -- possibly holding partitionwise paths, which are
+		 * gathered at the end of this function as before -- back afterwards.
+		 */
+		if (repart_paths != NIL)
+		{
+			List	   *saved_partial_pathlist = grouped_rel->partial_pathlist;
+			ListCell   *lc2;
+
+			grouped_rel->partial_pathlist = NIL;
+			foreach(lc2, repart_paths)
+				add_partial_path(grouped_rel, (Path *) lfirst(lc2));
+			gather_grouping_paths(root, grouped_rel);
+			grouped_rel->partial_pathlist = saved_partial_pathlist;
 		}
 
 		/*
@@ -8205,6 +8269,84 @@ gather_grouping_paths(PlannerInfo *root, RelOptInfo *rel)
 		add_path(rel, path);
 	}
 }
+
+#ifdef USE_ASSERT_CHECKING
+/*
+ * Check that every Repartition sits where add_paths_to_grouping_rel() puts
+ * it: directly below the finalize Agg it feeds, which in turn is directly
+ * below the Gather or Gather Merge that closes the parallel region.  At most
+ * one Sort may come in between on either side -- the sorted finalize sorts
+ * the exchange's output, and an ORDER BY on the group key may sort the
+ * finalized groups before Gather Merge.
+ *
+ * Anywhere else the exchange can wait at its sink barrier for a participant
+ * that will never come (see the comment in add_paths_to_grouping_rel()), and
+ * the result is a hang with no error.  Turn a planner change that lets it
+ * escape into an error at plan time instead.  p1 is the parent, p2 the
+ * grandparent, and so on.
+ */
+static void
+check_repartition_placement(Plan *plan, Plan *p1, Plan *p2, Plan *p3,
+							Plan *p4)
+{
+	ListCell   *lc;
+
+	if (plan == NULL)
+		return;
+
+	check_stack_depth();
+
+	if (IsA(plan, Repartition))
+	{
+		Plan	   *up[4] = {p1, p2, p3, p4};
+		int			i = 0;
+
+		if (up[i] != NULL && (IsA(up[i], Sort) || IsA(up[i], IncrementalSort)))
+			i++;
+		if (up[i] == NULL || !IsA(up[i], Agg) ||
+			((Agg *) up[i])->aggsplit != AGGSPLIT_FINAL_DESERIAL)
+			elog(ERROR, "Repartition is not directly below a finalize Agg");
+		i++;
+		if (up[i] != NULL && (IsA(up[i], Sort) || IsA(up[i], IncrementalSort)))
+			i++;
+		if (up[i] == NULL || !(IsA(up[i], Gather) || IsA(up[i], GatherMerge)))
+			elog(ERROR, "Repartition is not directly below the Gather that closes its parallel region");
+	}
+
+	check_repartition_placement(plan->lefttree, plan, p1, p2, p3);
+	check_repartition_placement(plan->righttree, plan, p1, p2, p3);
+
+	switch (nodeTag(plan))
+	{
+		case T_Append:
+			foreach(lc, ((Append *) plan)->appendplans)
+				check_repartition_placement(lfirst(lc), plan, p1, p2, p3);
+			break;
+		case T_MergeAppend:
+			foreach(lc, ((MergeAppend *) plan)->mergeplans)
+				check_repartition_placement(lfirst(lc), plan, p1, p2, p3);
+			break;
+		case T_BitmapAnd:
+			foreach(lc, ((BitmapAnd *) plan)->bitmapplans)
+				check_repartition_placement(lfirst(lc), plan, p1, p2, p3);
+			break;
+		case T_BitmapOr:
+			foreach(lc, ((BitmapOr *) plan)->bitmapplans)
+				check_repartition_placement(lfirst(lc), plan, p1, p2, p3);
+			break;
+		case T_SubqueryScan:
+			check_repartition_placement(((SubqueryScan *) plan)->subplan,
+										plan, p1, p2, p3);
+			break;
+		case T_CustomScan:
+			foreach(lc, ((CustomScan *) plan)->custom_plans)
+				check_repartition_placement(lfirst(lc), plan, p1, p2, p3);
+			break;
+		default:
+			break;
+	}
+}
+#endif
 
 /*
  * can_partial_agg

@@ -1608,6 +1608,101 @@ select count(*) from (select case when k % 3 = 0 then null else k::text end t,
  13334
 (1 row)
 
+-- The exchange never leaves the Gather right above its finalize Agg.  Under a
+-- Parallel Append two exchanges would each hold a barrier slot the other one
+-- needs; under a plain Append streaming into Gather a worker blocked on a
+-- full tuple queue would hold the leader at the next exchange's barrier.
+-- Both used to hang.  Each branch must get its own Gather instead.
+explain (costs off)
+  select k, count(*) from repart_t group by k
+  union all
+  select k, count(*) from repart_t group by k;
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Append
+   ->  Gather
+         Workers Planned: 4
+         ->  Finalize HashAggregate
+               Group Key: repart_t.k
+               ->  Parallel Repartition
+                     Partition Key: repart_t.k
+                     Partitions: 4
+                     ->  Partial HashAggregate
+                           Group Key: repart_t.k
+                           ->  Parallel Seq Scan on repart_t
+   ->  Gather
+         Workers Planned: 4
+         ->  Finalize HashAggregate
+               Group Key: repart_t_1.k
+               ->  Parallel Repartition
+                     Partition Key: repart_t_1.k
+                     Partitions: 4
+                     ->  Partial HashAggregate
+                           Group Key: repart_t_1.k
+                           ->  Parallel Seq Scan on repart_t repart_t_1
+(21 rows)
+
+select count(*), sum(c) from (
+  select k, count(*) c from repart_t group by k
+  union all
+  select k, count(*) from repart_t group by k) s;
+ count |  sum   
+-------+--------
+ 40000 | 400000
+(1 row)
+
+set enable_parallel_append = off;
+explain (costs off)
+  select k, count(*) from repart_t group by k
+  union all
+  select k, count(*) from repart_t group by k;
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Append
+   ->  Gather
+         Workers Planned: 4
+         ->  Finalize HashAggregate
+               Group Key: repart_t.k
+               ->  Parallel Repartition
+                     Partition Key: repart_t.k
+                     Partitions: 4
+                     ->  Partial HashAggregate
+                           Group Key: repart_t.k
+                           ->  Parallel Seq Scan on repart_t
+   ->  Gather
+         Workers Planned: 4
+         ->  Finalize HashAggregate
+               Group Key: repart_t_1.k
+               ->  Parallel Repartition
+                     Partition Key: repart_t_1.k
+                     Partitions: 4
+                     ->  Partial HashAggregate
+                           Group Key: repart_t_1.k
+                           ->  Parallel Seq Scan on repart_t repart_t_1
+(21 rows)
+
+select count(*), sum(c) from (
+  select k, count(*) c from repart_t group by k
+  union all
+  select k, count(*) from repart_t group by k) s;
+ count |  sum   
+-------+--------
+ 40000 | 400000
+(1 row)
+
+reset enable_parallel_append;
+-- An outer aggregate over the same union.
+select count(*), sum(s) from (
+  select k, sum(c) s from (
+    select k, count(*) c from repart_t group by k
+    union all
+    select k, -count(*) from repart_t group by k) u
+  group by k having sum(c) <> 0) x;
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
 drop table repart_t;
 reset debug_parallel_repartition;
 reset parallel_repartition_partitions;

@@ -659,6 +659,36 @@ set parallel_repartition_partitions = 4;
 select count(*) from (select k, v, count(*) from repart_t group by k, v) s;
 select count(*) from (select case when k % 3 = 0 then null else k::text end t,
                              count(*) from repart_t group by 1) s;
+-- The exchange never leaves the Gather right above its finalize Agg.  Under a
+-- Parallel Append two exchanges would each hold a barrier slot the other one
+-- needs; under a plain Append streaming into Gather a worker blocked on a
+-- full tuple queue would hold the leader at the next exchange's barrier.
+-- Both used to hang.  Each branch must get its own Gather instead.
+explain (costs off)
+  select k, count(*) from repart_t group by k
+  union all
+  select k, count(*) from repart_t group by k;
+select count(*), sum(c) from (
+  select k, count(*) c from repart_t group by k
+  union all
+  select k, count(*) from repart_t group by k) s;
+set enable_parallel_append = off;
+explain (costs off)
+  select k, count(*) from repart_t group by k
+  union all
+  select k, count(*) from repart_t group by k;
+select count(*), sum(c) from (
+  select k, count(*) c from repart_t group by k
+  union all
+  select k, count(*) from repart_t group by k) s;
+reset enable_parallel_append;
+-- An outer aggregate over the same union.
+select count(*), sum(s) from (
+  select k, sum(c) s from (
+    select k, count(*) c from repart_t group by k
+    union all
+    select k, -count(*) from repart_t group by k) u
+  group by k having sum(c) <> 0) x;
 drop table repart_t;
 reset debug_parallel_repartition;
 reset parallel_repartition_partitions;

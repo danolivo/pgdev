@@ -601,6 +601,15 @@ ExecRepartition(PlanState *pstate)
 				 * Safe to wait: we have emitted nothing, so no participant
 				 * can be blocked writing into a full tuple queue while we sit
 				 * here.
+				 *
+				 * That is a property of the region, not of this node.  It
+				 * holds because the planner puts us directly under the
+				 * finalize Agg and the Gather that closes the region, so
+				 * this sink is the first thing every participant does.  Put
+				 * an Append above us and a participant can reach this point
+				 * after emitting the output of an earlier child, or never
+				 * reach it while it waits at another exchange; both hang.
+				 * check_repartition_placement() in planner.c guards it.
 				 */
 				INJECTION_POINT("repartition-before-barrier", NULL);
 
