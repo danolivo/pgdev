@@ -181,6 +181,12 @@ typedef struct PlannerGlobal
 
 	/* partition descriptors */
 	PartitionDirectory partition_directory pg_node_attr(read_write_ignore);
+
+	/*
+	 * Does the plan contain a Repartition node?  Kept last so that the offsets
+	 * of the fields above do not move for extensions compiled against them.
+	 */
+	bool		hasRepartition;
 } PlannerGlobal;
 
 /* macro for fetching the Plan associated with a SubPlan node */
@@ -2138,6 +2144,20 @@ typedef struct MaterialPath
 	Path		path;
 	Path	   *subpath;
 } MaterialPath;
+
+/*
+ * RepartitionPath represents a hash redistribution of tuples among parallel
+ * participants.  Only ever a partial path.
+ */
+typedef struct RepartitionPath
+{
+	pg_node_attr(nodetag_number(481))
+
+	Path		path;
+	Path	   *subpath;
+	List	   *partitionClause;	/* list of SortGroupClause */
+	int			npartitions;
+} RepartitionPath;
 
 /*
  * MemoizePath represents a Memoize plan node, i.e., a cache that caches

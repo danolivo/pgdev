@@ -588,3 +588,137 @@ select parallel_workers_to_launch > :'parallel_workers_to_launch_before'  AS wrk
        parallel_workers_launched > :'parallel_workers_launched_before' AS wrk_launched
   from pg_stat_database
   where datname = current_database();
+
+--
+-- Parallel Repartition: Finalize Aggregate below Gather
+--
+create table repart_t as
+  select (i % 20000) as k, (i % 7) as v from generate_series(1, 200000) i;
+analyze repart_t;
+set parallel_setup_cost = 0;
+set min_parallel_table_scan_size = 0;
+set max_parallel_workers_per_gather = 4;
+set parallel_repartition_partitions = 4;
+-- The cost model will not choose this shape on a table small enough for a
+-- regression test, and there is no data shape that reliably makes it.  Force
+-- it: debug_parallel_repartition penalises every competing path.
+set debug_parallel_repartition = on;
+explain (costs off)
+  select k, count(*), avg(v::numeric) from repart_t group by k;
+-- Finalizing by sort instead of by hash.
+set enable_hashagg = off;
+explain (costs off)
+  select k, count(*) from repart_t group by k;
+reset enable_hashagg;
+-- Ordered output: groups are disjoint between participants, so Gather Merge
+-- over the per-participant sort is legitimate.
+explain (costs off)
+  select k, count(*) from repart_t group by k order by k;
+-- Results must match the serial plan.  avg(numeric) and var_samp(numeric) have
+-- an internal transition type, so their states round-trip through
+-- serialfn/deserialfn and a MinimalTuple in the exchange.
+select count(*), sum(c), round(sum(a), 4) sa, round(sum(sd), 4) ssd
+  from (select k, count(*) c, avg(v::numeric) a,
+               coalesce(var_samp(v::numeric), 0) sd
+          from repart_t group by k) s;
+set enable_hashagg = off;
+select count(*), sum(c), round(sum(a), 4) sa, round(sum(sd), 4) ssd
+  from (select k, count(*) c, avg(v::numeric) a,
+               coalesce(var_samp(v::numeric), 0) sd
+          from repart_t group by k) s;
+reset enable_hashagg;
+set debug_parallel_repartition = off;
+set enable_parallel_repartition = off;
+set max_parallel_workers_per_gather = 0;
+select count(*), sum(c), round(sum(a), 4) sa, round(sum(sd), 4) ssd
+  from (select k, count(*) c, avg(v::numeric) a,
+               coalesce(var_samp(v::numeric), 0) sd
+          from repart_t group by k) s;
+reset enable_parallel_repartition;
+set max_parallel_workers_per_gather = 4;
+set debug_parallel_repartition = on;
+-- HAVING is evaluated in the worker now, not in the leader
+select count(*) from (select k, count(*) c from repart_t group by k having count(*) > 9) s;
+-- The leader need not participate ...
+set parallel_leader_participation = off;
+select count(*) from (select k, count(*) from repart_t group by k) s;
+reset parallel_leader_participation;
+-- ... and no worker need actually start.
+set max_parallel_workers = 0;
+select count(*) from (select k, count(*) from repart_t group by k) s;
+reset max_parallel_workers;
+-- Early shutdown: the leader stops reading before the exchange is drained.
+select count(*) from (select k from (select k, count(*) from repart_t group by k) s limit 1) x;
+-- Extreme partition counts.
+set parallel_repartition_partitions = 1;
+select count(*) from (select k, count(*) from repart_t group by k) s;
+set parallel_repartition_partitions = 64;
+select count(*) from (select k, count(*) from repart_t group by k) s;
+-- Multi-column and text keys, and a NULL-heavy key.
+set parallel_repartition_partitions = 4;
+select count(*) from (select k, v, count(*) from repart_t group by k, v) s;
+select count(*) from (select case when k % 3 = 0 then null else k::text end t,
+                             count(*) from repart_t group by 1) s;
+-- The exchange never leaves the Gather right above its finalize Agg.  Under a
+-- Parallel Append two exchanges would each hold a barrier slot the other one
+-- needs; under a plain Append streaming into Gather a worker blocked on a
+-- full tuple queue would hold the leader at the next exchange's barrier.
+-- Both used to hang.  Each branch must get its own Gather instead.
+explain (costs off)
+  select k, count(*) from repart_t group by k
+  union all
+  select k, count(*) from repart_t group by k;
+select count(*), sum(c) from (
+  select k, count(*) c from repart_t group by k
+  union all
+  select k, count(*) from repart_t group by k) s;
+set enable_parallel_append = off;
+explain (costs off)
+  select k, count(*) from repart_t group by k
+  union all
+  select k, count(*) from repart_t group by k;
+select count(*), sum(c) from (
+  select k, count(*) c from repart_t group by k
+  union all
+  select k, count(*) from repart_t group by k) s;
+reset enable_parallel_append;
+-- An error inside the sink phase fails the query; it must not leave anybody
+-- waiting at the barrier.  Which participant hits the limit first varies, so
+-- keep the CONTEXT line out of the output.
+set temp_file_limit = '64kB';
+\set VERBOSITY terse
+select count(*) from (select k, count(*) from repart_t group by k) s;
+\set VERBOSITY default
+reset temp_file_limit;
+select count(*) from (select k, count(*) from repart_t group by k) s;
+-- A multi-batch Parallel Hash Join below the exchange.  Its batch barriers
+-- wait for every participant attached to the join while ours waits for every
+-- participant of the region; that must not form a cycle (README.exchange,
+-- item 3).  work_mem is small enough to split the hash table into many
+-- batches, and large enough to keep K = 4.
+create table repart_d as select k from generate_series(0, 199999) k;
+analyze repart_d;
+set enable_mergejoin = off;
+set enable_nestloop = off;
+set work_mem = '320kB';
+explain (costs off)
+  select d.k, count(*) from repart_t t join repart_d d using (k) group by d.k;
+select count(*), sum(c) from (
+  select d.k, count(*) c from repart_t t join repart_d d using (k) group by d.k) s;
+reset work_mem;
+reset enable_nestloop;
+reset enable_mergejoin;
+drop table repart_d;
+-- An outer aggregate over the same union.
+select count(*), sum(s) from (
+  select k, sum(c) s from (
+    select k, count(*) c from repart_t group by k
+    union all
+    select k, -count(*) from repart_t group by k) u
+  group by k having sum(c) <> 0) x;
+drop table repart_t;
+reset debug_parallel_repartition;
+reset parallel_repartition_partitions;
+reset max_parallel_workers_per_gather;
+reset min_parallel_table_scan_size;
+reset parallel_setup_cost;
