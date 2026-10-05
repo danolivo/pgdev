@@ -162,6 +162,7 @@ WAL_SUMMARY_READY	"Waiting for a new WAL summary to be generated."
 XACT_GROUP_UPDATE	"Waiting for the group leader to update transaction status at transaction end."
 
 ABI_compatibility:
+REPARTITION_SINK	"Waiting for all parallel participants to finish redistributing tuples."
 
 #
 # Wait Events - Timeout

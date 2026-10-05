@@ -94,6 +94,7 @@
 #include "executor/nodeLimit.h"
 #include "executor/nodeLockRows.h"
 #include "executor/nodeMaterial.h"
+#include "executor/nodeRepartition.h"
 #include "executor/nodeMemoize.h"
 #include "executor/nodeMergeAppend.h"
 #include "executor/nodeMergejoin.h"
@@ -315,6 +316,11 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 		case T_Material:
 			result = (PlanState *) ExecInitMaterial((Material *) node,
 													estate, eflags);
+			break;
+
+		case T_Repartition:
+			result = (PlanState *) ExecInitRepartition((Repartition *) node,
+													   estate, eflags);
 			break;
 
 		case T_Sort:
@@ -706,6 +712,10 @@ ExecEndNode(PlanState *node)
 			ExecEndMaterial((MaterialState *) node);
 			break;
 
+		case T_RepartitionState:
+			ExecEndRepartition((RepartitionState *) node);
+			break;
+
 		case T_SortState:
 			ExecEndSort((SortState *) node);
 			break;
@@ -813,6 +823,10 @@ ExecShutdownNode_walker(PlanState *node, void *context)
 			break;
 		case T_HashState:
 			ExecShutdownHash((HashState *) node);
+			break;
+
+		case T_RepartitionState:
+			ExecShutdownRepartition((RepartitionState *) node);
 			break;
 		case T_HashJoinState:
 			ExecShutdownHashJoin((HashJoinState *) node);

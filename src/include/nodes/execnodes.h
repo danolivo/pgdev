@@ -2294,6 +2294,57 @@ typedef struct MaterialState
 	Tuplestorestate *tuplestorestate;
 } MaterialState;
 
+/* ----------------
+ *	 RepartitionState information
+ * ----------------
+ */
+struct ParallelRepartitionState;	/* all three defined in */
+struct SharedRepartitionInfo;		/* executor/repartition.h */
+struct RepartitionInstrumentation;
+
+typedef enum RepartitionPhase
+{
+	RS_SINK,					/* draining the child into the partitions */
+	RS_DRAIN,					/* streaming claimed partitions upwards */
+	RS_DONE,
+} RepartitionPhase;
+
+typedef struct RepartitionState
+{
+	pg_node_attr(nodetag_number(482))
+
+	PlanState	ps;				/* its first field is NodeTag */
+	int			rs_numCols;
+	AttrNumber *rs_hashColIdx;
+	FmgrInfo   *rs_hashfunctions;
+	Oid		   *rs_collations;
+	int			rs_npartitions;
+	int			rs_part_shift;
+	int			rs_npasses;		/* exchanges run so far (leader only) */
+	RepartitionPhase rs_phase;
+	int			rs_curpart;		/* partition being drained, or -1 */
+	bool		rs_attached;	/* still counted by the sink barrier? */
+	bool		rs_post_launch_seen;	/* ExecRepartitionPostLaunch() ran? */
+	bool		rs_sink_started;	/* began writing, not yet past the barrier */
+	int64		rs_nread_part;	/* tuples read from the current partition */
+
+	/*
+	 * Set once this participant has written into the exchange, cleared
+	 * whenever the shared state is made fresh.  A sink phase that starts with
+	 * this already set means the exchange was never reset between two passes;
+	 * see ExecRepartition().
+	 */
+	bool		rs_shared_written;
+	TupleTableSlot *rs_slot;
+	MemoryContext rs_spillCxt;	/* holds STS accessors and their buffers */
+	int		   *rs_order;		/* partitions in descending size order */
+	instr_time	rs_drain_start;
+	struct SharedTuplestoreAccessor **rs_accessors;
+	struct ParallelRepartitionState *rs_shared; /* NULL => pass-through */
+	struct SharedRepartitionInfo *rs_shared_info;	/* copied out at shutdown */
+	struct RepartitionInstrumentation *rs_instrument;	/* mine */
+} RepartitionState;
+
 struct MemoizeEntry;
 struct MemoizeTuple;
 struct MemoizeKey;

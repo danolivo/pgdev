@@ -37,6 +37,7 @@
 #include "executor/nodeLimit.h"
 #include "executor/nodeLockRows.h"
 #include "executor/nodeMaterial.h"
+#include "executor/nodeRepartition.h"
 #include "executor/nodeMemoize.h"
 #include "executor/nodeMergeAppend.h"
 #include "executor/nodeMergejoin.h"
@@ -252,6 +253,10 @@ ExecReScan(PlanState *node)
 
 		case T_MaterialState:
 			ExecReScanMaterial((MaterialState *) node);
+			break;
+
+		case T_RepartitionState:
+			ExecReScanRepartition((RepartitionState *) node);
 			break;
 
 		case T_MemoizeState:

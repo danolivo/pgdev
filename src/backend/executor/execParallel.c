@@ -37,6 +37,7 @@
 #include "executor/nodeIndexonlyscan.h"
 #include "executor/nodeIndexscan.h"
 #include "executor/nodeMemoize.h"
+#include "executor/nodeRepartition.h"
 #include "executor/nodeSeqscan.h"
 #include "executor/nodeSort.h"
 #include "executor/nodeSubplan.h"
@@ -289,6 +290,11 @@ ExecParallelEstimate(PlanState *planstate, ExecParallelEstimateContext *e)
 			/* even when not parallel-aware, for EXPLAIN ANALYZE */
 			ExecHashEstimate((HashState *) planstate, e->pcxt);
 			break;
+		case T_RepartitionState:
+			if (planstate->plan->parallel_aware)
+				ExecRepartitionEstimate((RepartitionState *) planstate,
+										e->pcxt);
+			break;
 		case T_SortState:
 			/* even when not parallel-aware, for EXPLAIN ANALYZE */
 			ExecSortEstimate((SortState *) planstate, e->pcxt);
@@ -515,6 +521,11 @@ ExecParallelInitializeDSM(PlanState *planstate,
 		case T_HashState:
 			/* even when not parallel-aware, for EXPLAIN ANALYZE */
 			ExecHashInitializeDSM((HashState *) planstate, d->pcxt);
+			break;
+		case T_RepartitionState:
+			if (planstate->plan->parallel_aware)
+				ExecRepartitionInitializeDSM((RepartitionState *) planstate,
+											 d->pcxt);
 			break;
 		case T_SortState:
 			/* even when not parallel-aware, for EXPLAIN ANALYZE */
@@ -1007,6 +1018,11 @@ ExecParallelReInitializeDSM(PlanState *planstate,
 				ExecBitmapHeapReInitializeDSM((BitmapHeapScanState *) planstate,
 											  pcxt);
 			break;
+		case T_RepartitionState:
+			if (planstate->plan->parallel_aware)
+				ExecRepartitionReInitializeDSM((RepartitionState *) planstate,
+											   pcxt);
+			break;
 		case T_HashJoinState:
 			if (planstate->plan->parallel_aware)
 				ExecHashJoinReInitializeDSM((HashJoinState *) planstate,
@@ -1043,7 +1059,16 @@ ExecParallelPostLaunchWalker(PlanState *planstate,
 	if (planstate == NULL)
 		return false;
 
-	/* no parallel-aware node needs to be told yet */
+	switch (nodeTag(planstate))
+	{
+		case T_RepartitionState:
+			if (planstate->plan->parallel_aware)
+				ExecRepartitionPostLaunch((RepartitionState *) planstate,
+										  c->pcxt, c->leader_participates);
+			break;
+		default:
+			break;
+	}
 
 	return planstate_tree_walker(planstate, ExecParallelPostLaunchWalker, c);
 }
@@ -1059,8 +1084,8 @@ ExecParallelPostLaunchWalker(PlanState *planstate,
  *
  * A node whose shared state depends on the real participant count cannot
  * learn it in InitializeDSM, because that runs before LaunchParallelWorkers().
- * A node whose barrier reserves a slot per requested worker is one: the
- * slots of workers that did not start must be given back before anybody
+ * Repartition is one: its barrier reserves a slot per requested worker, and
+ * the slots of workers that did not start must be given back before anybody
  * waits on it, or the wait never ends.  Doing the launch and the fix-up in
  * one call means that a launch site cannot do one and forget the other, and
  * that the fix-up always happens before the leader executes the plan.
@@ -1144,6 +1169,9 @@ ExecParallelRetrieveInstrumentation(PlanState *planstate,
 			break;
 		case T_HashState:
 			ExecHashRetrieveInstrumentation((HashState *) planstate);
+			break;
+		case T_RepartitionState:
+			ExecRepartitionRetrieveInstrumentation((RepartitionState *) planstate);
 			break;
 		case T_AggState:
 			ExecAggRetrieveInstrumentation((AggState *) planstate);
@@ -1436,6 +1464,11 @@ ExecParallelInitializeWorker(PlanState *planstate, ParallelWorkerContext *pwcxt)
 		case T_HashState:
 			/* even when not parallel-aware, for EXPLAIN ANALYZE */
 			ExecHashInitializeWorker((HashState *) planstate, pwcxt);
+			break;
+		case T_RepartitionState:
+			if (planstate->plan->parallel_aware)
+				ExecRepartitionInitializeWorker((RepartitionState *) planstate,
+												pwcxt);
 			break;
 		case T_SortState:
 			/* even when not parallel-aware, for EXPLAIN ANALYZE */
