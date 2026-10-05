@@ -152,6 +152,7 @@ ExecGather(PlanState *pstate)
 	{
 		EState	   *estate = node->ps.state;
 		Gather	   *gather = (Gather *) node->ps.plan;
+		bool		leader_participates = true;
 
 		/*
 		 * Sometimes we might have to run without parallelism; but if parallel
@@ -175,10 +176,15 @@ ExecGather(PlanState *pstate)
 
 			/*
 			 * Register backend workers. We might not get as many as we
-			 * requested, or indeed any at all.
+			 * requested, or indeed any at all.  This also tells
+			 * parallel-aware nodes below how many started and whether the
+			 * leader will take part, before the leader touches the subplan.
 			 */
 			pcxt = node->pei->pcxt;
-			LaunchParallelWorkers(pcxt);
+			leader_participates =
+				ExecParallelLaunchWorkers(node->pei,
+										  !gather->single_copy &&
+										  parallel_leader_participation);
 			/* We save # workers launched for the benefit of EXPLAIN */
 			node->nworkers_launched = pcxt->nworkers_launched;
 
@@ -209,9 +215,14 @@ ExecGather(PlanState *pstate)
 			node->nextreader = 0;
 		}
 
-		/* Run plan locally if no workers or enabled and not single-copy. */
-		node->need_to_scan_locally = (node->nreaders == 0)
-			|| (!gather->single_copy && parallel_leader_participation);
+		/*
+		 * Run plan locally if no workers or enabled and not single-copy.
+		 * Take the answer from ExecParallelLaunchWorkers() rather than work it
+		 * out again: parallel-aware nodes below were told the same answer, and
+		 * may have given back a barrier slot reserved for the leader on the
+		 * strength of it.
+		 */
+		node->need_to_scan_locally = leader_participates;
 		node->initialized = true;
 	}
 

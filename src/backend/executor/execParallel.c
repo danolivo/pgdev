@@ -1028,6 +1028,59 @@ ExecParallelReInitializeDSM(PlanState *planstate,
 }
 
 /*
+ * Walker for ExecParallelLaunchWorkers.
+ */
+typedef struct ExecParallelPostLaunchContext
+{
+	ParallelContext *pcxt;
+	bool		leader_participates;
+} ExecParallelPostLaunchContext;
+
+static bool
+ExecParallelPostLaunchWalker(PlanState *planstate,
+							 ExecParallelPostLaunchContext *c)
+{
+	if (planstate == NULL)
+		return false;
+
+	/* no parallel-aware node needs to be told yet */
+
+	return planstate_tree_walker(planstate, ExecParallelPostLaunchWalker, c);
+}
+
+/*
+ * ExecParallelLaunchWorkers
+ *		Launch the workers for a Gather or Gather Merge, and tell the
+ *		parallel-aware nodes below it how many of them started.
+ *
+ * leader_willing says whether the leader would take part in executing the
+ * plan if it had a choice; it always takes part when no worker starts.
+ * Returns whether it will.
+ *
+ * A node whose shared state depends on the real participant count cannot
+ * learn it in InitializeDSM, because that runs before LaunchParallelWorkers().
+ * A node whose barrier reserves a slot per requested worker is one: the
+ * slots of workers that did not start must be given back before anybody
+ * waits on it, or the wait never ends.  Doing the launch and the fix-up in
+ * one call means that a launch site cannot do one and forget the other, and
+ * that the fix-up always happens before the leader executes the plan.
+ */
+bool
+ExecParallelLaunchWorkers(ParallelExecutorInfo *pei, bool leader_willing)
+{
+	ExecParallelPostLaunchContext c;
+
+	LaunchParallelWorkers(pei->pcxt);
+
+	c.pcxt = pei->pcxt;
+	c.leader_participates = (pei->pcxt->nworkers_launched == 0 ||
+							 leader_willing);
+	ExecParallelPostLaunchWalker(pei->planstate, &c);
+
+	return c.leader_participates;
+}
+
+/*
  * Copy instrumentation information about this node and its descendants from
  * dynamic shared memory.
  */

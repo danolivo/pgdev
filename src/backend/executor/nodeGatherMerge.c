@@ -196,6 +196,7 @@ ExecGatherMerge(PlanState *pstate)
 	{
 		EState	   *estate = node->ps.state;
 		GatherMerge *gm = castNode(GatherMerge, node->ps.plan);
+		bool		leader_participates = true;
 
 		/*
 		 * Sometimes we might have to run without parallelism; but if parallel
@@ -217,9 +218,14 @@ ExecGatherMerge(PlanState *pstate)
 										 node->pei,
 										 gm->initParam);
 
-			/* Try to launch workers. */
+			/*
+			 * Try to launch workers, and tell parallel-aware nodes below how
+			 * many started and whether the leader will take part.
+			 */
 			pcxt = node->pei->pcxt;
-			LaunchParallelWorkers(pcxt);
+			leader_participates =
+				ExecParallelLaunchWorkers(node->pei,
+										  parallel_leader_participation);
 			/* We save # workers launched for the benefit of EXPLAIN */
 			node->nworkers_launched = pcxt->nworkers_launched;
 
@@ -249,9 +255,16 @@ ExecGatherMerge(PlanState *pstate)
 			}
 		}
 
-		/* allow leader to participate if enabled or no choice */
-		if (parallel_leader_participation || node->nreaders == 0)
-			node->need_to_scan_locally = true;
+		/*
+		 * Allow leader to participate if enabled or no choice.  Take the
+		 * answer from ExecParallelLaunchWorkers() rather than work it out
+		 * again: parallel-aware nodes below were told the same answer, and
+		 * may have given back a barrier slot reserved for the leader on the
+		 * strength of it.  Assign the flag rather than only setting it: after
+		 * a rescan it may still be true from a previous pass that ended
+		 * before the leader drained its own plan.
+		 */
+		node->need_to_scan_locally = leader_participates;
 		node->initialized = true;
 	}
 
