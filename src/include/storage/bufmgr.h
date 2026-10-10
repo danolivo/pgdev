@@ -181,6 +181,11 @@ extern PGDLLIMPORT char *BufferBlocks;
 
 /* in localbuf.c */
 extern PGDLLIMPORT int NLocBuffer;
+
+/* Local buffer statistics */
+extern PGDLLIMPORT int allocated_localbufs;
+extern PGDLLIMPORT int dirtied_localbufs;
+
 extern PGDLLIMPORT Block *LocalBufferBlockPointers;
 extern PGDLLIMPORT int32 *LocalRefCount;
 
@@ -268,6 +273,7 @@ extern BlockNumber RelationGetNumberOfBlocksInFork(Relation relation,
 												   ForkNumber forkNum);
 extern void FlushOneBuffer(Buffer buffer);
 extern void FlushRelationBuffers(Relation rel);
+extern void FlushAllBuffers(void);
 extern void FlushRelationsAllBuffers(struct SMgrRelationData **smgrs, int nrels);
 extern void CreateAndCopyRelationData(RelFileLocator src_rlocator,
 									  RelFileLocator dst_rlocator,

@@ -36,6 +36,7 @@
 #include "executor/tqueue.h"
 #include "miscadmin.h"
 #include "optimizer/optimizer.h"
+#include "storage/bufmgr.h"
 #include "utils/wait_event.h"
 
 
@@ -160,6 +161,17 @@ ExecGather(PlanState *pstate)
 		if (gather->num_workers > 0 && estate->es_use_parallel_mode)
 		{
 			ParallelContext *pcxt;
+
+			/*
+			 * Flush temporary buffers if this parallel section contains
+			 * any objects with temporary storage type. Don't bother to do it
+			 * more than once per the query execution.
+			 */
+			if (gather->process_temp_tables && !estate->es_tempbufs_flushed)
+			{
+				FlushAllBuffers();
+				estate->es_tempbufs_flushed = true;
+			}
 
 			/* Initialize, or re-initialize, shared state needed by workers. */
 			if (!node->pei)
