@@ -45,6 +45,7 @@ typedef struct
 
 int			NLocBuffer = 0;		/* until buffers are initialized */
 int			dirtied_localbufs = 0;	/* number of dirty local buffers */
+bool		ParallelWorkerTempAccessOK = false; /* see LocalBufferAlloc */
 
 BufferDesc *LocalBufferDescriptors = NULL;
 Block	   *LocalBufferBlockPointers = NULL;
@@ -132,12 +133,17 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 
 	/*
 	 * A parallel worker reads a temporary relation from the on-disk file it
-	 * shares with the leader, so the leader must have flushed its dirty local
-	 * buffers before launching the workers.  The counter is inherited from
-	 * the leader at worker startup (see ParallelQueryMain), so a non-zero
-	 * value here means the planner failed to request the flush.
+	 * shares with the leader, so it must not do so unless the leader flushed
+	 * its dirty local buffers before launching the workers (see ExecGather).
+	 * The planner requests that flush when it knows the parallel subtree
+	 * touches temporary relations; what it cannot see through, such as a
+	 * function wrongly marked PARALLEL SAFE that reads a temporary table,
+	 * ends up here.  Fail rather than return stale data.
 	 */
-	Assert(!IsParallelWorker() || dirtied_localbufs == 0);
+	if (IsParallelWorker() && !ParallelWorkerTempAccessOK)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("cannot access temporary tables during a parallel operation")));
 
 	/* Initialize local buffers if first request in this session */
 	if (LocalBufHash == NULL)
@@ -384,6 +390,13 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 {
 	BlockNumber first_block;
 	instr_time	io_start;
+
+	/*
+	 * Workers may only read temporary relations; extending one would change
+	 * the file the leader and the other workers are reading.
+	 */
+	if (IsParallelWorker())
+		elog(ERROR, "cannot extend a temporary relation in a parallel worker");
 
 	/* Initialize local buffers if first request in this session */
 	if (LocalBufHash == NULL)
