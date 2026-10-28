@@ -418,3 +418,53 @@ SELECT count(*), max(a) max_a, min(a) min_a, max(cnt) max_cnt FROM test_temp;
 
 -- cleanup
 DROP FUNCTION test_temp_pin(int, int);
+
+-- Test visibility of temporary table tuples in parallel workers.
+-- The rows below live in dirty local buffers of the leader; a worker reads
+-- the on-disk file and would miss them without the pre-launch flush.
+CREATE TEMP TABLE test AS (SELECT x FROM generate_series(1,1000) AS x);
+VACUUM ANALYZE test;
+
+SET max_parallel_workers_per_gather = 2;
+SET write_page_cost = 0.0001;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET debug_parallel_query = 'on';
+-- Make the worker do all the reading, so a missing flush is visible
+SET parallel_leader_participation = off;
+
+-- Temp buffers will not be seen without flushing dirty buffers
+EXPLAIN (COSTS OFF) SELECT count(*), sum(x) FROM test;
+SELECT count(*), sum(x) FROM test;
+
+-- Gather Merge must flush as well: dirty a page first, the new row lives
+-- only in a local buffer of the leader until the flush.
+INSERT INTO test VALUES (0);
+SET enable_hashagg = off;
+EXPLAIN (COSTS OFF) SELECT x FROM test GROUP BY x ORDER BY x LIMIT 3;
+SELECT x FROM test GROUP BY x ORDER BY x LIMIT 3;
+RESET enable_hashagg;
+
+-- Check temporary indexes too
+CREATE INDEX idx1 ON test(x);
+SET enable_seqscan = 'off';
+EXPLAIN (COSTS OFF) SELECT count(*), sum(x) FROM test;
+SELECT count(*), sum(x) FROM test;
+
+RESET enable_seqscan;
+
+-- a view doesn't have a storage - it shouldn't cause issues.
+CREATE TEMP TABLE table_a (id integer);
+CREATE TEMP VIEW view_a AS SELECT * FROM table_a;
+SELECT view_a FROM view_a;
+
+RESET parallel_leader_participation;
+RESET debug_parallel_query;
+RESET min_parallel_index_scan_size;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET write_page_cost;
