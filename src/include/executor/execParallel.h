@@ -47,5 +47,8 @@ extern void ExecParallelReinitialize(PlanState *planstate,
 									 ParallelExecutorInfo *pei, Bitmapset *sendParams);
 
 extern void ParallelQueryMain(dsm_segment *seg, shm_toc *toc);
+#ifdef USE_ASSERT_CHECKING
+extern bool ExecParallelSubtreeScansTemp(PlanState *planstate, void *context);
+#endif
 
 #endif							/* EXECPARALLEL_H */

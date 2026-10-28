@@ -167,7 +167,12 @@ ExecGather(PlanState *pstate)
 			 * Flush temporary buffers if this parallel section contains
 			 * any objects with temporary storage type. Don't bother to do it
 			 * more than once per the query execution.
+			 *
+			 * The planner tracks this per path; make sure it did not miss a
+			 * temporary relation that the workers are about to read.
 			 */
+			Assert(gather->process_temp_tables ||
+				   !ExecParallelSubtreeScansTemp(outerPlanState(node), NULL));
 			if (gather->process_temp_tables && !estate->es_tempbufs_flushed)
 			{
 				FlushAllLocalBuffers();
