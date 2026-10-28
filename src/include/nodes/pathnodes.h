@@ -259,6 +259,12 @@ typedef struct PlannerGlobal
 	/* worst PROPARALLEL hazard level */
 	char		maxParallelHazard;
 
+	/*
+	 * plan_ids of subplans whose plan trees scan temporary relations; only
+	 * maintained in assert-enabled builds, see finalize_plan()
+	 */
+	Bitmapset  *tempScanSubplans pg_node_attr(read_write_ignore);
+
 	/* mask of allowed path generation strategies */
 	uint64		default_pgs_mask;
 

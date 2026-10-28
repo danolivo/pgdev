@@ -17,6 +17,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
@@ -34,6 +35,7 @@
 #include "optimizer/prep.h"
 #include "optimizer/subselect.h"
 #include "parser/parse_relation.h"
+#include "parser/parsetree.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -2604,6 +2606,37 @@ SS_attach_initplans(PlannerInfo *root, Plan *plan)
 	plan->initPlan = root->init_plans;
 }
 
+#ifdef USE_ASSERT_CHECKING
+/*
+ * Cross-check of the planner's needs_temp_flush bookkeeping.
+ *
+ * That flag is carried from path to path by hand, and a forgotten assignment
+ * would not be a compile error but a missing flush of the leader's local
+ * buffers, i.e. wrong results in the workers.  finalize_plan() already walks
+ * every plan node and every expression of a finished plan, with the subplans
+ * done before the plans referencing them, so it is a convenient place to
+ * verify that whenever a scan of a temporary relation sits below a Gather or
+ * GatherMerge -- directly, through a subquery, or through a SubPlan -- that
+ * node was told to flush.
+ *
+ * finalize_temp_scan_seen is set while walking a plan tree as soon as a
+ * temp-scanning node is met; Gather and GatherMerge nodes save and restore it
+ * around the walk of their subtree.  The verdict for each subplan is kept in
+ * glob->tempScanSubplans so that SubPlan references can be accounted for.
+ */
+static bool finalize_temp_scan_seen = false;
+
+static void
+finalize_note_temp_scan(PlannerInfo *root, Index scanrelid)
+{
+	RangeTblEntry *rte = planner_rt_fetch(scanrelid, root);
+
+	if (rte->rtekind == RTE_RELATION &&
+		get_rel_persistence(rte->relid) == RELPERSISTENCE_TEMP)
+		finalize_temp_scan_seen = true;
+}
+#endif							/* USE_ASSERT_CHECKING */
+
 /*
  * SS_finalize_plan - do final parameter processing for a completed Plan.
  *
@@ -2616,8 +2649,28 @@ SS_attach_initplans(PlannerInfo *root, Plan *plan)
 void
 SS_finalize_plan(PlannerInfo *root, Plan *plan)
 {
+#ifdef USE_ASSERT_CHECKING
+	finalize_temp_scan_seen = false;
+#endif
+
 	/* No setup needed, just recurse through plan tree. */
 	(void) finalize_plan(root, plan, -1, root->outer_params, NULL);
+
+#ifdef USE_ASSERT_CHECKING
+	/* If this is a subplan that scans temp relations, remember that */
+	if (finalize_temp_scan_seen)
+	{
+		ListCell   *lc;
+
+		foreach(lc, root->glob->subplans)
+		{
+			if ((Plan *) lfirst(lc) == plan)
+				root->glob->tempScanSubplans =
+					bms_add_member(root->glob->tempScanSubplans,
+								   foreach_current_index(lc) + 1);
+		}
+	}
+#endif
 }
 
 /*
@@ -2664,6 +2717,9 @@ finalize_plan(PlannerInfo *root, Plan *plan,
 	Bitmapset  *initSetParam;
 	Bitmapset  *child_params;
 	ListCell   *l;
+#ifdef USE_ASSERT_CHECKING
+	bool		saved_temp_scan_seen = false;
+#endif
 
 	if (plan == NULL)
 		return NULL;
@@ -2706,6 +2762,30 @@ finalize_plan(PlannerInfo *root, Plan *plan,
 	/* Find params in targetlist and qual */
 	finalize_primnode((Node *) plan->targetlist, &context);
 	finalize_primnode((Node *) plan->qual, &context);
+
+#ifdef USE_ASSERT_CHECKING
+	/* Note scans of temporary relations, see finalize_note_temp_scan */
+	switch (nodeTag(plan))
+	{
+		case T_SeqScan:
+		case T_SampleScan:
+		case T_IndexScan:
+		case T_IndexOnlyScan:
+		case T_BitmapHeapScan:
+		case T_TidScan:
+		case T_TidRangeScan:
+			finalize_note_temp_scan(root, ((Scan *) plan)->scanrelid);
+			break;
+		case T_Gather:
+		case T_GatherMerge:
+			/* start afresh for the subtree, verified below */
+			saved_temp_scan_seen = finalize_temp_scan_seen;
+			finalize_temp_scan_seen = false;
+			break;
+		default:
+			break;
+	}
+#endif
 
 	/*
 	 * If it's a parallel-aware scan node, mark it as dependent on the parent
@@ -3209,6 +3289,25 @@ finalize_plan(PlannerInfo *root, Plan *plan,
 	}
 	context.paramids = bms_add_members(context.paramids, child_params);
 
+#ifdef USE_ASSERT_CHECKING
+	/*
+	 * The workers are going to read whatever temporary relation is scanned
+	 * below a Gather; the planner must have asked for the flush.
+	 */
+	if (IsA(plan, Gather))
+	{
+		Assert(((Gather *) plan)->process_temp_tables ||
+			   !finalize_temp_scan_seen);
+		finalize_temp_scan_seen |= saved_temp_scan_seen;
+	}
+	else if (IsA(plan, GatherMerge))
+	{
+		Assert(((GatherMerge *) plan)->process_temp_tables ||
+			   !finalize_temp_scan_seen);
+		finalize_temp_scan_seen |= saved_temp_scan_seen;
+	}
+#endif
+
 	/*
 	 * Any locally generated parameter doesn't count towards its generating
 	 * plan node's external dependencies.  (Note: if we changed valid_params
@@ -3292,6 +3391,13 @@ finalize_primnode(Node *node, finalize_primnode_context *context)
 
 		/* Recurse into the testexpr, but not into the Plan */
 		finalize_primnode(subplan->testexpr, context);
+
+#ifdef USE_ASSERT_CHECKING
+		/* ... but do account for temp relations the Plan scans */
+		if (bms_is_member(subplan->plan_id,
+						  context->root->glob->tempScanSubplans))
+			finalize_temp_scan_seen = true;
+#endif
 
 		/*
 		 * Remove any param IDs of output parameters of the subplan that were
