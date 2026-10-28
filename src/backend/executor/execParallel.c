@@ -52,6 +52,7 @@
 #include "utils/datum.h"
 #include "utils/dsa.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 #include "utils/snapmgr.h"
 
 /*
@@ -1021,6 +1022,47 @@ ExecParallelReinitialize(PlanState *planstate,
 	ExecParallelReInitializeDSM(planstate, pei->pcxt);
 	estate->es_query_dsa = NULL;
 }
+
+#ifdef USE_ASSERT_CHECKING
+/*
+ * Does any node of this plan state tree, including the subplans it
+ * references, scan a relation that lives in local buffers?
+ *
+ * This is a cross-check of the planner's bookkeeping: the executor's view of
+ * the subtree under a Gather is the ground truth for which relations the
+ * workers are going to read, and if any of them is temporary, the planner
+ * must have told the Gather to flush the leader's local buffers first.
+ */
+bool
+ExecParallelSubtreeScansTemp(PlanState *planstate, void *context)
+{
+	if (planstate == NULL)
+		return false;
+
+	switch (nodeTag(planstate))
+	{
+		case T_SeqScanState:
+		case T_SampleScanState:
+		case T_IndexScanState:
+		case T_IndexOnlyScanState:
+		case T_BitmapHeapScanState:
+		case T_TidScanState:
+		case T_TidRangeScanState:
+			{
+				Relation	rel = ((ScanState *) planstate)->ss_currentRelation;
+
+				if (rel != NULL && RelationUsesLocalBuffers(rel))
+					return true;
+			}
+			break;
+		default:
+			break;
+	}
+
+	return planstate_tree_walker(planstate, ExecParallelSubtreeScansTemp,
+								 context);
+}
+#endif
 
 /*
  * Traverse plan tree to reinitialize per-node dynamic shared memory state

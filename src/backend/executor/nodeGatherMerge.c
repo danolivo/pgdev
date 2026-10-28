@@ -207,7 +207,9 @@ ExecGatherMerge(PlanState *pstate)
 		{
 			ParallelContext *pcxt;
 
-			/* The same as in the ExecGather */
+			/* The same as in ExecGather */
+			Assert(gm->process_temp_tables ||
+				   !ExecParallelSubtreeScansTemp(outerPlanState(node), NULL));
 			if (gm->process_temp_tables && !estate->es_tempbufs_flushed)
 			{
 				FlushAllLocalBuffers();
