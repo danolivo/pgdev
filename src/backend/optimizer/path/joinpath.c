@@ -2046,8 +2046,19 @@ match_unsorted_outer(PlannerInfo *root,
 	 * heap-sort cost model (N*log2(2K) instead of N*log2(N)), giving an
 	 * accurate startup-cost estimate that feeds into fractional path
 	 * comparison correctly.
+	 *
+	 * Skip JOIN_UNIQUE_OUTER and JOIN_UNIQUE_INNER.  In those cases one side
+	 * of the join must be unique-ified first, and the raw paths in
+	 * outerrel->pathlist and innerrel->cheapest_parameterized_paths are not:
+	 * feeding them to try_nestloop_path() would turn the semijoin into a
+	 * plain inner join and leak duplicate rows into the output.  (The main
+	 * loop above handles these cases by wrapping the cheapest-total path in
+	 * create_unique_path(); doing the same here is possible but not worth
+	 * the trouble for the LEFT JOIN cases this optimisation targets.)
 	 */
 	if (nestjoinOK && enable_presorted_outer && root->query_pathkeys != NIL &&
+		save_jointype != JOIN_UNIQUE_OUTER &&
+		save_jointype != JOIN_UNIQUE_INNER &&
 		IS_SIMPLE_REL(outerrel) && bms_is_empty(outerrel->lateral_relids))
 	{
 		List	   *useful_pathkeys = NIL;
