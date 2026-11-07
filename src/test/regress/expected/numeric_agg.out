@@ -1,8 +1,9 @@
 --
 -- Bounded sum() and avg() over numeric
 --
--- bounded_numeric_sum() and bounded_numeric_avg() accumulate numeric values
--- of bounded precision at the scale given by their second argument.  The
+-- numeric_agg_support() replaces sum(numeric) and avg(numeric) with
+-- bounded_numeric_sum()/bounded_numeric_avg() if the argument's precision and
+-- scale can be derived at plan time and the precision is at most 28.  The
 -- answer must always be that of sum() and avg(), dscale included.
 --
 -- invalid scale arguments
@@ -173,3 +174,615 @@ RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
 DROP TABLE bna_fb;
+--
+-- When the substitution happens and when it does not
+--
+CREATE TABLE t_ok    (v numeric(18,2));
+CREATE TABLE t_wide  (v numeric(19,2));
+CREATE TABLE t_w28   (v numeric(28,20));
+CREATE TABLE t_w29   (v numeric(29,2));
+CREATE TABLE t_plain (v numeric);
+CREATE TABLE t_int0  (v numeric(18,0));
+CREATE TABLE t_frac  (v numeric(18,18));
+CREATE DOMAIN money18 AS numeric(18,2);
+CREATE TABLE t_dom   (v money18);
+-- a domain over a domain
+CREATE DOMAIN money18_2 AS money18;
+CREATE TABLE t_dom2  (v money18_2);
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_ok;
+             QUERY PLAN              
+-------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum(v, 2)
+   ->  Seq Scan on public.t_ok
+         Output: v
+(4 rows)
+
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_int0;
+             QUERY PLAN              
+-------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum(v, 0)
+   ->  Seq Scan on public.t_int0
+         Output: v
+(4 rows)
+
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_frac;
+              QUERY PLAN              
+--------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum(v, 18)
+   ->  Seq Scan on public.t_frac
+         Output: v
+(4 rows)
+
+-- a domain over numeric(18,2): the typmod is taken from the domain
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_dom;
+                   QUERY PLAN                   
+------------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum((v)::numeric, 2)
+   ->  Seq Scan on public.t_dom
+         Output: v
+(4 rows)
+
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_dom2;
+                   QUERY PLAN                   
+------------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum((v)::numeric, 2)
+   ->  Seq Scan on public.t_dom2
+         Output: v
+(4 rows)
+
+SELECT sum(v) FROM (VALUES ('1.005'::money18_2), ('2.00')) x(v);
+ sum  
+------
+ 3.01
+(1 row)
+
+-- 19 <= p <= 28 uses the same aggregate
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_wide;
+             QUERY PLAN              
+-------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum(v, 2)
+   ->  Seq Scan on public.t_wide
+         Output: v
+(4 rows)
+
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_w28;
+              QUERY PLAN              
+--------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum(v, 20)
+   ->  Seq Scan on public.t_w28
+         Output: v
+(4 rows)
+
+-- p = 29 is too wide
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_w29;
+           QUERY PLAN           
+--------------------------------
+ Aggregate
+   Output: sum(v)
+   ->  Seq Scan on public.t_w29
+         Output: v
+(4 rows)
+
+-- no typmod at all
+EXPLAIN (verbose, costs off) SELECT sum(v) FROM t_plain;
+            QUERY PLAN            
+----------------------------------
+ Aggregate
+   Output: sum(v)
+   ->  Seq Scan on public.t_plain
+         Output: v
+(4 rows)
+
+-- CASE and COALESCE keep a typmod that is the same in every arm
+EXPLAIN (verbose, costs off)
+  SELECT sum(CASE WHEN v > 0 THEN v ELSE v END) FROM t_ok;
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum(CASE WHEN (v > '0'::numeric) THEN v ELSE v END, 2)
+   ->  Seq Scan on public.t_ok
+         Output: v
+(4 rows)
+
+EXPLAIN (verbose, costs off) SELECT sum(coalesce(v, v)) FROM t_ok;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum(COALESCE(v, v), 2)
+   ->  Seq Scan on public.t_ok
+         Output: v
+(4 rows)
+
+-- with arms of differing typmod it is lost
+EXPLAIN (verbose, costs off)
+  SELECT sum(CASE WHEN v > 0 THEN v ELSE 0::numeric END) FROM t_ok;
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Aggregate
+   Output: sum(CASE WHEN (v > '0'::numeric) THEN v ELSE '0'::numeric END)
+   ->  Seq Scan on public.t_ok
+         Output: v
+(4 rows)
+
+-- A PREPARE parameter carries no typmod, and neither does the Const it is
+-- folded to in a custom plan; in a generic plan the Param survives.  Either
+-- way nothing is substituted.
+PREPARE pparam (numeric(18,2)) AS SELECT sum(x) FROM (VALUES ($1)) t(x);
+EXPLAIN (verbose, costs off) EXECUTE pparam ('1.00');
+     QUERY PLAN      
+---------------------
+ Aggregate
+   Output: sum(1.00)
+   ->  Result
+(3 rows)
+
+EXECUTE pparam ('1.23456');
+   sum   
+---------
+ 1.23456
+(1 row)
+
+SET plan_cache_mode = force_generic_plan;
+EXPLAIN (verbose, costs off) EXECUTE pparam ('1.00');
+    QUERY PLAN     
+-------------------
+ Aggregate
+   Output: sum($1)
+   ->  Result
+(3 rows)
+
+EXECUTE pparam ('1.23456');
+   sum   
+---------
+ 1.23456
+(1 row)
+
+RESET plan_cache_mode;
+DEALLOCATE pparam;
+-- a plpgsql variable carries a typmod and is coerced on assignment
+CREATE FUNCTION bna_plpgsql_probe() RETURNS numeric LANGUAGE plpgsql AS $$
+DECLARE
+	x numeric(10,2) := 1.005;
+BEGIN
+	RETURN (SELECT sum(y) FROM (VALUES (x), (x)) t(y));
+END
+$$;
+SELECT bna_plpgsql_probe();
+ bna_plpgsql_probe 
+-------------------
+              2.02
+(1 row)
+
+DROP FUNCTION bna_plpgsql_probe();
+--
+-- avg() shares the transition function with sum() and differs only in the
+-- final function
+--
+EXPLAIN (verbose, costs off) SELECT avg(v) FROM t_ok;
+             QUERY PLAN              
+-------------------------------------
+ Aggregate
+   Output: bounded_numeric_avg(v, 2)
+   ->  Seq Scan on public.t_ok
+         Output: v
+(4 rows)
+
+EXPLAIN (verbose, costs off) SELECT avg(v) FROM t_w29;
+           QUERY PLAN           
+--------------------------------
+ Aggregate
+   Output: avg(v)
+   ->  Seq Scan on public.t_w29
+         Output: v
+(4 rows)
+
+-- shapes that are left alone
+EXPLAIN (verbose, costs off) SELECT sum(DISTINCT v) FROM t_ok;
+             QUERY PLAN              
+-------------------------------------
+ Aggregate
+   Output: sum(DISTINCT v)
+   ->  Sort
+         Output: v
+         Sort Key: t_ok.v
+         ->  Seq Scan on public.t_ok
+               Output: v
+(7 rows)
+
+EXPLAIN (verbose, costs off) SELECT sum(v ORDER BY v) FROM t_ok;
+             QUERY PLAN              
+-------------------------------------
+ Aggregate
+   Output: sum(v ORDER BY v)
+   ->  Sort
+         Output: v
+         Sort Key: t_ok.v
+         ->  Seq Scan on public.t_ok
+               Output: v
+(7 rows)
+
+EXPLAIN (verbose, costs off) SELECT sum(v) FILTER (WHERE v > 0) FROM t_ok;
+                     QUERY PLAN                     
+----------------------------------------------------
+ Aggregate
+   Output: sum(v) FILTER (WHERE (v > '0'::numeric))
+   ->  Seq Scan on public.t_ok
+         Output: v
+(4 rows)
+
+EXPLAIN (verbose, costs off) SELECT sum(v) OVER () FROM t_ok;
+          QUERY PLAN           
+-------------------------------
+ WindowAgg
+   Output: sum(v) OVER w1
+   Window: w1 AS ()
+   ->  Seq Scan on public.t_ok
+         Output: v
+(5 rows)
+
+EXPLAIN (verbose, costs off) SELECT max(v) FROM t_ok;
+          QUERY PLAN           
+-------------------------------
+ Aggregate
+   Output: max(v)
+   ->  Seq Scan on public.t_ok
+         Output: v
+(4 rows)
+
+-- an outer-level aggregate
+EXPLAIN (verbose, costs off)
+  SELECT (SELECT sum(t_ok.v) FROM t_int0 LIMIT 1) FROM t_ok;
+               QUERY PLAN                
+-----------------------------------------
+ Aggregate
+   Output: (SubPlan expr_1)
+   ->  Seq Scan on public.t_ok
+         Output: t_ok.v
+   SubPlan expr_1
+     ->  Limit
+           Output: (sum(t_ok.v))
+           ->  Seq Scan on public.t_int0
+                 Output: sum(t_ok.v)
+(9 rows)
+
+-- the switch
+SET enable_bounded_numeric_agg = off;
+EXPLAIN (verbose, costs off) SELECT sum(v), avg(v) FROM t_ok;
+          QUERY PLAN           
+-------------------------------
+ Aggregate
+   Output: sum(v), avg(v)
+   ->  Seq Scan on public.t_ok
+         Output: v
+(4 rows)
+
+RESET enable_bounded_numeric_agg;
+--
+-- Values
+--
+INSERT INTO t_ok VALUES (1.00), (2.50), (-0.75), (0.01), (1000000000000000.00);
+SELECT sum(v) FROM t_ok;
+         sum         
+---------------------
+ 1000000000000002.76
+(1 row)
+
+SELECT sum(v) FROM t_ok WHERE false;
+ sum 
+-----
+    
+(1 row)
+
+SELECT sum(v) FROM (VALUES (NULL::numeric(18,2))) x(v);
+ sum 
+-----
+    
+(1 row)
+
+SELECT sum(v) FROM (VALUES (1.00::numeric(18,2)), (NULL)) x(v);
+ sum  
+------
+ 1.00
+(1 row)
+
+SELECT sum(v) OVER (ORDER BY v) FROM t_ok;
+         sum         
+---------------------
+               -0.75
+               -0.74
+                0.26
+                2.76
+ 1000000000000002.76
+(5 rows)
+
+-- the result's scale must not depend on the values
+SELECT sum(v), pg_typeof(sum(v)) FROM (VALUES (1.00::numeric(18,2))) x(v);
+ sum  | pg_typeof 
+------+-----------
+ 1.00 | numeric
+(1 row)
+
+SELECT sum(v) FROM (VALUES (0.00::numeric(18,2))) x(v);
+ sum  
+------
+ 0.00
+(1 row)
+
+SELECT sum(v) FROM (VALUES (0::numeric(18,0))) x(v);
+ sum 
+-----
+   0
+(1 row)
+
+-- precision boundaries
+SELECT sum(v) FROM (VALUES ('999999999999999999'::numeric(18,0))) x(v);
+        sum         
+--------------------
+ 999999999999999999
+(1 row)
+
+SELECT sum(v) FROM (VALUES ('9999999999999999.99'::numeric(18,2))) x(v);
+         sum         
+---------------------
+ 9999999999999999.99
+(1 row)
+
+SELECT sum(v) FROM (VALUES ('0.999999999999999999'::numeric(18,18))) x(v);
+         sum          
+----------------------
+ 0.999999999999999999
+(1 row)
+
+SELECT sum(v) FROM (VALUES ('-9999999999999999.99'::numeric(18,2)),
+						   ('-9999999999999999.99')) x(v);
+          sum          
+-----------------------
+ -19999999999999999.98
+(1 row)
+
+-- the sum stops fitting in an int64
+SELECT sum(v) FROM (SELECT '9999999999999999.99'::numeric(18,2)
+					FROM generate_series(1, 20)) x(v);
+          sum          
+-----------------------
+ 199999999999999999.80
+(1 row)
+
+-- 19 <= p <= 28: each mantissa is already too wide for an int64
+SELECT sum(v) FROM (VALUES ('12345678901234567.89'::numeric(19,2))) x(v);
+         sum          
+----------------------
+ 12345678901234567.89
+(1 row)
+
+SELECT sum(v) FROM (VALUES ('99999999999999999.99'::numeric(19,2)),
+						   ('99999999999999999.99')) x(v);
+          sum          
+-----------------------
+ 199999999999999999.98
+(1 row)
+
+SELECT sum(v) FROM (VALUES ('99999999.99999999999999999999'::numeric(28,20))) x(v);
+              sum              
+-------------------------------
+ 99999999.99999999999999999999
+(1 row)
+
+SELECT sum(v) FROM (VALUES ('-99999999.99999999999999999999'::numeric(28,20)),
+						   ('0.00000000000000000001')) x(v);
+              sum               
+--------------------------------
+ -99999999.99999999999999999998
+(1 row)
+
+SELECT sum(v) FROM (VALUES ('9999999999999999999999999999'::numeric(28,0))) x(v);
+             sum              
+------------------------------
+ 9999999999999999999999999999
+(1 row)
+
+SELECT sum(v) FROM (VALUES ('-9999999999999999999999999999'::numeric(28,0)),
+						   ('-9999999999999999999999999999')) x(v);
+              sum               
+--------------------------------
+ -19999999999999999999999999998
+(1 row)
+
+SELECT sum(v) FROM (VALUES ('0.00'::numeric(19,2))) x(v);
+ sum  
+------
+ 0.00
+(1 row)
+
+SELECT sum(v) FROM (VALUES ('1.00'::numeric(19,2)), (NULL)) x(v);
+ sum  
+------
+ 1.00
+(1 row)
+
+SELECT sum(v) FROM (VALUES ('NaN'::numeric(19,2)), ('1.00')) x(v);
+ sum 
+-----
+ NaN
+(1 row)
+
+SELECT sum(v) FROM (SELECT '99999999999999999.99'::numeric(19,2)
+					FROM generate_series(1, 1000)) x(v);
+           sum           
+-------------------------
+ 99999999999999999990.00
+(1 row)
+
+SELECT sum(v) FROM (SELECT '-0.00000000000000000001'::numeric(28,20)
+					FROM generate_series(1, 1000)) x(v);
+           sum           
+-------------------------
+ -0.00000000000000001000
+(1 row)
+
+SELECT avg(v) FROM (SELECT '99999999999999999.99'::numeric(19,2)
+					FROM generate_series(1, 1000)) x(v);
+         avg          
+----------------------
+ 99999999999999999.99
+(1 row)
+
+-- Special values.  A numeric(18,2) column holds NaN but not the infinities,
+-- so those are exercised by calling the aggregate directly.
+SELECT sum(v) FROM (VALUES ('NaN'::numeric(18,2)), (1.00)) x(v);
+ sum 
+-----
+ NaN
+(1 row)
+
+SELECT sum(v) FROM (VALUES ('NaN'::numeric(18,2)), (NULL)) x(v);
+ sum 
+-----
+ NaN
+(1 row)
+
+SELECT 'Infinity'::numeric(18,2);
+ERROR:  numeric field overflow
+DETAIL:  A field with precision 18, scale 2 cannot hold an infinite value.
+--
+-- Differential check against the general aggregate on wider data.  The
+-- comparison is on text: numeric_eq considers 1.0 and 1.00 equal, and a
+-- dscale mismatch must be caught too.
+--
+CREATE TABLE t_bulk (grp int, v numeric(18,4), w numeric(26,10));
+INSERT INTO t_bulk
+  SELECT i % 97,
+		 ((i * 7919) % 1000000)::numeric / 10000,
+		 ((i * 104729)::numeric * 1000000007) / 10000000000
+  FROM generate_series(1, 20000) i;
+SET enable_bounded_numeric_agg = off;
+CREATE TABLE t_ref AS
+  SELECT grp, sum(v) AS s, sum(w) AS sw, avg(v) AS a, avg(w) AS aw
+  FROM t_bulk GROUP BY grp;
+SELECT sum(v)::text AS ref, avg(v)::text AS avgref FROM t_bulk \gset
+RESET enable_bounded_numeric_agg;
+SELECT count(*) AS mismatches
+FROM t_ref r
+FULL JOIN (SELECT grp, sum(v) AS s, sum(w) AS sw, avg(v) AS a, avg(w) AS aw
+		   FROM t_bulk GROUP BY grp) x USING (grp)
+WHERE r.s::text IS DISTINCT FROM x.s::text
+   OR r.sw::text IS DISTINCT FROM x.sw::text
+   OR r.a::text IS DISTINCT FROM x.a::text
+   OR r.aw::text IS DISTINCT FROM x.aw::text;
+ mismatches 
+------------
+          0
+(1 row)
+
+SELECT sum(v)::text = :'ref' AS sum_matches,
+	   avg(v)::text = :'avgref' AS avg_matches
+FROM t_bulk;
+ sum_matches | avg_matches 
+-------------+-------------
+ t           | t
+(1 row)
+
+--
+-- Parallel aggregation goes through the combine, serialize and deserialize
+-- functions; a sum outside int64 with mixed signs exercises the 128-bit
+-- state halves on the way.
+--
+CREATE TABLE t_big (v numeric(18,2), w numeric(26,10));
+INSERT INTO t_big
+  SELECT CASE WHEN i % 3 = 0 THEN -9999999999999999.99
+			  ELSE 9999999999999999.99 END,
+		 CASE WHEN i % 3 = 0 THEN -1234567890123456.7890123456
+			  ELSE 9876543210987654.3210987654 END
+  FROM generate_series(1, 50000) i;
+ANALYZE t_big;
+SET enable_bounded_numeric_agg = off;
+SELECT sum(v)::text AS bigref, sum(w)::text AS bigwref,
+	   avg(w)::text AS bigavgref FROM t_big \gset
+RESET enable_bounded_numeric_agg;
+SET max_parallel_workers_per_gather = 4;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+EXPLAIN (costs off) SELECT sum(v) FROM t_big;
+                  QUERY PLAN                  
+----------------------------------------------
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 4
+         ->  Partial Aggregate
+               ->  Parallel Seq Scan on t_big
+(5 rows)
+
+SELECT sum(v)::text = :'bigref' AS big_parallel,
+	   sum(w)::text = :'bigwref' AS wide_parallel,
+	   avg(w)::text = :'bigavgref' AS avg_parallel
+FROM t_big;
+ big_parallel | wide_parallel | avg_parallel 
+--------------+---------------+--------------
+ t            | t             | t
+(1 row)
+
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+SET max_parallel_workers_per_gather = 0;
+SELECT sum(v)::text = :'bigref' AS big_serial,
+	   sum(w)::text = :'bigwref' AS wide_serial
+FROM t_big;
+ big_serial | wide_serial 
+------------+-------------
+ t          | t
+(1 row)
+
+RESET max_parallel_workers_per_gather;
+--
+-- As with any other planner parameter, turning the switch off does not
+-- touch a plan that is already cached: a saved generic plan keeps the
+-- bounded aggregate until it is replanned.
+--
+SET plan_cache_mode = force_generic_plan;
+PREPARE pavg AS SELECT avg(v) FROM t_ok;
+EXPLAIN (verbose, costs off) EXECUTE pavg;
+             QUERY PLAN              
+-------------------------------------
+ Aggregate
+   Output: bounded_numeric_avg(v, 2)
+   ->  Seq Scan on public.t_ok
+         Output: v
+(4 rows)
+
+SET enable_bounded_numeric_agg = off;
+EXPLAIN (verbose, costs off) EXECUTE pavg;
+             QUERY PLAN              
+-------------------------------------
+ Aggregate
+   Output: bounded_numeric_avg(v, 2)
+   ->  Seq Scan on public.t_ok
+         Output: v
+(4 rows)
+
+DISCARD PLANS;
+EXPLAIN (verbose, costs off) EXECUTE pavg;
+          QUERY PLAN           
+-------------------------------
+ Aggregate
+   Output: avg(v)
+   ->  Seq Scan on public.t_ok
+         Output: v
+(4 rows)
+
+RESET enable_bounded_numeric_agg;
+DEALLOCATE pavg;
+RESET plan_cache_mode;
+DROP TABLE t_ok, t_wide, t_w28, t_w29, t_plain, t_int0, t_frac, t_dom, t_dom2,
+		   t_bulk, t_ref, t_big;
+DROP DOMAIN money18_2;
+DROP DOMAIN money18;

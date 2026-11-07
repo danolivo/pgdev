@@ -56,6 +56,7 @@
 #include "parser/parsetree.h"
 #include "postgres_fdw.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -970,6 +971,22 @@ foreign_expr_walker(Node *node,
 
 				/* As usual, it must be shippable. */
 				if (!is_shippable(agg->aggfnoid, ProcedureRelationId, fpinfo))
+					return false;
+
+				/*
+				 * The bounded numeric aggregates are built in, but they are
+				 * the planner's private substitutes for sum() and avg(), and
+				 * the remote server need not have them.  Their OIDs are below
+				 * FirstGenbkiObjectId, so is_shippable() takes them for
+				 * ordinary built-ins.
+				 *
+				 * XXX: the price is that an aggregate the planner has
+				 * substituted is computed locally over every row fetched.
+				 * Systems that use postgres_fdw should run with
+				 * enable_bounded_numeric_agg off.
+				 */
+				if (agg->aggfnoid == F_BOUNDED_NUMERIC_SUM ||
+					agg->aggfnoid == F_BOUNDED_NUMERIC_AVG)
 					return false;
 
 				/*

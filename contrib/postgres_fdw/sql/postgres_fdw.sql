@@ -4850,3 +4850,24 @@ RESET client_min_messages;
 DROP FUNCTION wait_for_backend_termination(int);
 DROP FOREIGN TABLE remote_backend_pid;
 DROP VIEW my_backend_pid;
+
+-- ===================================================================
+-- The specialized aggregates that replace sum() and avg() over a bounded
+-- numeric are never shipped, since the remote server need not have them;
+-- with the replacement off, sum() and avg() are pushed down as usual
+-- ===================================================================
+CREATE TABLE bna_local (g int, v numeric(10,2));
+CREATE FOREIGN TABLE bna_ft (g int, v numeric(10,2))
+  SERVER loopback OPTIONS (table_name 'bna_local');
+INSERT INTO bna_local VALUES (1, 1.25), (1, 2.50), (2, -0.75);
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT g, sum(v), avg(v), sum(v * v) FROM bna_ft GROUP BY g ORDER BY g;
+SELECT g, sum(v), avg(v), sum(v * v) FROM bna_ft GROUP BY g ORDER BY g;
+SET enable_bounded_numeric_agg = off;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT g, sum(v), avg(v), sum(v * v) FROM bna_ft GROUP BY g ORDER BY g;
+RESET enable_bounded_numeric_agg;
+-- the local table gets the specialized aggregate
+EXPLAIN (VERBOSE, COSTS OFF) SELECT sum(v) FROM bna_local;
+DROP FOREIGN TABLE bna_ft;
+DROP TABLE bna_local;

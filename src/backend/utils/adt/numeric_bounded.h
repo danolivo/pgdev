@@ -55,5 +55,6 @@ extern struct NumericAggState *numeric_avg_state_from_sum(MemoryContext agg_cont
 														  int64 NaNcount,
 														  int64 pInfcount,
 														  int64 nInfcount);
+extern bool numeric_bounded_typmod(int32 typmod, int *precision, int *scale);
 
 #endif							/* NUMERIC_BOUNDED_H */

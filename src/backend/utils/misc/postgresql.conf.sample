@@ -428,6 +428,7 @@
 
 #enable_async_append = on
 #enable_bitmapscan = on
+#enable_bounded_numeric_agg = on
 #enable_gathermerge = on
 #enable_hashagg = on
 #enable_hashjoin = on

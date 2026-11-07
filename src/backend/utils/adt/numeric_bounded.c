@@ -3,11 +3,12 @@
  * numeric_bounded.c
  *	  sum() and avg() over numeric of bounded precision and scale.
  *
- * bounded_numeric_sum(numeric, int4) and bounded_numeric_avg(numeric, int4)
- * compute sum() and avg() of numeric values that have at most
- * NUMERIC_BOUNDED_MAX_PRECISION digits at the scale given by the second,
- * constant argument.  Every input is accumulated as an integer mantissa at
- * that scale in an INT128.
+ * When the planner can show that every input of sum(numeric) or
+ * avg(numeric) has at most NUMERIC_BOUNDED_MAX_PRECISION digits at one fixed
+ * scale, numeric_agg_support() replaces the aggregate with
+ * bounded_numeric_sum() or bounded_numeric_avg().  These take the scale as a
+ * second, constant argument and accumulate every input as an integer
+ * mantissa at that scale in an INT128.
  *
  * What this buys is cheaper accumulation and a smaller state.  Per row, an
  * input costs a short Horner loop over its few base-NBASE digits and one
@@ -41,7 +42,8 @@
  * NumericAggState, built from what has been accumulated so far; from then on
  * the group is handled by the general transition, combine and final
  * functions.  So the answer is always the one sum() and avg() give, and the
- * bounded representation is only ever an optimization.
+ * bounded representation is only ever an optimization.  That also covers a
+ * mistake in the plan-time derivation in numeric_agg_support().
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
@@ -52,11 +54,19 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_class.h"
+#include "catalog/pg_type.h"
 #include "common/int128.h"
 #include "fmgr.h"
 #include "libpq/pqformat.h"
-#include "nodes/primnodes.h"
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#include "nodes/pathnodes.h"
+#include "nodes/supportnodes.h"
+#include "optimizer/cost.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "varatt.h"
 
@@ -679,4 +689,175 @@ numeric_bounded_avg(PG_FUNCTION_ARGS)
 															state->scale));
 
 	PG_RETURN_DATUM(DirectFunctionCall2(numeric_div, sumX_datum, N_datum));
+}
+
+/* ----------------------------------------------------------------------
+ *
+ * Plan-time part: deriving the precision and scale of the argument
+ *
+ * ----------------------------------------------------------------------
+ */
+
+/*
+ * bounded_numeric_typmod
+ *		The expression's numeric typmod, or -1.
+ *
+ * A domain over numeric(p,s) is coerced to its base type by relabelling,
+ * after which exprTypmod() says -1; the typmod is recovered from the domain.
+ * exprTypmod() also yields a typmod for CASE and COALESCE when it is the
+ * same in every arm, which is exactly when every value really carries it.
+ */
+static int32
+bounded_numeric_typmod(Node *node)
+{
+	Oid			typid = exprType(node);
+	int32		typmod = exprTypmod(node);
+
+	if (typid != NUMERICOID)
+	{
+		/* exprTypmod() of a domain-typed expression is -1 */
+		if (typmod != -1)
+			return -1;
+		typid = getBaseTypeAndTypmod(typid, &typmod);
+		if (typid != NUMERICOID)
+			return -1;
+	}
+
+	return typmod;
+}
+
+/*
+ * bounded_numeric_derive
+ *		Precision and scale of the aggregate's argument.
+ *
+ * They come from the argument's declared typmod: a column, a cast, a CASE,
+ * a domain.  The scale has to be exact, because it becomes the dscale of the
+ * result.  A value that does not honor it is caught by the transition
+ * functions, which check every value against the scale they were
+ * specialized on.
+ */
+static bool
+bounded_numeric_derive(Node *node, int *p, int *s)
+{
+	int32		typmod;
+
+	while (IsA(node, RelabelType))
+		node = (Node *) ((RelabelType *) node)->arg;
+
+	typmod = bounded_numeric_typmod(node);
+	if (!numeric_bounded_typmod(typmod, p, s))
+		return false;
+
+	return (*p >= 1 && *p <= NUMERIC_BOUNDED_MAX_PRECISION &&
+			*s >= 0 && *s <= *p);
+}
+
+/*
+ * bounded_numeric_scale_tle
+ *		An int4 constant scale argument for the rewritten Aggref.
+ */
+static TargetEntry *
+bounded_numeric_scale_tle(int scale, AttrNumber resno)
+{
+	Const	   *con = makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
+								Int32GetDatum(scale), false, true);
+
+	return makeTargetEntry((Expr *) con, resno, NULL, false);
+}
+
+/*
+ * numeric_agg_support
+ *		Planner support function for sum(numeric) and avg(numeric).
+ *
+ * On SupportRequestSimplifyAggref, replace the aggregate with its bounded
+ * counterpart if the argument's precision and scale can be derived and fall
+ * within the supported range; see the comments at the top of this file.
+ * Any other request gets NULL.
+ *
+ * XXX: the substitution is not always a win, and we cannot tell here when it
+ * is not.  Over a plain column the bounded transition function is clearly
+ * cheaper, but an argument computed per row (a cast, a CASE, an arithmetic
+ * expression) arrives as a freshly built numeric that the general transition
+ * function handles about as fast, and the bounded one can come out slightly
+ * slower -- about 2% was measured for sum(round(a * b, 2)).  What remains in
+ * that case is the smaller state, which pays off with many groups and not at
+ * all with few.  The number of groups is not known at this stage of
+ * planning, so we substitute anyway and accept the small loss in the
+ * unfavorable case.
+ *
+ * XXX: the substitution is invisible to anything that looks for
+ * F_SUM_NUMERIC or F_AVG_NUMERIC after constant folding -- an extension with
+ * its own implementation of these aggregates (a columnar or vectorized
+ * executor, a distributed planner doing partial aggregation, a tool that
+ * parses EXPLAIN output) will no longer recognize them and silently fall back
+ * to its general path.  This feature is meant for installations without such
+ * extensions; where they are used, enable_bounded_numeric_agg should be off.
+ *
+ * XXX: queries over foreign tables are substituted like any other.  An FDW
+ * that pushes aggregation down cannot ship the bounded aggregates --
+ * postgres_fdw refuses to -- so with the substitution such an aggregate is
+ * computed locally over every row fetched; and foreign tables are also the
+ * likeliest source of values that break their typmod, which costs a
+ * fallback.  Leaving those queries alone would need a cheap way to tell,
+ * once per query level rather than for every Aggref, whether foreign tables
+ * or foreign partitions are involved; that is worth looking into.
+ */
+Datum
+numeric_agg_support(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+	SupportRequestSimplifyAggref *req;
+	Aggref	   *agg;
+	Aggref	   *newagg;
+	TargetEntry *tle;
+	bool		is_sum;
+	int			p,
+				s;
+
+	if (!IsA(rawreq, SupportRequestSimplifyAggref))
+		PG_RETURN_POINTER(NULL);
+
+	if (!enable_bounded_numeric_agg)
+		PG_RETURN_POINTER(NULL);
+
+	req = (SupportRequestSimplifyAggref *) rawreq;
+	agg = req->aggref;
+
+	if (agg->aggfnoid == F_SUM_NUMERIC)
+		is_sum = true;
+	else if (agg->aggfnoid == F_AVG_NUMERIC)
+		is_sum = false;
+	else
+		PG_RETURN_POINTER(NULL);
+
+	/*
+	 * Shapes we leave alone.  DISTINCT and ORDER BY live in the argument list
+	 * that we rewrite; FILTER and an outer-level aggregate are left alone to
+	 * keep the substitution simple, and could be lifted later.
+	 */
+	if (agg->aggdistinct != NIL || agg->aggorder != NIL ||
+		agg->aggfilter != NULL || agg->aggvariadic ||
+		agg->agglevelsup != 0 || list_length(agg->args) != 1 ||
+		agg->aggsplit != AGGSPLIT_SIMPLE)
+		PG_RETURN_POINTER(NULL);
+
+	tle = linitial_node(TargetEntry, agg->args);
+
+	if (!bounded_numeric_derive((Node *) tle->expr, &p, &s))
+		PG_RETURN_POINTER(NULL);
+
+	Assert(p >= 1 && p <= NUMERIC_BOUNDED_MAX_PRECISION && s >= 0 && s <= p);
+
+	/*
+	 * A flat copy is enough, as in int8inc_support(): the Aggref we were
+	 * handed is a fresh node of eval_const_expressions() that nothing else
+	 * points to, so its argument can be shared rather than copied.
+	 */
+	newagg = makeNode(Aggref);
+	memcpy(newagg, agg, sizeof(Aggref));
+	newagg->aggfnoid = is_sum ? F_BOUNDED_NUMERIC_SUM : F_BOUNDED_NUMERIC_AVG;
+	newagg->args = list_make2(tle, bounded_numeric_scale_tle(s, 2));
+	newagg->aggargtypes = list_make2_oid(NUMERICOID, INT4OID);
+
+	PG_RETURN_POINTER(newagg);
 }

@@ -5096,6 +5096,9 @@
 { oid => '9886', descr => 'aggregate final function',
   proname => 'numeric_bounded_avg', proisstrict => 'f', prorettype => 'numeric',
   proargtypes => 'internal', prosrc => 'numeric_bounded_avg' },
+{ oid => '9887', descr => 'planner support for numeric sum and avg',
+  proname => 'numeric_agg_support', prorettype => 'internal',
+  proargtypes => 'internal', prosrc => 'numeric_agg_support' },
 { oid => '2514', descr => 'aggregate final function',
   proname => 'numeric_var_pop', proisstrict => 'f', prorettype => 'numeric',
   proargtypes => 'internal', prosrc => 'numeric_var_pop' },
@@ -7009,8 +7012,9 @@
   proargtypes => 'int2', prosrc => 'aggregate_dummy' },
 { oid => '2103',
   descr => 'the average (arithmetic mean) as numeric of all numeric values',
-  proname => 'avg', prokind => 'a', proisstrict => 'f', prorettype => 'numeric',
-  proargtypes => 'numeric', prosrc => 'aggregate_dummy' },
+  proname => 'avg', prosupport => 'numeric_agg_support', prokind => 'a',
+  proisstrict => 'f', prorettype => 'numeric', proargtypes => 'numeric',
+  prosrc => 'aggregate_dummy' },
 { oid => '2104',
   descr => 'the average (arithmetic mean) as float8 of all float4 values',
   proname => 'avg', prokind => 'a', proisstrict => 'f', prorettype => 'float8',
@@ -7048,10 +7052,12 @@
   prorettype => 'interval', proargtypes => 'interval',
   prosrc => 'aggregate_dummy' },
 { oid => '2114', descr => 'sum as numeric across all numeric input values',
-  proname => 'sum', prokind => 'a', proisstrict => 'f', prorettype => 'numeric',
-  proargtypes => 'numeric', prosrc => 'aggregate_dummy' },
+  proname => 'sum', prosupport => 'numeric_agg_support', prokind => 'a',
+  proisstrict => 'f', prorettype => 'numeric', proargtypes => 'numeric',
+  prosrc => 'aggregate_dummy' },
 
-# specialized sum() and avg() over numeric of bounded precision, see numeric.c
+# specialized sum() and avg() over numeric of bounded precision; the planner
+# substitutes these for sum(numeric) and avg(numeric), see numeric_agg_support
 { oid => '9888',
   descr => 'sum of numeric values of bounded precision at the given scale',
   proname => 'bounded_numeric_sum', prokind => 'a', proisstrict => 'f',

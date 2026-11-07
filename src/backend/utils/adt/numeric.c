@@ -12628,3 +12628,19 @@ numeric_avg_state_from_sum(MemoryContext agg_context, Numeric sum, int64 N,
 
 	return state;
 }
+
+/*
+ * numeric_bounded_typmod
+ *		Decode a numeric typmod into precision and scale; false if the
+ *		typmod is not a valid numeric one (-1, say).
+ */
+bool
+numeric_bounded_typmod(int32 typmod, int *precision, int *scale)
+{
+	if (!is_valid_numeric_typmod(typmod))
+		return false;
+
+	*precision = numeric_typmod_precision(typmod);
+	*scale = numeric_typmod_scale(typmod);
+	return true;
+}

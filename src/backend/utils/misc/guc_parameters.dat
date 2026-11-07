@@ -875,6 +875,14 @@
   boot_val => 'true',
 },
 
+{ name => 'enable_bounded_numeric_agg', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
+  short_desc => 'Enables the planner\'s use of specialized sum() and avg() over numeric of bounded precision.',
+  long_desc => 'Allows the query planner to replace sum(numeric) and avg(numeric) with aggregates that accumulate into a fixed-size 128-bit integer state, when the precision and scale of the argument can be derived at plan time.',
+  flags => 'GUC_EXPLAIN',
+  variable => 'enable_bounded_numeric_agg',
+  boot_val => 'true',
+},
+
 { name => 'enable_distinct_reordering', type => 'bool', context => 'PGC_USERSET', group => 'QUERY_TUNING_METHOD',
   short_desc => 'Enables reordering of DISTINCT keys.',
   flags => 'GUC_EXPLAIN',
