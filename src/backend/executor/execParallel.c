@@ -46,6 +46,7 @@
 #include "jit/jit.h"
 #include "nodes/nodeFuncs.h"
 #include "pgstat.h"
+#include "storage/bufmgr.h"
 #include "storage/proc.h"
 #include "tcop/tcopprot.h"
 #include "utils/datum.h"
@@ -80,6 +81,7 @@ typedef struct FixedParallelExecutorState
 	dsa_pointer param_exec;
 	int			eflags;
 	int			jit_flags;
+	int			dirtied_localbufs;	/* leader's count, for sanity checks */
 } FixedParallelExecutorState;
 
 /*
@@ -818,6 +820,7 @@ ExecInitParallelPlan(PlanState *planstate, EState *estate,
 	fpes->param_exec = InvalidDsaPointer;
 	fpes->eflags = estate->es_top_eflags;
 	fpes->jit_flags = estate->es_jit_flags;
+	fpes->dirtied_localbufs = dirtied_localbufs;
 	shm_toc_insert(pcxt->toc, PARALLEL_KEY_EXECUTOR_FIXED, fpes);
 
 	/* Store query string */
@@ -1542,6 +1545,7 @@ ParallelQueryMain(dsm_segment *seg, shm_toc *toc)
 
 	/* Get fixed-size state. */
 	fpes = shm_toc_lookup(toc, PARALLEL_KEY_EXECUTOR_FIXED, false);
+	dirtied_localbufs = fpes->dirtied_localbufs;
 
 	/* Set up DestReceiver, SharedExecutorInstrumentation, and QueryDesc. */
 	receiver = ExecParallelGetReceiver(seg, toc);
