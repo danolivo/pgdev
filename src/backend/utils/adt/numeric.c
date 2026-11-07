@@ -5025,34 +5025,61 @@ numeric_pg_lsn(PG_FUNCTION_ARGS)
  * ----------------------------------------------------------------------
  */
 
+/*
+ * The parts of a NumericAggState that an int128 fast-mode sum/avg state never
+ * needs: the digit-array accumulators and the counters of special values.
+ * They live out of line and are allocated on first use (promotion, the first
+ * finite input of a sumX2 state, or the first NaN/Inf input), so that a
+ * fast-mode group costs one 64-byte chunk rather than a 256-byte one.  That
+ * matters for hash aggregation over many groups, where the transition state
+ * is the per-group memory.
+ */
+typedef struct NumericAggStateExt
+{
+	NumericSumAccum sumX;		/* sum of processed numbers */
+	NumericSumAccum sumX2;		/* sum of squares of processed numbers */
+	/* These counts are *not* included in N!  Use NA_TOTAL_COUNT() as needed */
+	int64		NaNcount;		/* count of NaN values */
+	int64		pInfcount;		/* count of +Inf values */
+	int64		nInfcount;		/* count of -Inf values */
+} NumericAggStateExt;
+
 typedef struct NumericAggState
 {
 	/*
-	 * The fields down to maxScaleCount are all that the int128 fast path
-	 * touches per input row.  Keep them adjacent and first, so that a
-	 * transition does not reach across the digit-array accumulators and the
-	 * counters of special values.
+	 * Everything the int128 fast path touches per input row is here, inline;
+	 * the rest is in ext.  Keep this struct within 64 bytes, see
+	 * NumericAggStateExt.
 	 */
 	bool		calcSumX2;		/* if true, calculate sumX2 */
 
 	/*
 	 * promoted: if false, the running sum lives in sumX128/fastScale (the
-	 * "fast" int128 representation); if true, it lives in sumX (the exact
+	 * "fast" int128 representation); if true, it lives in ext->sumX (the exact
 	 * digit-array accumulator).  States that must not use the fast
 	 * representation at all (calcSumX2 ones: their sum of squares does not
 	 * fit int128 for realistic inputs) are created with promoted = true, so
 	 * the digit-array path stays the single unconditional fallback for every
 	 * consumer.  So are all states when DEC_DIGITS is not 4, for which the
 	 * conversions to and from int128 are not written.  Promotion is one-way
-	 * and exact: it converts sumX128 * 10^(-fastScale) into sumX, so results
-	 * never depend on whether or when it happened.
+	 * and exact: it converts sumX128 * 10^(-fastScale) into ext->sumX, so
+	 * results never depend on whether or when it happened.
 	 */
 	bool		promoted;
 
 	/*
+	 * has_specials: set once a NaN or an infinity has been counted in ext.
+	 * It lets readers of the special-value counters skip ext, which is a
+	 * separate chunk and usually a cache miss, for the common state that
+	 * never saw one.  It is never cleared; the counters themselves may be
+	 * back at zero after inverse transitions.
+	 */
+	bool		has_specials;
+
+	/*
 	 * fastScale is the decimal scale of sumX128, the counterpart of
-	 * sumX.dscale.  Between calls it equals maxScale as long as the state is
-	 * not promoted, since both are then the widest dscale among the
+	 * ext->sumX.dscale.  Between calls it equals maxScale as long as the
+	 * state is not promoted, since both are then the widest dscale among the
 	 * accumulated finite inputs; that is asserted after each update of the
 	 * fast sum and wherever it is finalized or serialized.  The two are
 	 * nevertheless separate fields: maxScale is bookkeeping for inverse
@@ -5065,18 +5092,99 @@ typedef struct NumericAggState
 	INT128		sumX128;		/* running sum while !promoted */
 	int64		N;				/* count of processed numbers */
 	int64		maxScaleCount;	/* number of values seen with maximum scale */
-
 	MemoryContext agg_context;	/* context we're calculating in */
-	NumericSumAccum sumX;		/* sum of processed numbers */
-	NumericSumAccum sumX2;		/* sum of squares of processed numbers */
-	/* These counts are *not* included in N!  Use NA_TOTAL_COUNT() as needed */
-	int64		NaNcount;		/* count of NaN values */
-	int64		pInfcount;		/* count of +Inf values */
-	int64		nInfcount;		/* count of -Inf values */
+	NumericAggStateExt *ext;	/* out-of-line part, NULL until needed */
 } NumericAggState;
 
+StaticAssertDecl(sizeof(NumericAggState) <= 64,
+				 "NumericAggState no longer fits a 64-byte chunk");
+
+/* Read a special-value counter, touching ext only if one was ever counted */
+#define NA_COUNT(na, field) ((na)->has_specials ? (na)->ext->field : 0)
+
 #define NA_TOTAL_COUNT(na) \
-	((na)->N + (na)->NaNcount + (na)->pInfcount + (na)->nInfcount)
+	((na)->N + NA_COUNT(na, NaNcount) + NA_COUNT(na, pInfcount) + \
+	 NA_COUNT(na, nInfcount))
+
+/*
+ * Return the out-of-line part of the state, allocating it (zeroed, in the
+ * state's own context) on first use.  Only the owner of a state may call
+ * this; a state that is merely read, such as the second argument of a combine
+ * function, must be taken as it is.
+ */
+static inline NumericAggStateExt *
+na_ext(NumericAggState *state)
+{
+	if (unlikely(state->ext == NULL))
+		state->ext = MemoryContextAllocZero(state->agg_context,
+											sizeof(NumericAggStateExt));
+	return state->ext;
+}
+
+/*
+ * Like na_ext(), for a caller about to make a special-value counter nonzero.
+ */
+static inline NumericAggStateExt *
+na_special_ext(NumericAggState *state)
+{
+	state->has_specials = true;
+	return na_ext(state);
+}
+
+/*
+ * Add state2's special-value counters to state1.  state1 gets an out-of-line
+ * part only if there is a nonzero counter to carry; state2 is only read.
+ */
+static inline void
+na_add_counts(NumericAggState *state1, const NumericAggState *state2)
+{
+	if (!state2->has_specials)
+		return;
+	if (state2->ext->NaNcount != 0 ||
+		state2->ext->pInfcount != 0 ||
+		state2->ext->nInfcount != 0)
+	{
+		NumericAggStateExt *ext = na_special_ext(state1);
+
+		ext->NaNcount += state2->ext->NaNcount;
+		ext->pInfcount += state2->ext->pInfcount;
+		ext->nInfcount += state2->ext->nInfcount;
+	}
+}
+
+/*
+ * Set the special-value counters of a state under construction, which gets
+ * an out-of-line part only if one of them is nonzero.
+ */
+static inline void
+na_set_counts(NumericAggState *state, int64 NaNcount, int64 pInfcount,
+			  int64 nInfcount)
+{
+	if (NaNcount != 0 || pInfcount != 0 || nInfcount != 0)
+	{
+		NumericAggStateExt *ext = na_special_ext(state);
+
+		ext->NaNcount = NaNcount;
+		ext->pInfcount = pInfcount;
+		ext->nInfcount = nInfcount;
+	}
+}
+
+/*
+ * Extract a digit-array sum of the state, sumX2 or else sumX, into 'result'.
+ * A state without an out-of-line part has accumulated nothing there and
+ * stands for zero, which is also what accum_sum_final() makes of an empty
+ * accumulator; the state is not given one just to say so.
+ */
+static void
+na_sum_final(NumericAggState *state, bool sumX2, NumericVar *result)
+{
+	if (state->ext == NULL)
+		set_var_from_var(&const_zero, result);
+	else
+		accum_sum_final(sumX2 ? &state->ext->sumX2 : &state->ext->sumX,
+						result);
+}
 
 /*
  * Prepare state data for a numeric aggregate function that needs to compute
@@ -5165,7 +5273,7 @@ promote_numeric_agg_state(NumericAggState *state)
 
 		/* ... but the accumulator's buffers must live in the agg context */
 		old_context = MemoryContextSwitchTo(state->agg_context);
-		accum_sum_add(&state->sumX, &tmp);
+		accum_sum_add(&na_ext(state)->sumX, &tmp);
 		MemoryContextSwitchTo(old_context);
 
 		free_var(&tmp);
@@ -5221,17 +5329,18 @@ do_numeric_accum(NumericAggState *state, Numeric newval)
 {
 	NumericVar	X;
 	NumericVar	X2;
+	NumericAggStateExt *ext;
 	MemoryContext old_context;
 
 	/* Count NaN/infinity inputs separately from all else */
 	if (NUMERIC_IS_SPECIAL(newval))
 	{
 		if (NUMERIC_IS_PINF(newval))
-			state->pInfcount++;
+			na_special_ext(state)->pInfcount++;
 		else if (NUMERIC_IS_NINF(newval))
-			state->nInfcount++;
+			na_special_ext(state)->nInfcount++;
 		else
-			state->NaNcount++;
+			na_special_ext(state)->NaNcount++;
 		return;
 	}
 
@@ -5280,10 +5389,11 @@ do_numeric_accum(NumericAggState *state, Numeric newval)
 	state->N++;
 
 	/* Accumulate sums */
-	accum_sum_add(&(state->sumX), &X);
+	ext = na_ext(state);
+	accum_sum_add(&ext->sumX, &X);
 
 	if (state->calcSumX2)
-		accum_sum_add(&(state->sumX2), &X2);
+		accum_sum_add(&ext->sumX2, &X2);
 
 	MemoryContextSwitchTo(old_context);
 }
@@ -5308,17 +5418,20 @@ do_numeric_discard(NumericAggState *state, Numeric newval)
 {
 	NumericVar	X;
 	NumericVar	X2;
+	NumericAggStateExt *ext;
 	MemoryContext old_context;
 
 	/* Count NaN/infinity inputs separately from all else */
 	if (NUMERIC_IS_SPECIAL(newval))
 	{
+		/* the value was counted on the way in, so its counter exists */
+		Assert(state->has_specials);
 		if (NUMERIC_IS_PINF(newval))
-			state->pInfcount--;
+			state->ext->pInfcount--;
 		else if (NUMERIC_IS_NINF(newval))
-			state->nInfcount--;
+			state->ext->nInfcount--;
 		else
-			state->NaNcount--;
+			state->ext->NaNcount--;
 		return true;
 	}
 
@@ -5326,7 +5439,7 @@ do_numeric_discard(NumericAggState *state, Numeric newval)
 	init_var_from_num(newval, &X);
 
 	/*
-	 * state->sumX's dscale is the maximum dscale of any of the inputs.
+	 * The sum's dscale is the maximum dscale of any of the inputs.
 	 * Removing the last input with that dscale would require us to recompute
 	 * the maximum dscale of the *remaining* inputs, which we cannot do unless
 	 * no more non-NaN inputs remain at all.  So we report a failure instead,
@@ -5404,17 +5517,19 @@ do_numeric_discard(NumericAggState *state, Numeric newval)
 	/* The rest of this needs to work in the aggregate context */
 	old_context = MemoryContextSwitchTo(state->agg_context);
 
+	ext = na_ext(state);
+
 	if (state->N-- > 1)
 	{
 		/* Negate X, to subtract it from the sum */
 		X.sign = (X.sign == NUMERIC_POS ? NUMERIC_NEG : NUMERIC_POS);
-		accum_sum_add(&(state->sumX), &X);
+		accum_sum_add(&ext->sumX, &X);
 
 		if (state->calcSumX2)
 		{
 			/* Negate X^2. X^2 is always positive */
 			X2.sign = NUMERIC_NEG;
-			accum_sum_add(&(state->sumX2), &X2);
+			accum_sum_add(&ext->sumX2, &X2);
 		}
 	}
 	else
@@ -5422,9 +5537,9 @@ do_numeric_discard(NumericAggState *state, Numeric newval)
 		/* Zero the sums */
 		Assert(state->N == 0);
 
-		accum_sum_reset(&state->sumX);
+		accum_sum_reset(&ext->sumX);
 		if (state->calcSumX2)
-			accum_sum_reset(&state->sumX2);
+			accum_sum_reset(&ext->sumX2);
 	}
 
 	MemoryContextSwitchTo(old_context);
@@ -5497,14 +5612,18 @@ numeric_combine(PG_FUNCTION_ARGS)
 
 		state1 = makeNumericAggStateCurrentContext(true);
 		state1->N = state2->N;
-		state1->NaNcount = state2->NaNcount;
-		state1->pInfcount = state2->pInfcount;
-		state1->nInfcount = state2->nInfcount;
+		na_add_counts(state1, state2);
 		state1->maxScale = state2->maxScale;
 		state1->maxScaleCount = state2->maxScaleCount;
 
-		accum_sum_copy(&state1->sumX, &state2->sumX);
-		accum_sum_copy(&state1->sumX2, &state2->sumX2);
+		/* without an out-of-line part, state2's sums are empty */
+		if (state2->ext != NULL)
+		{
+			NumericAggStateExt *ext = na_ext(state1);
+
+			accum_sum_copy(&ext->sumX, &state2->ext->sumX);
+			accum_sum_copy(&ext->sumX2, &state2->ext->sumX2);
+		}
 
 		MemoryContextSwitchTo(old_context);
 
@@ -5512,12 +5631,12 @@ numeric_combine(PG_FUNCTION_ARGS)
 	}
 
 	state1->N += state2->N;
-	state1->NaNcount += state2->NaNcount;
-	state1->pInfcount += state2->pInfcount;
-	state1->nInfcount += state2->nInfcount;
+	na_add_counts(state1, state2);
 
 	if (state2->N > 0)
 	{
+		NumericAggStateExt *ext;
+
 		/*
 		 * These are currently only needed for moving aggregates, but let's do
 		 * the right thing anyway...
@@ -5533,9 +5652,11 @@ numeric_combine(PG_FUNCTION_ARGS)
 		/* The rest of this needs to work in the aggregate context */
 		old_context = MemoryContextSwitchTo(agg_context);
 
-		/* Accumulate sums */
-		accum_sum_combine(&state1->sumX, &state2->sumX);
-		accum_sum_combine(&state1->sumX2, &state2->sumX2);
+		/* Accumulate sums; state2 has them, having seen finite inputs */
+		Assert(state2->ext != NULL);
+		ext = na_ext(state1);
+		accum_sum_combine(&ext->sumX, &state2->ext->sumX);
+		accum_sum_combine(&ext->sumX2, &state2->ext->sumX2);
 
 		MemoryContextSwitchTo(old_context);
 	}
@@ -5607,16 +5728,18 @@ numeric_avg_combine(PG_FUNCTION_ARGS)
 
 		state1 = makeNumericAggStateCurrentContext(false);
 		state1->N = state2->N;
-		state1->NaNcount = state2->NaNcount;
-		state1->pInfcount = state2->pInfcount;
-		state1->nInfcount = state2->nInfcount;
+		na_add_counts(state1, state2);
 		state1->maxScale = state2->maxScale;
 		state1->maxScaleCount = state2->maxScaleCount;
 
 		/* clone state2's representation, whichever mode it is in */
 		state1->promoted = state2->promoted;
 		if (state2->promoted)
-			accum_sum_copy(&state1->sumX, &state2->sumX);
+		{
+			/* without an out-of-line part, state2's sum is empty */
+			if (state2->ext != NULL)
+				accum_sum_copy(&na_ext(state1)->sumX, &state2->ext->sumX);
+		}
 		else
 		{
 			state1->sumX128 = state2->sumX128;
@@ -5629,9 +5752,7 @@ numeric_avg_combine(PG_FUNCTION_ARGS)
 	}
 
 	state1->N += state2->N;
-	state1->NaNcount += state2->NaNcount;
-	state1->pInfcount += state2->pInfcount;
-	state1->nInfcount += state2->nInfcount;
+	na_add_counts(state1, state2);
 
 	if (state2->N > 0)
 	{
@@ -5690,8 +5811,9 @@ numeric_avg_combine(PG_FUNCTION_ARGS)
 			/* The rest of this needs to work in the aggregate context */
 			old_context = MemoryContextSwitchTo(agg_context);
 
-			/* Accumulate sums */
-			accum_sum_combine(&state1->sumX, &state2->sumX);
+			/* Accumulate sums; state2 has one, having seen finite inputs */
+			Assert(state2->ext != NULL);
+			accum_sum_combine(&na_ext(state1)->sumX, &state2->ext->sumX);
 
 			MemoryContextSwitchTo(old_context);
 		}
@@ -5705,7 +5827,7 @@ numeric_avg_combine(PG_FUNCTION_ARGS)
 										&tmp);
 
 			old_context = MemoryContextSwitchTo(agg_context);
-			accum_sum_add(&state1->sumX, &tmp);
+			accum_sum_add(&na_ext(state1)->sumX, &tmp);
 			MemoryContextSwitchTo(old_context);
 
 			free_var(&tmp);
@@ -5752,7 +5874,7 @@ numeric_avg_serialize(PG_FUNCTION_ARGS)
 									&tmp_var);
 	}
 	else
-		accum_sum_final(&state->sumX, &tmp_var);
+		na_sum_final(state, false, &tmp_var);
 	numericvar_serialize(&buf, &tmp_var);
 
 	/* maxScale */
@@ -5762,13 +5884,13 @@ numeric_avg_serialize(PG_FUNCTION_ARGS)
 	pq_sendint64(&buf, state->maxScaleCount);
 
 	/* NaNcount */
-	pq_sendint64(&buf, state->NaNcount);
+	pq_sendint64(&buf, NA_COUNT(state, NaNcount));
 
 	/* pInfcount */
-	pq_sendint64(&buf, state->pInfcount);
+	pq_sendint64(&buf, NA_COUNT(state, pInfcount));
 
 	/* nInfcount */
-	pq_sendint64(&buf, state->nInfcount);
+	pq_sendint64(&buf, NA_COUNT(state, nInfcount));
 
 	result = pq_endtypsend(&buf);
 
@@ -5789,6 +5911,9 @@ numeric_avg_deserialize(PG_FUNCTION_ARGS)
 	NumericAggState *result;
 	StringInfoData buf;
 	NumericVar	tmp_var;
+	int64		NaNcount;
+	int64		pInfcount;
+	int64		nInfcount;
 
 	if (!AggCheckCallContext(fcinfo, NULL))
 		elog(ERROR, "aggregate function called in non-aggregate context");
@@ -5824,7 +5949,7 @@ numeric_avg_deserialize(PG_FUNCTION_ARGS)
 	else
 	{
 		result->promoted = true;
-		accum_sum_add(&(result->sumX), &tmp_var);
+		accum_sum_add(&na_ext(result)->sumX, &tmp_var);
 	}
 
 	/* maxScale */
@@ -5833,14 +5958,11 @@ numeric_avg_deserialize(PG_FUNCTION_ARGS)
 	/* maxScaleCount */
 	result->maxScaleCount = pq_getmsgint64(&buf);
 
-	/* NaNcount */
-	result->NaNcount = pq_getmsgint64(&buf);
-
-	/* pInfcount */
-	result->pInfcount = pq_getmsgint64(&buf);
-
-	/* nInfcount */
-	result->nInfcount = pq_getmsgint64(&buf);
+	/* NaNcount, pInfcount, nInfcount */
+	NaNcount = pq_getmsgint64(&buf);
+	pInfcount = pq_getmsgint64(&buf);
+	nInfcount = pq_getmsgint64(&buf);
+	na_set_counts(result, NaNcount, pInfcount, nInfcount);
 
 	pq_getmsgend(&buf);
 
@@ -5876,11 +5998,11 @@ numeric_serialize(PG_FUNCTION_ARGS)
 	pq_sendint64(&buf, state->N);
 
 	/* sumX */
-	accum_sum_final(&state->sumX, &tmp_var);
+	na_sum_final(state, false, &tmp_var);
 	numericvar_serialize(&buf, &tmp_var);
 
 	/* sumX2 */
-	accum_sum_final(&state->sumX2, &tmp_var);
+	na_sum_final(state, true, &tmp_var);
 	numericvar_serialize(&buf, &tmp_var);
 
 	/* maxScale */
@@ -5890,13 +6012,13 @@ numeric_serialize(PG_FUNCTION_ARGS)
 	pq_sendint64(&buf, state->maxScaleCount);
 
 	/* NaNcount */
-	pq_sendint64(&buf, state->NaNcount);
+	pq_sendint64(&buf, NA_COUNT(state, NaNcount));
 
 	/* pInfcount */
-	pq_sendint64(&buf, state->pInfcount);
+	pq_sendint64(&buf, NA_COUNT(state, pInfcount));
 
 	/* nInfcount */
-	pq_sendint64(&buf, state->nInfcount);
+	pq_sendint64(&buf, NA_COUNT(state, nInfcount));
 
 	result = pq_endtypsend(&buf);
 
@@ -5917,6 +6039,9 @@ numeric_deserialize(PG_FUNCTION_ARGS)
 	NumericAggState *result;
 	StringInfoData buf;
 	NumericVar	tmp_var;
+	int64		NaNcount;
+	int64		pInfcount;
+	int64		nInfcount;
 
 	if (!AggCheckCallContext(fcinfo, NULL))
 		elog(ERROR, "aggregate function called in non-aggregate context");
@@ -5939,11 +6064,11 @@ numeric_deserialize(PG_FUNCTION_ARGS)
 
 	/* sumX */
 	numericvar_deserialize(&buf, &tmp_var);
-	accum_sum_add(&(result->sumX), &tmp_var);
+	accum_sum_add(&na_ext(result)->sumX, &tmp_var);
 
 	/* sumX2 */
 	numericvar_deserialize(&buf, &tmp_var);
-	accum_sum_add(&(result->sumX2), &tmp_var);
+	accum_sum_add(&na_ext(result)->sumX2, &tmp_var);
 
 	/* maxScale */
 	result->maxScale = pq_getmsgint(&buf, 4);
@@ -5951,14 +6076,11 @@ numeric_deserialize(PG_FUNCTION_ARGS)
 	/* maxScaleCount */
 	result->maxScaleCount = pq_getmsgint64(&buf);
 
-	/* NaNcount */
-	result->NaNcount = pq_getmsgint64(&buf);
-
-	/* pInfcount */
-	result->pInfcount = pq_getmsgint64(&buf);
-
-	/* nInfcount */
-	result->nInfcount = pq_getmsgint64(&buf);
+	/* NaNcount, pInfcount, nInfcount */
+	NaNcount = pq_getmsgint64(&buf);
+	pInfcount = pq_getmsgint64(&buf);
+	nInfcount = pq_getmsgint64(&buf);
+	na_set_counts(result, NaNcount, pInfcount, nInfcount);
 
 	pq_getmsgend(&buf);
 
@@ -6569,15 +6691,15 @@ numeric_avg(PG_FUNCTION_ARGS)
 	if (state == NULL || NA_TOTAL_COUNT(state) == 0)
 		PG_RETURN_NULL();
 
-	if (state->NaNcount > 0)	/* there was at least one NaN input */
+	if (NA_COUNT(state, NaNcount) > 0)	/* there was at least one NaN input */
 		PG_RETURN_NUMERIC(make_result(&const_nan));
 
 	/* adding plus and minus infinities gives NaN */
-	if (state->pInfcount > 0 && state->nInfcount > 0)
+	if (NA_COUNT(state, pInfcount) > 0 && NA_COUNT(state, nInfcount) > 0)
 		PG_RETURN_NUMERIC(make_result(&const_nan));
-	if (state->pInfcount > 0)
+	if (NA_COUNT(state, pInfcount) > 0)
 		PG_RETURN_NUMERIC(make_result(&const_pinf));
-	if (state->nInfcount > 0)
+	if (NA_COUNT(state, nInfcount) > 0)
 		PG_RETURN_NUMERIC(make_result(&const_ninf));
 
 	N_datum = NumericGetDatum(int64_to_numeric(state->N));
@@ -6590,7 +6712,7 @@ numeric_avg(PG_FUNCTION_ARGS)
 									&sumX_var);
 	}
 	else
-		accum_sum_final(&state->sumX, &sumX_var);
+		na_sum_final(state, false, &sumX_var);
 	sumX_datum = NumericGetDatum(make_result(&sumX_var));
 	free_var(&sumX_var);
 
@@ -6610,15 +6732,15 @@ numeric_sum(PG_FUNCTION_ARGS)
 	if (state == NULL || NA_TOTAL_COUNT(state) == 0)
 		PG_RETURN_NULL();
 
-	if (state->NaNcount > 0)	/* there was at least one NaN input */
+	if (NA_COUNT(state, NaNcount) > 0)	/* there was at least one NaN input */
 		PG_RETURN_NUMERIC(make_result(&const_nan));
 
 	/* adding plus and minus infinities gives NaN */
-	if (state->pInfcount > 0 && state->nInfcount > 0)
+	if (NA_COUNT(state, pInfcount) > 0 && NA_COUNT(state, nInfcount) > 0)
 		PG_RETURN_NUMERIC(make_result(&const_nan));
-	if (state->pInfcount > 0)
+	if (NA_COUNT(state, pInfcount) > 0)
 		PG_RETURN_NUMERIC(make_result(&const_pinf));
-	if (state->nInfcount > 0)
+	if (NA_COUNT(state, nInfcount) > 0)
 		PG_RETURN_NUMERIC(make_result(&const_ninf));
 
 	init_var(&sumX_var);
@@ -6629,7 +6751,7 @@ numeric_sum(PG_FUNCTION_ARGS)
 									&sumX_var);
 	}
 	else
-		accum_sum_final(&state->sumX, &sumX_var);
+		na_sum_final(state, false, &sumX_var);
 	result = make_result(&sumX_var);
 	free_var(&sumX_var);
 
@@ -6686,7 +6808,9 @@ numeric_stddev_internal(NumericAggState *state,
 	 * Deal with NaN and infinity cases.  By analogy to the behavior of the
 	 * float8 functions, any infinity input produces NaN output.
 	 */
-	if (state->NaNcount > 0 || state->pInfcount > 0 || state->nInfcount > 0)
+	if (NA_COUNT(state, NaNcount) > 0 ||
+		NA_COUNT(state, pInfcount) > 0 ||
+		NA_COUNT(state, nInfcount) > 0)
 		return make_result(&const_nan);
 
 	/* OK, normal calculation applies */
@@ -6695,8 +6819,8 @@ numeric_stddev_internal(NumericAggState *state,
 	init_var(&vsumX2);
 
 	int64_to_numericvar(state->N, &vN);
-	accum_sum_final(&(state->sumX), &vsumX);
-	accum_sum_final(&(state->sumX2), &vsumX2);
+	na_sum_final(state, false, &vsumX);
+	na_sum_final(state, true, &vsumX2);
 
 	init_var(&vNminus1);
 	sub_var(&vN, &const_one, &vNminus1);
@@ -6808,15 +6932,20 @@ numeric_poly_stddev_internal(Int128AggState *state,
 							 bool *is_null)
 {
 	NumericAggState numstate;
+	NumericAggStateExt numext;
 	Numeric		res;
 
 	/*
 	 * Initialize an empty agg state.  It holds a sum of squares, so like any
-	 * such state it is in the digit-array representation from the start.
+	 * such state it is in the digit-array representation from the start; its
+	 * out-of-line part is on the stack too.
 	 */
 	memset(&numstate, 0, sizeof(NumericAggState));
+	memset(&numext, 0, sizeof(NumericAggStateExt));
 	numstate.calcSumX2 = true;
 	numstate.promoted = true;
+	numstate.agg_context = CurrentMemoryContext;
+	numstate.ext = &numext;
 
 	if (state)
 	{
@@ -6827,25 +6956,25 @@ numeric_poly_stddev_internal(Int128AggState *state,
 		init_var(&tmp_var);
 
 		int128_to_numericvar(state->sumX, &tmp_var);
-		accum_sum_add(&numstate.sumX, &tmp_var);
+		accum_sum_add(&numext.sumX, &tmp_var);
 
 		int128_to_numericvar(state->sumX2, &tmp_var);
-		accum_sum_add(&numstate.sumX2, &tmp_var);
+		accum_sum_add(&numext.sumX2, &tmp_var);
 
 		free_var(&tmp_var);
 	}
 
 	res = numeric_stddev_internal(&numstate, variance, sample, is_null);
 
-	if (numstate.sumX.ndigits > 0)
+	if (numext.sumX.ndigits > 0)
 	{
-		pfree(numstate.sumX.pos_digits);
-		pfree(numstate.sumX.neg_digits);
+		pfree(numext.sumX.pos_digits);
+		pfree(numext.sumX.neg_digits);
 	}
-	if (numstate.sumX2.ndigits > 0)
+	if (numext.sumX2.ndigits > 0)
 	{
-		pfree(numstate.sumX2.pos_digits);
-		pfree(numstate.sumX2.neg_digits);
+		pfree(numext.sumX2.pos_digits);
+		pfree(numext.sumX2.neg_digits);
 	}
 
 	return res;
@@ -8698,7 +8827,7 @@ numericvar_to_int128_scaled(const NumericVar *var, int scale, INT128 *result)
 	shift = scale - (var->ndigits - var->weight - 1) * DEC_DIGITS;
 
 	/*
-	 * Int64 lane for the overwhelmingly common case: up to 4 stored digits
+	 * Int64 path for the overwhelmingly common case: up to 4 stored digits
 	 * (16 decimal digits) whose scaled coefficient provably fits int64. This
 	 * avoids all 128-bit multiplications on the per-row path.  The bounds
 	 * make every operation overflow-free by construction: 4 digits <= 10^16 -
@@ -8756,7 +8885,7 @@ numericvar_to_int128_scaled(const NumericVar *var, int scale, INT128 *result)
 #if USE_NATIVE_INT128
 
 	/*
-	 * Native int128 lane for wider values: coefficients of up to
+	 * Native int128 path for wider values: coefficients of up to
 	 * INT128_POW10_MAX decimal digits.  The width cap above keeps the result
 	 * below 10^INT128_POW10_MAX < 2^127, and no intermediate value exceeds
 	 * the result in magnitude, so no operation can overflow and no checked
