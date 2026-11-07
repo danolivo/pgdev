@@ -38,6 +38,7 @@
 #include <unistd.h>
 
 #include "access/tableam.h"
+#include "access/xact.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
 #ifdef USE_ASSERT_CHECKING
@@ -5036,6 +5037,12 @@ FlushRelationBuffers(Relation rel)
 	}
 }
 
+void
+FlushAllBuffers(void)
+{
+	FlushAllLocalBuffers();
+}
+
 /* ---------------------------------------------------------------------
  *		FlushRelationsAllBuffers
  *
@@ -5460,7 +5467,22 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 
 	if (BufferIsLocal(buffer))
 	{
-		MarkLocalBufferDirty(buffer);
+		/*
+		 * Marking a local buffer dirty causes it to be written back to disk
+		 * when evicted (see FlushLocalBuffer).  During a parallel section the
+		 * leader and each of its workers maintain a private local buffer pool
+		 * over the *same* on-disk file of a temporary relation.  A write-back
+		 * from any one participant would then race with the others reading the
+		 * file, leaving torn or otherwise invalid pages behind.
+		 *
+		 * A hint bit is only an optimization, and the caller has already
+		 * updated the page image, so it is safe to leave the buffer clean and
+		 * let the change be discarded when the buffer is evicted.  Hence skip
+		 * the dirty-marking while in a parallel section; the hint will be set
+		 * again, and persisted, by ordinary (non-parallel) accesses later.
+		 */
+		if (!IsInParallelMode())
+			MarkLocalBufferDirty(buffer);
 		return;
 	}
 
