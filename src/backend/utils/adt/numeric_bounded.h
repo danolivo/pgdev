@@ -32,6 +32,14 @@
  */
 #define NUMERIC_BOUNDED_MAX_PRECISION		28
 
+/*
+ * The highest precision either factor of a folded product may have.  Both
+ * mantissas go through int128_add_int64_mul_int64(), so each has to fit an
+ * int64.  The product itself obeys NUMERIC_BOUNDED_MAX_PRECISION, which
+ * numeric_agg_support() checks on p1 + p2.
+ */
+#define NUMERIC_BOUNDED_MAX_FACTOR_PRECISION	18
+
 /* What an input of a bounded aggregate turned out to be */
 typedef enum NumericBoundedKind
 {
@@ -48,6 +56,9 @@ struct NumericAggState;
 extern NumericBoundedKind numeric_bounded_classify(Datum value,
 												   int target_scale,
 												   INT128 *mantissa);
+extern NumericBoundedKind numeric_bounded_classify64(Datum value,
+													 int target_scale,
+													 int64 *mantissa);
 extern Numeric numeric_bounded_special(NumericBoundedKind kind);
 extern Numeric int128_div_fast_to_numeric(INT128 val1, int log10val2);
 extern struct NumericAggState *numeric_avg_state_from_sum(MemoryContext agg_context,

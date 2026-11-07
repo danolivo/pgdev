@@ -5936,14 +5936,17 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
         type modifier, or through addition, subtraction, multiplication,
         <function>round</function> or <function>trunc</function> of such
         values and constants &mdash; and the precision does not exceed 28.
-        Aggregates with
+        When the argument is a product, the multiplication is performed
+        inside the aggregate as well.  Aggregates with
         <literal>DISTINCT</literal>, <literal>ORDER BY</literal> or
         <literal>FILTER</literal> are not replaced, nor are window functions.
        </para>
        <para>
         The specialized aggregates appear in <command>EXPLAIN VERBOSE</command>
-        output as <function>bounded_numeric_sum</function> and
-        <function>bounded_numeric_avg</function>, with the derived scale as
+        output as <function>bounded_numeric_sum</function>,
+        <function>bounded_numeric_avg</function>,
+        <function>bounded_numeric_sum_mul</function> and
+        <function>bounded_numeric_avg_mul</function>, with the derived scale as
         an extra constant argument.  They are internal to the planner and not
         meant to be called directly.  Every input value is checked against
         the derived scale.  A value with digits beyond that scale or more
@@ -5963,8 +5966,10 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
         query.  Their privileges should therefore be kept the same as those of
         the built-in <function>sum</function> and <function>avg</function>
         aggregates: if <literal>EXECUTE</literal> on built-in functions is
-        restricted, grant it on <function>bounded_numeric_sum</function> and
-        <function>bounded_numeric_avg</function> to the same roles, or
+        restricted, grant it on <function>bounded_numeric_sum</function>,
+        <function>bounded_numeric_avg</function>,
+        <function>bounded_numeric_sum_mul</function> and
+        <function>bounded_numeric_avg_mul</function> to the same roles, or
         queries using <function>sum(numeric)</function> and
         <function>avg(numeric)</function> will fail with a permission error
         for a function they do not name.

@@ -12671,3 +12671,24 @@ numeric_bounded_const_bounds(Numeric num, int *precision, int *scale)
 
 	return true;
 }
+
+/*
+ * numeric_bounded_classify64
+ *		Like numeric_bounded_classify(), for a factor of a folded product: an
+ *		ordinary value must fit NUMERIC_BOUNDED_MAX_FACTOR_PRECISION digits,
+ *		and its mantissa is returned as an int64, which that many digits
+ *		always fit.
+ */
+NumericBoundedKind
+numeric_bounded_classify64(Datum value, int target_scale, int64 *mantissa)
+{
+	INT128		m;
+	NumericBoundedKind kind;
+
+	kind = bounded_numeric_kind_of(value, target_scale,
+								   NUMERIC_BOUNDED_MAX_FACTOR_PRECISION, &m);
+	if (kind == NUMERIC_BOUNDED_ORDINARY)
+		*mantissa = int128_to_int64(m);
+
+	return kind;
+}

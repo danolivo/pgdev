@@ -986,7 +986,9 @@ foreign_expr_walker(Node *node,
 				 * enable_bounded_numeric_agg off.
 				 */
 				if (agg->aggfnoid == F_BOUNDED_NUMERIC_SUM ||
-					agg->aggfnoid == F_BOUNDED_NUMERIC_AVG)
+					agg->aggfnoid == F_BOUNDED_NUMERIC_AVG ||
+					agg->aggfnoid == F_BOUNDED_NUMERIC_SUM_MUL ||
+					agg->aggfnoid == F_BOUNDED_NUMERIC_AVG_MUL)
 					return false;
 
 				/*

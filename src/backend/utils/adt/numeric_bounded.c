@@ -8,7 +8,10 @@
  * scale, numeric_agg_support() replaces the aggregate with
  * bounded_numeric_sum() or bounded_numeric_avg().  These take the scale as a
  * second, constant argument and accumulate every input as an integer
- * mantissa at that scale in an INT128.
+ * mantissa at that scale in an INT128.  When the argument is a product of two
+ * such values, the multiplication is folded into the transition function as
+ * well (bounded_numeric_sum_mul() / bounded_numeric_avg_mul()), so that no
+ * intermediate numeric is built at all.
  *
  * What this buys is cheaper accumulation and a smaller state.  Per row, an
  * input costs a short Horner loop over its few base-NBASE digits and one
@@ -113,6 +116,14 @@ typedef struct BoundedNumericAggState
 	int64		nInfcount;		/* count of -Inf values */
 	struct NumericAggState *fallback;	/* general state, after falling back */
 	int32		scale;			/* scale of sumX, 0 .. MAX_PRECISION */
+
+	/*
+	 * The scales of the two factors, for the product form only; zero in a
+	 * plain state.  They are kept here rather than read from the arguments on
+	 * every row, so that the arguments are looked at exactly once.
+	 */
+	int16		scale1;
+	int16		scale2;
 } BoundedNumericAggState;
 
 /*
@@ -128,6 +139,25 @@ StaticAssertDecl(sizeof(BoundedNumericAggState) > 32 &&
 
 #define BNA_TOTAL_COUNT(state) \
 	((state)->N + (state)->NaNcount + (state)->pInfcount + (state)->nInfcount)
+
+/*
+ * bounded_int128_within_max_precision
+ *		Is |v| < 10^NUMERIC_BOUNDED_MAX_PRECISION?
+ */
+static inline bool
+bounded_int128_within_max_precision(INT128 v)
+{
+	/* +-10^28, as two's complement halves */
+	const INT128 hi_bound = make_int128(INT64CONST(0x204FCE5E),
+										UINT64CONST(0x3E25026110000000));
+	const INT128 lo_bound = make_int128(-INT64CONST(0x204FCE5F),
+										UINT64CONST(0xC1DAFD9EF0000000));
+
+	StaticAssertStmt(NUMERIC_BOUNDED_MAX_PRECISION == 28,
+					 "bounds below are 10^28");
+
+	return int128_compare(v, hi_bound) < 0 && int128_compare(v, lo_bound) > 0;
+}
 
 /*
  * bounded_numeric_has_room
@@ -354,6 +384,166 @@ numeric_bounded_accum(PG_FUNCTION_ARGS)
 }
 
 /*
+ * bounded_numeric_product_kind
+ *		What the product of two classified factors is: an ordinary value, or
+ *		what numeric_mul() would produce if a special value is involved.
+ *
+ * Reproduces the rules at the top of numeric_mul_safe(): NaN wins over
+ * everything, infinity times zero is NaN, and otherwise an infinity takes
+ * the sign of the product.  A factor that does not fit makes the product
+ * NUMERIC_BOUNDED_NOFIT, and numeric_mul() decides it after the fallback.
+ */
+static NumericBoundedKind
+bounded_numeric_product_kind(NumericBoundedKind ka, int64 ma,
+							 NumericBoundedKind kb, int64 mb)
+{
+	int			sign;
+
+	if (ka == NUMERIC_BOUNDED_ORDINARY && kb == NUMERIC_BOUNDED_ORDINARY)
+		return NUMERIC_BOUNDED_ORDINARY;
+	if (ka == NUMERIC_BOUNDED_NOFIT || kb == NUMERIC_BOUNDED_NOFIT)
+		return NUMERIC_BOUNDED_NOFIT;
+	if (ka == NUMERIC_BOUNDED_NAN || kb == NUMERIC_BOUNDED_NAN)
+		return NUMERIC_BOUNDED_NAN;
+
+	if (ka != NUMERIC_BOUNDED_ORDINARY && kb != NUMERIC_BOUNDED_ORDINARY)
+		return ((ka == NUMERIC_BOUNDED_NINF) != (kb == NUMERIC_BOUNDED_NINF)) ?
+			NUMERIC_BOUNDED_NINF : NUMERIC_BOUNDED_PINF;
+
+	/* exactly one side is an infinity; the sign of the other decides */
+	if (ka == NUMERIC_BOUNDED_ORDINARY)
+	{
+		if (ma == 0)
+			return NUMERIC_BOUNDED_NAN;
+		sign = (ma < 0) ? -1 : 1;
+		if (kb == NUMERIC_BOUNDED_NINF)
+			sign = -sign;
+	}
+	else
+	{
+		if (mb == 0)
+			return NUMERIC_BOUNDED_NAN;
+		sign = (mb < 0) ? -1 : 1;
+		if (ka == NUMERIC_BOUNDED_NINF)
+			sign = -sign;
+	}
+
+	return (sign > 0) ? NUMERIC_BOUNDED_PINF : NUMERIC_BOUNDED_NINF;
+}
+
+/*
+ * numeric_bounded_accum_mul
+ *		Transition function of bounded_numeric_sum_mul() and
+ *		bounded_numeric_avg_mul(): (internal, numeric, numeric, int4, int4).
+ *
+ * This is where sum(a * b) stops paying for the multiplication.  Left alone,
+ * every row calls numeric_mul(), which allocates a digit buffer and a packed
+ * result that the transition function immediately unpacks again.  Here both
+ * mantissas are taken from the operands and the product is accumulated with
+ * int128_add_int64_mul_int64().
+ *
+ * The state's scale is s1 + s2, exactly the dscale numeric_mul() would have
+ * given the product.  The factor scales are taken from the state, not from
+ * this call's arguments, which are only read when the state is created.
+ *
+ * A factor that does not fit its scale or an int64, a product of more than
+ * NUMERIC_BOUNDED_MAX_PRECISION digits, or a full accumulator makes the state
+ * fall back; from then on the product is computed by numeric_mul() and
+ * accumulated by the general transition function.
+ */
+Datum
+numeric_bounded_accum_mul(PG_FUNCTION_ARGS)
+{
+	BoundedNumericAggState *state;
+	MemoryContext aggcontext;
+	Datum		product;
+
+	if (!AggCheckCallContext(fcinfo, &aggcontext))
+		elog(ERROR, "aggregate function called in non-aggregate context");
+
+	if (PG_ARGISNULL(0))
+	{
+		int32		s1 = bounded_numeric_scale_arg(fcinfo, 3);
+		int32		s2 = bounded_numeric_scale_arg(fcinfo, 4);
+
+		/* each is at most NUMERIC_BOUNDED_MAX_PRECISION, so no overflow */
+		if (s1 + s2 > NUMERIC_BOUNDED_MAX_PRECISION)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("scales %d and %d are out of range for a bounded numeric aggregate",
+							s1, s2),
+					 errdetail("The sum of the scales must not exceed %d.",
+							   NUMERIC_BOUNDED_MAX_PRECISION)));
+
+		state = makeBoundedNumericAggState(aggcontext, s1 + s2);
+		state->scale1 = (int16) s1;
+		state->scale2 = (int16) s2;
+	}
+	else
+		state = (BoundedNumericAggState *) PG_GETARG_POINTER(0);
+
+	/* a NULL on either side makes the product NULL, which sum() skips */
+	if (PG_ARGISNULL(1) || PG_ARGISNULL(2))
+		PG_RETURN_POINTER(state);
+
+	if (likely(state->fallback == NULL))
+	{
+		int64		ma = 0;
+		int64		mb = 0;
+		NumericBoundedKind ka;
+		NumericBoundedKind kb;
+
+		ka = numeric_bounded_classify64(PG_GETARG_DATUM(1), state->scale1, &ma);
+		kb = numeric_bounded_classify64(PG_GETARG_DATUM(2), state->scale2, &mb);
+
+		switch (bounded_numeric_product_kind(ka, ma, kb, mb))
+		{
+			case NUMERIC_BOUNDED_ORDINARY:
+				{
+					INT128		wide;
+
+					/*
+					 * numeric_agg_support() only folds factors whose
+					 * precisions add up to NUMERIC_BOUNDED_MAX_PRECISION or
+					 * less, which is what keeps every product below 10^28 as
+					 * the addend limit assumes.  A row source that breaks the
+					 * typmod carries no such guarantee, so check.
+					 */
+					wide = int64_to_int128(0);
+					int128_add_int64_mul_int64(&wide, ma, mb);
+					if (likely(bounded_numeric_has_room(state->N, 1) &&
+							   bounded_int128_within_max_precision(wide)))
+					{
+						int128_add_int128(&state->sumX, wide);
+						state->N++;
+						PG_RETURN_POINTER(state);
+					}
+				}
+				break;
+			case NUMERIC_BOUNDED_NAN:
+				state->NaNcount++;
+				PG_RETURN_POINTER(state);
+			case NUMERIC_BOUNDED_PINF:
+				state->pInfcount++;
+				PG_RETURN_POINTER(state);
+			case NUMERIC_BOUNDED_NINF:
+				state->nInfcount++;
+				PG_RETURN_POINTER(state);
+			case NUMERIC_BOUNDED_NOFIT:
+				break;
+		}
+
+		bounded_numeric_fall_back(state, aggcontext);
+	}
+
+	product = DirectFunctionCall2(numeric_mul,
+								  PG_GETARG_DATUM(1), PG_GETARG_DATUM(2));
+	bounded_numeric_fallback_accum(fcinfo, state, product);
+
+	PG_RETURN_POINTER(state);
+}
+
+/*
  * numeric_bounded_combine
  *		Combine function of all the bounded aggregates.
  *
@@ -464,6 +654,8 @@ numeric_bounded_serialize(PG_FUNCTION_ARGS)
 
 	pq_sendbyte(&buf, state->fallback != NULL ? 1 : 0);
 	pq_sendint32(&buf, state->scale);
+	pq_sendint16(&buf, state->scale1);
+	pq_sendint16(&buf, state->scale2);
 
 	if (state->fallback == NULL)
 	{
@@ -504,6 +696,8 @@ numeric_bounded_deserialize(PG_FUNCTION_ARGS)
 	StringInfoData buf;
 	int			kind;
 	int32		scale;
+	int16		scale1;
+	int16		scale2;
 
 	if (!AggCheckCallContext(fcinfo, &aggcontext))
 		elog(ERROR, "aggregate function called in non-aggregate context");
@@ -519,11 +713,17 @@ numeric_bounded_deserialize(PG_FUNCTION_ARGS)
 	 */
 	kind = pq_getmsgbyte(&buf);
 	scale = pq_getmsgint(&buf, 4);
+	scale1 = (int16) pq_getmsgint(&buf, 2);
+	scale2 = (int16) pq_getmsgint(&buf, 2);
 	if ((kind != 0 && kind != 1) ||
-		scale < 0 || scale > NUMERIC_BOUNDED_MAX_PRECISION)
+		scale < 0 || scale > NUMERIC_BOUNDED_MAX_PRECISION ||
+		scale1 < 0 || scale2 < 0 ||
+		(scale1 + scale2 != 0 && scale1 + scale2 != scale))
 		elog(ERROR, "invalid header in serialized bounded numeric aggregate state");
 
 	result = makeBoundedNumericAggState(aggcontext, scale);
+	result->scale1 = scale1;
+	result->scale2 = scale2;
 
 	if (kind == 0)
 	{
@@ -609,7 +809,7 @@ bounded_numeric_special_result(BoundedNumericAggState *state,
 
 /*
  * numeric_bounded_sum
- *		Final function of bounded_numeric_sum().
+ *		Final function of bounded_numeric_sum() and bounded_numeric_sum_mul().
  *
  * The result has dscale equal to the state's scale, which is what
  * numeric_sum() yields for the same inputs.
@@ -646,7 +846,7 @@ numeric_bounded_sum(PG_FUNCTION_ARGS)
 
 /*
  * numeric_bounded_avg
- *		Final function of bounded_numeric_avg().
+ *		Final function of bounded_numeric_avg() and bounded_numeric_avg_mul().
  *
  * This is numeric_avg() with our sum in place of its own.  Since the sum has
  * the same value and the same dscale as core's, select_div_scale() picks the
@@ -892,6 +1092,29 @@ bounded_numeric_derive(Node *node, int depth, int *p, int *s)
 }
 
 /*
+ * bounded_numeric_product
+ *		The argument as a numeric multiplication, or NULL if it is not one.
+ */
+static OpExpr *
+bounded_numeric_product(Node *node)
+{
+	OpExpr	   *op;
+
+	while (IsA(node, RelabelType))
+		node = (Node *) ((RelabelType *) node)->arg;
+
+	if (!IsA(node, OpExpr))
+		return NULL;
+
+	op = (OpExpr *) node;
+	if (list_length(op->args) != 2 ||
+		bounded_numeric_opfunc(op) != F_NUMERIC_MUL)
+		return NULL;
+
+	return op;
+}
+
+/*
  * bounded_numeric_scale_tle
  *		An int4 constant scale argument for the rewritten Aggref.
  */
@@ -949,9 +1172,14 @@ numeric_agg_support(PG_FUNCTION_ARGS)
 	Aggref	   *agg;
 	Aggref	   *newagg;
 	TargetEntry *tle;
+	OpExpr	   *prod;
 	bool		is_sum;
 	int			p,
-				s;
+				s,
+				p1,
+				s1,
+				p2,
+				s2;
 
 	if (!IsA(rawreq, SupportRequestSimplifyAggref))
 		PG_RETURN_POINTER(NULL);
@@ -982,7 +1210,54 @@ numeric_agg_support(PG_FUNCTION_ARGS)
 
 	tle = linitial_node(TargetEntry, agg->args);
 
-	if (!bounded_numeric_derive((Node *) tle->expr, 0, &p, &s))
+	/*
+	 * A product is looked at first, so that its factors are derived only
+	 * once: if each fits an int64 mantissa and together they fit
+	 * NUMERIC_BOUNDED_MAX_PRECISION, the multiplication is folded into the
+	 * transition function as well.  Otherwise the bounds of the product are
+	 * exactly what bounded_numeric_derive() would compute for it, and only
+	 * the accumulation is specialized.
+	 *
+	 * The factors need not be columns; each goes through
+	 * bounded_numeric_derive() like any other argument.
+	 */
+	prod = bounded_numeric_product((Node *) tle->expr);
+	if (prod != NULL)
+	{
+		Node	   *lhs = (Node *) linitial(prod->args);
+		Node	   *rhs = (Node *) lsecond(prod->args);
+
+		if (!bounded_numeric_derive(lhs, 1, &p1, &s1) ||
+			!bounded_numeric_derive(rhs, 1, &p2, &s2))
+			PG_RETURN_POINTER(NULL);
+
+		if (p1 <= NUMERIC_BOUNDED_MAX_FACTOR_PRECISION &&
+			p2 <= NUMERIC_BOUNDED_MAX_FACTOR_PRECISION &&
+			p1 + p2 <= NUMERIC_BOUNDED_MAX_PRECISION)
+		{
+			/* a flat copy, sharing the factors; see below */
+			newagg = makeNode(Aggref);
+			memcpy(newagg, agg, sizeof(Aggref));
+			newagg->aggfnoid = is_sum ? F_BOUNDED_NUMERIC_SUM_MUL :
+				F_BOUNDED_NUMERIC_AVG_MUL;
+			newagg->args = list_make4(makeTargetEntry((Expr *) lhs,
+													  1, NULL, false),
+									  makeTargetEntry((Expr *) rhs,
+													  2, NULL, false),
+									  bounded_numeric_scale_tle(s1, 3),
+									  bounded_numeric_scale_tle(s2, 4));
+			newagg->aggargtypes = list_make4_oid(NUMERICOID, NUMERICOID,
+												 INT4OID, INT4OID);
+
+			PG_RETURN_POINTER(newagg);
+		}
+
+		p = p1 + p2;
+		s = s1 + s2;
+		if (p > NUMERIC_BOUNDED_MAX_PRECISION)
+			PG_RETURN_POINTER(NULL);
+	}
+	else if (!bounded_numeric_derive((Node *) tle->expr, 0, &p, &s))
 		PG_RETURN_POINTER(NULL);
 
 	Assert(p >= 1 && p <= NUMERIC_BOUNDED_MAX_PRECISION && s >= 0 && s <= p);

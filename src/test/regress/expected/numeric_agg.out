@@ -2,11 +2,16 @@
 -- Bounded sum() and avg() over numeric
 --
 -- numeric_agg_support() replaces sum(numeric) and avg(numeric) with
--- bounded_numeric_sum()/bounded_numeric_avg() if the argument's precision and
--- scale can be derived at plan time and the precision is at most 28.  The
+-- bounded_numeric_sum()/bounded_numeric_avg() (or their _mul forms, when the
+-- argument is a product) if the argument's precision and scale can be
+-- derived at plan time and the precision is at most 28.  The
 -- answer must always be that of sum() and avg(), dscale included.
 --
 -- invalid scale arguments
+SELECT bounded_numeric_sum_mul(x, y, 20, 20)
+  FROM (VALUES (1.00::numeric, 2.00)) t(x, y);
+ERROR:  scales 20 and 20 are out of range for a bounded numeric aggregate
+DETAIL:  The sum of the scales must not exceed 28.
 SELECT bounded_numeric_sum(v, NULL::int4) FROM (VALUES (1.00::numeric)) x(v);
 ERROR:  scale argument of a bounded numeric aggregate must not be null
 -- the scale must be a constant: it is read only when a state is created
@@ -499,6 +504,246 @@ EXPLAIN (verbose, costs off) SELECT sum(a * v) FROM t_ab, t_plain;
                      Output: t_ab.a
 (10 rows)
 
+--
+-- A product at the top of the argument is folded into the transition
+-- function.  Each factor goes through the same derivation and must fit 18
+-- digits; together they must fit 28.
+--
+CREATE TABLE t_mul (grp int, a numeric(10,2), b numeric(8,4),
+					d numeric(20,2), e numeric(6,2));
+EXPLAIN (verbose, costs off) SELECT sum(a * b) FROM t_mul;
+                  QUERY PLAN                   
+-----------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum_mul(a, b, 2, 4)
+   ->  Seq Scan on public.t_mul
+         Output: grp, a, b, d, e
+(4 rows)
+
+EXPLAIN (verbose, costs off) SELECT avg(a * b) FROM t_mul;
+                  QUERY PLAN                   
+-----------------------------------------------
+ Aggregate
+   Output: bounded_numeric_avg_mul(a, b, 2, 4)
+   ->  Seq Scan on public.t_mul
+         Output: grp, a, b, d, e
+(4 rows)
+
+EXPLAIN (verbose, costs off) SELECT sum((a + 1) * b) FROM t_mul;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum_mul((a + '1'::numeric), b, 2, 4)
+   ->  Seq Scan on public.t_mul
+         Output: grp, a, b, d, e
+(4 rows)
+
+EXPLAIN (verbose, costs off) SELECT sum(a * 1.2) FROM t_mul;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum_mul(a, 1.2, 2, 1)
+   ->  Seq Scan on public.t_mul
+         Output: grp, a, b, d, e
+(4 rows)
+
+EXPLAIN (verbose, costs off) SELECT sum(round(a, 1) * b) FROM t_mul;
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum_mul(round(a, 1), b, 1, 4)
+   ->  Seq Scan on public.t_mul
+         Output: grp, a, b, d, e
+(4 rows)
+
+-- a cast inside the product
+EXPLAIN (verbose, costs off) SELECT sum(a * d::numeric(14,4)) FROM t_mul;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum_mul(a, (d)::numeric(14,4), 2, 4)
+   ->  Seq Scan on public.t_mul
+         Output: grp, a, b, d, e
+(4 rows)
+
+-- the product is not at the top: only the accumulation is specialized
+EXPLAIN (verbose, costs off) SELECT sum(a * b + a) FROM t_mul;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum(((a * b) + a), 6)
+   ->  Seq Scan on public.t_mul
+         Output: grp, a, b, d, e
+(4 rows)
+
+-- a factor wider than 18 digits: only the accumulation is specialized
+EXPLAIN (verbose, costs off) SELECT sum(d * e) FROM t_mul;
+                QUERY PLAN                 
+-------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum((d * e), 4)
+   ->  Seq Scan on public.t_mul
+         Output: grp, a, b, d, e
+(4 rows)
+
+-- nesting: the inner product becomes the left factor
+EXPLAIN (verbose, costs off) SELECT sum(a * b * a) FROM t_mul;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum_mul((a * b), a, 6, 2)
+   ->  Seq Scan on public.t_mul
+         Output: grp, a, b, d, e
+(4 rows)
+
+-- one more digit and nothing fits any more
+EXPLAIN (verbose, costs off) SELECT sum(a * b * d) FROM t_mul;
+           QUERY PLAN            
+---------------------------------
+ Aggregate
+   Output: sum(((a * b) * d))
+   ->  Seq Scan on public.t_mul
+         Output: grp, a, b, d, e
+(4 rows)
+
+INSERT INTO t_mul VALUES
+	(1,  1.25,  3.1234,  1.00,  1.00),
+	(1, -0.10,  0.0001, -2.50,  3.00),
+	(1,  0.00,  9999.9999, 0.00, 0.00),
+	(2,  99999999.99,  9999.9999,  999999999999999999.99,  9999.99),
+	(2, -99999999.99, -9999.9999, -999999999999999999.99, -9999.99),
+	(3,  0.01,  0.0001, 0.01, 0.01),
+	(3,  NULL,  1.0000, NULL, 1.00),
+	(3,  1.00,  NULL,   1.00, NULL),
+	(4, 'NaN', 1.0000, 'NaN', 1.00),
+	(4,  2.00, 3.0000,  2.00, 3.00);
+SET enable_bounded_numeric_agg = off;
+CREATE TABLE t_mulref AS
+	SELECT grp,
+		   sum(a * b)::text          AS s1,
+		   avg(a * b)::text          AS s2,
+		   sum((a + 1) * b)::text    AS s3,
+		   sum(a * 1.2)::text        AS s4,
+		   sum(round(a, 1) * b)::text AS s5,
+		   sum(a * b + a)::text      AS s6,
+		   sum(d * e)::text          AS s7,
+		   sum(a * b * a)::text      AS s8
+	FROM t_mul GROUP BY grp;
+RESET enable_bounded_numeric_agg;
+SELECT count(*) AS mul_mismatches
+FROM t_mulref r
+FULL JOIN (
+	SELECT grp,
+		   sum(a * b)::text          AS s1,
+		   avg(a * b)::text          AS s2,
+		   sum((a + 1) * b)::text    AS s3,
+		   sum(a * 1.2)::text        AS s4,
+		   sum(round(a, 1) * b)::text AS s5,
+		   sum(a * b + a)::text      AS s6,
+		   sum(d * e)::text          AS s7,
+		   sum(a * b * a)::text      AS s8
+	FROM t_mul GROUP BY grp) x USING (grp)
+WHERE (r.s1, r.s2, r.s3, r.s4, r.s5, r.s6, r.s7, r.s8)
+	  IS DISTINCT FROM (x.s1, x.s2, x.s3, x.s4, x.s5, x.s6, x.s7, x.s8);
+ mul_mismatches 
+----------------
+              0
+(1 row)
+
+SELECT grp, sum(a * b), avg(a * b) FROM t_mul GROUP BY grp ORDER BY grp;
+ grp |         sum          |            avg             
+-----+----------------------+----------------------------
+   1 |             3.904240 |     1.30141333333333333333
+   2 | 1999999979800.000002 |      999999989900.00000100
+   3 |             0.000001 | 0.000001000000000000000000
+   4 |                  NaN |                        NaN
+(4 rows)
+
+-- Special values in a product.  A numeric(p,s) column cannot hold an
+-- infinity, so these are reachable only by calling the aggregate directly,
+-- but numeric_mul()'s rules must be reproduced all the same.
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
+  FROM (VALUES ('Infinity'::numeric, 2.00)) t(x, y);
+ bounded_numeric_sum_mul 
+-------------------------
+                Infinity
+(1 row)
+
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
+  FROM (VALUES ('Infinity'::numeric, -2.00)) t(x, y);
+ bounded_numeric_sum_mul 
+-------------------------
+               -Infinity
+(1 row)
+
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
+  FROM (VALUES ('Infinity'::numeric, 0.00)) t(x, y);
+ bounded_numeric_sum_mul 
+-------------------------
+                     NaN
+(1 row)
+
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
+  FROM (VALUES ('-Infinity'::numeric, '-Infinity'::numeric)) t(x, y);
+ bounded_numeric_sum_mul 
+-------------------------
+                Infinity
+(1 row)
+
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
+  FROM (VALUES ('-Infinity'::numeric, 'Infinity'::numeric)) t(x, y);
+ bounded_numeric_sum_mul 
+-------------------------
+               -Infinity
+(1 row)
+
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
+  FROM (VALUES ('NaN'::numeric, 'Infinity'::numeric)) t(x, y);
+ bounded_numeric_sum_mul 
+-------------------------
+                     NaN
+(1 row)
+
+SELECT bounded_numeric_sum_mul(x, y, 2, 2)
+  FROM (VALUES (NULL::numeric, 2.00)) t(x, y);
+ bounded_numeric_sum_mul 
+-------------------------
+                        
+(1 row)
+
+-- Factors that do not fit the scales they were specialized on, or a product
+-- wider than 28 digits, make the state fall back; the answer is that of
+-- sum(x * y).
+SELECT bounded_numeric_sum_mul(x, y, 2, 2), sum(x * y)
+  FROM (VALUES (1.234::numeric, 2.00)) t(x, y);
+ bounded_numeric_sum_mul |   sum   
+-------------------------+---------
+                 2.46800 | 2.46800
+(1 row)
+
+SELECT bounded_numeric_sum_mul(x, y, 2, 2), sum(x * y)
+  FROM (VALUES (1e20::numeric, 2.00)) t(x, y);
+ bounded_numeric_sum_mul  |           sum            
+--------------------------+--------------------------
+ 200000000000000000000.00 | 200000000000000000000.00
+(1 row)
+
+SELECT bounded_numeric_sum_mul(x, y, 0, 0), sum(x * y)
+  FROM (VALUES (1e15::numeric, 1e15::numeric)) t(x, y);
+     bounded_numeric_sum_mul     |               sum               
+---------------------------------+---------------------------------
+ 1000000000000000000000000000000 | 1000000000000000000000000000000
+(1 row)
+
+SELECT bounded_numeric_sum_mul(x, y, 2, 2), sum(x * y),
+	   bounded_numeric_avg_mul(x, y, 2, 2), avg(x * y)
+  FROM (VALUES (1.25::numeric, 2.00), (-0.50, 3.00), (1.234, 2.00),
+			   (0.10, 0.10)) t(x, y);
+ bounded_numeric_sum_mul |   sum   | bounded_numeric_avg_mul |          avg           
+-------------------------+---------+-------------------------+------------------------
+                 3.47800 | 3.47800 |  0.86950000000000000000 | 0.86950000000000000000
+(1 row)
+
 -- the values have to match the general aggregate exactly, dscale included
 INSERT INTO t_ab VALUES (1.25, 3.1234, 7.0123456789),
 						(-0.10, 0.0001, -1.0000000001),
@@ -914,6 +1159,7 @@ ANALYZE t_big;
 SET enable_bounded_numeric_agg = off;
 SELECT sum(v)::text AS bigref, sum(w)::text AS bigwref,
 	   avg(w)::text AS bigavgref FROM t_big \gset
+SELECT sum(a * b)::text AS mulref FROM t_mul \gset
 RESET enable_bounded_numeric_agg;
 SET max_parallel_workers_per_gather = 4;
 SET parallel_setup_cost = 0;
@@ -936,6 +1182,12 @@ FROM t_big;
  big_parallel | wide_parallel | avg_parallel 
 --------------+---------------+--------------
  t            | t             | t
+(1 row)
+
+SELECT sum(a * b)::text = :'mulref' AS mul_parallel FROM t_mul;
+ mul_parallel 
+--------------
+ t
 (1 row)
 
 RESET max_parallel_workers_per_gather;
@@ -992,6 +1244,6 @@ RESET enable_bounded_numeric_agg;
 DEALLOCATE pavg;
 RESET plan_cache_mode;
 DROP TABLE t_ok, t_wide, t_w28, t_w29, t_plain, t_int0, t_frac, t_dom, t_dom2,
-		   t_bulk, t_ref, t_big, t_ab;
+		   t_bulk, t_ref, t_big, t_ab, t_mul, t_mulref;
 DROP DOMAIN money18_2;
 DROP DOMAIN money18;

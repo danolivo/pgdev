@@ -13460,10 +13460,10 @@ CREATE FOREIGN TABLE bna_ft (g int, v numeric(10,2))
 INSERT INTO bna_local VALUES (1, 1.25), (1, 2.50), (2, -0.75);
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT g, sum(v), avg(v), sum(v * v) FROM bna_ft GROUP BY g ORDER BY g;
-                                   QUERY PLAN                                    
----------------------------------------------------------------------------------
+                                               QUERY PLAN                                               
+--------------------------------------------------------------------------------------------------------
  GroupAggregate
-   Output: g, bounded_numeric_sum(v, 2), bounded_numeric_avg(v, 2), sum((v * v))
+   Output: g, bounded_numeric_sum(v, 2), bounded_numeric_avg(v, 2), bounded_numeric_sum_mul(v, v, 2, 2)
    Group Key: bna_ft.g
    ->  Foreign Scan on public.bna_ft
          Output: g, v
