@@ -1834,6 +1834,7 @@ NullableDatum
 NullingRelsMatch
 Numeric
 NumericAggState
+NumericAggStateExt
 NumericDigit
 NumericSortSupport
 NumericSumAccum
