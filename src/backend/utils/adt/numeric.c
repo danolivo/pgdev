@@ -12644,3 +12644,30 @@ numeric_bounded_typmod(int32 typmod, int *precision, int *scale)
 	*scale = numeric_typmod_scale(typmod);
 	return true;
 }
+
+/*
+ * numeric_bounded_const_bounds
+ *		Exact precision and scale of a numeric value; false for NaN and the
+ *		infinities.
+ *
+ * The scale is the value's dscale; the precision counts the significant
+ * integer digits on top of it, so 0.05 needs numeric(2,2) and 120 needs
+ * numeric(3,0).
+ */
+bool
+numeric_bounded_const_bounds(Numeric num, int *precision, int *scale)
+{
+	int			intlen = 0;
+
+	if (NUMERIC_IS_SPECIAL(num))
+		return false;
+
+	if (NUMERIC_NDIGITS(num) > 0 && NUMERIC_WEIGHT(num) >= 0)
+		intlen = bounded_decimal_len(NUMERIC_DIGITS(num)[0]) +
+			DEC_DIGITS * NUMERIC_WEIGHT(num);
+
+	*scale = NUMERIC_DSCALE(num);
+	*precision = Max(intlen + *scale, 1);
+
+	return true;
+}

@@ -311,15 +311,15 @@ EXPLAIN (verbose, costs off)
          Output: v
 (4 rows)
 
--- A PREPARE parameter carries no typmod, and neither does the Const it is
--- folded to in a custom plan; in a generic plan the Param survives.  Either
--- way nothing is substituted.
+-- A PREPARE parameter carries no typmod.  In a custom plan it is folded to a
+-- Const before the support function sees it, and the constant's own digits
+-- decide; in a generic plan the Param survives and nothing is substituted.
 PREPARE pparam (numeric(18,2)) AS SELECT sum(x) FROM (VALUES ($1)) t(x);
 EXPLAIN (verbose, costs off) EXECUTE pparam ('1.00');
-     QUERY PLAN      
----------------------
+               QUERY PLAN               
+----------------------------------------
  Aggregate
-   Output: sum(1.00)
+   Output: bounded_numeric_sum(1.00, 2)
    ->  Result
 (3 rows)
 
@@ -346,6 +346,206 @@ EXECUTE pparam ('1.23456');
 
 RESET plan_cache_mode;
 DEALLOCATE pparam;
+--
+-- Arithmetic arguments.  A product has scale s1+s2 and at most p1+p2 digits,
+-- a sum or difference has scale max(s1,s2) and at most
+-- max(p1-s1,p2-s2)+1+max(s1,s2).  Division is never derived.
+--
+CREATE TABLE t_ab (a numeric(10,2), b numeric(12,4), c numeric(20,10));
+EXPLAIN (verbose, costs off) SELECT sum(a + b) FROM t_ab;
+                QUERY PLAN                 
+-------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum((a + b), 4)
+   ->  Seq Scan on public.t_ab
+         Output: a, b, c
+(4 rows)
+
+EXPLAIN (verbose, costs off) SELECT sum(a - b) FROM t_ab;
+                QUERY PLAN                 
+-------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum((a - b), 4)
+   ->  Seq Scan on public.t_ab
+         Output: a, b, c
+(4 rows)
+
+EXPLAIN (verbose, costs off) SELECT sum(-a) FROM t_ab;
+               QUERY PLAN                
+-----------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum((- a), 2)
+   ->  Seq Scan on public.t_ab
+         Output: a, b, c
+(4 rows)
+
+-- (a * b) + a is 22 digits at scale 6, then max(16,8)+1+6 = 23
+EXPLAIN (verbose, costs off) SELECT sum(a * b + a) FROM t_ab;
+                   QUERY PLAN                    
+-------------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum(((a * b) + a), 6)
+   ->  Seq Scan on public.t_ab
+         Output: a, b, c
+(4 rows)
+
+-- constants carry no typmod, so their digits are counted from the value
+EXPLAIN (verbose, costs off) SELECT sum(a - 1) FROM t_ab;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum((a - '1'::numeric), 2)
+   ->  Seq Scan on public.t_ab
+         Output: a, b, c
+(4 rows)
+
+EXPLAIN (verbose, costs off) SELECT sum(a + 0.05) FROM t_ab;
+                  QUERY PLAN                  
+----------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum((a + 0.05), 2)
+   ->  Seq Scan on public.t_ab
+         Output: a, b, c
+(4 rows)
+
+-- round() and trunc() with a constant scale
+EXPLAIN (verbose, costs off) SELECT sum(round(a * b, 2)) FROM t_ab;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum(round((a * b), 2), 2)
+   ->  Seq Scan on public.t_ab
+         Output: a, b, c
+(4 rows)
+
+EXPLAIN (verbose, costs off) SELECT sum(trunc(a * b, 2)) FROM t_ab;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum(trunc((a * b), 2), 2)
+   ->  Seq Scan on public.t_ab
+         Output: a, b, c
+(4 rows)
+
+EXPLAIN (verbose, costs off) SELECT sum(round(a * b)) FROM t_ab;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum(round((a * b), 0), 0)
+   ->  Seq Scan on public.t_ab
+         Output: a, b, c
+(4 rows)
+
+EXPLAIN (verbose, costs off) SELECT sum(round(a, -1)) FROM t_ab;
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Aggregate
+   Output: bounded_numeric_sum(round(a, '-1'::integer), 0)
+   ->  Seq Scan on public.t_ab
+         Output: a, b, c
+(4 rows)
+
+-- a non-constant scale is not known at plan time
+EXPLAIN (verbose, costs off)
+  SELECT sum(round(a, g)) FROM t_ab, generate_series(1,2) g;
+                        QUERY PLAN                         
+-----------------------------------------------------------
+ Aggregate
+   Output: sum(round(t_ab.a, g.g))
+   ->  Nested Loop
+         Output: t_ab.a, g.g
+         ->  Function Scan on pg_catalog.generate_series g
+               Output: g.g
+               Function Call: generate_series(1, 2)
+         ->  Materialize
+               Output: t_ab.a
+               ->  Seq Scan on public.t_ab
+                     Output: t_ab.a
+(11 rows)
+
+-- 10 + 20 = 30 > 28: too wide
+EXPLAIN (verbose, costs off) SELECT sum(a * c) FROM t_ab;
+          QUERY PLAN           
+-------------------------------
+ Aggregate
+   Output: sum((a * c))
+   ->  Seq Scan on public.t_ab
+         Output: a, b, c
+(4 rows)
+
+-- division is never derived
+EXPLAIN (verbose, costs off) SELECT sum(a / b) FROM t_ab;
+          QUERY PLAN           
+-------------------------------
+ Aggregate
+   Output: sum((a / b))
+   ->  Seq Scan on public.t_ab
+         Output: a, b, c
+(4 rows)
+
+-- neither is an unbounded operand
+EXPLAIN (verbose, costs off) SELECT sum(a * v) FROM t_ab, t_plain;
+                QUERY PLAN                 
+-------------------------------------------
+ Aggregate
+   Output: sum((t_ab.a * t_plain.v))
+   ->  Nested Loop
+         Output: t_ab.a, t_plain.v
+         ->  Seq Scan on public.t_plain
+               Output: t_plain.v
+         ->  Materialize
+               Output: t_ab.a
+               ->  Seq Scan on public.t_ab
+                     Output: t_ab.a
+(10 rows)
+
+-- the values have to match the general aggregate exactly, dscale included
+INSERT INTO t_ab VALUES (1.25, 3.1234, 7.0123456789),
+						(-0.10, 0.0001, -1.0000000001),
+						(99999999.99, 99999999.9999, 1234567890.0123456789);
+SET enable_bounded_numeric_agg = off;
+SELECT sum(a * b)::text AS r1, sum(a + b)::text AS r2, sum(a - b)::text AS r3,
+	   sum(-a)::text AS r4, sum(a * b + a)::text AS r5,
+	   sum(a * 1.2)::text AS r6, sum(a - 1)::text AS r7,
+	   sum(a * 0.05)::text AS r8,
+	   sum(a * c::numeric(14,4))::text AS r9,
+	   sum(round(a * b, 2))::text AS r10,
+	   sum(trunc(a * b, 2))::text AS r11,
+	   sum(round(a * b))::text AS r12,
+	   sum(round(a, -1))::text AS r13 FROM t_ab \gset
+RESET enable_bounded_numeric_agg;
+SELECT sum(a * b)::text = :'r1' AS mul,
+	   sum(a + b)::text = :'r2' AS add,
+	   sum(a - b)::text = :'r3' AS sub,
+	   sum(-a)::text = :'r4' AS neg,
+	   sum(a * b + a)::text = :'r5' AS nested,
+	   sum(a * 1.2)::text = :'r6' AS const_mul,
+	   sum(a - 1)::text = :'r7' AS const_sub,
+	   sum(a * 0.05)::text = :'r8' AS const_small
+FROM t_ab;
+ mul | add | sub | neg | nested | const_mul | const_sub | const_small 
+-----+-----+-----+-----+--------+-----------+-----------+-------------
+ t   | t   | t   | t   | t      | t         | t         | t
+(1 row)
+
+SELECT sum(a * c::numeric(14,4))::text = :'r9' AS cast_mul,
+	   sum(round(a * b, 2))::text = :'r10' AS rounded,
+	   sum(trunc(a * b, 2))::text = :'r11' AS truncated,
+	   sum(round(a * b))::text = :'r12' AS rounded0,
+	   sum(round(a, -1))::text = :'r13' AS rounded_neg
+FROM t_ab;
+ cast_mul | rounded | truncated | rounded0 | rounded_neg 
+----------+---------+-----------+----------+-------------
+ t        | t       | t         | t        | t
+(1 row)
+
+-- rounding that carries into an extra integer digit: round(9.99, 1) is 10.0
+SELECT sum(round(v, 1))::text FROM (VALUES ('9.99'::numeric(3,2))) x(v);
+ sum  
+------
+ 10.0
+(1 row)
+
 -- a plpgsql variable carries a typmod and is coerced on assignment
 CREATE FUNCTION bna_plpgsql_probe() RETURNS numeric LANGUAGE plpgsql AS $$
 DECLARE
@@ -372,6 +572,15 @@ EXPLAIN (verbose, costs off) SELECT avg(v) FROM t_ok;
    Output: bounded_numeric_avg(v, 2)
    ->  Seq Scan on public.t_ok
          Output: v
+(4 rows)
+
+EXPLAIN (verbose, costs off) SELECT avg(a + b) FROM t_ab;
+                QUERY PLAN                 
+-------------------------------------------
+ Aggregate
+   Output: bounded_numeric_avg((a + b), 4)
+   ->  Seq Scan on public.t_ab
+         Output: a, b, c
 (4 rows)
 
 EXPLAIN (verbose, costs off) SELECT avg(v) FROM t_w29;
@@ -783,6 +992,6 @@ RESET enable_bounded_numeric_agg;
 DEALLOCATE pavg;
 RESET plan_cache_mode;
 DROP TABLE t_ok, t_wide, t_w28, t_w29, t_plain, t_int0, t_frac, t_dom, t_dom2,
-		   t_bulk, t_ref, t_big;
+		   t_bulk, t_ref, t_big, t_ab;
 DROP DOMAIN money18_2;
 DROP DOMAIN money18;

@@ -698,6 +698,9 @@ numeric_bounded_avg(PG_FUNCTION_ARGS)
  * ----------------------------------------------------------------------
  */
 
+/* bound on the recursion of bounded_numeric_derive() */
+#define NUMERIC_BOUNDED_MAX_DERIVE_DEPTH	8
+
 /*
  * bounded_numeric_typmod
  *		The expression's numeric typmod, or -1.
@@ -727,29 +730,165 @@ bounded_numeric_typmod(Node *node)
 }
 
 /*
- * bounded_numeric_derive
- *		Precision and scale of the aggregate's argument.
+ * bounded_numeric_const_bounds
+ *		Exact precision and scale of a numeric constant.
  *
- * They come from the argument's declared typmod: a column, a cast, a CASE,
- * a domain.  The scale has to be exact, because it becomes the dscale of the
- * result.  A value that does not honor it is caught by the transition
- * functions, which check every value against the scale they were
- * specialized on.
+ * A numeric Const carries no typmod, so without this a single literal would
+ * sink the derivation of sum(qty * 1.2).  The scale is the value's dscale;
+ * the precision counts the significant integer digits on top of it, so 0.05
+ * needs numeric(2,2) and 120 needs numeric(3,0).
  */
 static bool
-bounded_numeric_derive(Node *node, int *p, int *s)
+bounded_numeric_const_bounds(Const *con, int *p, int *s)
+{
+	if (con->constisnull || con->consttype != NUMERICOID)
+		return false;
+
+	return numeric_bounded_const_bounds(DatumGetNumeric(con->constvalue), p, s);
+}
+
+/*
+ * bounded_numeric_opfunc
+ *		The function implementing an operator.
+ *
+ * eval_const_expressions() has normally filled in opfuncid already, since
+ * it simplifies an Aggref's arguments before it calls the support function,
+ * so this saves a syscache lookup per operator.
+ */
+static inline Oid
+bounded_numeric_opfunc(OpExpr *op)
+{
+	return OidIsValid(op->opfuncid) ? op->opfuncid : get_opcode(op->opno);
+}
+
+/*
+ * bounded_numeric_derive
+ *		Precision and scale of an arithmetic expression over numeric.
+ *
+ * exprTypmod() gives up on an OpExpr, so without this sum(a * b) and
+ * sum(a - b) would never be specialized -- and those, not sum(column), are
+ * the common shapes in reporting queries.
+ *
+ * The scale has to be exact, because it becomes the dscale of the result.
+ * numeric guarantees it for these operations: a product has scale s1 + s2,
+ * a sum or difference max(s1, s2), and round(x, n) or trunc(x, n) with a
+ * constant n exactly max(n, 0).  Division is deliberately absent:
+ * select_div_scale() derives the quotient's scale from the operand values,
+ * so even a / 100 has no fixed scale.
+ *
+ * The precision only decides whether we accept, but it is exact as well: a
+ * product has at most p1 + p2 digits, a sum at most
+ * max(p1 - s1, p2 - s2) + 1 + max(s1, s2), and rounding can carry into one
+ * more integer digit -- round(9.99, 1) is 10.0.
+ *
+ * A mistake here does not produce a wrong answer: the transition functions
+ * check every value against the scale they were specialized on.  That is
+ * what allows this to be clever at all.
+ *
+ * The single-argument round(numeric) and trunc(numeric) are SQL functions
+ * that the planner inlines into the two-argument forms with a constant zero,
+ * so they are covered too.
+ */
+static bool
+bounded_numeric_derive(Node *node, int depth, int *p, int *s)
 {
 	int32		typmod;
+
+	if (node == NULL || depth > NUMERIC_BOUNDED_MAX_DERIVE_DEPTH)
+		return false;
 
 	while (IsA(node, RelabelType))
 		node = (Node *) ((RelabelType *) node)->arg;
 
+	/* a declared typmod: a column, a cast, a CASE, a domain */
 	typmod = bounded_numeric_typmod(node);
-	if (!numeric_bounded_typmod(typmod, p, s))
-		return false;
+	if (numeric_bounded_typmod(typmod, p, s))
+		return (*p >= 1 && *p <= NUMERIC_BOUNDED_MAX_PRECISION &&
+				*s >= 0 && *s <= *p);
 
-	return (*p >= 1 && *p <= NUMERIC_BOUNDED_MAX_PRECISION &&
-			*s >= 0 && *s <= *p);
+	if (IsA(node, Const))
+		return bounded_numeric_const_bounds((Const *) node, p, s) &&
+			*p <= NUMERIC_BOUNDED_MAX_PRECISION;
+
+	if (IsA(node, OpExpr))
+	{
+		OpExpr	   *op = (OpExpr *) node;
+		Oid			opfunc = bounded_numeric_opfunc(op);
+		int			p1,
+					s1,
+					p2,
+					s2;
+
+		if (opfunc == F_NUMERIC_UMINUS)
+		{
+			if (list_length(op->args) != 1)
+				return false;
+			return bounded_numeric_derive((Node *) linitial(op->args),
+										  depth + 1, p, s);
+		}
+
+		if (opfunc != F_NUMERIC_ADD && opfunc != F_NUMERIC_SUB &&
+			opfunc != F_NUMERIC_MUL)
+			return false;
+		if (list_length(op->args) != 2)
+			return false;
+
+		if (!bounded_numeric_derive((Node *) linitial(op->args), depth + 1,
+									&p1, &s1) ||
+			!bounded_numeric_derive((Node *) lsecond(op->args), depth + 1,
+									&p2, &s2))
+			return false;
+
+		if (opfunc == F_NUMERIC_MUL)
+		{
+			*s = s1 + s2;
+			*p = p1 + p2;
+		}
+		else
+		{
+			*s = Max(s1, s2);
+			*p = Max(p1 - s1, p2 - s2) + 1 + *s;
+		}
+
+		return (*p <= NUMERIC_BOUNDED_MAX_PRECISION && *s <= *p);
+	}
+
+	if (IsA(node, FuncExpr))
+	{
+		FuncExpr   *fe = (FuncExpr *) node;
+		Node	   *scalearg;
+		int			p1,
+					s1,
+					n;
+
+		if (fe->funcid != F_ROUND_NUMERIC_INT4 &&
+			fe->funcid != F_TRUNC_NUMERIC_INT4)
+			return false;
+		if (list_length(fe->args) != 2)
+			return false;
+
+		scalearg = (Node *) lsecond(fe->args);
+		if (!IsA(scalearg, Const) ||
+			((Const *) scalearg)->constisnull ||
+			((Const *) scalearg)->consttype != INT4OID)
+			return false;
+		n = DatumGetInt32(((Const *) scalearg)->constvalue);
+
+		if (!bounded_numeric_derive((Node *) linitial(fe->args), depth + 1,
+									&p1, &s1))
+			return false;
+
+		/* a huge n would overflow below; it is out of range anyway */
+		if (n > NUMERIC_BOUNDED_MAX_PRECISION)
+			return false;
+
+		*s = Max(n, 0);
+		*p = (p1 - s1) + 1 + *s;
+
+		return (*p <= NUMERIC_BOUNDED_MAX_PRECISION && *s <= *p);
+	}
+
+	return false;
 }
 
 /*
@@ -843,7 +982,7 @@ numeric_agg_support(PG_FUNCTION_ARGS)
 
 	tle = linitial_node(TargetEntry, agg->args);
 
-	if (!bounded_numeric_derive((Node *) tle->expr, &p, &s))
+	if (!bounded_numeric_derive((Node *) tle->expr, 0, &p, &s))
 		PG_RETURN_POINTER(NULL);
 
 	Assert(p >= 1 && p <= NUMERIC_BOUNDED_MAX_PRECISION && s >= 0 && s <= p);

@@ -5932,8 +5932,11 @@ ANY <replaceable class="parameter">num_sync</replaceable> ( <replaceable class="
         <function>sum(numeric)</function> and <function>avg(numeric)</function>
         with specialized aggregates that accumulate into a fixed-size 128-bit
         integer state.  The replacement is made when the precision and scale
-        of the argument can be derived at plan time from its declared type
-        modifier and the precision does not exceed 28.  Aggregates with
+        of the argument can be derived at plan time &mdash; from a declared
+        type modifier, or through addition, subtraction, multiplication,
+        <function>round</function> or <function>trunc</function> of such
+        values and constants &mdash; and the precision does not exceed 28.
+        Aggregates with
         <literal>DISTINCT</literal>, <literal>ORDER BY</literal> or
         <literal>FILTER</literal> are not replaced, nor are window functions.
        </para>

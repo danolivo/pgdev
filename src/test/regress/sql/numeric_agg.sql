@@ -123,9 +123,9 @@ EXPLAIN (verbose, costs off) SELECT sum(coalesce(v, v)) FROM t_ok;
 EXPLAIN (verbose, costs off)
   SELECT sum(CASE WHEN v > 0 THEN v ELSE 0::numeric END) FROM t_ok;
 
--- A PREPARE parameter carries no typmod, and neither does the Const it is
--- folded to in a custom plan; in a generic plan the Param survives.  Either
--- way nothing is substituted.
+-- A PREPARE parameter carries no typmod.  In a custom plan it is folded to a
+-- Const before the support function sees it, and the constant's own digits
+-- decide; in a generic plan the Param survives and nothing is substituted.
 PREPARE pparam (numeric(18,2)) AS SELECT sum(x) FROM (VALUES ($1)) t(x);
 EXPLAIN (verbose, costs off) EXECUTE pparam ('1.00');
 EXECUTE pparam ('1.23456');
@@ -134,6 +134,73 @@ EXPLAIN (verbose, costs off) EXECUTE pparam ('1.00');
 EXECUTE pparam ('1.23456');
 RESET plan_cache_mode;
 DEALLOCATE pparam;
+
+--
+-- Arithmetic arguments.  A product has scale s1+s2 and at most p1+p2 digits,
+-- a sum or difference has scale max(s1,s2) and at most
+-- max(p1-s1,p2-s2)+1+max(s1,s2).  Division is never derived.
+--
+CREATE TABLE t_ab (a numeric(10,2), b numeric(12,4), c numeric(20,10));
+
+EXPLAIN (verbose, costs off) SELECT sum(a + b) FROM t_ab;
+EXPLAIN (verbose, costs off) SELECT sum(a - b) FROM t_ab;
+EXPLAIN (verbose, costs off) SELECT sum(-a) FROM t_ab;
+-- (a * b) + a is 22 digits at scale 6, then max(16,8)+1+6 = 23
+EXPLAIN (verbose, costs off) SELECT sum(a * b + a) FROM t_ab;
+-- constants carry no typmod, so their digits are counted from the value
+EXPLAIN (verbose, costs off) SELECT sum(a - 1) FROM t_ab;
+EXPLAIN (verbose, costs off) SELECT sum(a + 0.05) FROM t_ab;
+-- round() and trunc() with a constant scale
+EXPLAIN (verbose, costs off) SELECT sum(round(a * b, 2)) FROM t_ab;
+EXPLAIN (verbose, costs off) SELECT sum(trunc(a * b, 2)) FROM t_ab;
+EXPLAIN (verbose, costs off) SELECT sum(round(a * b)) FROM t_ab;
+EXPLAIN (verbose, costs off) SELECT sum(round(a, -1)) FROM t_ab;
+-- a non-constant scale is not known at plan time
+EXPLAIN (verbose, costs off)
+  SELECT sum(round(a, g)) FROM t_ab, generate_series(1,2) g;
+-- 10 + 20 = 30 > 28: too wide
+EXPLAIN (verbose, costs off) SELECT sum(a * c) FROM t_ab;
+-- division is never derived
+EXPLAIN (verbose, costs off) SELECT sum(a / b) FROM t_ab;
+-- neither is an unbounded operand
+EXPLAIN (verbose, costs off) SELECT sum(a * v) FROM t_ab, t_plain;
+
+-- the values have to match the general aggregate exactly, dscale included
+INSERT INTO t_ab VALUES (1.25, 3.1234, 7.0123456789),
+						(-0.10, 0.0001, -1.0000000001),
+						(99999999.99, 99999999.9999, 1234567890.0123456789);
+
+SET enable_bounded_numeric_agg = off;
+SELECT sum(a * b)::text AS r1, sum(a + b)::text AS r2, sum(a - b)::text AS r3,
+	   sum(-a)::text AS r4, sum(a * b + a)::text AS r5,
+	   sum(a * 1.2)::text AS r6, sum(a - 1)::text AS r7,
+	   sum(a * 0.05)::text AS r8,
+	   sum(a * c::numeric(14,4))::text AS r9,
+	   sum(round(a * b, 2))::text AS r10,
+	   sum(trunc(a * b, 2))::text AS r11,
+	   sum(round(a * b))::text AS r12,
+	   sum(round(a, -1))::text AS r13 FROM t_ab \gset
+RESET enable_bounded_numeric_agg;
+
+SELECT sum(a * b)::text = :'r1' AS mul,
+	   sum(a + b)::text = :'r2' AS add,
+	   sum(a - b)::text = :'r3' AS sub,
+	   sum(-a)::text = :'r4' AS neg,
+	   sum(a * b + a)::text = :'r5' AS nested,
+	   sum(a * 1.2)::text = :'r6' AS const_mul,
+	   sum(a - 1)::text = :'r7' AS const_sub,
+	   sum(a * 0.05)::text = :'r8' AS const_small
+FROM t_ab;
+
+SELECT sum(a * c::numeric(14,4))::text = :'r9' AS cast_mul,
+	   sum(round(a * b, 2))::text = :'r10' AS rounded,
+	   sum(trunc(a * b, 2))::text = :'r11' AS truncated,
+	   sum(round(a * b))::text = :'r12' AS rounded0,
+	   sum(round(a, -1))::text = :'r13' AS rounded_neg
+FROM t_ab;
+
+-- rounding that carries into an extra integer digit: round(9.99, 1) is 10.0
+SELECT sum(round(v, 1))::text FROM (VALUES ('9.99'::numeric(3,2))) x(v);
 
 -- a plpgsql variable carries a typmod and is coerced on assignment
 CREATE FUNCTION bna_plpgsql_probe() RETURNS numeric LANGUAGE plpgsql AS $$
@@ -151,6 +218,7 @@ DROP FUNCTION bna_plpgsql_probe();
 -- final function
 --
 EXPLAIN (verbose, costs off) SELECT avg(v) FROM t_ok;
+EXPLAIN (verbose, costs off) SELECT avg(a + b) FROM t_ab;
 EXPLAIN (verbose, costs off) SELECT avg(v) FROM t_w29;
 
 -- shapes that are left alone
@@ -308,6 +376,6 @@ DEALLOCATE pavg;
 RESET plan_cache_mode;
 
 DROP TABLE t_ok, t_wide, t_w28, t_w29, t_plain, t_int0, t_frac, t_dom, t_dom2,
-		   t_bulk, t_ref, t_big;
+		   t_bulk, t_ref, t_big, t_ab;
 DROP DOMAIN money18_2;
 DROP DOMAIN money18;
