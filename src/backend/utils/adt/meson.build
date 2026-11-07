@@ -71,6 +71,7 @@ backend_sources += files(
   'network_gist.c',
   'network_selfuncs.c',
   'network_spgist.c',
+  'numeric_bounded.c',
   'numutils.c',
   'oid.c',
   'oid8.c',

@@ -328,6 +328,8 @@ BoolExprType
 BoolTestType
 Boolean
 BooleanTest
+BoundedNumericAggState
+BoundedNumericBuf
 BpChar
 BrinBuildState
 BrinDesc
@@ -1832,6 +1834,7 @@ NullableDatum
 NullingRelsMatch
 Numeric
 NumericAggState
+NumericBoundedKind
 NumericDigit
 NumericSortSupport
 NumericSumAccum

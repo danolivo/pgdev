@@ -44,6 +44,8 @@
 #include "utils/pg_lsn.h"
 #include "utils/sortsupport.h"
 
+#include "numeric_bounded.h"
+
 /* ----------
  * Uncomment the following to enable compilation of dump_numeric()
  * and dump_var() and to get a dump of any result produced by make_result().
@@ -12198,4 +12200,431 @@ accum_sum_combine(NumericSumAccum *accum, NumericSumAccum *accum2)
 	accum_sum_add(accum, &tmp_var);
 
 	free_var(&tmp_var);
+}
+
+
+/* ----------------------------------------------------------------------
+ *
+ * Support for the bounded sum() and avg() aggregates
+ *
+ * Everything the aggregates in numeric_bounded.c need to know about the
+ * representation of a numeric is here, behind the interface declared in
+ * numeric_bounded.h, so that the definitions at the top of this file stay
+ * private to it.
+ *
+ * ----------------------------------------------------------------------
+ */
+
+/* 10^i for 0 <= i < DEC_DIGITS */
+#if DEC_DIGITS == 4
+static const int32 bounded_pow10[] = {1, 10, 100, 1000};
+#elif DEC_DIGITS == 2
+static const int32 bounded_pow10[] = {1, 10};
+#elif DEC_DIGITS == 1
+static const int32 bounded_pow10[] = {1};
+#else
+#error unsupported NBASE
+#endif
+
+StaticAssertDecl(lengthof(bounded_pow10) == DEC_DIGITS,
+				 "mismatch with DEC_DIGITS");
+
+/*
+ * Room for any short-header numeric converted to a 4-byte header, so that
+ * the NUMERIC_* macros can be used on it; see bounded_numeric_unpack().
+ */
+typedef union BoundedNumericBuf
+{
+	int32		force_align;
+	char		data[VARHDRSZ + VARATT_SHORT_MAX];
+} BoundedNumericBuf;
+
+/*
+ * bounded_numeric_unpack
+ *		Return a numeric argument in a form the NUMERIC_* macros can read.
+ *
+ * Values coming out of a tuple usually have a 1-byte varlena header, at an
+ * arbitrary alignment, and the macros need a 4-byte one.  Such a value is
+ * copied into a caller-supplied stack buffer, as numeric_abbrev_convert()
+ * does, rather than into the palloc'd copy PG_GETARG_NUMERIC() would make.
+ * That is tidy but not where the bounded aggregates gain: with the palloc'd
+ * copy instead, they measured the same within noise, since a per-tuple
+ * memory context makes the allocation cheap.
+ *
+ * A compressed or external value is detoasted first, into the current
+ * (per-tuple) memory context; note that an external TOAST pointer also has a
+ * 1-byte header, so that test has to come before the short-header one.
+ * Anything else is a plain 4-byte-header value, which is aligned and is used
+ * in place.
+ */
+static inline Numeric
+bounded_numeric_unpack(Datum d, BoundedNumericBuf *buf)
+{
+	struct varlena *v = (struct varlena *) DatumGetPointer(d);
+
+	if (unlikely(VARATT_IS_COMPRESSED(v) || VARATT_IS_EXTERNAL(v)))
+		return DatumGetNumeric(d);
+
+	if (VARATT_IS_SHORT(v))
+	{
+		Size		sz = VARSIZE_SHORT(v) - VARHDRSZ_SHORT;
+
+		SET_VARSIZE(buf->data, VARHDRSZ + sz);
+		memcpy(VARDATA(buf->data), VARDATA_SHORT(v), sz);
+
+		return (Numeric) buf->data;
+	}
+
+	return (Numeric) v;
+}
+
+/*
+ * bounded_int128_mul_add
+ *		*i128 = *i128 * mul + add.
+ *
+ * The caller must guarantee *i128 >= 0, 0 < mul <= NBASE and
+ * 0 <= add < NBASE, and must have bounded the result in advance: there is no
+ * overflow check here.  common/int128.h has nothing of this shape, because
+ * nothing else needs a Horner step over base-NBASE digits.
+ */
+static inline void
+bounded_int128_mul_add(INT128 *i128, int32 mul, int32 add)
+{
+#if USE_NATIVE_INT128
+	*i128 = *i128 * mul + add;
+#else
+	uint64		lo = i128->lo;
+	uint64		hi = (uint64) i128->hi;
+	uint64		m = (uint64) mul;
+	uint64		p0;
+	uint64		p1;
+
+	Assert(i128->hi >= 0);
+
+	/*
+	 * lo * m + add, split into 32-bit halves.  Each partial product is at
+	 * most (2^32 - 1) * NBASE + NBASE < 2^46, so a uint64 holds it.
+	 */
+	p0 = (lo & UINT64CONST(0xFFFFFFFF)) * m + (uint64) add;
+	p1 = (lo >> 32) * m + (p0 >> 32);
+
+	i128->lo = (p1 << 32) | (p0 & UINT64CONST(0xFFFFFFFF));
+	i128->hi = (int64) (hi * m + (p1 >> 32));
+#endif
+}
+
+/*
+ * bounded_int128_neg
+ *		*i128 = -*i128.  Only ever applied to a mantissa, which is far from
+ *		the minimum value, so the negation cannot overflow.
+ */
+static inline void
+bounded_int128_neg(INT128 *i128)
+{
+#if USE_NATIVE_INT128
+	*i128 = -*i128;
+#else
+	/* two's complement: carry into the high half iff the low half was 0 */
+	i128->lo = ~i128->lo + 1;
+	i128->hi = ~i128->hi + (i128->lo == 0 ? 1 : 0);
+#endif
+}
+
+/*
+ * bounded_decimal_len
+ *		Number of decimal digits in one non-zero base-NBASE digit.
+ */
+static inline int
+bounded_decimal_len(NumericDigit d)
+{
+	int			len = 1;
+
+	Assert(d > 0 && d < NBASE);
+
+	while (len < DEC_DIGITS && d >= bounded_pow10[len])
+		len++;
+
+	return len;
+}
+
+/*
+ * bounded_numeric_mantissa
+ *		The value's mantissa at scale target_scale, that is
+ *		value * 10^target_scale as an integer.
+ *
+ * Returns false if the value does not fit target_scale, that is if it has
+ * non-zero digits beyond that scale or more than max_precision digits at it.
+ * That means the typmod promise was broken by the row source, and the
+ * aggregate has to fall back to the general state.  The value must not be
+ * special.
+ *
+ * XXX: the value's display scale is not checked against target_scale.  Every
+ * honest input has dscale == target_scale -- apply_typmod() sets it, and the
+ * arithmetic the planner derives scales through produces it exactly -- so the
+ * input is trusted here.  A value that fits but carries a larger dscale
+ * (1.000 delivered into a numeric(18,2) column, say, by an FDW) is summed at
+ * target_scale, and the result's dscale can then be smaller than the one
+ * numeric_sum() would have produced.  Falling back on
+ * NUMERIC_DSCALE(num) != target_scale would close that gap.
+ *
+ * The loops below carry no overflow checks, because the mantissa has at most
+ *
+ *		bounded_decimal_len(digits[0]) + DEC_DIGITS * weight + target_scale
+ *
+ * decimal digits, and that is tested against the limit once, up front.  The
+ * bound is exact, not conservative: numeric(28,0) legitimately holds 28
+ * nines.
+ *
+ * Aligning the stored digits to target_scale goes either way.  The stored
+ * digits usually run past the display scale inside the last base-NBASE digit,
+ * so that digit has to be divided down; but make_result() strips trailing
+ * zero digits, so 1.00 is stored as a single digit and has to be multiplied
+ * up instead.
+ */
+static bool
+bounded_numeric_mantissa(Numeric num, int target_scale, int max_precision,
+						 INT128 *result)
+{
+	NumericDigit *digits = NUMERIC_DIGITS(num);
+	int			ndigits = NUMERIC_NDIGITS(num);
+	int			weight = NUMERIC_WEIGHT(num);
+	int			stored;
+	INT128		m;
+	int			i;
+
+	Assert(!NUMERIC_IS_SPECIAL(num));
+	Assert(target_scale >= 0 && target_scale <= max_precision);
+
+	m = int64_to_int128(0);
+
+	if (ndigits == 0)
+	{
+		*result = m;
+		return true;
+	}
+
+	/* a non-normalized value cannot come out of make_result() */
+	if (unlikely(digits[0] <= 0 || digits[0] >= NBASE))
+		return false;
+	if (unlikely(bounded_decimal_len(digits[0]) + DEC_DIGITS * weight +
+				 target_scale > max_precision))
+		return false;
+
+	/* number of decimal places the stored digits represent */
+	stored = DEC_DIGITS * (ndigits - 1 - weight);
+
+	if (stored >= target_scale)
+	{
+		int			down = stored - target_scale;
+		int32		split;
+
+		/* a whole extra base-NBASE digit would be a trailing zero digit */
+		if (unlikely(down >= DEC_DIGITS))
+			return false;
+
+		split = bounded_pow10[down];
+
+		for (i = 0; i < ndigits - 1; i++)
+			bounded_int128_mul_add(&m, NBASE, digits[i]);
+
+		/* the part of the last digit beyond the display scale must be zero */
+		if (unlikely(digits[ndigits - 1] % split != 0))
+			return false;
+
+		bounded_int128_mul_add(&m, NBASE / split, digits[ndigits - 1] / split);
+	}
+	else
+	{
+		int			up = target_scale - stored;
+
+		for (i = 0; i < ndigits; i++)
+			bounded_int128_mul_add(&m, NBASE, digits[i]);
+
+		while (up >= DEC_DIGITS)
+		{
+			bounded_int128_mul_add(&m, NBASE, 0);
+			up -= DEC_DIGITS;
+		}
+		if (up > 0)
+			bounded_int128_mul_add(&m, bounded_pow10[up], 0);
+	}
+
+	if (NUMERIC_SIGN(num) == NUMERIC_NEG)
+		bounded_int128_neg(&m);
+
+	*result = m;
+	return true;
+}
+
+/*
+ * bounded_numeric_kind_of
+ *		Unpack a numeric input and classify it, computing the mantissa of an
+ *		ordinary value; the body shared by the numeric_bounded_classify*()
+ *		functions.
+ */
+static inline NumericBoundedKind
+bounded_numeric_kind_of(Datum value, int target_scale, int max_precision,
+						INT128 *mantissa)
+{
+	BoundedNumericBuf buf;
+	Numeric		num = bounded_numeric_unpack(value, &buf);
+
+	if (NUMERIC_IS_SPECIAL(num))
+	{
+		if (NUMERIC_IS_NAN(num))
+			return NUMERIC_BOUNDED_NAN;
+		if (NUMERIC_IS_PINF(num))
+			return NUMERIC_BOUNDED_PINF;
+		return NUMERIC_BOUNDED_NINF;
+	}
+
+	if (unlikely(!bounded_numeric_mantissa(num, target_scale, max_precision,
+										   mantissa)))
+		return NUMERIC_BOUNDED_NOFIT;
+
+	return NUMERIC_BOUNDED_ORDINARY;
+}
+
+/*
+ * numeric_bounded_classify
+ *		Classify an input of a bounded aggregate; for an ordinary value that
+ *		fits target_scale and NUMERIC_BOUNDED_MAX_PRECISION digits, also
+ *		return its mantissa at target_scale.
+ */
+NumericBoundedKind
+numeric_bounded_classify(Datum value, int target_scale, INT128 *mantissa)
+{
+	return bounded_numeric_kind_of(value, target_scale,
+								   NUMERIC_BOUNDED_MAX_PRECISION, mantissa);
+}
+
+/*
+ * numeric_bounded_special
+ *		NaN, +Infinity or -Infinity as a numeric.
+ */
+Numeric
+numeric_bounded_special(NumericBoundedKind kind)
+{
+	switch (kind)
+	{
+		case NUMERIC_BOUNDED_NAN:
+			return make_result(&const_nan);
+		case NUMERIC_BOUNDED_PINF:
+			return make_result(&const_pinf);
+		case NUMERIC_BOUNDED_NINF:
+			return make_result(&const_ninf);
+		default:
+			elog(ERROR, "unexpected kind %d of a special numeric", (int) kind);
+	}
+
+	pg_unreachable();
+}
+
+/*
+ * int128_div_fast_to_numeric() -
+ *
+ *	The 128-bit counterpart of int64_div_fast_to_numeric(): convert
+ *	val1/(10**log10val2) to numeric, with display scale log10val2.  Only
+ *	log10val2 >= 0 is supported.
+ *
+ * When the value fits an int64 this is int64_div_fast_to_numeric().
+ * Otherwise val1 at scale s = DEC_DIGITS * w + m is split as
+ * val1 = Q * 10^m + r, so that
+ *
+ *		val1 / 10^s = Q / NBASE^w + (r * 10^(DEC_DIGITS - m)) / NBASE^(w + 1)
+ *
+ * The first term is Q's digits with the weight shifted down by w, the second
+ * a single base-NBASE digit; Q and r have the same sign, since the division
+ * truncates.  Multiplying val1 up instead, as the int64 version does, could
+ * overflow the 128 bits.
+ */
+Numeric
+int128_div_fast_to_numeric(INT128 val1, int log10val2)
+{
+	int64		hi = PG_INT128_HI_INT64(val1);
+	uint64		lo = PG_INT128_LO_UINT64(val1);
+	int			w = log10val2 / DEC_DIGITS;
+	int			m = log10val2 % DEC_DIGITS;
+	int32		r = 0;
+	NumericVar	result;
+	Numeric		res;
+
+	Assert(log10val2 >= 0);
+
+	/* fits an int64 if the high half is the sign extension of the low one */
+	if ((hi == 0 && (lo >> 63) == 0) || (hi == -1 && (lo >> 63) == 1))
+		return int64_div_fast_to_numeric((int64) lo, log10val2);
+
+	init_var(&result);
+
+	if (m > 0)
+		int128_div_mod_int32(&val1, bounded_pow10[m], &r);
+
+	int128_to_numericvar(val1, &result);
+	result.weight -= w;
+
+	if (r != 0)
+	{
+		NumericVar	tail;
+
+		init_var(&tail);
+		int64_to_numericvar((int64) r * bounded_pow10[DEC_DIGITS - m], &tail);
+		tail.weight -= w + 1;
+		add_var(&result, &tail, &result);
+		free_var(&tail);
+	}
+
+	result.dscale = log10val2;
+	res = make_result(&result);
+	free_var(&result);
+
+	return res;
+}
+
+/*
+ * numeric_avg_state_from_sum
+ *		Build the transition state of sum(numeric) and avg(numeric) out of a
+ *		partial result computed elsewhere.
+ *
+ * This is how a bounded aggregate hands over to the general one when it
+ * meets an input it cannot take: "sum" is the sum of the N ordinary inputs
+ * seen so far (NULL if N is 0), and the special values are passed as counts.
+ * The state is allocated in agg_context, and from then on the ordinary
+ * numeric_avg_accum(), numeric_avg_combine() and friends work on it.
+ *
+ * Every one of those N inputs had the display scale of "sum", so that is
+ * also what maxScale and maxScaleCount record.  They are only used by the
+ * moving-aggregate inverse transition, which bounded aggregates never have,
+ * but let's keep the state consistent anyway.
+ */
+struct NumericAggState *
+numeric_avg_state_from_sum(MemoryContext agg_context, Numeric sum, int64 N,
+						   int64 NaNcount, int64 pInfcount, int64 nInfcount)
+{
+	NumericAggState *state;
+	MemoryContext old_context;
+
+	old_context = MemoryContextSwitchTo(agg_context);
+
+	state = makeNumericAggStateCurrentContext(false);
+	state->N = N;
+	state->NaNcount = NaNcount;
+	state->pInfcount = pInfcount;
+	state->nInfcount = nInfcount;
+
+	if (N > 0)
+	{
+		NumericVar	X;
+
+		Assert(sum != NULL && !NUMERIC_IS_SPECIAL(sum));
+
+		init_var_from_num(sum, &X);
+		state->maxScale = X.dscale;
+		state->maxScaleCount = N;
+		accum_sum_add(&state->sumX, &X);
+	}
+
+	MemoryContextSwitchTo(old_context);
+
+	return state;
 }

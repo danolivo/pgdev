@@ -75,6 +75,7 @@ OBJS = \
 	network_selfuncs.o \
 	network_spgist.o \
 	numeric.o \
+	numeric_bounded.o \
 	numutils.o \
 	oid.o \
 	oid8.o \

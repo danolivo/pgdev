@@ -91,6 +91,21 @@
   aggtransspace => '128', aggmtranstype => 'internal',
   aggmtransspace => '128' },
 
+# bounded numeric sum/avg; aggtransspace is sizeof(BoundedNumericAggState),
+# rounded up to a power of 2, plus an allocator chunk header; see numeric.c
+{ aggfnoid => 'bounded_numeric_sum(numeric,int4)',
+  aggtransfn => 'numeric_bounded_accum', aggfinalfn => 'numeric_bounded_sum',
+  aggcombinefn => 'numeric_bounded_combine',
+  aggserialfn => 'numeric_bounded_serialize',
+  aggdeserialfn => 'numeric_bounded_deserialize', aggtranstype => 'internal',
+  aggtransspace => '72' },
+{ aggfnoid => 'bounded_numeric_avg(numeric,int4)',
+  aggtransfn => 'numeric_bounded_accum', aggfinalfn => 'numeric_bounded_avg',
+  aggcombinefn => 'numeric_bounded_combine',
+  aggserialfn => 'numeric_bounded_serialize',
+  aggdeserialfn => 'numeric_bounded_deserialize', aggtranstype => 'internal',
+  aggtransspace => '72' },
+
 # max
 { aggfnoid => 'max(int8)', aggtransfn => 'int8larger',
   aggcombinefn => 'int8larger', aggsortop => '>(int8,int8)',
