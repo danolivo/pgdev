@@ -3267,6 +3267,228 @@ numeric_sub_safe(Numeric num1, Numeric num2, Node *escontext)
 
 
 /*
+ * Multiplication of short operands.
+ *
+ * Most numerics that reach the * operator come straight out of a tuple and are
+ * small: a price, a quantity, an amount with two decimal places.  For those the
+ * general path spends far more on its machinery than on the multiplication: it
+ * copies each operand out of the tuple, unpacks it into a NumericVar, allocates
+ * a digit buffer for the product, strips it, copies it once more into the
+ * palloc'd result and frees the buffer.  numeric_mul_short() reads both
+ * operands where they lie, multiplies the digits in a local array and builds
+ * the result directly, with one allocation in total.
+ *
+ * It applies when both operands are inline (neither compressed nor out of
+ * line), stored in the short format -- which excludes NaN and the infinities --
+ * and have at most NUMERIC_MUL_SHORT_NDIGITS digits each.  Their exact product
+ * has at most twice as many digits, and its display scale, the sum of the two
+ * operand scales, is at most 2 * NUMERIC_SHORT_DSCALE_MAX.  That is the rscale
+ * numeric_mul_safe() asks mul_var() for, and it is far below
+ * NUMERIC_DSCALE_MAX, so the general path does not round either; the weight
+ * cannot overflow int16.  The result is therefore the one the general path
+ * produces, down to the choice of header format.
+ *
+ * The limit of five digits per operand is where the simple loop below stops
+ * paying off: for wider operands, the unrolled code of mul_var_short() is as
+ * fast or faster.
+ *
+ * Both operands are checked before either is unpacked, so that a product the
+ * fast path rejects -- a short price times a wide amount, say -- does not pay
+ * for decoding the operand that did qualify.  On an accepted product this only
+ * reorders the same work.
+ *
+ * The operand bytes are read with memcpy() of a fixed size, because a value
+ * with a one-byte varlena header is stored without alignment padding (see
+ * numeric_unpack_local()).
+ */
+#define NUMERIC_MUL_SHORT_NDIGITS	5
+
+/*
+ * A product position collects at most NUMERIC_MUL_SHORT_NDIGITS terms, each at
+ * most (NBASE - 1)^2, and the carry into it is below
+ * NUMERIC_MUL_SHORT_NDIGITS * NBASE; their sum must fit the uint32 accumulator.
+ */
+StaticAssertDecl((uint64) NUMERIC_MUL_SHORT_NDIGITS * NBASE * NBASE <= PG_UINT32_MAX,
+				 "NUMERIC_MUL_SHORT_NDIGITS is too large for a uint32 accumulator");
+
+typedef struct NumericShortOperand
+{
+	const char *data;			/* the numeric header word, then the digits */
+	uint32		header;
+	int			ndigits;
+	int			weight;
+	int			dscale;
+	bool		neg;
+	NumericDigit digits[NUMERIC_MUL_SHORT_NDIGITS];
+} NumericShortOperand;
+
+/*
+ * Return true if X qualifies for numeric_mul_short(), and set op->data,
+ * op->header and op->ndigits.  This is the whole cost of rejecting an operand.
+ */
+static inline bool
+numeric_check_short_operand(Datum X, NumericShortOperand *op)
+{
+	struct varlena *attr = (struct varlena *) DatumGetPointer(X);
+	Size		len;
+	uint16		rawheader;
+
+	/* see numeric_unpack_local() for why these two are tested first */
+	if (unlikely(VARATT_IS_COMPRESSED(attr) || VARATT_IS_EXTERNAL(attr)))
+		return false;
+
+	len = VARSIZE_ANY_EXHDR(attr);
+	if (len < sizeof(uint16) ||
+		len > sizeof(uint16) + NUMERIC_MUL_SHORT_NDIGITS * sizeof(NumericDigit))
+		return false;
+
+	/*
+	 * Widen the header and test the flag bits by shifting rather than by
+	 * masking with NUMERIC_SIGN_MASK.  On a uint16, gcc implements the mask
+	 * test with 16-bit instructions carrying a 16-bit immediate, and on x86
+	 * every such instruction stalls the legacy decoder (a length-changing
+	 * prefix).  That costs nothing while the code runs from the decoded-uop
+	 * cache, but whether it does depends on where the linker happens to place
+	 * it, and this path runs once per row.
+	 */
+	op->data = VARDATA_ANY(attr);
+	memcpy(&rawheader, op->data, sizeof(uint16));
+	op->header = rawheader;
+	if ((op->header >> 14) != (NUMERIC_SHORT >> 14))
+		return false;
+
+	op->ndigits = (len - sizeof(uint16)) / sizeof(NumericDigit);
+	return true;
+}
+
+/*
+ * Decode the header fields and the digits of an operand that has passed
+ * numeric_check_short_operand().
+ */
+static inline void
+numeric_unpack_short_operand(NumericShortOperand *op)
+{
+	uint32		header = op->header;
+	const char *src = op->data + sizeof(uint16);
+
+	op->neg = (header & NUMERIC_SHORT_SIGN_MASK) != 0;
+	op->dscale = (header & NUMERIC_SHORT_DSCALE_MASK) >>
+		NUMERIC_SHORT_DSCALE_SHIFT;
+	op->weight = ((header & NUMERIC_SHORT_WEIGHT_SIGN_MASK) ?
+				  ~NUMERIC_SHORT_WEIGHT_MASK : 0) |
+		(int) (header & NUMERIC_SHORT_WEIGHT_MASK);
+
+	/*
+	 * Copy digit by digit rather than with one memcpy() of the whole array. A
+	 * copy of variable length becomes a library call or an inline expansion,
+	 * and either costs more than the few 16-bit loads this compiles to.
+	 */
+	for (int i = 0; i < op->ndigits; i++)
+		memcpy(&op->digits[i], src + i * sizeof(NumericDigit),
+			   sizeof(NumericDigit));
+}
+
+/*
+ * Return X * Y, or NULL if either operand does not qualify; see above.
+ */
+static Numeric
+numeric_mul_short(Datum X, Datum Y)
+{
+	NumericShortOperand a;
+	NumericShortOperand b;
+	uint32		prod[2 * NUMERIC_MUL_SHORT_NDIGITS];
+	NumericDigit digits[2 * NUMERIC_MUL_SHORT_NDIGITS];
+	NumericDigit *res_digits;
+	NumericDigit *dst;
+	int			res_ndigits;
+	int			res_weight;
+	int			res_dscale;
+	bool		res_neg;
+	uint32		carry;
+	Numeric		result;
+	Size		len;
+
+	if (!numeric_check_short_operand(X, &a) ||
+		!numeric_check_short_operand(Y, &b))
+		return NULL;
+	numeric_unpack_short_operand(&a);
+	numeric_unpack_short_operand(&b);
+
+	res_ndigits = a.ndigits + b.ndigits;
+	res_weight = a.weight + b.weight + 1;
+	res_dscale = a.dscale + b.dscale;
+	res_neg = (a.neg != b.neg);
+
+	/*
+	 * Schoolbook multiplication.  As in mul_var_short(), the i'th product
+	 * digit collects the terms a[i1] * b[i2] with i = i1 + i2 + 1, leaving
+	 * prod[0] for the final carry.  The static assertion above guarantees
+	 * that no position overflows uint32, carry included.
+	 */
+	memset(prod, 0, sizeof(prod));
+	for (int i1 = 0; i1 < a.ndigits; i1++)
+		for (int i2 = 0; i2 < b.ndigits; i2++)
+			prod[i1 + i2 + 1] += (uint32) a.digits[i1] * (uint32) b.digits[i2];
+
+	carry = 0;
+	for (int i = res_ndigits - 1; i >= 0; i--)
+	{
+		uint32		term = prod[i] + carry;
+
+		digits[i] = (NumericDigit) (term % NBASE);
+		carry = term / NBASE;
+	}
+	Assert(carry == 0);
+
+	/* strip leading and trailing zeroes, as make_result() does */
+	res_digits = digits;
+	while (res_ndigits > 0 && *res_digits == 0)
+	{
+		res_digits++;
+		res_weight--;
+		res_ndigits--;
+	}
+	while (res_ndigits > 0 && res_digits[res_ndigits - 1] == 0)
+		res_ndigits--;
+
+	if (res_ndigits == 0)
+	{
+		res_weight = 0;
+		res_neg = false;
+	}
+
+	if (NUMERIC_CAN_BE_SHORT(res_dscale, res_weight))
+	{
+		len = NUMERIC_HDRSZ_SHORT + res_ndigits * sizeof(NumericDigit);
+		result = (Numeric) palloc(len);
+		SET_VARSIZE(result, len);
+		result->choice.n_short.n_header =
+			(res_neg ? (NUMERIC_SHORT | NUMERIC_SHORT_SIGN_MASK) : NUMERIC_SHORT)
+			| (res_dscale << NUMERIC_SHORT_DSCALE_SHIFT)
+			| (res_weight < 0 ? NUMERIC_SHORT_WEIGHT_SIGN_MASK : 0)
+			| (res_weight & NUMERIC_SHORT_WEIGHT_MASK);
+	}
+	else
+	{
+		len = NUMERIC_HDRSZ + res_ndigits * sizeof(NumericDigit);
+		result = (Numeric) palloc(len);
+		SET_VARSIZE(result, len);
+		result->choice.n_long.n_sign_dscale =
+			(res_neg ? NUMERIC_NEG : NUMERIC_POS) | res_dscale;
+		result->choice.n_long.n_weight = res_weight;
+	}
+
+	Assert(NUMERIC_NDIGITS(result) == res_ndigits);
+	Assert(NUMERIC_WEIGHT(result) == res_weight);
+	Assert(NUMERIC_DSCALE(result) == res_dscale);
+	dst = NUMERIC_DIGITS(result);
+	for (int i = 0; i < res_ndigits; i++)
+		dst[i] = res_digits[i];
+
+	return result;
+}
+
+/*
  * numeric_mul() -
  *
  *	Calculate the product of two numerics
@@ -3278,9 +3500,16 @@ numeric_mul(PG_FUNCTION_ARGS)
 	NumericLocalBuf buf2;
 	bool		free1;
 	bool		free2;
-	Numeric		num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
-	Numeric		num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
+	Numeric		num1;
+	Numeric		num2;
 	Numeric		res;
+
+	res = numeric_mul_short(PG_GETARG_DATUM(0), PG_GETARG_DATUM(1));
+	if (likely(res != NULL))
+		PG_RETURN_NUMERIC(res);
+
+	num1 = numeric_unpack_local(PG_GETARG_DATUM(0), &buf1, &free1);
+	num2 = numeric_unpack_local(PG_GETARG_DATUM(1), &buf2, &free2);
 
 	res = numeric_mul_safe(num1, num2, fcinfo->context);
 

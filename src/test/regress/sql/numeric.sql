@@ -1955,3 +1955,60 @@ COMMIT;
 
 DROP TABLE num_fast_agg_scale_map;
 DROP TABLE num_fast_agg_scale;
+
+--
+-- Multiplication of short operands.
+--
+-- numeric_mul_short() builds the product directly when both operands are
+-- short-format values of at most five digits.  Its result has to match the
+-- general path's exactly, including the display scale and the choice between
+-- the short and the long header, so show all three.  The operands come from a
+-- table, so that they reach numeric_mul() with a one-byte varlena header as
+-- column values do; the last rows exceed the five-digit limit or are special
+-- and take the general path, for comparison.
+--
+CREATE TABLE num_mul_short (id int, a numeric, b numeric);
+INSERT INTO num_mul_short VALUES
+  (1, 0, 0),
+  (2, '0.000', '-0.00'),          -- zero keeps the summed scale
+  (3, '-1.5', '0'),               -- a zero product is never negative
+  (4, '-0.5', '0.2'),             -- trailing zero digit stripped, scale kept
+  (5, '0.0001', '0.0001'),        -- negative weight
+  (6, '9999.9999', '9999.9999'),  -- carry into every digit
+  (7, '-1234.5678', '8765.4321'),
+  (8, '1e-63', '1e-63'),          -- scale 126: result needs the long header
+  (9, '1e250', '1e250'),          -- weight 125: result needs the long header
+  (10, '1e-60', '1e60'),
+  (11, '99999999999999999999', '99999999999999999999'),  -- five digits each
+  (12, '999999999999999999999', '2'),  -- six digits: general path
+  (13, '1.5', '999999999999999999999'),  -- rejected on the second operand
+  (14, '999999999999999999999', '1.5'),  -- rejected on the first operand
+  (15, 'NaN', '2'),
+  (16, '-Infinity', '0');
+SELECT id,
+       CASE WHEN length(p::text) <= 40 THEN p::text
+            ELSE left(p::text, 8) || '..' || right(p::text, 8) END AS product,
+       length(p::text) AS len, scale(p), pg_column_size(p) AS size
+FROM (SELECT id, a * b AS p FROM num_mul_short) s ORDER BY id;
+DROP TABLE num_mul_short;
+
+-- Compare with the general path on operands of zero to eight digits, signs
+-- and scales mixed.  jsonpath multiplies through numeric_mul_safe(), which
+-- the fast path does not reach.
+CREATE TABLE num_mul_short_oracle AS
+SELECT round(((random() * 1e15)::int8 * 1e15 + (random() * 1e15)::int8)
+             * 10::numeric ^ (-(random() * 30)::int)
+             * (CASE WHEN random() < 0.5 THEN -1 ELSE 1 END),
+             (random() * 16)::int) AS a,
+       round(((random() * 1e15)::int8 * 1e15 + (random() * 1e15)::int8)
+             * 10::numeric ^ (-(random() * 30)::int)
+             * (CASE WHEN random() < 0.5 THEN -1 ELSE 1 END),
+             (random() * 16)::int) AS b
+FROM generate_series(1, 10000);
+SELECT count(*) AS mismatches
+FROM num_mul_short_oracle,
+     LATERAL (SELECT a * b AS p,
+                     jsonb_path_query_first(jsonb_build_array(a, b),
+                                            '$[0] * $[1]')::numeric AS g) s
+WHERE p::text <> g::text OR scale(p) <> scale(g);
+DROP TABLE num_mul_short_oracle;
