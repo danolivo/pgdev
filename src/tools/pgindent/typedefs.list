@@ -1836,6 +1836,7 @@ Numeric
 NumericAggState
 NumericAggStateExt
 NumericDigit
+NumericShortOperand
 NumericSortSupport
 NumericSumAccum
 NumericVar
