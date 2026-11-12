@@ -661,23 +661,26 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 	/* This should only be called for baserels and appendrel children. */
 	Assert(IS_SIMPLE_REL(rel));
 
+	/* Set if the data source refers temp storage somehow */
+	rel->needs_temp_safety = false;
+
 	/* Assorted checks based on rtekind. */
 	switch (rte->rtekind)
 	{
 		case RTE_RELATION:
 
 			/*
-			 * Currently, parallel workers can't access the leader's temporary
-			 * tables.  We could possibly relax this if we wrote all of its
-			 * local buffers at the start of the query and made no changes
-			 * thereafter (maybe we could allow hint bit changes), and if we
-			 * taught the workers to read them.  Writing a large number of
-			 * temporary buffers could be expensive, though, and we don't have
-			 * the rest of the necessary infrastructure right now anyway.  So
-			 * for now, bail out if we see a temporary table.
+			 * Parallel workers can read the leader's temporary tables only
+			 * after the leader has flushed its dirty local buffers, which is
+			 * not free; the planner accounts for it, and the user can turn
+			 * the whole feature off.
 			 */
 			if (get_rel_persistence(rte->relid) == RELPERSISTENCE_TEMP)
-				return;
+			{
+				if (!enable_parallel_temp_scan)
+					return;
+				rel->needs_temp_safety = true;
+			}
 
 			/*
 			 * Table sampling can be pushed down to workers if the sample
@@ -689,7 +692,7 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 
 				if (proparallel != PROPARALLEL_SAFE)
 					return;
-				if (!is_parallel_safe(root, (Node *) rte->tablesample->args))
+				if (!is_parallel_safe(root, (Node *) rte->tablesample->args, &rel->needs_temp_safety))
 					return;
 			}
 
@@ -755,7 +758,7 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 
 		case RTE_FUNCTION:
 			/* Check for parallel-restricted functions. */
-			if (!is_parallel_safe(root, (Node *) rte->functions))
+			if (!is_parallel_safe(root, (Node *) rte->functions, &rel->needs_temp_safety))
 				return;
 			break;
 
@@ -765,7 +768,7 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 
 		case RTE_VALUES:
 			/* Check for parallel-restricted functions. */
-			if (!is_parallel_safe(root, (Node *) rte->values_lists))
+			if (!is_parallel_safe(root, (Node *) rte->values_lists, &rel->needs_temp_safety))
 				return;
 			break;
 
@@ -806,14 +809,14 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 	 * outer join clauses work correctly.  It would likely break equivalence
 	 * classes, too.
 	 */
-	if (!is_parallel_safe(root, (Node *) rel->baserestrictinfo))
+	if (!is_parallel_safe(root, (Node *) rel->baserestrictinfo, &rel->needs_temp_safety))
 		return;
 
 	/*
 	 * Likewise, if the relation's outputs are not parallel-safe, give up.
 	 * (Usually, they're just Vars, but sometimes they're not.)
 	 */
-	if (!is_parallel_safe(root, (Node *) rel->reltarget->exprs))
+	if (!is_parallel_safe(root, (Node *) rel->reltarget->exprs, &rel->needs_temp_safety))
 		return;
 
 	/* We have a winner. */
