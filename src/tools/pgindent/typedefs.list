@@ -1833,6 +1833,7 @@ NullTestType
 NullableDatum
 NullingRelsMatch
 Numeric
+NumericAggPromoteCause
 NumericAggState
 NumericAggStateExt
 NumericDigit
