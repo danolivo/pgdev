@@ -204,6 +204,7 @@ main(int argc, char *argv[])
 	bool		tablespaces_only = false;
 	PGconn	   *conn;
 	int			encoding;
+	const char *std_strings;
 	int			c,
 				ret;
 	int			optindex;
@@ -572,17 +573,14 @@ main(int argc, char *argv[])
 	}
 
 	/*
-	 * Force standard_conforming_strings on, just in case we are dumping from
-	 * an old server that has it disabled.  Without this, literals in views,
-	 * expressions, etc, would be incorrect for modern servers.
-	 */
-	executeCommand(conn, "SET standard_conforming_strings = on");
-
-	/*
-	 * Get the active encoding, so we know how to escape strings.
+	 * Get the active encoding and the standard_conforming_strings setting, so
+	 * we know how to escape strings.
 	 */
 	encoding = PQclientEncoding(conn);
 	setFmtEncoding(encoding);
+	std_strings = PQparameterStatus(conn, "standard_conforming_strings");
+	if (!std_strings)
+		std_strings = "off";
 
 	/* Set the role if requested */
 	if (use_role)
@@ -622,10 +620,12 @@ main(int argc, char *argv[])
 	/* Restore will need to write to the target cluster */
 	fprintf(OPF, "SET default_transaction_read_only = off;\n\n");
 
-	/* Replicate encoding and standard_conforming_strings in output */
+	/* Replicate encoding and std_strings in output */
 	fprintf(OPF, "SET client_encoding = '%s';\n",
 			pg_encoding_to_char(encoding));
-	fprintf(OPF, "SET standard_conforming_strings = on;\n");
+	fprintf(OPF, "SET standard_conforming_strings = %s;\n", std_strings);
+	if (strcmp(std_strings, "off") == 0)
+		fprintf(OPF, "SET escape_string_warning = off;\n");
 	fprintf(OPF, "\n");
 
 	if (!data_only && !statistics_only && !no_schema)

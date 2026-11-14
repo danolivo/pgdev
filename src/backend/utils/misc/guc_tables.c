@@ -558,10 +558,10 @@ bool		row_security;
 bool		check_function_bodies = true;
 
 /*
- * These GUCs exist solely for backward compatibility.
+ * This GUC exists solely for backward compatibility, check its definition for
+ * details.
  */
 static bool default_with_oids = false;
-static bool standard_conforming_strings = true;
 
 bool		current_role_is_superuser;
 

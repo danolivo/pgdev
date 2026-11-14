@@ -11,6 +11,8 @@ SELECT getdatabaseencoding() <> 'UTF8'
 
 set client_encoding = utf8;
 
+set standard_conforming_strings = on;
+
 
 -- Run the Tcl test cases that require Unicode
 

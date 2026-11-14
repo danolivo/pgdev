@@ -85,6 +85,8 @@ typedef struct core_yy_extra_type
 	 * prevailing GUC settings.
 	 */
 	int			backslash_quote;
+	bool		escape_string_warning;
+	bool		standard_conforming_strings;
 
 	/*
 	 * literalbuf is used to accumulate literal values when multiple rules are
@@ -108,7 +110,8 @@ typedef struct core_yy_extra_type
 	/* first part of UTF16 surrogate pair for Unicode escapes */
 	int32		utf16_first_part;
 
-	/* true if we need to verify valid encoding of current literal string */
+	/* state variables for literal-lexing warnings */
+	bool		warn_on_first_escape;
 	bool		saw_non_ascii;
 } core_yy_extra_type;
 
