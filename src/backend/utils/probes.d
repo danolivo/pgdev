@@ -91,4 +91,7 @@ provider postgresql {
 	probe wal__switch();
 	probe wal__buffer__write__dirty__start();
 	probe wal__buffer__write__dirty__done();
+
+	probe numeric__agg__fast__start();
+	probe numeric__agg__promote(int, long);
 };

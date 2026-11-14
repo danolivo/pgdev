@@ -36,6 +36,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/supportnodes.h"
 #include "optimizer/optimizer.h"
+#include "pg_trace.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/float.h"
@@ -5444,6 +5445,33 @@ makeNumericAggState(FunctionCallInfo fcinfo, bool calcSumX2)
 
 	MemoryContextSwitchTo(old_context);
 
+	/*
+	 * Report that the fast path has been entered, once per transition
+	 * function call site -- that is, per transition state of a plan node, in
+	 * each process that runs it -- rather than once per group: a hash
+	 * aggregate over many groups would otherwise fire the probe for every
+	 * group.  Aggregates that share a transition state, such as sum(x) and
+	 * avg(x) over the same input, share the transition function's FmgrInfo
+	 * and are reported once.  A non-NULL fn_extra marks it as reported; it
+	 * lives as long as the FmgrInfo, so rescans and spilled batches do not
+	 * report it again.  Only transition states are considered: the states
+	 * built by combine and deserialization functions come from
+	 * makeNumericAggStateCurrentContext() and merely carry on partial states
+	 * that started elsewhere.
+	 *
+	 * The _ENABLED() test is constant false without --enable-dtrace, and with
+	 * it is true only while a tracer has activated the probe, so fn_extra is
+	 * left alone in every other case.  numeric-agg-promote is guarded the
+	 * same way, so that a tracer sees either both probes or neither.
+	 */
+	if (TRACE_POSTGRESQL_NUMERIC_AGG_FAST_START_ENABLED() &&
+		!state->promoted && fcinfo->flinfo->fn_extra == NULL)
+	{
+		TRACE_POSTGRESQL_NUMERIC_AGG_FAST_START();
+		fcinfo->flinfo->fn_extra =
+			MemoryContextAllocZero(fcinfo->flinfo->fn_mcxt, 1);
+	}
+
 	return state;
 }
 
@@ -5470,21 +5498,42 @@ makeNumericAggStateCurrentContext(bool calcSumX2)
 }
 
 /*
+ * Why a state left the fast path, as reported by the numeric-agg-promote
+ * probe.  The probe's second argument is the state's input count at the
+ * moment of promotion.  For NUMERIC_AGG_PROMOTE_ACCUM it excludes the input
+ * being added, so zero means that the group's very first input did not fit;
+ * for NUMERIC_AGG_PROMOTE_DISCARD it still includes the input being removed;
+ * for the two combine causes it already includes the other partial state's
+ * inputs.
+ */
+typedef enum NumericAggPromoteCause
+{
+	NUMERIC_AGG_PROMOTE_ACCUM = 1,	/* transition: input or sum does not fit */
+	NUMERIC_AGG_PROMOTE_DISCARD = 2,	/* moving-aggregate inverse transition */
+	NUMERIC_AGG_PROMOTE_COMBINE_OVERFLOW = 3,	/* two fast partial sums */
+	NUMERIC_AGG_PROMOTE_COMBINE_MIXED = 4,	/* fast state meets a promoted one */
+} NumericAggPromoteCause;
+
+/*
  * Convert the accumulated int128 fast sum into the digit-array accumulator
  * and switch the state to the (permanent) promoted mode; see NumericAggState.
  *
  * This only moves the sum itself: an input that failed to be accumulated the
  * fast way must afterwards be processed by the regular digit-array path,
- * including its N++.
+ * including its N++.  'cause' is only reported to the tracing probe.
  */
 static void
-promote_numeric_agg_state(NumericAggState *state)
+promote_numeric_agg_state(NumericAggState *state, NumericAggPromoteCause cause)
 {
 	NumericVar	tmp;
 	MemoryContext old_context;
 
 	Assert(!state->promoted);
 	Assert(!state->calcSumX2);
+
+	/* guarded like numeric-agg-fast-start; see makeNumericAggState() */
+	if (TRACE_POSTGRESQL_NUMERIC_AGG_PROMOTE_ENABLED())
+		TRACE_POSTGRESQL_NUMERIC_AGG_PROMOTE((int) cause, (long) state->N);
 
 	/*
 	 * A zero sum at scale zero carries neither a value nor a display scale,
@@ -5602,7 +5651,7 @@ do_numeric_accum(NumericAggState *state, Numeric newval)
 			state->N++;
 			return;
 		}
-		promote_numeric_agg_state(state);
+		promote_numeric_agg_state(state, NUMERIC_AGG_PROMOTE_ACCUM);
 	}
 
 	/* if we need X^2, calculate that in short-lived context */
@@ -5732,7 +5781,7 @@ do_numeric_discard(NumericAggState *state, Numeric newval)
 				state->N--;
 				return true;
 			}
-			promote_numeric_agg_state(state);
+			promote_numeric_agg_state(state, NUMERIC_AGG_PROMOTE_DISCARD);
 		}
 	}
 
@@ -6033,7 +6082,10 @@ numeric_avg_combine(PG_FUNCTION_ARGS)
 
 		/* At least one side needs the digit-array path: promote state1 */
 		if (!state1->promoted)
-			promote_numeric_agg_state(state1);
+			promote_numeric_agg_state(state1,
+									  state2->promoted ?
+									  NUMERIC_AGG_PROMOTE_COMBINE_MIXED :
+									  NUMERIC_AGG_PROMOTE_COMBINE_OVERFLOW);
 
 		if (state2->promoted)
 		{

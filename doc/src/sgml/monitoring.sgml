@@ -8361,6 +8361,40 @@ FROM pg_stat_get_backend_idset() AS backendid;
      <entry>Probe that fires when a deadlock is found by the deadlock
       detector.</entry>
     </row>
+    <row>
+     <entry><literal>numeric-agg-fast-start</literal></entry>
+     <entry><literal>()</literal></entry>
+     <entry>Probe that fires when <function>sum(numeric)</function> or
+      <function>avg(numeric)</function> creates its first transition state
+      that accumulates in the 128-bit integer representation.  It fires once
+      per transition state of a plan node, in each process that runs it, not
+      once per group, and not again on rescans; aggregates that share a
+      transition state, such as <literal>sum(x)</literal> and
+      <literal>avg(x)</literal> over the same input, are reported once.
+      In a parallel plan each worker reports its own partial aggregation.
+      States built by combine or deserialization functions are not reported.
+      Like <literal>numeric-agg-promote</literal>, this probe fires only
+      while the tracing tool has activated its semaphore.</entry>
+    </row>
+    <row>
+     <entry><literal>numeric-agg-promote</literal></entry>
+     <entry><literal>(int, long)</literal></entry>
+     <entry>Probe that fires when such a state switches to the arbitrary
+      precision representation because its sum no longer fits.
+      arg0 is the cause: 1 for a transition (an input value or the running
+      sum does not fit), 2 for the inverse transition of a moving aggregate,
+      3 when two partial sums are combined and their total does not fit,
+      4 when a partial state is combined with one that has already switched.
+      Causes 3 and 4 are reported by the process that combines the partial
+      states, which in a parallel plan is the leader.
+      arg1 is the state's number of input values at that moment: with
+      cause 1 it excludes the value being added, so 0 means the first input
+      value did not fit; with cause 2 it still includes the value being
+      removed; with causes 3 and 4 it already includes the inputs of the
+      other partial state.
+      This probe fires only while the tracing tool has activated its
+      semaphore.</entry>
+    </row>
 
    </tbody>
    </tgroup>
