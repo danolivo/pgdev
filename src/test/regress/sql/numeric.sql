@@ -1613,6 +1613,15 @@ FROM num_toast_test;
 SELECT id FROM num_toast_test ORDER BY v, id;
 SELECT length(sum(v)::text) AS sum_digits FROM num_toast_test;
 
+-- unary functions and a RANGE frame over out-of-line values
+SELECT id, abs(-v) = v AS abs, round(v) = v AS round, trunc(v) = v AS trunc,
+       ceil(v) = v AS ceil, floor(v) = v AS floor, sign(v), scale(v),
+       min_scale(v), length(trim_scale(v)::text) AS trim_digits,
+       v % 10 AS mod, div(v, 10) % 10 AS div
+FROM num_toast_test ORDER BY id;
+SELECT id, count(*) OVER (ORDER BY v RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+FROM num_toast_test ORDER BY id;
+
 DROP TABLE num_toast_test;
 
 --
