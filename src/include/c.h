@@ -1303,7 +1303,7 @@ pg_noreturn extern void ExceptionalCondition(const char *conditionName,
  *
  * N must not exceed PG_MEMCPY_SMALL_MAX: without assertions a longer copy
  * would silently lose its middle.  A caller that cannot guarantee the bound
- * has to test the length and call memcpy() itself.  Making that test here
+ * has to use pg_memcpy_mostly_small().  Making its test of the length here
  * instead is not free.  Where N comes from an unsigned subtraction, as it
  * does for short varlenas, the compiler cannot rule out wraparound, so it
  * keeps the branch, and gcc warns about the bound of the memcpy() behind it.
@@ -1367,6 +1367,27 @@ pg_memcpy_small(void *dst, const void *src, size_t n)
 
 	memcpy(dst, src, n);
 #endif
+}
+
+/*
+ * pg_memcpy_mostly_small
+ *		memcpy(DST, SRC, N) for a copy that is nearly always, but not always,
+ *		at most PG_MEMCPY_SMALL_MAX bytes, such as an index tuple.
+ *
+ * Where pg_memcpy_small() is plain memcpy(), so is this, with no test of the
+ * length left behind.
+ */
+static inline void
+pg_memcpy_mostly_small(void *dst, const void *src, size_t n)
+{
+#ifdef PG_MEMCPY_SMALL_OPEN_CODED
+	if (likely(n <= PG_MEMCPY_SMALL_MAX))
+	{
+		pg_memcpy_small(dst, src, n);
+		return;
+	}
+#endif
+	memcpy(dst, src, n);
 }
 
 

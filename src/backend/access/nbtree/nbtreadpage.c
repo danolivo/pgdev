@@ -1044,7 +1044,9 @@ _bt_saveitem(BTScanOpaque so, int itemIndex,
 		Size		itupsz = IndexTupleSize(itup);
 
 		currItem->tupleOffset = so->currPos.nextTupleOffset;
-		memcpy(so->currTuples + so->currPos.nextTupleOffset, itup, itupsz);
+		/* index tuples are nearly always short */
+		pg_memcpy_mostly_small(so->currTuples + so->currPos.nextTupleOffset,
+							   itup, itupsz);
 		so->currPos.nextTupleOffset += MAXALIGN(itupsz);
 	}
 }
