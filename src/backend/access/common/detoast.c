@@ -193,7 +193,7 @@ detoast_attr(varlena *attr)
 
 		new_attr = (varlena *) palloc(new_size);
 		SET_VARSIZE(new_attr, new_size);
-		memcpy(VARDATA(new_attr), VARDATA_SHORT(attr), data_size);
+		pg_memcpy_small(VARDATA(new_attr), VARDATA_SHORT(attr), data_size);
 		attr = new_attr;
 	}
 

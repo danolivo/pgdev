@@ -384,14 +384,14 @@ fill_val(CompactAttribute *att,
 		{
 			/* no alignment for short varlenas */
 			data_length = VARSIZE_SHORT(val);
-			memcpy(data, val, data_length);
+			pg_memcpy_small(data, val, data_length);
 		}
 		else if (att->attispackable && VARATT_CAN_MAKE_SHORT(val))
 		{
 			/* convert to short varlena -- no alignment */
 			data_length = VARATT_CONVERTED_SHORT_SIZE(val);
 			SET_VARSIZE_SHORT(data, data_length);
-			memcpy(data + 1, VARDATA(val), data_length - 1);
+			pg_memcpy_small(data + 1, VARDATA(val), data_length - 1);
 		}
 		else
 		{

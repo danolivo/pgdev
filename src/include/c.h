@@ -1280,6 +1280,95 @@ pg_noreturn extern void ExceptionalCondition(const char *conditionName,
 			memset(_start, _val, _len); \
 	} while (0)
 
+/*
+ * pg_memcpy_small
+ *		memcpy(DST, SRC, N) for a copy whose length varies but is known to be
+ *		at most PG_MEMCPY_SMALL_MAX bytes, such as a short varlena.
+ *
+ * Plain memcpy() is avoided because the compiler can often see that its
+ * length is bounded, and gcc on x86-64 then expands it inline as rep movsq
+ * instead of calling the library; the startup cost of rep movsq exceeds the
+ * whole copy at these lengths.  A copy of a constant 2, 4, 8 or 16 bytes is
+ * expanded into plain loads and stores, and a pair of them placed at both
+ * ends covers every length in between.  The pairs overlap, but no byte
+ * outside SRC[0, N) is read and none outside DST[0, N) is written.  DST and
+ * SRC must not overlap.
+ *
+ * The copy is open-coded only where it is needed: for gcc on x86-64 before
+ * version 16, which emits rep movsq at the default -mtune=generic (seen with
+ * versions 9 to 15).  gcc 16 expands a bounded copy into loads and stores by
+ * itself.  clang on x86-64 and gcc on arm64 call the library, which the
+ * open-coded copy beats by much less, or not at all when the lengths vary.
+ * For all of those pg_memcpy_small() is plain memcpy().
+ *
+ * N must not exceed PG_MEMCPY_SMALL_MAX: without assertions a longer copy
+ * would silently lose its middle.  A caller that cannot guarantee the bound
+ * has to test the length and call memcpy() itself.  Making that test here
+ * instead is not free.  Where N comes from an unsigned subtraction, as it
+ * does for short varlenas, the compiler cannot rule out wraparound, so it
+ * keeps the branch, and gcc warns about the bound of the memcpy() behind it.
+ */
+#define PG_MEMCPY_SMALL_MAX	128
+
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ < 16 && \
+	defined(__x86_64__)
+#define PG_MEMCPY_SMALL_OPEN_CODED
+#endif
+
+static inline void
+pg_memcpy_small(void *dst, const void *src, size_t n)
+{
+#ifdef PG_MEMCPY_SMALL_OPEN_CODED
+	char	   *d = (char *) dst;
+	const char *s = (const char *) src;
+
+	Assert(n <= PG_MEMCPY_SMALL_MAX);
+
+	if (n <= 16)
+	{
+		if (n >= 8)
+		{
+			memcpy(d, s, 8);
+			memcpy(d + n - 8, s + n - 8, 8);
+		}
+		else if (n >= 4)
+		{
+			memcpy(d, s, 4);
+			memcpy(d + n - 4, s + n - 4, 4);
+		}
+		else if (n >= 2)
+		{
+			memcpy(d, s, 2);
+			memcpy(d + n - 2, s + n - 2, 2);
+		}
+		else if (n == 1)
+			d[0] = s[0];
+	}
+	else
+	{
+		/* the first and last 16, 32 or 64 bytes */
+		memcpy(d, s, 16);
+		if (n > 32)
+		{
+			memcpy(d + 16, s + 16, 16);
+			if (n > 64)
+			{
+				memcpy(d + 32, s + 32, 16);
+				memcpy(d + 48, s + 48, 16);
+				memcpy(d + n - 64, s + n - 64, 16);
+				memcpy(d + n - 48, s + n - 48, 16);
+			}
+			memcpy(d + n - 32, s + n - 32, 16);
+		}
+		memcpy(d + n - 16, s + n - 16, 16);
+	}
+#else
+	Assert(n <= PG_MEMCPY_SMALL_MAX);
+
+	memcpy(dst, src, n);
+#endif
+}
+
 
 /*
  * Macros for range-checking float values before converting to integer.
