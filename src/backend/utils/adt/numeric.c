@@ -2175,7 +2175,7 @@ numeric_abbrev_convert(Datum original_datum, SortSupport ssup)
 		Assert(sz <= VARATT_SHORT_MAX - VARHDRSZ_SHORT);
 
 		SET_VARSIZE(buf, VARHDRSZ + sz);
-		memcpy(VARDATA(buf), VARDATA_SHORT(original_varatt), sz);
+		pg_memcpy_small(VARDATA(buf), VARDATA_SHORT(original_varatt), sz);
 
 		value = (Numeric) buf;
 	}

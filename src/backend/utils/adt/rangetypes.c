@@ -2993,7 +2993,7 @@ datum_write(char *ptr, Datum datum, bool typbyval, char typalign,
 		{
 			/* no alignment for short varlenas */
 			data_length = VARSIZE_SHORT(val);
-			memcpy(ptr, val, data_length);
+			pg_memcpy_small(ptr, val, data_length);
 		}
 		else if (TYPE_IS_PACKABLE(typlen, typstorage) &&
 				 VARATT_CAN_MAKE_SHORT(val))
@@ -3001,7 +3001,7 @@ datum_write(char *ptr, Datum datum, bool typbyval, char typalign,
 			/* convert to short varlena -- no alignment */
 			data_length = VARATT_CONVERTED_SHORT_SIZE(val);
 			SET_VARSIZE_SHORT(ptr, data_length);
-			memcpy(ptr + 1, VARDATA(val), data_length - 1);
+			pg_memcpy_small(ptr + 1, VARDATA(val), data_length - 1);
 		}
 		else
 		{
