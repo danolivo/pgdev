@@ -38,6 +38,7 @@
 #include <unistd.h>
 
 #include "access/tableam.h"
+#include "access/xact.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
 #ifdef USE_ASSERT_CHECKING
@@ -5856,7 +5857,21 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 
 	if (BufferIsLocal(buffer))
 	{
-		MarkLocalBufferDirty(buffer);
+		/*
+		 * During a parallel section the leader and each of its workers keep
+		 * a private local buffer pool over the same on-disk file of a
+		 * temporary relation.  A dirty local buffer is written back to disk
+		 * on eviction (see FlushLocalBuffer), and such a write would race
+		 * with the other participants reading the file, leaving torn pages
+		 * behind.
+		 *
+		 * A hint is only an optimization and the caller has already updated
+		 * the page image, so just leave the buffer clean: the change is
+		 * discarded on eviction and re-established by a later non-parallel
+		 * access.
+		 */
+		if (!IsInParallelMode())
+			MarkLocalBufferDirty(buffer);
 		return;
 	}
 
@@ -7161,7 +7176,9 @@ BufferSetHintBits16(uint16 *ptr, uint16 val, Buffer buffer)
 	{
 		*ptr = val;
 
-		MarkLocalBufferDirty(buffer);
+		/* see MarkBufferDirtyHint() for why we skip this in parallel mode */
+		if (!IsInParallelMode())
+			MarkLocalBufferDirty(buffer);
 
 		return true;
 	}
