@@ -3045,81 +3045,103 @@ in_range_numeric_numeric(PG_FUNCTION_ARGS)
 	PG_RETURN_BOOL(result);
 }
 
-Datum
-hash_numeric(PG_FUNCTION_ARGS)
+/*
+ * numeric_hash_digits() -
+ *
+ *	Common part of hash_numeric() and hash_numeric_extended(): given the
+ *	stored data of a numeric, find the digits to hash and the weight to mix
+ *	in.  Returns false if there is nothing to hash, setting *special to tell
+ *	NaN and the infinities from zero.
+ *
+ *	Leading and trailing zero digits are left out.  The numeric
+ *	implementation *should* guarantee that they are suppressed, but we're
+ *	paranoid.
+ */
+static pg_always_inline bool
+numeric_hash_digits(const char *p, Size len, bool *special,
+					int *weight, const char **digits, Size *nbytes)
 {
-	Numeric		key = PG_GETARG_NUMERIC(0);
-	uint32		digit_hash;
-	uint32		result;
-	int			weight;
-	int			start_offset;
-	int			end_offset;
-	int			i;
-	int			hash_len;
-	NumericDigit *digits;
+	uint16		header;
+	int			sign;
+	Size		start;
+	Size		end;
+
+	memcpy(&header, p, sizeof(uint16));
 
 	/* If it's NaN or infinity, don't try to hash the rest of the fields */
-	if (NUMERIC_IS_SPECIAL(key))
-		PG_RETURN_UINT32(0);
+	*special = (header & NUMERIC_SIGN_MASK) == NUMERIC_SPECIAL;
+	if (*special)
+		return false;
 
-	weight = NUMERIC_WEIGHT(key);
-	start_offset = 0;
-	end_offset = 0;
+	if (unlikely(!numeric_stored_parts(header, p, len, &sign, weight,
+									   digits, nbytes)))
+		return false;
+
+	/* A fraction of a digit at the end is ignored, as NUMERIC_NDIGITS does */
+	end = *nbytes - *nbytes % sizeof(NumericDigit);
 
 	/*
-	 * Omit any leading or trailing zeros from the input to the hash. The
-	 * numeric implementation *should* guarantee that leading and trailing
-	 * zeros are suppressed, but we're paranoid. Note that we measure the
-	 * starting and ending offsets in units of NumericDigits, not bytes.
+	 * The weight is effectively the # of digits before the decimal point, so
+	 * decrement it for each leading zero we skip.
 	 */
-	digits = NUMERIC_DIGITS(key);
-	for (i = 0; i < NUMERIC_NDIGITS(key); i++)
+	start = 0;
+	while (start < end && numeric_stored_digit(*digits, start) == 0)
 	{
-		if (digits[i] != (NumericDigit) 0)
-			break;
-
-		start_offset++;
-
-		/*
-		 * The weight is effectively the # of digits before the decimal point,
-		 * so decrement it for each leading zero we skip.
-		 */
-		weight--;
+		start += sizeof(NumericDigit);
+		(*weight)--;
 	}
 
 	/*
 	 * If there are no non-zero digits, then the value of the number is zero,
 	 * regardless of any other fields.
 	 */
-	if (NUMERIC_NDIGITS(key) == start_offset)
-		PG_RETURN_UINT32(-1);
+	if (start == end)
+		return false;
 
-	for (i = NUMERIC_NDIGITS(key) - 1; i >= 0; i--)
+	while (numeric_stored_digit(*digits, end - sizeof(NumericDigit)) == 0)
+		end -= sizeof(NumericDigit);
+
+	*digits += start;
+	*nbytes = end - start;
+
+	return true;
+}
+
+/*
+ * The hash functions work on the stored form where they can, to save
+ * copying a value that has a 1-byte varlena header just to align it.
+ */
+Datum
+hash_numeric(PG_FUNCTION_ARGS)
+{
+	const char *p;
+	Size		len;
+	bool		special;
+	int			weight;
+	const char *digits;
+	Size		nbytes;
+
+	if (unlikely(!numeric_stored_data(PG_GETARG_DATUM(0), &p, &len)))
 	{
-		if (digits[i] != (NumericDigit) 0)
-			break;
+		Numeric		key = PG_GETARG_NUMERIC(0);
 
-		end_offset++;
+		p = VARDATA(key);
+		len = VARSIZE(key) - VARHDRSZ;
 	}
 
-	/* If we get here, there should be at least one non-zero digit */
-	Assert(start_offset + end_offset < NUMERIC_NDIGITS(key));
+	if (!numeric_hash_digits(p, len, &special, &weight, &digits, &nbytes))
+		PG_RETURN_UINT32(special ? 0 : -1);
 
 	/*
 	 * Note that we don't hash on the Numeric's scale, since two numerics can
 	 * compare equal but have different scales. We also don't hash on the
 	 * sign, although we could: since a sign difference implies inequality,
 	 * this shouldn't affect correctness.
+	 *
+	 * Mix in the weight, via XOR.
 	 */
-	hash_len = NUMERIC_NDIGITS(key) - start_offset - end_offset;
-	digit_hash = hash_bytes((unsigned char *) (NUMERIC_DIGITS(key)
-											   + start_offset),
-							hash_len * sizeof(NumericDigit));
-
-	/* Mix in the weight, via XOR */
-	result = digit_hash ^ weight;
-
-	PG_RETURN_UINT32(result);
+	PG_RETURN_UINT32(hash_bytes((const unsigned char *) digits, nbytes) ^
+					 weight);
 }
 
 /*
@@ -3129,60 +3151,28 @@ hash_numeric(PG_FUNCTION_ARGS)
 Datum
 hash_numeric_extended(PG_FUNCTION_ARGS)
 {
-	Numeric		key = PG_GETARG_NUMERIC(0);
 	uint64		seed = PG_GETARG_INT64(1);
-	uint64		digit_hash;
-	uint64		result;
+	const char *p;
+	Size		len;
+	bool		special;
 	int			weight;
-	int			start_offset;
-	int			end_offset;
-	int			i;
-	int			hash_len;
-	NumericDigit *digits;
+	const char *digits;
+	Size		nbytes;
 
-	/* If it's NaN or infinity, don't try to hash the rest of the fields */
-	if (NUMERIC_IS_SPECIAL(key))
-		PG_RETURN_UINT64(seed);
-
-	weight = NUMERIC_WEIGHT(key);
-	start_offset = 0;
-	end_offset = 0;
-
-	digits = NUMERIC_DIGITS(key);
-	for (i = 0; i < NUMERIC_NDIGITS(key); i++)
+	if (unlikely(!numeric_stored_data(PG_GETARG_DATUM(0), &p, &len)))
 	{
-		if (digits[i] != (NumericDigit) 0)
-			break;
+		Numeric		key = PG_GETARG_NUMERIC(0);
 
-		start_offset++;
-
-		weight--;
+		p = VARDATA(key);
+		len = VARSIZE(key) - VARHDRSZ;
 	}
 
-	if (NUMERIC_NDIGITS(key) == start_offset)
-		PG_RETURN_UINT64(seed - 1);
+	if (!numeric_hash_digits(p, len, &special, &weight, &digits, &nbytes))
+		PG_RETURN_UINT64(special ? seed : seed - 1);
 
-	for (i = NUMERIC_NDIGITS(key) - 1; i >= 0; i--)
-	{
-		if (digits[i] != (NumericDigit) 0)
-			break;
-
-		end_offset++;
-	}
-
-	Assert(start_offset + end_offset < NUMERIC_NDIGITS(key));
-
-	hash_len = NUMERIC_NDIGITS(key) - start_offset - end_offset;
-	digit_hash = hash_bytes_extended((unsigned char *) (NUMERIC_DIGITS(key)
-														+ start_offset),
-									 hash_len * sizeof(NumericDigit),
-									 seed);
-
-	result = digit_hash ^ weight;
-
-	PG_RETURN_UINT64(result);
+	PG_RETURN_UINT64(hash_bytes_extended((const unsigned char *) digits,
+										 nbytes, seed) ^ weight);
 }
-
 
 /* ----------------------------------------------------------------------
  *
