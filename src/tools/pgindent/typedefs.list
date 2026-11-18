@@ -1845,6 +1845,7 @@ NullingRelsMatch
 Numeric
 NumericAggState
 NumericDigit
+NumericQuickEq
 NumericSortSupport
 NumericSumAccum
 NumericVar

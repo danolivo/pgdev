@@ -1585,3 +1585,68 @@ SELECT pg_lsn(18446744073709551615::numeric);
 SELECT pg_lsn(-1::numeric);
 SELECT pg_lsn(18446744073709551616::numeric);
 SELECT pg_lsn('NaN'::numeric);
+
+--
+-- Tests for numeric equality.  numeric_eq and numeric_ne look at the stored
+-- form of their arguments before comparing them; the answer must not depend
+-- on display scale, on the varlena header, or on a value being compressed
+-- or stored out of line.
+--
+CREATE TABLE num_eq_test (id int, a numeric, b numeric);
+INSERT INTO num_eq_test VALUES
+  (1, 1.5, 1.5), (2, 1.5, 1.50), (3, 0, -0.000), (4, 'NaN', 'NaN'),
+  (5, 'Infinity', 'Infinity'), (6, '-Infinity', 'Infinity'),
+  (7, 1.5, 2.5), (8, 'NaN', 0), (9, -1.5, 1.5);
+SELECT id, a, b, a = b AS eq, a <> b AS ne FROM num_eq_test ORDER BY id;
+-- hash aggregation must merge values that differ only in display scale
+SET enable_sort = off;
+SELECT count(*)
+  FROM (SELECT DISTINCT a
+          FROM (VALUES (1.5), (1.50), (1.500), (2.5), ('NaN'), ('NaN')) v(a)) s;
+RESET enable_sort;
+-- compressed and out-of-line values, large enough to be toasted whatever
+-- the block size
+CREATE TABLE num_eq_toast (c numeric, e numeric);
+ALTER TABLE num_eq_toast ALTER COLUMN e SET STORAGE EXTERNAL;
+INSERT INTO num_eq_toast
+  VALUES (repeat('1', 40000)::numeric, repeat('1', 40000)::numeric);
+SELECT pg_column_compression(c) IS NOT NULL AS c_compressed,
+       pg_column_toast_chunk_id(e) IS NOT NULL AS e_external
+  FROM num_eq_toast;
+SELECT c = e AS c_eq_e, c <> e AS c_ne_e,
+       c = repeat('1', 40000)::numeric AS c_eq_plain,
+       e = repeat('1', 40000)::numeric AS e_eq_plain,
+       e = (repeat('1', 39999) || '2')::numeric AS e_eq_other,
+       e <> (repeat('1', 39999) || '2')::numeric AS e_ne_other
+  FROM num_eq_toast;
+-- = and <> must agree with numeric_cmp() across display scales, signs, zero,
+-- special values and both header formats (a display scale above 63 or a
+-- weight outside -64..63 forces the long format)
+CREATE TABLE num_eq_vals (v numeric);
+INSERT INTO num_eq_vals VALUES
+  (0), (0.00), (-0.0), (0::numeric(1000,100)), (0.0001), (-0.0001),
+  (1), (1.0), (1.5), (1.50), (-1.5), (-1.500),
+  (1.5::numeric(1000,100)), (-1.5::numeric(1000,100)),
+  (10000), (10000.0), (9999.9999), (12345678.9), (12345678.90),
+  (1e100), (1e100::numeric(200,2)), (1e300), (1e300::numeric(400,70)),
+  (-1e300), (2e300), (1e304), (1e-100), (1e-300),
+  (1e-300::numeric(1000,400)),
+  ('NaN'), ('Infinity'), ('-Infinity');
+SELECT count(*) AS mismatches
+  FROM num_eq_vals a, num_eq_vals b
+ WHERE (a.v = b.v) IS DISTINCT FROM (numeric_cmp(a.v, b.v) = 0)
+    OR (a.v <> b.v) IS DISTINCT FROM (numeric_cmp(a.v, b.v) <> 0);
+-- the same with one side computed in memory, so with a 4-byte varlena header
+SELECT count(*) AS mismatches
+  FROM num_eq_vals a, num_eq_vals b
+ WHERE (a.v = b.v + 0) IS DISTINCT FROM (numeric_cmp(a.v, b.v + 0) = 0)
+    OR (a.v <> b.v + 0) IS DISTINCT FROM (numeric_cmp(a.v, b.v + 0) <> 0);
+SELECT count(*) AS equal_pairs
+  FROM num_eq_vals a, num_eq_vals b WHERE a.v = b.v;
+SET enable_nestloop = off;
+SET enable_mergejoin = off;
+SELECT count(*) AS hash_join_pairs
+  FROM num_eq_vals a JOIN num_eq_vals b ON a.v = b.v;
+RESET enable_nestloop;
+RESET enable_mergejoin;
+DROP TABLE num_eq_test, num_eq_toast, num_eq_vals;
