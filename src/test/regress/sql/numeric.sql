@@ -1649,4 +1649,18 @@ SELECT count(*) AS hash_join_pairs
   FROM num_eq_vals a JOIN num_eq_vals b ON a.v = b.v;
 RESET enable_nestloop;
 RESET enable_mergejoin;
+-- hash functions look at the stored form as well; equal values must hash
+-- alike whatever their display scale and varlena header
+SELECT count(*) AS hash_mismatches
+  FROM num_eq_vals a, num_eq_vals b
+ WHERE a.v = b.v
+   AND (hash_numeric(a.v) <> hash_numeric(b.v)
+        OR hash_numeric(a.v) <> hash_numeric(b.v + 0)
+        OR hash_numeric_extended(a.v, 1) <> hash_numeric_extended(b.v, 1)
+        OR hash_numeric_extended(a.v, 1) <> hash_numeric_extended(b.v + 0, 1));
+SELECT hash_numeric(c) = hash_numeric(e) AS c_e,
+       hash_numeric(c) = hash_numeric(repeat('1', 40000)::numeric) AS c_plain,
+       hash_numeric_extended(e, 1) =
+       hash_numeric_extended(repeat('1', 40000)::numeric, 1) AS e_plain_ext
+  FROM num_eq_toast;
 DROP TABLE num_eq_test, num_eq_toast, num_eq_vals;
