@@ -347,6 +347,16 @@ typedef struct
 	hyperLogLogState abbr_card; /* cardinality estimator */
 } NumericSortSupport;
 
+/*
+ * What numeric_quick_eq() can say about two numerics.
+ */
+typedef enum NumericQuickEq
+{
+	NUMERIC_QEQ_NO,				/* they differ */
+	NUMERIC_QEQ_YES,			/* they are equal */
+	NUMERIC_QEQ_UNKNOWN,		/* cannot tell; use cmp_numerics() */
+} NumericQuickEq;
+
 
 /* ----------
  * Fast sum accumulator.
@@ -2431,12 +2441,322 @@ numeric_cmp(PG_FUNCTION_ARGS)
 }
 
 
+/*
+ * numeric_stored_data() -
+ *
+ *	Locate the data of a numeric datum as it is stored, without detoasting or
+ *	copying anything.  The data starts with the numeric header word, right
+ *	after the varlena header, and need not be aligned.  Returns false if the
+ *	datum is compressed or stored out of line.
+ */
+static pg_always_inline bool
+numeric_stored_data(Datum d, const char **data, Size *len)
+{
+	const varlena *v = (const varlena *) DatumGetPointer(d);
+	Size		l;
+
+	/* Values read from a table mostly have a 1-byte header; test it first */
+	if (VARATT_IS_SHORT(v))
+	{
+		/* An out-of-line pointer starts with a 1-byte header too */
+		if (unlikely(VARATT_IS_EXTERNAL(v)))
+			return false;
+		l = VARSIZE_SHORT(v) - VARHDRSZ_SHORT;
+		*data = VARDATA_SHORT(v);
+	}
+	else
+	{
+		/* Don't let a corrupt length word send us out of bounds */
+		if (unlikely(VARATT_IS_COMPRESSED(v) || VARSIZE(v) < VARHDRSZ))
+			return false;
+		l = VARSIZE(v) - VARHDRSZ;
+		*data = VARDATA(v);
+	}
+
+	Assert(l >= sizeof(uint16) && l % sizeof(NumericDigit) == 0);
+	*len = l;
+
+	return true;
+}
+
+/*
+ * numeric_stored_parts() -
+ *
+ *	Locate the sign, weight and digits of a stored finite numeric, given its
+ *	header word and its data as found by numeric_stored_data().  Returns
+ *	false if the data is too short for the header its format calls for.
+ *
+ *	The sign and weight come out as NUMERIC_SIGN() and NUMERIC_WEIGHT() would
+ *	give them, but those work on a Numeric with a 4-byte varlena header.
+ */
+static pg_always_inline bool
+numeric_stored_parts(uint16 header, const char *p, Size len,
+					 int *sign, int *weight, const char **digits, Size *nbytes)
+{
+	Size		hdrsz;
+
+	Assert((header & NUMERIC_SIGN_MASK) != NUMERIC_SPECIAL);
+
+	if (header & NUMERIC_SHORT)
+	{
+		*sign = (header & NUMERIC_SHORT_SIGN_MASK) ? NUMERIC_NEG : NUMERIC_POS;
+		*weight = ((header & NUMERIC_SHORT_WEIGHT_SIGN_MASK) ?
+				   ~NUMERIC_SHORT_WEIGHT_MASK : 0) |
+			(header & NUMERIC_SHORT_WEIGHT_MASK);
+		hdrsz = sizeof(uint16);
+	}
+	else
+	{
+		int16		w;
+
+		if (unlikely(len < sizeof(uint16) + sizeof(int16)))
+			/* A corrupted value should go the slow path */
+			return false;
+		memcpy(&w, p + sizeof(uint16), sizeof(int16));
+		*sign = header & NUMERIC_SIGN_MASK;
+		*weight = w;
+		hdrsz = sizeof(uint16) + sizeof(int16);
+	}
+
+	*digits = p + hdrsz;
+	*nbytes = len - hdrsz;
+
+	return true;
+}
+
+/*
+ * numeric_stored_digit() -
+ *
+ *	Fetch the digit at the given byte offset of a stored, possibly unaligned
+ *	digit array.
+ */
+static pg_always_inline NumericDigit
+numeric_stored_digit(const char *digits, Size offset)
+{
+	NumericDigit digit;
+
+	memcpy(&digit, digits + offset, sizeof(NumericDigit));
+	return digit;
+}
+
+/*
+ * numeric_special_eq() -
+ *
+ *	Equality of two stored numerics, given their header words, when at least
+ *	one of them is NaN or an infinity.  Such a value never equals a finite
+ *	one, and two of them are compared just as cmp_numerics() does it.
+ */
+static pg_always_inline bool
+numeric_special_eq(uint16 h1, uint16 h2)
+{
+	bool		special1 = (h1 & NUMERIC_SIGN_MASK) == NUMERIC_SPECIAL;
+	bool		special2 = (h2 & NUMERIC_SIGN_MASK) == NUMERIC_SPECIAL;
+
+	if (special1 != special2)
+		return false;
+	if (h1 == NUMERIC_NAN)
+		return h2 == NUMERIC_NAN;
+	if (h1 == NUMERIC_PINF)
+		return h2 == NUMERIC_PINF;
+	return h2 == NUMERIC_NINF;
+}
+
+/*
+ * numeric_quick_eq() -
+ *
+ *	Try to decide whether two numeric datums are equal from their stored
+ *	form, without detoasting either one.  Fall back to cmp_numerics() if needed.
+ *
+ *	A finite numeric is stored as a sign, a display scale, a weight and an
+ *	array of base-NBASE digits.  The display scale takes no part in
+ *	comparison, and neither does the choice between the short and the long
+ *	header format, so the stored bytes of equal values can differ: 1.5 and
+ *	1.50 are equal.
+ *
+ *	This walks through cmp_numerics() -- that is, cmp_var_common() and
+ *	cmp_abs_common() -- test by test, replacing each with a cheaper one that
+ *	gives the same answer.  It therefore does not depend on the inputs having
+ *	the form make_result() produces, with leading and trailing zero digits
+ *	stripped; where a zero digit in such a position would matter, we give up
+ *	and let cmp_numerics() decide.  Anyone changing those functions must
+ *	change this one to match; assert-enabled builds check every answer given
+ *	here against cmp_numerics().
+ *
+ *	- NaN and the infinities are settled by their header words.
+ *	- cmp_var_common() takes a value without digits to be zero, whatever its
+ *	  stored sign and weight, and equal only to another value without
+ *	  digits.
+ *	- Values of different sign differ.
+ *	- If the weights differ, the values differ as soon as the first digit of
+ *	  the one with the larger weight is nonzero.
+ *	- If the weights are equal, the values differ if the digits they both
+ *	  have do, which memcmp() can tell.  If those match and so do the
+ *	  lengths, the values are equal.  Otherwise the values differ as soon as
+ *	  the last digit of the longer one is nonzero.
+ *
+ *	All of it is inlined into the two callers.  Leaving only the first test
+ *	inline and calling a shared function for the rest was measured to cost
+ *	values that differ in display scale more than the smaller code gains.
+ */
+static pg_always_inline NumericQuickEq
+numeric_quick_eq(Datum d1, Datum d2)
+{
+	const char *p1;
+	const char *p2;
+	Size		len1;
+	Size		len2;
+	uint16		h1;
+	uint16		h2;
+	int			sign1;
+	int			sign2;
+	int			weight1;
+	int			weight2;
+	const char *digits1;
+	const char *digits2;
+	Size		nbytes1;
+	Size		nbytes2;
+	NumericDigit last;
+
+	if (unlikely(!numeric_stored_data(d1, &p1, &len1) ||
+				 !numeric_stored_data(d2, &p2, &len2)))
+		return NUMERIC_QEQ_UNKNOWN;
+
+	memcpy(&h1, p1, sizeof(uint16));
+	memcpy(&h2, p2, sizeof(uint16));
+
+	/*
+	 * The common case first: finite values with the same header word and the
+	 * same length, which is what values of one column, or of columns declared
+	 * with the same scale, usually are.
+	 */
+	if (h1 == h2 && len1 == len2 &&
+		likely((h1 & NUMERIC_SIGN_MASK) != NUMERIC_SPECIAL))
+	{
+		if (memcmp(p1, p2, len1) == 0)
+			return NUMERIC_QEQ_YES;
+
+		/*
+		 * The bytes differ, but the signs match, being part of the header
+		 * word, and so does the number of digits.  If the weights match as
+		 * well, some digit must differ, and equal-length digit strings of
+		 * equal weight denote different values.  In the short format the
+		 * weight is part of the header word too; in the long format it is the
+		 * word that follows, and there is one, as the lengths are equal and
+		 * the header words are not where the bytes differ.
+		 */
+		if (likely((h1 & NUMERIC_SIGN_MASK) == NUMERIC_SHORT))
+			return NUMERIC_QEQ_NO;
+
+		Assert(len1 >= sizeof(uint16) + sizeof(int16));
+		if (memcmp(p1 + sizeof(uint16), p2 + sizeof(uint16),
+				   sizeof(int16)) == 0)
+			return NUMERIC_QEQ_NO;
+
+		/* Fall through to check the values with different weights. */
+	}
+
+	if ((h1 & NUMERIC_SIGN_MASK) == NUMERIC_SPECIAL ||
+		(h2 & NUMERIC_SIGN_MASK) == NUMERIC_SPECIAL)
+		return numeric_special_eq(h1, h2) ? NUMERIC_QEQ_YES : NUMERIC_QEQ_NO;
+
+	if (unlikely(!numeric_stored_parts(h1, p1, len1, &sign1, &weight1,
+									   &digits1, &nbytes1) ||
+				 !numeric_stored_parts(h2, p2, len2, &sign2, &weight2,
+									   &digits2, &nbytes2)))
+		return NUMERIC_QEQ_UNKNOWN;
+
+	/* One more specific case: zero doesn't have digits at all */
+	if (nbytes1 == 0 || nbytes2 == 0)
+		return (nbytes1 == nbytes2) ? NUMERIC_QEQ_YES : NUMERIC_QEQ_NO;
+
+	if (sign1 != sign2)
+		return NUMERIC_QEQ_NO;
+
+	if (weight1 != weight2)
+	{
+		/*
+		 * The one with the larger weight is the larger in absolute value,
+		 * unless it starts with a zero digit.
+		 */
+		const char *larger = (weight1 > weight2) ? digits1 : digits2;
+
+		if (numeric_stored_digit(larger, 0) != 0)
+			return NUMERIC_QEQ_NO;
+
+		/* Normally shouldn't happen */
+		return NUMERIC_QEQ_UNKNOWN;
+	}
+
+	/* Equal weights: compare the digits that both values have */
+	if (memcmp(digits1, digits2, Min(nbytes1, nbytes2)) != 0)
+		return NUMERIC_QEQ_NO;
+	if (nbytes1 == nbytes2)
+		return NUMERIC_QEQ_YES;
+
+	/*
+	 * One value has more digits than the other, and they agree as far as the
+	 * shorter one goes.  They differ unless those extra digits are all zero,
+	 * which the last one normally is not.
+	 */
+	if (nbytes1 > nbytes2)
+		last = numeric_stored_digit(digits1, nbytes1 - sizeof(NumericDigit));
+	else
+		last = numeric_stored_digit(digits2, nbytes2 - sizeof(NumericDigit));
+	if (last != 0)
+		return NUMERIC_QEQ_NO;
+
+	/* Normally shouldn't happen */
+	return NUMERIC_QEQ_UNKNOWN;
+}
+
+#ifdef USE_ASSERT_CHECKING
+/*
+ * numeric_eq_by_cmp() -
+ *
+ *	Equality the long way round, to check numeric_quick_eq() against.
+ */
+static bool
+numeric_eq_by_cmp(Datum d1, Datum d2)
+{
+	Numeric		num1 = DatumGetNumeric(d1);
+	Numeric		num2 = DatumGetNumeric(d2);
+	bool		result;
+
+	result = cmp_numerics(num1, num2) == 0;
+
+	if (num1 != DatumGetPointer(d1))
+		pfree(num1);
+	if (num2 != DatumGetPointer(d2))
+		pfree(num2);
+
+	return result;
+}
+#endif
+
+/*
+ * Equality and inequality are decided from the stored form when possible.
+ * That saves copying inputs that have a 1-byte varlena header into palloc'd
+ * storage, which PG_GETARG_NUMERIC() must do to align them, as well as the
+ * call to cmp_numerics().
+ */
 Datum
 numeric_eq(PG_FUNCTION_ARGS)
 {
-	Numeric		num1 = PG_GETARG_NUMERIC(0);
-	Numeric		num2 = PG_GETARG_NUMERIC(1);
+	Numeric		num1;
+	Numeric		num2;
+	NumericQuickEq quick;
 	bool		result;
+
+	quick = numeric_quick_eq(PG_GETARG_DATUM(0), PG_GETARG_DATUM(1));
+	if (quick != NUMERIC_QEQ_UNKNOWN)
+	{
+		Assert((quick == NUMERIC_QEQ_YES) ==
+			   numeric_eq_by_cmp(PG_GETARG_DATUM(0), PG_GETARG_DATUM(1)));
+		PG_RETURN_BOOL(quick == NUMERIC_QEQ_YES);
+	}
+
+	num1 = PG_GETARG_NUMERIC(0);
+	num2 = PG_GETARG_NUMERIC(1);
 
 	result = cmp_numerics(num1, num2) == 0;
 
@@ -2449,9 +2769,21 @@ numeric_eq(PG_FUNCTION_ARGS)
 Datum
 numeric_ne(PG_FUNCTION_ARGS)
 {
-	Numeric		num1 = PG_GETARG_NUMERIC(0);
-	Numeric		num2 = PG_GETARG_NUMERIC(1);
+	Numeric		num1;
+	Numeric		num2;
+	NumericQuickEq quick;
 	bool		result;
+
+	quick = numeric_quick_eq(PG_GETARG_DATUM(0), PG_GETARG_DATUM(1));
+	if (quick != NUMERIC_QEQ_UNKNOWN)
+	{
+		Assert((quick == NUMERIC_QEQ_YES) ==
+			   numeric_eq_by_cmp(PG_GETARG_DATUM(0), PG_GETARG_DATUM(1)));
+		PG_RETURN_BOOL(quick == NUMERIC_QEQ_NO);
+	}
+
+	num1 = PG_GETARG_NUMERIC(0);
+	num2 = PG_GETARG_NUMERIC(1);
 
 	result = cmp_numerics(num1, num2) != 0;
 
@@ -8105,6 +8437,10 @@ cmp_var(const NumericVar *var1, const NumericVar *var2)
  *
  *	Main routine of cmp_var(). This function can be used by both
  *	NumericVar and Numeric.
+ *
+ *	numeric_quick_eq() reproduces the tests made here, and those made in
+ *	cmp_abs_common(), on the stored form of a numeric.  A change to either
+ *	must be made there as well.
  */
 static int
 cmp_var_common(const NumericDigit *var1digits, int var1ndigits,
@@ -11485,6 +11821,8 @@ cmp_abs(const NumericVar *var1, const NumericVar *var2)
  *
  *	Main routine of cmp_abs(). This function can be used by both
  *	NumericVar and Numeric.
+ *
+ *	See the note at cmp_var_common() about numeric_quick_eq().
  * ----------
  */
 static int
