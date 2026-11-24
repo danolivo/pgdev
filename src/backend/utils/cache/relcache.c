@@ -2187,6 +2187,10 @@ RelationIdGetRelation(Oid relationId)
 			Assert(rd->rd_isvalid ||
 				   (rd->rd_isnailed && !criticalRelcachesBuilt));
 		}
+
+		/* Consistency check to be paranoid introducing parallel temp scan. */
+		Assert(!(rd != NULL && RelationUsesLocalBuffers(rd) && IsParallelWorker() && dirtied_localbufs != 0));
+
 		return rd;
 	}
 
@@ -2197,6 +2201,10 @@ RelationIdGetRelation(Oid relationId)
 	rd = RelationBuildDesc(relationId, true);
 	if (RelationIsValid(rd))
 		RelationIncrementReferenceCount(rd);
+
+	/* Consistency check to be paranoid introducing parallel temp scan. */
+	Assert(!(rd != NULL && RelationUsesLocalBuffers(rd) && IsParallelWorker() && dirtied_localbufs != 0));
+
 	return rd;
 }
 

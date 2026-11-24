@@ -185,7 +185,7 @@ typedef struct Plan
 	/* engage parallel-aware logic? */
 	bool		parallel_aware;
 	/* OK to use as part of parallel plan? */
-	bool		parallel_safe;
+	ParallelSafe	parallel_safe;
 
 	/*
 	 * information needed for asynchronous execution
@@ -1286,6 +1286,8 @@ typedef struct Gather
 	bool		single_copy;
 	/* suppress EXPLAIN display (for testing)? */
 	bool		invisible;
+	/* Signal if any object with temporary storage is scanned in this subtree */
+	bool		process_temp_tables;
 
 	/*
 	 * param id's of initplans which are referred at gather or one of its
@@ -1324,6 +1326,9 @@ typedef struct GatherMerge
 
 	/* NULLS FIRST/LAST directions */
 	bool	   *nullsFirst pg_node_attr(array_size(numCols));
+
+	/* Signal if any objects with temporary storage are scanned in this subtree */
+	bool		process_temp_tables;
 
 	/*
 	 * param id's of initplans which are referred at gather merge or one of
